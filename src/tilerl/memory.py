@@ -94,33 +94,56 @@ def page_bounds_bytes(cfg, pages: int) -> int:
     return pages * 2 * len(cfg.full_attn_layers) * cfg.num_kv_heads * cfg.head_dim * 2
 
 
-def sparse_rows(cfg, *, num_rows: int, context_tokens: int, k_pages: int,
-                scorer: str, kv_io, kv_fp8=None, hot_extra_pages: int = 0) -> list[Row]:
+def sparse_hot_pages_per_slot(cfg, k_pages: int, max_num_batched_tokens: int) -> int:
+    """Resident hot pages one slot's pool is sized for — the exact expression
+    build_engine allocates: ``n_groups*k + WINDOW + chunk_pages``. Groups choose
+    independently, so the worst case is their DISJOINT union (n_groups*k); the
+    forced own window and one max-size prefill chunk (+1 partial) co-reside.
+    Canonical here so the ledger row and the pool cannot drift apart."""
+    from .sparse_index import WINDOW_PAGES
+
+    chunk_pages = max_num_batched_tokens // BLOCK_TOKENS + 1
+    return sparse_source_count(cfg) * k_pages + WINDOW_PAGES + chunk_pages
+
+
+def sparse_pool_num_blocks(cfg, num_slots: int, k_pages: int,
+                           max_num_batched_tokens: int) -> int:
+    """Total device blocks build_engine allocates for a sparse engine:
+    one per slot's hot ceiling plus a single shared spare block."""
+    return num_slots * sparse_hot_pages_per_slot(cfg, k_pages, max_num_batched_tokens) + 1
+
+
+def sparse_rows(cfg, *, num_rows: int, num_slots: int, context_tokens: int,
+                k_pages: int, max_num_batched_tokens: int,
+                scorer: str, kv_io, kv_fp8=None) -> list[Row]:
     """The three sparse-KV owners (design-sparse-kv.md "Cost model rows"):
 
     - ``index_keys`` (learned scorer) or ``page_bounds`` (Quest scorer) on device;
-    - ``kv_hot``: each row pins (k_pages + 8-window) pages; a source group reuses one
-      selection for its full-attn layers, and every group covers the layer set, so the
-      per-row hot bytes are hot_pages x one whole KV block. ``hot_extra_pages`` is the
-      live engine's prefill headroom: the chunk's OWN pages are resident alongside the
-      selected set until the chunk ends (dry-run passes 0);
-    - ``kv_cold`` on host: every written page the hot set does not pin.
+    - ``kv_hot``: the device pool build_engine ALLOCATES — ``num_slots`` times the
+      per-slot hot ceiling ``n_groups*k + 8-window + chunk`` plus one spare block.
+      This is a capacity row (bounded by worst-case disjoint groups), not the number
+      of a context's pages that happen to be resident this tick;
+    - ``kv_cold`` on host: per concurrent row, every written page outside the
+      selected + window hot set (the chunk pages are transient write headroom, not
+      part of the context's cold set).
     """
     from .sparse_index import WINDOW_PAGES
 
     if scorer not in ("index", "bounds"):
         raise ValueError(f"unknown sparse scorer {scorer!r}; want index|bounds")
     written = sparse_pages(context_tokens)
-    hot_pages = min(k_pages + WINDOW_PAGES + hot_extra_pages, written)
-    cold_pages = written - min(k_pages + WINDOW_PAGES, written)
+    pool_blocks = sparse_pool_num_blocks(cfg, num_slots, k_pages, max_num_batched_tokens)
+    selected_hot = min(sparse_source_count(cfg) * k_pages + WINDOW_PAGES, written)
+    cold_pages = written - selected_hot
     block = per_kv_block_bytes(cfg, kv_io, kv_fp8)
     scorer_n = index_keys_bytes(cfg, written) if scorer == "index" \
         else page_bounds_bytes(cfg, written)
     return [
         Row("device", "index_keys" if scorer == "index" else "page_bounds", scorer_n,
             f"{written} written pages, {scorer} scorer, {k_pages} hot + {WINDOW_PAGES} window"),
-        Row("device", "kv_hot", num_rows * hot_pages * block,
-            f"{num_rows} rows x {hot_pages} hot pages x a full KV block"),
+        Row("device", "kv_hot", pool_blocks * block,
+            f"{pool_blocks} allocated pool blocks "
+            f"({num_slots} slots x {sparse_hot_pages_per_slot(cfg, k_pages, max_num_batched_tokens)} hot ceiling + 1 spare)"),
         Row("host", "kv_cold", num_rows * cold_pages * block,
             f"{num_rows} rows x {cold_pages} cold pages"),
     ]
@@ -358,9 +381,10 @@ def plan(cfg, params: dict | None, device_free: int, *, num_slots: int, num_bloc
         # Sparse deployment: the device pool IS the pinned hot set (plus scorer keys);
         # cold pages live on host. No dense kv_pool row to avoid counting hot twice.
         rows.extend(sparse_rows(
-            cfg, num_rows=sparse["num_rows"], context_tokens=sparse["context"],
-            k_pages=sparse["k_pages"], scorer=sparse["scorer"],
-            kv_io=kv_io, kv_fp8=kv_fp8))
+            cfg, num_rows=sparse["num_rows"], num_slots=num_slots,
+            context_tokens=sparse["context"], k_pages=sparse["k_pages"],
+            max_num_batched_tokens=sparse["max_num_batched_tokens"],
+            scorer=sparse["scorer"], kv_io=kv_io, kv_fp8=kv_fp8))
     else:
         rows.append(
             Row(

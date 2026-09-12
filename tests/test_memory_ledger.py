@@ -420,8 +420,10 @@ if __name__ == "__main__":
 def test_sparse_rows_match_real_tensor_storage_on_27b():
     """The sparse ledger's derived bytes equal the storage of the tensors the engine
     will actually allocate, on the 27B V4.1 geometry (docs/design-sparse-kv.md):
-    index_keys = pages x 4 sources x 4 heads x 132 B; kv_hot = rows x 136 pages x one
-    full KV block; kv_cold = rows x remaining pages x one block. All fp8 KV."""
+    index_keys = pages x 4 sources x 4 heads x 132 B; kv_hot = the 554-block
+    allocated device pool (1 slot x (4 groups x 128 + 8 window + 33 chunk) + 1
+    spare) x one full KV block; kv_cold = rows x remaining selected-window pages
+    x one block. All fp8 KV."""
     import torch
 
     from tilerl.config import qwen38_27b
@@ -453,15 +455,19 @@ def test_sparse_rows_match_real_tensor_storage_on_27b():
     assert key_storage == 34_603_008  # 33.0 MiB reconciled
 
     got = {r.owner: r for r in sparse_rows(
-        cfg, num_rows=rows_b, context_tokens=ctx, k_pages=k_pages,
+        cfg, num_rows=rows_b, num_slots=1, context_tokens=ctx, k_pages=k_pages,
+        max_num_batched_tokens=512,
         scorer=scorer, kv_io=torch.bfloat16, kv_fp8=torch.float8_e4m3fn)}
     assert set(got) == {"index_keys", "kv_hot", "kv_cold"}
-    # hot = (128 + 8 window) pages x one full block
-    assert got["kv_hot"].n == 136 * block == 72_417_280          # 69.06 MiB
-    # cold = the remaining written pages; hot + cold per row == the dense block total
-    cold_pages = pages - 136
+    # kv_hot prices the ALLOCATED device pool, exactly build_engine's expression:
+    # slots*(n_groups*k + 8-window + chunk_pages) + 1 spare. 27B n_groups=4,
+    # chunk=512/16+1=33 -> 1*(4*128 + 8 + 33) + 1 = 554 blocks. The old ledger
+    # priced only k+8 = 136 (no n_groups, no chunk), ~4x under the real pool.
+    assert sparse_source_count(cfg) == 4
+    assert got["kv_hot"].n == 554 * block
+    # cold is per concurrent row, every written page outside selected+window
+    cold_pages = pages - (4 * 128 + 8)
     assert got["kv_cold"].n == rows_b * cold_pages * block
-    assert (got["kv_hot"].n + got["kv_cold"].n) == rows_b * pages * block
 
 
 def test_sparse_bounds_scorer_uses_quest_bounds_bytes():
@@ -474,8 +480,9 @@ def test_sparse_bounds_scorer_uses_quest_bounds_bytes():
     pages = sparse_pages(262_144)
     assert page_bounds_bytes(cfg, pages) == pages * 2 * 16 * 4 * 256 * 2
     got = {r.owner: r for r in sparse_rows(
-        cfg, num_rows=1, context_tokens=262_144, k_pages=128, scorer="bounds",
-        kv_io=__import__("torch").bfloat16)}
+        cfg, num_rows=1, num_slots=1, context_tokens=262_144, k_pages=128,
+        max_num_batched_tokens=512,
+        scorer="bounds", kv_io=__import__("torch").bfloat16)}
     assert got["page_bounds"].n == page_bounds_bytes(cfg, pages)
     assert "index_keys" not in got
 
@@ -522,8 +529,9 @@ def test_sparse_kv_cold_excluded_from_device_peak_but_in_host_total():
 
     cfg = qwen38_27b()
     rows = sparse_rows(
-        cfg, num_rows=1, context_tokens=262_144, k_pages=128, scorer="index",
-        kv_io=torch.bfloat16, kv_fp8=torch.float8_e4m3fn)
+        cfg, num_rows=1, num_slots=1, context_tokens=262_144, k_pages=128,
+        max_num_batched_tokens=512,
+        scorer="index", kv_io=torch.bfloat16, kv_fp8=torch.float8_e4m3fn)
     device_static = sum(r.n for r in rows if r.tier == "device")
     cold = sum(r.n for r in rows if r.owner == "kv_cold")
     assert cold > 0

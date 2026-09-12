@@ -256,16 +256,19 @@ def _require_checkpoint_matches(cfg, model_name: str, checkpoint: str) -> None:
 
 
 def _sparse_spec(args, cfg) -> dict | None:
-    """--sparse-k K: price the sparse-KV ledger. Concurrent rows = --max-batch, context
-    per row = --max-ctx or the model ceiling; scorer picks learned index keys vs Quest
-    bounds."""
+    """--sparse-k K: price the sparse-KV ledger. Concurrent rows = --max-batch,
+    slots and chunk budget come from the same args build_engine uses (a 0 chunk
+    budget means the engine default 512); context per row = --max-ctx or the
+    model ceiling; scorer picks learned index keys vs Quest bounds."""
     k = getattr(args, "sparse_k", 0)
     if not k:
         return None
     return {
         "num_rows": args.max_batch,
+        "num_slots": args.slots,
         "context": int(args.max_ctx or cfg.max_position_embeddings),
         "k_pages": k,
+        "max_num_batched_tokens": args.max_batched_tokens or 512,
         "scorer": getattr(args, "scorer", "index"),
     }
 
