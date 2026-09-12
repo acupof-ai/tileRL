@@ -162,13 +162,86 @@ Prefill is chunked already; a chunk's queries select from pages written by
 earlier chunks, and the chunk's own pages stay on the device until the chunk
 ends. The union of a chunk's selected sets is fetched once, not per query.
 
+### The resident pool is a cross-group UNION, sized `union_cap`
+
+The hot pool is currently sized for the worst case — groups choosing disjoint
+page sets:
+
+```
+pages/slot = n_groups * k + WINDOW_PAGES + chunk_pages
+```
+
+The residency boundary is already the union (finalize keeps exactly the union
+of the groups' picks plus the own span; #534), but the pool pays for `n_groups`
+independent k's. On the 27B `n_groups = 4`; at k=1024 that is 4096 + 8 + 33 =
+4137 pages/slot. One sm70 f32 block is `2 * 16 * 4 * 16 * 256 * 4` = 2,097,152
+B, so this is 8.08 GiB/slot — 64.6 GiB at 8 slots; k=512 is 4.08 GiB/slot
+(32.6 GiB at 8). If the 8k fidelity row says the model needs that k, the
+per-group sizing makes sparse unusable at batch even though the four groups'
+top-k sets overlap heavily in practice.
+
+The pool becomes one shared per-slot pool of resident pages sized
+
+```
+union_cap = k + WINDOW_PAGES + chunk_pages + h_pages(overlap headroom)
+```
+
+where `h_pages` is fixed from measurement, not guessed: cc's 32k/8k runs log
+the per-tick union size `|∪_g S_g ∪ own|` (a one-counter probe alongside the
+fidelity runs), and `h_pages` is the observed high-water minus k over the run
+plus a named slack. `union_cap = n_groups*k + ...` must remain a legal setting
+and reproduce current outputs exactly (the continuity gate).
+
+**Eviction when the union exceeds `union_cap`.** Today the within-tick victim
+guarantees every reserved pick a frame (the "no unreserved victim" error) — that
+guarantee cannot hold below `n_groups*k`. Picks then contest the cap by one
+rule: order every `(group, page)` pick by how marginal it is to its OWN group —
+its score gap over that group's k-th pick — and drop the smallest-gap picks
+until the union fits. The forced window and the own span never compete. A group
+that loses a pick attends to its remaining picks, i.e. it reads as that group
+running a smaller k for the tick; the rule is max-min on within-group rank, so
+no group loses two picks while another keeps a pick more marginal to it. This
+is deterministic and score-only, so it runs in the device path: eligibility is
+the current `l2p >= 0` mask AND "the page survives the marginality clipping",
+computed from the same batched scores with no new host sync. Demotion still
+goes through the one-batch D2H context.
+
+**Ledger.** There is no existing row equal to the pool ceiling; today's two
+`kv_hot` readings are:
+- *Plan/dry-run row* (`memory.sparse_rows`): `k + WINDOW_PAGES` — no
+  `n_groups` factor, and `hot_extra_pages` (the chunk) has no nonzero caller in
+  `src/`. At k=128 on the 27B that is 136 pages while the pool allocates
+  `4*128+8+33 = 553`, so the plan-derived `kv_hot` under-prices the real device
+  pool by ~n_groups on multi-group models (and misses the chunk).
+- *Live engine row* (`_memory_rows`): per-tick residency (`sum(len(r.blocks))`
+  / `_measured_peak` on current residents), held pages this tick, not allocated
+  capacity.
+
+Introducing `union_cap` fixes the plan row: thread the real pool sizing (the
+union, or the worst case `n_groups*k + W + chunk`) into `sparse_rows` /
+`_sparse_spec` so the dry-run row matches the pool's `num_blocks`, and price
+`union_cap` per slot. The live row stays per-tick residency; stats gains one
+measured counter, the tick union size, so the bench prints the planned ceiling
+vs held-union distribution. The eager refresh promotes the
+highest-aggregate-score missing pages up to free union slots.
+
+**Gates (CPU tiny):** (1) `h_pages` large enough that the union never clips —
+token-identical to the current per-group sizing; (2) `union_cap = k` with
+fixtures giving disjoint group preferences clips exactly the named
+lowest-marginal picks, symmetric across groups, and tokens equal an oracle
+that clips each group's list the same way; (3) plan `kv_hot` == allocated pool
+bytes at a fixed `union_cap` (the CEILING), separately from the live row which
+equals measured tick residency (the HELD set) — never assert those two equal;
+(4) full-k (`k >= pages`) still equals dense. Implementation
+lands only after the 8k row fixes the k this serves.
+
 ## Cost model rows
 
 `memory.plan` adds three owners, priced by `nbytes` like every other row:
 
 ```
 index_keys  device  count = pages_resident x 4 source layers x 4 heads, fmt = Format(bits=8, scales=((128, f32),)), shape [128]   (learned indexer; bounds scorer: pages x 16 layers x [2, 4, 256] bf16)
-kv_hot      device  count = rows x (k_pages + 8 window) x 4 groups, bytes = per_kv_block_bytes / 4  (a group is 4 of the 16 layers' planes)
+kv_hot      device  count = rows x (k_pages + 8 window) hot pages, bytes = one whole KV block per hot page   (today: no n_groups factor — under-prices the multi-group pool by ~n_groups; the union_cap change above makes this rows x union_cap == pool num_blocks)
 kv_cold     host|ssd count = pages_written - pages_on_device, per_kv_block_bytes
 ```
 
