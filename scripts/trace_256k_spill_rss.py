@@ -21,7 +21,6 @@ import threading
 import time
 
 import numpy as np
-
 from tilerl_kernels.backend import get_backend
 
 from tilerl import cli
