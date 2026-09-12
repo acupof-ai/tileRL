@@ -578,6 +578,54 @@ def test_sparse_with_draft_matches_sparse_without_draft_greedy():
     assert t_spec == t_plain, f"spec {t_spec} != plain {t_plain}"
 
 
+def test_sparse_draft_admission_reject_does_not_leak_a_state_slot():
+    """Sparse+spec reject path: when the dense draft pool is full (a running row
+    owns its blocks), _admit frees the just-allocated state slot and returns
+    False, and the bookkeeping counter _slots_used must come back with it.
+    Otherwise every rejected tick permanently consumes a slot and the engine
+    fills up on a row it never admitted.
+
+    Two rows are required: the submit capacity guard is STATIC (num_blocks), so
+    one row sized to the pool passes submit; it is the admit-time free-blocks
+    guard (dynamic) that rejects a second row once the first owns the blocks."""
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    from tilerl_kernels.backend import get_backend
+
+    e = build_engine(
+        cfg=cfg, model=model, backend=get_backend(),
+        num_blocks=64, num_slots=4, max_batch=2, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+        kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+    # The 5-page prompt needs 6 dense draft blocks (plus one verify position);
+    # size the shared draft pool so one row fits but two cannot.
+    from tilerl.kv_cache import PagedKvPool
+
+    d = e._draft
+    d.kv = PagedKvPool(6, cfg.num_kv_heads, cfg.head_dim,
+                       num_layers=d.cfg.num_layers,
+                       layer_map=tuple(range(d.cfg.num_layers)),
+                       device=d.backend.device, dtype=d.kv.dtype)
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)  # 6 pages
+    params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=0)
+    r1 = e.submit(prompt, params)
+    try:
+        for _ in range(6):                       # admit r1, grow its draft blocks
+            e.step()
+            if e._running and e._running[0].draft_blocks:
+                break
+        assert e._draft.kv.free_blocks < 6, "fixture: row 1 did not fill the draft pool"
+        e.submit(prompt, params)                 # static guard passes, admit rejects
+        slots_before = e.stats()["slots_used"]
+        for _ in range(6):
+            e.step()                             # r2 retries admit every tick
+        st = e.stats()
+        assert st["slots_used"] == slots_before == 1, (
+            f"rejected admits leaked slots: {st['slots_used']} vs {slots_before}")
+    finally:
+        e.shutdown()
+
+
 def test_full_k_sparse_with_draft_matches_dense_with_draft():
     """k>=pages selects everything: sparse + draft equals dense + draft."""
     prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
