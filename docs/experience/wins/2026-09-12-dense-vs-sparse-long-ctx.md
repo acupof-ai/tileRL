@@ -43,13 +43,22 @@ Dense rows measured; sparse rows are blanks until the runs below return. All
 sparse rows are **pre-#546 (wrong output, timing valid)** — see the caveat at
 top. Dense rows are unaffected.
 
-| machine | mode | ctx | prefill s | ms/tok | decode tok/s | device KV GiB | cold host GiB |
+| machine | mode | ctx | prefill s | ms/tok | decode tok/s | K-pool GiB | cold host GiB |
 |---|---|---:|---:|---:|---:|---:|---:|
 | H20 | dense (graph) | 131072 | **88.6** | 0.676 | **58.28** | **8.02** | 0 |
 | H20 | sparse k=128 (eager) ⚠ pre-#546 | 131072 | **108.0** | 0.824 | **19.16** | 0.55 | 0 at finish |
+| H20 | sparse k=128 hot-pin (eager) ⚠ pre-#546 | 32768 | — | — | **21.783** (45.9 ms) | 0.55 | 0 at finish |
 | V100 | dense f32 (eager) | 32768 | **594.6** | 18.15 | **8.28** | **4.04** | 0 |
-| V100 | sparse k=128 (eager) ⚠ pre-#546 | 32768 | **341.3** | 10.42 | **1.252** | 1.16 | 0 at finish |
-| V100 | sparse k=128 (eager) ⚠ pre-#546 | 131072 | **2271.1** | 17.33 | **0.556** | 1.16 | 0 at finish |
+| V100 | sparse k=128 (eager) ⚠ pre-#546 | 32768 | **341.3** | 10.42 | **1.252** · demote-all pre-#534 | 1.16 | 0 at finish |
+| V100 | sparse k=128 (eager) ⚠ pre-#546 | 131072 | **2271.1** | 17.33 | **0.556** · demote-all pre-#534 | 1.16 | 0 at finish |
+
+The H20 hot-pin row is a different machine and head than the V100 #534 pin row
+below: head 5b8df74d, H20 card 6, 21.783 tok/s / 45.9 ms/tok, artifact
+`/work/sparsepin32k6.log` in the card-6 pod (driver
+`scripts/_staged_hotpin_h20_card6.sh`). Decode cells tagged **demote-all
+pre-#534** are the un-pinned path (pages re-fetched every tick); do not read
+1.252 / 0.556 as cross-tick-pinned sparse decode — that number is 5.653 tok/s
+on V100 (#534, overnight table) and 21.783 tok/s on H20 (this table).
 
 Dense controls: H20 128k prefill 88.621 s / decode 58.279 tok/s (17.2 ms/tok) /
 KV 8612478976 B; V100 32k prefill 594.578 s / decode 8.278 tok/s
@@ -89,7 +98,7 @@ attention it removes; sparse at 128k on an H20 buys capacity past the 8.6 GiB
 bf16 KV fit, not prefill latency, and at 128k it fits so dense is the choice.
 
 **V100 128k sparse (eager)** (head f0a45485, 256 prefill ticks): completes where
-dense cannot fit (dense 128k needs 17.2 GiB f32 KV against ~4.9 GiB free) — the
+dense cannot fit (dense 128k needs ~16.0 GiB f32 KV, 17.18 GB, against ~4.9 GiB free) — the
 capacity win is real. Prefill 2271.1 s = 17.33 ms/tok (37.9 min), close to the
 18.15 ms/tok dense pays at 32k: sparse holds the per-token prefill roughly flat
 with context because it caps attended keys, while dense's attention grows
@@ -179,8 +188,9 @@ swaps 3.46 ms → 0.40 ms (−3.1 ms), giving ~117.7 ms/tok = 8.50 tok/s. Under
 sparsity this stays flat as context grows (the dense number degrades), which is
 the decode claim to check at 32k/128k/256k.
 
-**Cold capacity: fits.** f16 KV at 256k is 65536 B/tok ×262144 = 17.18 GiB
-total; the 128 hot pages (~0.13 GiB) stay device, so ~16 GiB demotes to host
+**Cold capacity: fits.** f16 KV at 256k is 65536 B/tok ×262144 = 17.18 GB
+= **16.0 GiB** total; the 128 hot pages (~0.13 GiB) stay device, so ~16 GiB
+demotes to host
 against 26.6 GiB host free (~10.6 GiB slack). Depends on the #513 f16 cold
 path; without it V100 cannot take f16 cold and this row does not run.
 
