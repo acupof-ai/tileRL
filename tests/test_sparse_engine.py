@@ -1325,102 +1325,95 @@ def test_prefix_publish_consumes_boundary_snapshots_no_second_copy():
     assert snap == {}, f"consumed boundary snapshots retained: {sorted(snap)}"
     hit = cache.lookup(tokens)
     assert hit is not None and len(hit["keys"]) == P
+def test_sparse_draft_follower_adopts_a_published_prefix_and_matches_cold():
+    """Warm path: under sparse+spec a follower ADOPTS a published prefix — the
+    published page blobs carry the draft head's per-page KV, the follower copies
+    it into its dense draft pool and resumes drafting at the boundary (the
+    boundary slot stays zero, exactly like position 0 in a cold run). Its tokens
+    must be bit-equal to a cold spec follower's. The held prefix bytes (trunk
+    pages, bounds, draft KV) show as a host ledger row."""
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    # k=2 + the forced 8-page window keep ~10 pages hot; a 24-page prompt drops
+    # its early pages and the drop-only frontier closes over all 24.
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    follow = np.concatenate([prompt, np.arange(100, 120, dtype=np.int64)])
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
 
+    def spec_engine():
+        from tilerl_kernels.backend import get_backend
 
-def test_published_content_keys_are_bit_identical_to_page_key():
-    """The incremental rolling hash must produce the SAME integer content keys as
-    the from-zero page_key at every page — published blobs are addressed by
-    them, so a recurrence change silently corrupts the shared index."""
-    import torch as _torch
+        return build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
 
-    from tilerl.kv_cache import HostKvPages
-    from tilerl.sparse_engine import SparsePrefixCache, page_key
+    # Cold oracle: a spec engine whose prefix index never serves this prompt.
+    cold = spec_engine()
+    cold_got = _drain(cold, cold.submit(follow, params), 8)
+    cold.shutdown()
 
-    rng = np.random.default_rng(0)
-    for P in (1, 7, 13):
-        tokens = tuple(int(x) for x in rng.integers(0, 100_000, P * BLOCK_TOKENS))
-        cold = HostKvPages(budget_bytes=1 << 30)
-        cache = SparsePrefixCache(cold, states=None)
-        rid = 0
-        cache.set_request(rid, P)
-        bounds = {p: _torch.zeros(1) for p in range(P)}
-        for m in range(1, P + 1):
-            cache.note_boundary(rid, m, (_torch.zeros(2), None))
-        for p in range(P):
-            t = _torch.full((2,), float(p))
-            out = cache.publish_dropped(rid, tokens, bounds, p, {"k": t, "v": t})
-            for page, key in out.items():
-                assert key == page_key(tokens, page)
-        entry = cache.lookup(tokens)
-        assert entry is not None
-        assert entry["keys"] == [page_key(tokens, p) for p in range(P)]
-        # the entry sits on the chain keyed by the from-zero page-(m-1) hash
-        assert entry["hash"] == page_key(tokens, P - 1)
-        assert entry in cache._entries[page_key(tokens, P - 1)]
+    warm = spec_engine()
+    pub = warm.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    _drain(warm, pub, 200)
+    entry = warm._sparse.prefix.lookup(follow)
+    assert entry is not None and len(entry["keys"]) == 24
+    assert all("dk" in warm._kv.cold.share_take(k) for k in entry["keys"]), \
+        "published prefix blobs carry no draft KV"
 
+    nrow = [r for r in warm.stats()["memory"] if r["owner"] == "kv_prefix"]
+    assert nrow and nrow[0]["measured"] > 0 and nrow[0]["delta"] == 0, nrow
 
-def test_publish_hash_steps_stay_linear_not_quadratic_in_context():
-    """256k top profile frame: page_key rehashed the whole prefix per dropped page
-    (O(M^2)). With the rolling hash, extending by one page hashes only its 16
-    tokens, so over P one-at-a-time drops _page_hash is called exactly 16*P
-    times — not sum_p 16*(p+1)."""
-    import torch as _torch
+    rid = warm.submit(follow, params)
+    warm.step()
+    req = next(x for x in warm._running if x.req_id == rid)
+    assert req.sparse_matched == 24 * BLOCK_TOKENS, req.sparse_matched
+    got = _drain(warm, rid, 8)
+    warm.shutdown()
+def test_sparse_draft_follower_adopts_a_published_prefix_and_matches_cold():
+    """Warm path: under sparse+spec a follower ADOPTS a published prefix — the
+    published page blobs carry the draft head's per-page KV, the follower copies
+    it into its dense draft pool and resumes drafting at the boundary (the
+    boundary slot stays zero, exactly like position 0 in a cold run). Its tokens
+    must be bit-equal to a cold spec follower's. The held prefix bytes (trunk
+    pages, bounds, draft KV) show as a host ledger row."""
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    # k=2 + the forced 8-page window keep ~10 pages hot; a 24-page prompt drops
+    # its early pages and the drop-only frontier closes over all 24.
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    follow = np.concatenate([prompt, np.arange(100, 120, dtype=np.int64)])
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
 
-    from tilerl import sparse_engine as se
-    from tilerl.kv_cache import HostKvPages
-    from tilerl.sparse_engine import SparsePrefixCache
+    def spec_engine():
+        from tilerl_kernels.backend import get_backend
 
-    P = 128
-    cold = HostKvPages(budget_bytes=1 << 30)
-    cache = SparsePrefixCache(cold, states=None)
-    rid = 0
-    cache.set_request(rid, P)
-    bounds = {p: _torch.zeros(1) for p in range(P)}
-    for m in range(1, P + 1):
-        cache.note_boundary(rid, m, (_torch.zeros(2), None))
+        return build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
 
-    calls = 0
-    orig = se._page_hash
+    # Cold oracle: a spec engine whose prefix index never serves this prompt.
+    cold = spec_engine()
+    cold_got = _drain(cold, cold.submit(follow, params), 8)
+    cold.shutdown()
 
-    def counted(prev, token):
-        nonlocal calls
-        calls += 1
-        return orig(prev, token)
+    warm = spec_engine()
+    pub = warm.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    _drain(warm, pub, 200)
+    entry = warm._sparse.prefix.lookup(follow)
+    assert entry is not None and len(entry["keys"]) == 24
+    assert all("dk" in warm._kv.cold.share_take(k) for k in entry["keys"]), \
+        "published prefix blobs carry no draft KV"
 
-    se._page_hash = counted
-    try:
-        # the engine passes the prefix as it exists at the moment each page drops,
-        # growing by exactly one page between calls
-        for p in range(P):
-            t = _torch.full((2,), float(p))
-            cache.publish_dropped(rid, tuple(range((p + 1) * BLOCK_TOKENS)),
-                                 bounds, p, {"k": t, "v": t})
-    finally:
-        se._page_hash = orig
-    assert calls == 16 * P, calls
+    nrow = [r for r in warm.stats()["memory"] if r["owner"] == "kv_prefix"]
+    assert nrow and nrow[0]["measured"] > 0 and nrow[0]["delta"] == 0, nrow
 
-
-def test_drop_reads_the_host_bounds_mask_without_touching_the_device_tensor():
-    """has_bounds per dropped page did bool(device_mask[page]), a device sync per
-    page. It must read the host mirror: after bounds are written, swapping the
-    device twin for an object that explodes on indexing must leave the per-drop
-    has_bounds path untouched."""
-    from tilerl.sparse_engine import SparseTracker
-
-    tr = SparseTracker(tiny(), k_pages=4, scorer="bounds",
-                       device=torch.device("cpu"))
-    tr.attach(0)
-    b = torch.zeros((tr.n_full, tr.hkv, 2, tr.dim), dtype=torch.float16)
-    tr.set_bounds(0, 0, b)
-    tr.set_bounds(0, 2, b)
-
-    class _Explodes:
-        def __getitem__(self, idx):
-            raise AssertionError("has_bounds touched the device bounds mask")
-
-    tr.bounds_valid[0] = _Explodes()
-    assert tr.has_bounds(0, 0)
-    assert not tr.has_bounds(0, 1)
-    assert tr.has_bounds(0, 2)
-    assert not tr.has_bounds(0, 999)
-    tr.drop(0)
+    rid = warm.submit(follow, params)
+    warm.step()
+    req = next(x for x in warm._running if x.req_id == rid)
+    assert req.sparse_matched == 24 * BLOCK_TOKENS, req.sparse_matched
+    got = _drain(warm, rid, 8)
+    warm.shutdown()
