@@ -402,9 +402,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
             transient = by["transient"]
             card = _torch2.cuda.current_device()
             name = _torch2.cuda.get_device_name(card)
+            uuid = str(_torch2.cuda.get_device_properties(card).uuid)
             rid = append_residency(
                 residency_row(name, card, peak, static, transient, backend.arch,
-                              model=cfg.name))
+                              model=cfg.name, uuid=uuid))
             print(f"appended device_resident_bytes peak {peak:,} = static {static:,} + "
                   f"transient {transient:,} ({name}) -> {rid}")
         return
@@ -2008,12 +2009,17 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
     # is no measured floor (a --device-name override exists only for debugging the join).
     device_name = args.device_name
     on_cuda = False
+    uuid = None
     if device_name is None:
         import torch
 
         on_cuda = torch.cuda.is_available()
-        device_name = torch.cuda.get_device_name(0) if on_cuda else f"{cfg.name}-cpu"
-    floors = cal.calibration(cal.load_rows(), device_name)
+        if on_cuda:
+            device_name = torch.cuda.get_device_name(0)
+            uuid = str(torch.cuda.get_device_properties(0).uuid)
+        else:
+            device_name = f"{cfg.name}-cpu"
+    floors = cal.calibration(cal.load_rows(), device_name, uuid)
     # On cuda, time the actual registry GEMM kernel per row so %bound is measured; the
     # backend is built once. Off cuda (or for non-GEMM rows) ms/%bound stay pending.
     # Spec dims come from the config (quant face does not change a linear's dims); the

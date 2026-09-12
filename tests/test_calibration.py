@@ -63,6 +63,33 @@ def test_latest_floor_rejects_a_near_prefix_device_name(tmp_path):
     assert got is None, f"a prefix-near card ({h200}) must not satisfy the {H20} floor"
 
 
+
+def test_latest_floor_keys_on_the_physical_uuid_when_uuid_rows_exist(tmp_path):
+    """Two same-name rows from DIFFERENT physical cards with different values:
+    without uuid the name-keyed floor is whichever appended last (the H20 card-5
+    die measured 8% low). With uuid the lookup returns that card's own newest row;
+    when no uuid row matches (or none passed) it falls back to the name pool."""
+    ua, ub = "aaaaaaaa-0000-0000-0000-000000000000", "bbbbbbbb-0000-0000-0000-000000000000"
+    ra = _row(cal.PEAK_METRIC, 136.5, "TFLOP/s", H20, card=0)
+    ra["device"]["uuid"] = ua
+    rb = _row(cal.PEAK_METRIC, 125.8, "TFLOP/s", H20, card=0)
+    rb["device"]["uuid"] = ub
+    rows = cal.load_rows(_store(tmp_path, [ra, rb]))
+    assert cal.latest_floor(rows, cal.PEAK_METRIC, H20)["value"] == 125.8
+    assert cal.latest_floor(rows, cal.PEAK_METRIC, H20, ua)["value"] == 136.5
+    assert cal.latest_floor(rows, cal.PEAK_METRIC, H20, ub)["value"] == 125.8
+    assert cal.latest_floor(rows, cal.PEAK_METRIC, H20,
+                            "cccccccc-0000-0000-0000-000000000000")["value"] == 125.8
+    assert cal.latest_floor(rows, cal.PEAK_METRIC, V100, ua) is None
+    bw = _row(cal.BW_METRIC, 3312.0, "GB/s", H20, card=0)
+    bw["device"]["uuid"] = ua
+    p2 = tmp_path / "u" / "measurements.jsonl"
+    p2.parent.mkdir()
+    p2.write_text("".join(json.dumps(r) + "\n" for r in (ra, rb, bw)))
+    got = cal.calibration(cal.load_rows(p2), H20, ua)
+    assert got == {"bw_gbs": 3312.0, "peak_tflops": 136.5,
+                   "fp8_peak_tflops": None, "pcie_gbs": None}
+
 def test_newest_row_wins_and_superseded_skipped(tmp_path):
     old = _row(cal.BW_METRIC, 3900.0, "GB/s", H20)
     old["id"] = "old"
@@ -380,11 +407,15 @@ def test_bench_kernels_decode_times_one_token_launch(monkeypatch):
     monkeypatch.setattr(cal, "load_rows", lambda: [])
     monkeypatch.setattr(
         cal, "calibration",
-        lambda rows, name: {"bw_gbs": 4000.0, "peak_tflops": 100.0,
+        lambda rows, name, uuid=None: {"bw_gbs": 4000.0, "peak_tflops": 100.0,
                             "fp8_peak_tflops": 200.0})
+    class _Props:
+        uuid = "stub-uuid"
+
     fake_cuda = type("C", (), {
         "is_available": lambda self: True,
-        "get_device_name": lambda self, i: "stub",
+        "get_device_name": lambda self, *a: "stub",
+        "get_device_properties": lambda self, *a: _Props(),
         "_is_compiled": staticmethod(lambda: False)})()
     monkeypatch.setattr(torch, "cuda", fake_cuda)
     monkeypatch.setattr(torch.version, "hip", None, raising=False)

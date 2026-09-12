@@ -502,6 +502,7 @@ def residency_row(
     target: str,
     model: str,
     build: str = "eager",
+    uuid: str | None = None,
 ):
     """One ledger row recording steady-state device residency and its static/transient
     split, so occupancy lives in the same measurements.jsonl as the kernel roofline.
@@ -513,6 +514,9 @@ def residency_row(
     from .cli import _benchrec
 
     br = _benchrec()
+    device = {"name": device_name, "card": card}
+    if uuid is not None:
+        device["uuid"] = uuid
     return {
         "metric": "device_resident_bytes",
         "value": int(peak_bytes),
@@ -528,7 +532,7 @@ def residency_row(
         "warm": {"state": "warm", "compiles": None},
         "n": 1,
         "spread": 0,
-        "device": {"name": device_name, "card": card},
+        "device": device,
         "commit": br.git_commit(),
         "dirty": br.git_dirty(),
         "cmd": "tilerl serve --dry-run --record-residency",
