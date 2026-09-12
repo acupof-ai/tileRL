@@ -98,6 +98,8 @@ def test_sparse_pins_selected_pages_across_ticks_and_demotes_what_leaves():
         assert 0 <= promoted <= len(cold_before), (promoted, len(cold_before))
         # demote + the kept resident set partition last tick's residents.
         assert demoted >= 0, demoted
+        # bounds for complete pages survive demotion in the contiguous store
+        assert int(sparse._sparse.bounds_valid[rid].sum()) >= 5
         checked += 1
     else:
         raise TimeoutError
@@ -110,9 +112,11 @@ def test_sparse_pins_selected_pages_across_ticks_and_demotes_what_leaves():
 def test_sparse_a_stable_selection_promotes_nothing_after_the_first_tick():
     """Strong half of the pin gate: force the SAME selection on successive decode
     ticks and assert zero promotions/demotions — the kept frames are reused. The
-    selection is pinned by monkeypatching select_pages to a fixed top-k for the
-    rows once they are in decode."""
+    selection is pinned by monkeypatching the CONSUMER
+    (sparse_engine.select_pages) to a fixed top-k once the rows are in decode."""
     import tilerl_kernels.reference as ref
+
+    import tilerl.sparse_engine as se
 
     prompt = np.arange(7, 7 + 12 * BLOCK_TOKENS, dtype=np.int64)
     sparse = _engine(True, 2)
@@ -131,7 +135,7 @@ def test_sparse_a_stable_selection_promotes_nothing_after_the_first_tick():
         return out
 
     rid = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
-    ref.select_pages = stable_select
+    se.select_pages = stable_select
     cycles = []
     try:
         for _ in range(256):
@@ -147,7 +151,7 @@ def test_sparse_a_stable_selection_promotes_nothing_after_the_first_tick():
             sparse.step()
             cycles.append((cold.demotions - d0, cold.promotions - p0))
     finally:
-        ref.select_pages = orig_select
+        se.select_pages = orig_select
     sparse.shutdown()
     assert len(cycles) >= 3, cycles
     # from the second stable tick on, nothing moves between device and host
@@ -272,7 +276,7 @@ def test_index_scorer_writes_fp8_keys_and_reconciles_measured_bytes():
             break
         e.step()
         tr = e._sparse
-        assert tr.bounds is None and tr.keys is not None
+        assert tr.scorer == "index" and tr.keys is not None
         if any(tr.keys.get(r.req_id, {}) for r in e._running):
             page, (keys, scales) = next(
                 (p, kv) for rid2, pages in tr.keys.items() if pages
@@ -527,3 +531,372 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_select_tensor_op_count_is_constant_in_candidate_count():
+    """The 128k host-bound fix: _select gathers candidate bounds with one
+    index_select, so the number of aten ops it dispatches does not grow with
+    the candidate count (a torch.stack-per-page would dispatch per page)."""
+    import torch
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from tilerl.sparse_engine import SparseForward, SparseTracker
+
+    class _Count(TorchDispatchMode):
+        n = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            self.n += 1
+            return func(*args, **(kwargs or {}))
+
+    cfg = tiny()
+
+    def select_ops(n_cand: int) -> int:
+        tr = SparseTracker(cfg, k_pages=4, scorer="bounds")
+        tr.attach(0)
+        b = torch.randn(tr.n_full, tr.hkv, 2, tr.dim, dtype=torch.float16)
+        for p in range(n_cand):
+            tr.set_bounds(0, p, b)
+        cand = list(range(n_cand))
+        row = dict(req_id=0, own=[n_cand], own_len=BLOCK_TOKENS, cand=cand,
+                   force_window=0, resolve=lambda p: p, reserved=set())
+        sf = SparseForward(tr, [row], torch.device("cpu"))
+        q = torch.randn(1, cfg.num_attention_heads, cfg.head_dim)
+        with _Count() as c:
+            sf._select(0, 0, q, None)
+        return c.n
+
+    ops_8 = select_ops(8)
+    ops_64 = select_ops(64)
+    assert ops_64 == ops_8, f"ops grow with candidates: {ops_8} @8 -> {ops_64} @64"
+
+
+def test_bounds_tensor_holds_every_full_attn_plane_not_every_source_group():
+    """The 27B has 16 full-attn planes grouped into 4 index sources. Bounds are
+    stored and read per plane; sizing the plane dim at n_src (4) made the first
+    finalize write crash and plane 15 unindexable. tiny has 1 plane, which hid
+    it until the 27B ran."""
+    from dataclasses import replace
+
+    from tilerl.sparse_engine import SparseTracker
+
+    cfg = replace(tiny(), num_layers=16, full_attn_layers=tuple(range(16)))
+    tr = SparseTracker(cfg, k_pages=4, scorer="bounds")
+    assert tr.n_full == 16
+    assert len(tr.src_planes) == 4
+    tr.attach(0)
+    b = torch.randn(16, tr.hkv, 2, tr.dim, dtype=torch.float16)
+    tr.set_bounds(0, 0, b)  # raised: size (4) vs (16) before the fix
+    # bounds_t is plane-first [n_full, cap, ...]; plane 15 must be indexable.
+    assert tr.bounds_t[0].shape[0] == 16
+    one = tr.bounds_one(0, 0)  # raised: index 15 out of bounds before the fix
+    assert one.shape == (16, tr.hkv, 2, tr.dim)
+    assert torch.equal(one[15], b[15])
+    # scoring one plane gathers only that plane's page rows
+    row = tr.bounds_rows(0, 15, [0])
+    assert row.shape == (1, tr.hkv, 2, tr.dim)
+    assert torch.equal(row[0], b[15])
+
+
+def test_bounds_tracker_allocates_on_the_backend_device_not_cpu_for_first_request():
+    """GPU regression in the contiguous-bounds commit: the tracker inferred its
+    device from already-allocated bounds_t and fell back to CPU, so the FIRST
+    request's bounds_t/l2p_t were allocated on CPU even on a cuda backend; a GPU
+    query scored against CPU bounds -> cross-device RuntimeError at the second
+    prefill chunk. CI has no GPU, so use a non-CPU fake-device seam: the tensors
+    must be allocated on the device the tracker was constructed with, before any
+    bound exists. Red on the old _device-fallback constructor (forced CPU)."""
+    from types import SimpleNamespace
+
+    from tilerl.sparse_engine import SparseTracker
+
+    # A device object that is not CPU, distinct across attach calls. torch meta
+    # allocates without compute, which is all the seam needs (device placement).
+    dev = torch.device("meta")
+    cfg = SimpleNamespace(full_attn_layers=(0,), num_kv_heads=2, head_dim=16)
+    tr = SparseTracker(cfg, k_pages=2, scorer="bounds", device=dev)
+    tr.attach(0)                       # first request, no prior bounds to infer from
+    assert tr.bounds_t[0].device == dev, tr.bounds_t[0].device
+    assert tr.bounds_valid[0].device == dev
+    assert tr.l2p_t[0].device == dev
+    # growing past INIT_CAP keeps the device too
+    page = tr.INIT_CAP + 1
+    tr.map_resident(0, page, 7)
+    assert tr.l2p_t[0].device == dev
+    assert int(tr.l2p_t[0].shape[0]) > page
+    # default (tests, CPU backends) is still CPU
+    tr_cpu = SparseTracker(cfg, k_pages=2, scorer="bounds")
+    tr_cpu.attach(1)
+    assert tr_cpu.bounds_t[1].device.type == "cpu"
+
+
+# ---------------------------------------------------------------- graph-capturable decode tick
+
+
+def _resident_forward(B, device_select, n_pages=20, k=4):
+    """A SparseForward over B rows where every page is RESIDENT (the cross-tick
+    pin steady state a captured decode tick requires): k selection from
+    n_pages-2 candidate pages plus a trailing 2-page own window."""
+    import torch
+
+    from tilerl.sparse_engine import SparseForward, SparseTracker
+
+    cfg = tiny()
+    torch.manual_seed(0)
+    tr = SparseTracker(cfg, k, "bounds")
+    rows = []
+    for bi in range(B):
+        tr.attach(bi)
+        own = [n_pages - 2, n_pages - 1]
+        cand = list(range(n_pages - 2))
+        b = torch.randn(tr.n_full, tr.hkv, 2, tr.dim, dtype=torch.float16)
+        for p in cand:
+            tr.set_bounds(bi, p, b)
+        phys = {}
+        for p in cand + own:
+            pm = 1000 + bi * 1000 + p
+            phys[p] = pm
+            tr.map_resident(bi, p, pm)
+        tr.resident[bi] = phys
+        rows.append(dict(
+            req_id=bi, own=own, own_len=2 * BLOCK_TOKENS + 5, q_start=0, q_hi=0,
+            decoding=True, tq=1, cand=cand, force_window=0,
+            resolve=lambda p, rid=bi: tr.resident[rid][p], reserved=set()))
+    sf = SparseForward(tr, rows, torch.device("cpu"), device_select=device_select)
+    return cfg, sf
+
+
+def test_device_select_packs_a_fixed_width_table_with_no_host_sync_at_b1_and_b8():
+    """The captured decode tick's structural gate at B=1 and B=8:
+
+    - the packed table is a FIXED ``min(k,cand)+own_window`` width for the tick
+      (a captured graph replays one shape), never the eager dynamic width;
+    - building it through attention_args issues NO host-syncing scalar read
+      (``aten._local_scalar_dense`` is what ``.item()``/``bool(tensor)`` lower
+      to — one of those inside the replay breaks capture).
+    """
+    import torch
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class _NoScalarSync(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            assert "_local_scalar_dense" not in str(func), f"host sync in tick: {func}"
+            return func(*args, **(kwargs or {}))
+
+    for B in (1, 8):
+        cfg, sf = _resident_forward(B, True, k=4)
+        q = torch.randn(B, 1, cfg.num_attention_heads, cfg.head_dim)
+        with _NoScalarSync():
+            table, sl = sf.attention_args(0, q)
+        assert table.shape == (B, 4 + 2), table.shape   # fixed k + trailing own window
+        assert sl.shape == (B,)
+        # seq_len excludes the padded tail: each row selected exactly k here.
+        assert torch.equal(sl, torch.full((B,), 4 * BLOCK_TOKENS + 2 * BLOCK_TOKENS + 5))
+
+
+def test_device_select_packed_table_matches_eager_at_b1_and_b8():
+    """Token-equality to eager sparse at the SparseForward level: the device
+    path's leading compact physical columns and seq_len must equal the eager
+    path's packed table at B=1 and B=8 (same selection, same own pages)."""
+    import torch
+
+    for B in (1, 8):
+        cfg, eager = _resident_forward(B, False, k=4)
+        _, device = _resident_forward(B, True, k=4)
+        # identical bounds/phys seeds: _resident_forward reseeds torch each call
+        g = torch.Generator().manual_seed(0)
+        q = torch.randn(B, 1, cfg.num_attention_heads, cfg.head_dim, generator=g)
+        g2 = torch.Generator().manual_seed(0)
+        q2 = torch.randn(B, 1, cfg.num_attention_heads, cfg.head_dim, generator=g2)
+        te, sle = eager.attention_args(0, q)
+        td, sld = device.attention_args(0, q2)
+        for bi in range(B):
+            n = int((te[bi] != 0).sum())
+            assert te[bi, :n].tolist() == td[bi, :n].tolist(), (B, bi)
+            assert int(sle[bi]) == int(sld[bi]), (B, bi)
+
+
+def test_device_select_engine_tokens_equal_eager_sparse_at_full_k():
+    """End-to-end gate: through the real Engine the device-selection decode tick
+    is token-for-token equal to the eager sparse engine at full k (B=1)."""
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    def run(devsel):
+        kw = dict(
+            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+            sparse_k=6, scorer="bounds", kv_cold_bytes=1 << 30,
+            sparse_device_select=devsel)
+        e = build_engine(**kw)
+        tok = _drain(e, e.submit(prompt, params), 8)
+        e.shutdown()
+        return tok
+
+    assert run(True) == run(False)
+
+
+def test_quest_scores_batched_matches_single_row_bit_for_bit():
+    """The captured tick scores all B rows with quest_scores_batched; it must be
+    bit-identical to applying the single-row quest_scores per row (the page chunk
+    split commutes over rows exactly as it does over pages)."""
+    import torch
+
+    from tilerl.sparse_engine import quest_scores, quest_scores_batched
+
+    B, tq, hq, hkv, d, cp = 4, 3, 8, 4, 16, 33
+    q = torch.randn(B, tq, hq, d)
+    bounds = torch.randn(B, cp, hkv, 2, d) * 0.3
+    batched = quest_scores_batched(q, bounds)
+    for bi in range(B):
+        assert torch.equal(batched[bi], quest_scores(q[bi], bounds[bi]))
+
+
+# ------------------------------------------------ device path: resident-only selection + refresh
+
+
+def _forward_one_cold(B, device_select, cold_pages):
+    """Like _resident_forward but ``cold_pages`` are NON-resident (l2p=-1):
+    bounds exist for them (a demoted page keeps its bounds) but the K is cold or
+    SSD-resident. Returns (SparseForward, cfg, cold_pages)."""
+    import torch
+
+    from tilerl.sparse_engine import SparseForward, SparseTracker
+
+    cfg = tiny()
+    torch.manual_seed(0)
+    k = 2
+    n_pages = 12
+    tr = SparseTracker(cfg, k, "bounds")
+    rows = []
+    for bi in range(B):
+        tr.attach(bi)
+        own = [n_pages - 2, n_pages - 1]
+        cand = list(range(n_pages - 2))
+        # descending-magnitude bounds so candidate index 0 is the top score
+        for pi, p in enumerate(cand):
+            b = torch.full((tr.n_full, tr.hkv, 2, tr.dim),
+                           1.0 - pi * 0.01, dtype=torch.float16)
+            tr.set_bounds(bi, p, b)
+        phys = {}
+        for p in cand + own:
+            if p in cold_pages:
+                continue                          # cold: bounds held, l2p stays -1
+            pm = 1000 + bi * 1000 + p
+            phys[p] = pm
+            tr.map_resident(bi, p, pm)
+        tr.resident[bi] = phys
+        rows.append(dict(
+            req_id=bi, own=own, own_len=2 * BLOCK_TOKENS + 5, q_start=0, q_hi=0,
+            decoding=True, tq=1, cand=cand, force_window=0,
+            resolve=lambda p, rid=bi: tr.resident[rid].get(p, 7000 + p),
+            reserved=set()))
+    return SparseForward(tr, rows, torch.device("cpu"), device_select=device_select), cfg
+
+
+def test_device_select_excludes_a_cold_candidate_and_eager_promotes_it():
+    """The SSD-spill hole: the top scoring candidate is cold (l2p=-1).
+
+    - the device (captured, no-promote) path must score only RESIDENT candidates
+      and leave the cold page out, never map it to a phantom block 0;
+    - the eager refresh path scores ALL candidates and resolves (promotes) it.
+    """
+    import torch
+
+    cold = {0}  # candidate page 0 has the highest score but is non-resident
+    dev, cfg = _forward_one_cold(1, True, cold)
+    q = torch.randn(1, 1, cfg.num_attention_heads, cfg.head_dim)
+    table_d, sl_d = dev.attention_args(0, q)
+    chosen_dev = {int(x) for x in dev._dchosen[0][0]}
+    assert 0 not in chosen_dev, f"cold page selected on device path: {chosen_dev}"
+    assert len(chosen_dev) == 2 and all(p >= 1 for p in chosen_dev), chosen_dev
+    assert not bool((table_d < 0).any())  # no -1 leaked into the physical table
+
+    eager, _ = _forward_one_cold(1, False, cold)
+    table_e, _ = eager.attention_args(0, q)
+    chosen_eager = eager._chosen[(0, 0)]
+    assert 0 in chosen_eager, f"eager refresh must re-select the cold page: {chosen_eager}"
+    assert 7000 in table_e[0].tolist()  # resolve() supplied the promoted fresh block
+
+
+def _device_engine(refresh, max_new=10):
+    import tilerl.sparse_engine as se
+
+    se.SPARSE_REFRESH_TICKS = refresh
+    kw = dict(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=8192,
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+        sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30,
+        sparse_device_select=True)
+    return build_engine(**kw)
+
+
+def test_refresh_r1_device_selection_is_token_equal_to_eager_sparse():
+    """R=1: every decode tick is an eager full-candidate refresh, so device-select
+    output must equal a pure eager sparse engine (zero staleness)."""
+    import tilerl.sparse_engine as se
+
+    saved = se.SPARSE_REFRESH_TICKS
+    se.SPARSE_REFRESH_TICKS = 1
+    prompt = np.arange(7, 7 + 12 * BLOCK_TOKENS, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=10, seed=0)
+    e = _device_engine(1)
+    try:
+        t_dev = _drain(e, e.submit(prompt, params), 10)
+    finally:
+        e.shutdown()
+        se.SPARSE_REFRESH_TICKS = saved
+
+    def eager_tokens():
+        kw = dict(
+            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=8192,
+            max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+            sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
+        e2 = build_engine(**kw)
+        t = _drain(e2, e2.submit(prompt, params), 10)
+        e2.shutdown()
+        return t
+
+    assert t_dev == eager_tokens(), (t_dev, eager_tokens())
+
+
+def test_refresh_r8_routes_device_for_seven_ticks_then_eager_promotes():
+    """R=8 routing: 7 resident-only device decode ticks, then one eager refresh
+    that re-scores all candidates and PROMOTES a cold page the hot set is missing
+    (context exceeds the k+window hot set). No device tick promotes a candidate."""
+    import tilerl.sparse_engine as se
+    from tilerl.sparse_engine import SparseForward
+
+    routed = []
+    orig_init = SparseForward.__init__
+
+    def spy_init(self, *a, **k):
+        routed.append(k.get("device_select", False))
+        return orig_init(self, *a, **k)
+
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    saved = se.SPARSE_REFRESH_TICKS
+    se.SPARSE_REFRESH_TICKS = 8
+    e = _device_engine(8, max_new=12)
+    SparseForward.__init__ = spy_init
+    rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=12, seed=0))
+    try:
+        for _ in range(256):
+            d = e.poll()
+            if rid in d and len(d[rid]) >= 12:
+                break
+            e.step()
+    finally:
+        SparseForward.__init__ = orig_init
+        promoted = e._kv.cold.promotions
+        e.shutdown()
+        se.SPARSE_REFRESH_TICKS = saved
+
+    decode_routes = [x for x in routed]  # one SparseForward per tick incl prefill
+    # the first pure-decode tick is device, an eager refresh lands within 8 decode
+    assert True in decode_routes and False in decode_routes, decode_routes
+    # an eager refresh promoted at least one cold page (the device path never does)
+    assert promoted >= 1, promoted

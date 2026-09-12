@@ -27,6 +27,7 @@ from __future__ import annotations
 from collections import OrderedDict
 
 import torch
+from tilerl_kernels.reference import select_pages
 from torch import Tensor
 
 from .kv_cache import BLOCK_TOKENS
@@ -36,6 +37,17 @@ from .sparse_index import index_source_groups
 _SENTINEL = 1
 #: candidate pages scored per chunk so the f32 scoring intermediates stay bounded
 _SCORE_PAGE_CHUNK = 64
+
+#: Decode ticks between eager full-candidate re-selection (refresh) when device
+#: selection is on. Device ticks score only among RESIDENT candidates (zero
+#: syncs, graph-capturable), so a page cold/on-SSD that the Quest top-k now
+#: wants is brought into the hot set at the next refresh: every R decode ticks
+#: the engine runs the eager path, which scores ALL candidates and promotes what
+#: it names through the pin. R=1 makes every decode tick a refresh (token-equal
+#: to eager sparse, no staleness); larger R trades <=R-tick selection staleness
+#: for more captured ticks. Quest decode selections drift slowly, so 8 is the
+#: default; measure output fidelity at R=1 vs R with the k-fidelity table.
+SPARSE_REFRESH_TICKS = 8
 
 
 def group_map(cfg) -> tuple[list[int], dict[int, int]]:
@@ -85,12 +97,104 @@ def quest_scores(q: Tensor, bounds: Tensor) -> Tensor:
     return out
 
 
-class SparseTracker:
-    """Engine-scoped scorer store, independent of the KV pool so it survives a
-    page's demotion to host:
+def quest_scores_batched(q: Tensor, bounds: Tensor) -> Tensor:
+    """Batched form of :func:`quest_scores` for the captured decode tick:
+    ``q`` [B,Tq,hq,D], ``bounds`` [B,Cp,Hkv,2,D] -> scores [B,Cp], chunked over
+    pages exactly like the single-row form (same split, same commute)."""
+    b, t, hq, d = q.shape
+    hkv = bounds.shape[2]
+    qi = q.float().reshape(b, t, hkv, hq // hkv, d).mean(3)      # [B,Tq,Hkv,D]
+    kmin, kmax = bounds.unbind(dim=3)                            # each [B,Cp,Hkv,D]
+    cp = bounds.shape[1]
+    out = q.new_empty(b, cp)
+    for c0 in range(0, cp, _SCORE_PAGE_CHUNK):
+        sl = slice(c0, c0 + _SCORE_PAGE_CHUNK)
+        qb = qi[:, :, None, :, :]                                # [B,Tq,1,Hkv,D]
+        per = torch.maximum(qb * kmin[:, None, sl], qb * kmax[:, None, sl]).sum(-1)
+        out[:, sl] = per.amax(dim=1).sum(dim=-1)                 # [B,b]
+    return out
 
-    - ``bounds`` (scorer="bounds"): req -> page -> fp16 ``[n_full, Hkv, 2, D]``
-      Quest kmin/kmax, one per full-attn plane;
+
+def select_members(scores: Tensor, n_cand: Tensor, k_pages: int,
+                   n_window: Tensor, eligible: Tensor | None = None) -> Tensor:
+    """Top-k UNION forced-window membership, pure device ops (no host sync —
+    this runs inside the captured decode tick).
+
+    ``scores`` [B,Cp] with padding positions already -inf-able, ``n_cand`` [B]
+    valid candidate count, ``n_window`` [B] forced trailing pages per row,
+    ``eligible`` optional bool [B,Cp] restricting which valid candidates may be
+    chosen (the device path passes the residency mask l2p>=0). Returns bool
+    member [B,Cp] (sequence positions kept, in candidate order)."""
+    b, cp = scores.shape
+    pos = torch.arange(cp, device=scores.device)
+    valid = pos[None, :] < n_cand[:, None]
+    if eligible is not None:
+        valid = valid & eligible
+    k = min(k_pages, cp)
+    member = torch.zeros_like(scores, dtype=torch.bool)
+    member.scatter_(
+        1, torch.topk(scores.masked_fill(~valid, float("-inf")), k, dim=1).indices,
+        True)
+    member &= valid  # a row with <k eligible candidates must not mark padding
+    # forced trailing window; decode rows carry n_window=0 so their mask is empty
+    # (unconditional tensor OR — no host branch, this runs under capture).
+    window = pos[None, :] >= (n_cand[:, None] - n_window[:, None]).clamp_min(0)
+    member |= window & valid & (n_window[:, None] > 0)
+    return member
+
+
+def order_members(member: Tensor, k_pages: int) -> tuple[Tensor, Tensor]:
+    """Compact member POSITIONS (into the candidate axis) to a FIXED width k in
+    sequence order, with no host read: returns ``(positions [B,k] padded to cp,
+    n_sel [B])``. cumsum gives each member's output slot (the same compaction
+    ``reference.select_pages`` uses). ``select_members`` never marks more than k
+    members, so every member rank is a valid slot; padded slots hold ``cp`` and
+    the gather caller masks them."""
+    b, cp = member.shape
+    k = min(k_pages, cp)
+    n_sel = member.sum(dim=1)
+    # Fixed-shape stable sort: members (key 0) before padding (key 1), ties keep
+    # candidate order, so the first k columns are the chosen positions in sequence
+    # order. argsort has a static [B,cp] output shape (unlike nonzero), so this is
+    # graph-capture-safe; padded slots hold cp and the caller masks them.
+    order = torch.sort(member.long(), dim=1, stable=True, descending=True).indices
+    idx = torch.arange(cp, device=member.device).expand(b, cp)
+    positions = idx.gather(1, order[:, :k])
+    return positions, n_sel
+
+
+class _BoundsView:
+    """Read-only ``page -> bound`` face over one request's contiguous
+    ``bounds_t``, so prefix publish can keep its mapping-shaped contract
+    without a second per-page dict. Each lookup clones — the published entry
+    owns its tensor."""
+
+    __slots__ = ("tr", "rid")
+
+    def __init__(self, tr, rid: int):
+        self.tr, self.rid = tr, rid
+
+    def __contains__(self, page) -> bool:
+        return self.tr.has_bounds(self.rid, int(page))
+
+    def __getitem__(self, page) -> Tensor:
+        page = int(page)
+        if not self.tr.has_bounds(self.rid, page):
+            raise KeyError(page)
+        return self.tr.bounds_one(self.rid, page)
+
+
+class SparseTracker:
+    """Engine-scoped scorer store, independent of the KV pool so a page's state
+    survives its demotion to host:
+
+    - ``bounds`` scorer: one preallocated fp16 tensor per request,
+      ``bounds_t[rid] = [n_full, cap, Hkv, 2, D]`` (PLANE first) grown by
+      doubling, not one small tensor per page in a dict (at 128k a per-page dict
+      forced _select to torch.stack ~8192 tensors x4 planes every tick). Plane-first
+      lets scoring slice the plane before gathering the cap axis, so a call moves
+      one plane (64 MiB at 256k), not all 16 (1 GiB). A logical page addresses
+      its cap row directly; bounds_valid marks written rows.
     - ``keys`` (scorer="index"): req -> page -> fp8 indexer keys
       ``[n_src, Hkv, di]`` plus an f32 scale per key ``[n_src, Hkv]`` (one scale
       over di=128), projected from the page's mean K at append time by the
@@ -100,15 +204,41 @@ class SparseTracker:
     learned weights are a later load. At full k both scorers select every
     candidate page and are token-identical to dense."""
 
-    def __init__(self, cfg, k_pages: int, scorer: str, weights: dict | None = None):
+    #: initial page-row capacity of a request's bounds tensor
+    INIT_CAP = 64
+
+    def __init__(self, cfg, k_pages: int, scorer: str, weights: dict | None = None,
+                 device=None):
         if scorer not in ("bounds", "index"):
             raise NotImplementedError(
                 f'sparse engine scorer {scorer!r}: want "bounds" or "index"')
         self.cfg = cfg
         self.k_pages = k_pages
         self.scorer = scorer
+        #: Device the preallocated bounds/l2p tensors live on. Must be the
+        #: BACKEND device: attach runs before any bound exists, so inferring it
+        #: from existing tensors put the first request's bounds_t/l2p_t on CPU on
+        #: a GPU build, and the next GPU q scored against CPU bounds raised a
+        #: cross-device error (289b28ca GPU regression; CPU CI cannot see it).
+        self.device = torch.device(device) if device is not None else torch.device("cpu")
         self.src_planes, self.group_of = group_map(cfg)
         self.src_index = {plane: j for j, plane in enumerate(self.src_planes)}
+        #: number of full-attn PLANES (= PagedKvPool.num_layers): bounds are
+        #: stored and scored per plane; only the SELECTION is shared per group.
+        #: Not len(src_planes) (the source count, /4) — that dim fit tiny (1
+        #: full-attn plane) but the 27B's 16-plane finalize write crashes it.
+        self.n_full = len(cfg.full_attn_layers)
+        self.hkv = cfg.num_kv_heads
+        self.dim = cfg.head_dim
+        #: [cap, n_full, Hkv, 2, D] fp16 per request + per-row-valid mask/count
+        self.bounds_t: dict[int, Tensor] = {}
+        self.bounds_valid: dict[int, Tensor] = {}
+        self.bounds_count: dict[int, int] = {}
+        #: device twin of ``resident``: logical page -> physical block, -1 if not
+        #: resident. The captured decode tick gathers selected blocks with one
+        #: index_select instead of a host resolve loop; the dict stays the owner
+        #: of residency and this mirrors it one scalar write per resolve/demote.
+        self.l2p_t: dict[int, Tensor] = {}
         #: resident private pages: req_id -> {logical page: physical block}
         self.resident: dict[int, dict[int, int]] = {}
         #: logical pages adopted from a shared prefix entry: req_id -> {page: content key}
@@ -121,7 +251,6 @@ class SparseTracker:
         self.last_selected: dict[int, dict[int, list[int]]] = {}
         self.bytes_per_page = 0
         if scorer == "bounds":
-            self.bounds: dict[int, dict[int, Tensor]] = {}
             self.keys = None
             self.iq = self.ik = None
         else:
@@ -132,7 +261,6 @@ class SparseTracker:
             # indexer-weight init used by the warm-up.
             ih = min(INDEX_HEADS, cfg.num_kv_heads)
             self.ih = ih
-            self.bounds = None
             self.keys: dict[int, dict[int, tuple[Tensor, Tensor]]] = {}
             di = min(16, cfg.head_dim)          # tiny cell di=16; served di=128
             gen = torch.Generator().manual_seed(0)
@@ -154,17 +282,25 @@ class SparseTracker:
                 len(self.src_planes) * ih * di + len(self.src_planes) * ih * 4)
 
     def attach(self, req_id: int) -> None:
-        if self.scorer == "bounds":
-            self.bounds.setdefault(req_id, {})
-        else:
+        dev = self.device
+        self.bounds_t[req_id] = torch.empty(
+            (self.n_full, self.INIT_CAP, self.hkv, 2, self.dim),
+            dtype=torch.float16, device=dev)
+        self.bounds_valid[req_id] = torch.zeros(self.INIT_CAP, dtype=torch.bool, device=dev)
+        self.l2p_t[req_id] = torch.full(
+            (self.INIT_CAP,), -1, dtype=torch.long, device=dev)
+        self.bounds_count[req_id] = 0
+        if self.scorer == "index":
             self.keys.setdefault(req_id, {})
         self.resident.setdefault(req_id, {})
         self.shared.setdefault(req_id, {})
 
     def drop(self, req_id: int) -> None:
-        if self.scorer == "bounds":
-            self.bounds.pop(req_id, None)
-        else:
+        self.bounds_t.pop(req_id, None)
+        self.bounds_valid.pop(req_id, None)
+        self.l2p_t.pop(req_id, None)
+        self.bounds_count.pop(req_id, None)
+        if self.scorer == "index":
             self.keys.pop(req_id, None)
         self.last_selected.pop(req_id, None)
         self.resident.pop(req_id, None)
@@ -172,11 +308,62 @@ class SparseTracker:
         if self.prefix is not None:
             self.prefix.drop_request(req_id)
 
+    def _grow(self, rid: int, need: int) -> None:
+        t = self.bounds_t[rid]
+        cap = t.shape[1]
+        new_cap = max(need, cap * 2)
+        nt = torch.empty((t.shape[0], new_cap, *t.shape[2:]),
+                         dtype=t.dtype, device=t.device)
+        nt[:, :cap] = t
+        nv = torch.zeros(new_cap, dtype=torch.bool, device=t.device)
+        nv[:cap] = self.bounds_valid[rid]
+        nl = torch.full((new_cap,), -1, dtype=torch.long, device=t.device)
+        nl[:cap] = self.l2p_t[rid]
+        self.bounds_t[rid] = nt
+        self.bounds_valid[rid] = nv
+        self.l2p_t[rid] = nl
+
+    def map_resident(self, rid: int, page: int, phys: int) -> None:
+        """Mirror a resolve into the device l2p (grows if a new own page passed
+        the bounds tensor's capacity)."""
+        if page >= self.l2p_t[rid].shape[0]:
+            self._grow(rid, page + 1)
+        self.l2p_t[rid][page] = phys
+
+    def map_evict(self, rid: int, page: int) -> None:
+        self.l2p_t[rid][page] = -1
+
     def set_bounds(self, req_id: int, page: int, b: Tensor) -> None:
         b = b.contiguous().to(torch.float16)
+        if page >= self.bounds_t[req_id].shape[1]:
+            self._grow(req_id, page + 1)
+        self.bounds_t[req_id][:, page] = b
+        self.bounds_valid[req_id][page] = True
+        if page >= self.bounds_count[req_id]:
+            self.bounds_count[req_id] = page + 1
         if not self.bytes_per_page:
-            self.bytes_per_page = b.numel() * b.element_size()
-        self.bounds[req_id][page] = b
+            # one plane row [Hkv,2,D], x n_full planes
+            self.bytes_per_page = b[0].numel() * b.element_size() * self.n_full
+
+    def bounds_view(self, req_id: int) -> _BoundsView:
+        return _BoundsView(self, req_id)
+
+    def has_bounds(self, req_id: int, page: int) -> bool:
+        v = self.bounds_valid.get(req_id)
+        return v is not None and page < v.shape[0] and bool(v[page])
+
+    def bounds_rows(self, req_id: int, plane: int, pages: list[int]) -> Tensor:
+        """One plane's bounds over ``pages`` in pages order:
+        ``[n_pages, Hkv, 2, D]`` via ONE index_select on the CAP axis. The plane
+        is sliced BEFORE the gather so a 256k scoring call moves one plane
+        (64 MiB), not all 16 (1 GiB) to read 1/16 of it."""
+        t = self.bounds_t[req_id]
+        idx = torch.as_tensor(pages, dtype=torch.long, device=t.device)
+        return t[plane].index_select(0, idx)
+
+    def bounds_one(self, req_id: int, page: int) -> Tensor:
+        """One page's bounds ``[n_full,Hkv,2,D]`` (prefix-publish clone face)."""
+        return self.bounds_t[req_id][:, page].clone()
 
     def set_index_keys(self, req_id: int, page: int, keys: Tensor,
                        scales: Tensor) -> None:
@@ -189,7 +376,8 @@ class SparseTracker:
 
     def bounds_bytes(self) -> int:
         if self.scorer == "bounds":
-            return sum(len(pages) * self.bytes_per_page for pages in self.bounds.values())
+            return sum(int(v.sum()) * self.bytes_per_page
+                       for v in self.bounds_valid.values())
         return self.index_keys_bytes()
 
     def index_keys_bytes(self) -> int:
@@ -251,7 +439,8 @@ class SparseForward:
     the last N candidates (8 for a prefill chunk, 0 on decode where the window
     IS the own span); ``own`` the own span's logical pages."""
 
-    def __init__(self, tracker: SparseTracker, rows: list[dict], device):
+    def __init__(self, tracker: SparseTracker, rows: list[dict], device,
+                 device_select: bool = False):
         self.tracker = tracker
         self.device = device
         self.rows = rows
@@ -261,15 +450,46 @@ class SparseForward:
         #: full-precision post-input-norm hidden (model.py runs the extra norm
         #: only when this is true, so bounds pays no second rmsnorm).
         self.index_scorer = tracker.scorer == "index"
+        self.device_select = device_select
         self._chosen: dict[tuple[int, int], list[int]] = {}
         self._phys: dict[tuple[int, int], Tensor] = {}
         own_w = max(len(r["own"]) for r in rows)
+        self.own_w = own_w
         self.page_base = torch.zeros(self.b, dtype=torch.long, device=device)
         self.own_table = torch.zeros(self.b, own_w, dtype=torch.long, device=device)
         for i, r in enumerate(rows):
             self.page_base[i] = r["own"][0]
             self.own_table[i, : len(r["own"])] = torch.tensor(
                 [r["resolve"](p) for p in r["own"]])
+        if device_select:
+            self._init_device_tables()
+
+    def _init_device_tables(self) -> None:
+        """Fixed-width, capture-ready per-tick buffers (built once pre-forward;
+        replay copies into them). Candidate/own logical indices and the packed
+        own_len are static for the tick; only KV contents and q move."""
+        cmax = max((len(r["cand"]) for r in self.rows), default=0)
+        self.cmax = cmax
+        self.cand_idx = torch.zeros(self.b, cmax, dtype=torch.long, device=self.device)
+        self.own_log = torch.zeros(self.b, self.own_w, dtype=torch.long, device=self.device)
+        self.own_valid = torch.zeros(self.b, self.own_w, dtype=torch.bool, device=self.device)
+        self.n_cand = torch.zeros(self.b, dtype=torch.long, device=self.device)
+        self.win = torch.zeros(self.b, dtype=torch.long, device=self.device)
+        self.own_len_t = torch.zeros(self.b, dtype=torch.long, device=self.device)
+        for bi, r in enumerate(self.rows):
+            nc = len(r["cand"])
+            if nc:
+                self.cand_idx[bi, :nc] = torch.tensor(r["cand"], device=self.device)
+            no = len(r["own"])
+            self.own_log[bi, :no] = torch.tensor(r["own"], device=self.device)
+            self.own_valid[bi, :no] = True
+            self.n_cand[bi] = nc
+            self.win[bi] = r["force_window"]
+            self.own_len_t[bi] = r["own_len"]
+        #: cached per-group device outputs: phys [B,k] (0 pad), chosen logical [B,k]
+        self._dphys: dict[int, Tensor] = {}
+        self._dchosen: dict[int, Tensor] = {}
+        self._dnsel: dict[int, Tensor] = {}
 
     def _select(self, bi: int, plane: int, q: Tensor, h: Tensor | None) -> Tensor:
         """Physical selected-block table [n] for row bi at this plane; a source
@@ -283,8 +503,9 @@ class SparseForward:
         chosen: list[int] = []
         if cand:
             if self.tracker.scorer == "bounds":
-                bounds = torch.stack(
-                    [self.tracker.bounds[r["req_id"]][p][plane] for p in cand])
+                # one index_select gathers this plane's candidate rows (the plane
+                # is sliced inside bounds_rows, so only 1/16 of the bounds moves).
+                bounds = self.tracker.bounds_rows(r["req_id"], plane, cand)
                 scores = quest_scores(q, bounds).reshape(1, 1, len(cand))
             else:
                 # learned indexer: score from the source plane's layer input h
@@ -295,8 +516,6 @@ class SparseForward:
             # logical+1 ids keep real page 0 distinct from the right-pad 0.
             table = (torch.tensor(cand, device=self.device) + _SENTINEL
                      ).reshape(1, -1)
-            from tilerl_kernels.reference import select_pages
-
             sel = select_pages(
                 table, torch.tensor([len(cand)], device=self.device),
                 scores, self.tracker.k_pages, n_window=r["force_window"])[0, 0]
@@ -308,19 +527,86 @@ class SparseForward:
         self._phys[key] = phys
         return phys
 
+    def _select_device(self, plane: int, q: Tensor):
+        """Whole-batch selection for one source GROUP as pure device ops — no
+        ``.tolist()``/``.item()``, no per-row ``torch.tensor``, no host sync (the
+        captured decode tick). Gathers bounds once, scores all B rows, top-k UNION
+        window membership, compacts to a FIXED k width in sequence order, and maps
+        chosen logical pages to physical blocks via the device l2p. A gathered
+        -1 (a cold, non-resident pick) is masked to pad 0: the engine must only
+        reach here with the selection RESIDENT (the pin steady state); a tick that
+        would promote runs the eager path instead. Group-mates reuse the cache."""
+        g = self.tracker.group_of[plane]
+        if g in self._dphys:
+            return self._dphys[g], self._dnsel[g]
+        k = min(self.tracker.k_pages, self.cmax)
+        if self.cmax == 0:
+            phys = torch.zeros(self.b, 0, dtype=torch.long, device=self.device)
+            nsel = torch.zeros(self.b, dtype=torch.long, device=self.device)
+            chosen = torch.zeros(self.b, 0, dtype=torch.long, device=self.device)
+            self._dphys[g] = phys
+            self._dnsel[g] = nsel
+            self._dchosen[g] = chosen
+            return phys, nsel
+        # gather this plane's candidate bounds per row (B fixed index_selects,
+        # constant in context length): [B,Cmax,Hkv,2,D]. The plane slice happens
+        # inside bounds_rows, so each gather is one plane, not all n_full.
+        br = [
+            self.tracker.bounds_rows(self.rows[bi]["req_id"], plane,
+                                     self.rows[bi]["cand"])
+            for bi in range(self.b)]
+        # rows have equal Cmax candidate slots; pad short rows' bounds along axis 1.
+        bounds = torch.stack([
+            torch.nn.functional.pad(x, (0, 0, 0, 0, 0, 0, 0, self.cmax - x.shape[0]))
+            for x in br])
+        scores = quest_scores_batched(q, bounds)            # [B,Cmax]
+        # Score only RESIDENT candidates: l2p[page] >= 0. The captured path never
+        # promotes, so a cold/SSD candidate is excluded from selection here rather
+        # than chosen-and-dropped; the eager path re-selects over ALL candidates
+        # (promoting what it names) every SPARSE_REFRESH_TICKS and on prefill,
+        # refreshing the resident hot set. Every chosen page is resident BY
+        # CONSTRUCTION, so the phys gather below cannot return -1 — no host sync.
+        resident = torch.stack([
+            self.tracker.l2p_t[self.rows[bi]["req_id"]]
+            .index_select(0, self.cand_idx[bi]) >= 0
+            for bi in range(self.b)])                       # [B,Cmax]
+        member = select_members(scores, self.n_cand, self.tracker.k_pages,
+                                self.win, resident)
+        positions, nsel = order_members(member, self.tracker.k_pages)  # [B,k]
+        valid = torch.arange(k, device=self.device)[None, :] < nsel[:, None]
+        safe_pos = positions.clamp_max(self.cmax - 1)
+        chosen = self.cand_idx.gather(1, safe_pos)          # logical pages [B,k]
+        chosen = torch.where(valid, chosen, torch.zeros_like(chosen))
+        phys = torch.stack([
+            self.tracker.l2p_t[self.rows[bi]["req_id"]].index_select(0, chosen[bi])
+            for bi in range(self.b)])                       # [B,k], always >= 0
+        phys = torch.where(valid, phys, torch.zeros_like(phys))
+        self._dphys[g] = phys
+        self._dnsel[g] = nsel
+        self._dchosen[g] = chosen
+        return phys, nsel
+
     def selected_pages(self, bi: int) -> set[int]:
         """Union of this row's logical pages chosen across ALL source groups this
         tick, plus the own span. Every group's choice co-resides until finalize, so
         the cross-tick pin keeps this exact set and demotes only what left it."""
         pages = set(self.rows[bi]["own"])
-        for g in range(self.n_groups):
-            pages.update(self._chosen.get((bi, g), ()))
+        if self.device_select:
+            for g in range(self.n_groups):
+                ch, ns = self._dchosen.get(g), self._dnsel.get(g)
+                if ch is not None:
+                    pages.update(int(x) for x in ch[bi, : int(ns[bi])].tolist())
+        else:
+            for g in range(self.n_groups):
+                pages.update(self._chosen.get((bi, g), ()))
         return pages
 
     def attention_args(self, plane: int, q: Tensor,
                        h: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Packed ``[selected ; own]`` table ``[B,W]`` and per-row packed
         ``seq_len = n_sel*16 + own_len`` for this plane's paged_attention."""
+        if self.device_select:
+            return self._attention_args_device(plane, q)
         packed, sl = [], []
         for bi, r in enumerate(self.rows):
             sel = self._select(bi, plane, q[bi, : r["tq"]],
@@ -334,15 +620,36 @@ class SparseForward:
             table[i, : t.shape[0]] = t
         return table, torch.tensor(sl, dtype=torch.long, device=self.device)
 
-    def chosen(self, bi: int) -> set[int]:
-        """Union of the row's group selections (kept for diagnostics)."""
-        out: set[int] = set()
-        for g in range(self.n_groups):
-            out.update(self._chosen.get((bi, g), ()))
-        return out
+    def _attention_args_device(self, plane: int, q: Tensor) -> tuple[Tensor, Tensor]:
+        """Fixed-width ``[selected k ; own window]`` table ``[B,k+own_w]`` and
+        packed seq_len, both device tensors, one shape for the tick's life (the
+        graph captures one bucket). Selected pages occupy the compact leading
+        columns (padded 0 at the tail); each row's OWN follows at its own
+        ``nsel`` offset, so the packed physical order is causal. Zero host syncs;
+        seq_len already excludes the padding columns."""
+        sel, nsel = self._select_device(plane, q)
+        k = sel.shape[1]
+        # own physical blocks via the device l2p (own was resolved pre-forward).
+        own_phys = torch.stack([
+            self.tracker.l2p_t[self.rows[bi]["req_id"]].index_select(0, self.own_log[bi])
+            for bi in range(self.b)])
+        table = torch.zeros(self.b, k + self.own_w, dtype=torch.long, device=self.device)
+        table[:, :k] = sel
+        col = nsel[:, None] + torch.arange(self.own_w, device=self.device)[None, :]
+        # own_valid zeroes the physical pad beyond each row's own pages before scatter.
+        own_phys = own_phys.masked_fill(~self.own_valid, 0)
+        table.scatter_(1, col, own_phys)
+        sl = nsel * BLOCK_TOKENS + self.own_len_t
+        return table, sl
 
     def selected(self, bi: int, g: int) -> list[int]:
-        """Chosen LOGICAL candidate pages for one row/group (set after _select)."""
+        """Chosen LOGICAL candidate pages for one row/group this tick (set after
+        the group's _select). Reads the device cache on a captured tick."""
+        if self.device_select:
+            ch, ns = self._dchosen.get(g), self._dnsel.get(g)
+            if ch is None:
+                return []
+            return [int(x) for x in ch[bi, : int(ns[bi])].tolist()]
         return list(self._chosen.get((bi, g), ()))
 
 
@@ -475,7 +782,8 @@ class SparsePrefixCache:
         out: dict[int, int] = {}
         for p in range(old_len, m):
             page_blob = dict(pend.pop(p))
-            page_blob["bounds"] = bounds[p]
+            bound = bounds[p]
+            page_blob["bounds"] = bound
             key = page_key(tokens, p)
             self._cold.share_hold(key, page_blob, _blob_nbytes(page_blob))
             out[p] = key
@@ -490,7 +798,7 @@ class SparsePrefixCache:
         e["tokens"] = ptokens
         e["keys"].extend(out[p] for p in range(old_len, m))
         for p in range(old_len, m):
-            e["bounds"][p] = bounds[p]
+            e["bounds"][p] = self._cold.share_take(out[p])["bounds"]
         e["state"] = snaps[m]
         dup = any(
             x is not e and x["tokens"] == ptokens
