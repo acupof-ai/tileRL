@@ -1570,7 +1570,9 @@ class Engine:
         private blob is gone, so the shared key just starts at ref 0-byte and gets
         promoted from the private SSD on its own next read."""
         tr = self._sparse
-        bound = tr.bounds_view(r.req_id)[page]
+        # Host clone: the bound rides in the shared blob, which can spill through
+        # ColdSsdFile.write (numpy), so it must not be a device tensor.
+        bound = tr.bounds_view(r.req_id)[page].cpu()
         self._kv.cold.share_hold_kv(
             (r.req_id, page), content_key, extra={"bounds": bound})
         tr.shared.setdefault(r.req_id, {})[page] = content_key
