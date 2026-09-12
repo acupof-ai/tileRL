@@ -125,6 +125,12 @@ def make_engine(model, backend, t, k, num_blocks):
         max_total_tokens=t + 4096,
         max_num_batched_tokens=512,
         prefix_store=NoPrefixStore(),
+        # Both arms eager: sparse forces eager in build_engine, and a dense arm
+        # that lazily captures on its first decode tick is not apples-to-apples.
+        # On sm70 the capture also fails mid-kernel; eager fallback ran the tokens
+        # but left the caching allocator's captures_underway set, so the
+        # between-arm empty_cache asserted. decode_graph=False sidesteps both.
+        decode_graph=False,
     )
     if k == 0:
         return build_engine(num_blocks=num_blocks, **common)
