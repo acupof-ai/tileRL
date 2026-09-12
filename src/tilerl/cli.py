@@ -2517,9 +2517,11 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
 
     p_serve.add_argument("--sparse-k", type=int, default=DEFAULT_SPARSE_K, metavar="PAGES",
                          help=f"sparse-KV pages selected per row (default {DEFAULT_SPARSE_K} "
-                              "+ the always-on 8-page window); sparse Quest selection is the "
-                              "Pass 0 for the legacy dense engine. With --dry-run --checkpoint "
-                              "it instead prices the derived ledger. docs/design-sparse-kv.md")
+                              "= sparse OFF, dense engine; pass N>0 to opt in to Quest "
+                              "selection with N pages + the always-on 8-page window). "
+                              "Sparse is off by default pending the sm90 continuity gate. "
+                              "With --dry-run --checkpoint it instead prices the derived "
+                              "ledger. docs/design-sparse-kv.md")
     p_serve.add_argument("--scorer", choices=["index", "bounds"], default="bounds",
                          help="sparse-KV page scorer: training-free Quest page bounds "
                               "(default) or the learned V4.1 indexer keys")
