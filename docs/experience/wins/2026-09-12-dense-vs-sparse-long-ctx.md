@@ -1,11 +1,24 @@
 # Dense vs sparse long-context on the 27B — H20 and V100, 2026-09-12
 
-> Status: **two dense rows measured; three sparse rows pre-registered with their
-> launch commands, blocked on #518 merge + sync.** The V100 256k sparse point is
-> a pre-registered *prediction* (below) for the overnight run to hit or miss,
-> not a measurement. Driver `scripts/bench_dense_point.py`, tick-boundary CUDA
-> timing, held spans, `--eager`, 64 decode tokens (skip 16), sparse_k=128,
-> bounds scorer.
+> **Correctness caveat (all sparse rows below):** every sparse output in this
+> entry was taken **before #546**. The tilelang KV writer kernels indexed the
+> sparse own-block table by the absolute page column and ignored `page_base`, so
+> from the second prefill chunk on a chunk's own K/V landed in padding frames.
+> Measured on V100 at full coverage (8k k=512): prefill KL 0.676 / top-1 0.65 /
+> 7-of-64 greedy vs dense; after #546: KL **0.0** / top-1 **1.0** / 64-of-64
+> greedy. The bug affected **both sm70 and sm90** sparse prefill, so these
+> sparse rows show *timing of a wrong-output path*. The wall-clock numbers are
+> kept — the page_base fix changes a block-table index, not byte counts or tick
+> time, so a fixed sparse re-run gives the same prefill/decode seconds and needs
+> no re-measure for this table; only the output is now correct. Dense rows are
+> unaffected. Details in the errors entry
+> `2026-09-12-sparse-write-tokens-ignored-page-base.md` shipped with #546.
+
+> Status: **ready — dense and sparse rows measured (timing); pre-#546 sparse
+> outputs carry the correctness caveat above.** The 256k prediction was tested
+> by the M-tile overnight row (measured section at the end). Driver
+> `scripts/bench_dense_point.py`, tick-boundary CUDA timing, held spans,
+> `--eager`, 64 decode tokens (skip 16), sparse_k=128, bounds scorer.
 
 ## Context
 
@@ -25,15 +38,17 @@ so V100 128k/256k are sparse-only regardless of speed.
 
 ## Results
 
-Dense rows measured; sparse rows are blanks until the runs below return.
+Dense rows measured; sparse rows are blanks until the runs below return. All
+sparse rows are **pre-#546 (wrong output, timing valid)** — see the caveat at
+top. Dense rows are unaffected.
 
 | machine | mode | ctx | prefill s | ms/tok | decode tok/s | device KV GiB | cold host GiB |
 |---|---|---:|---:|---:|---:|---:|---:|
 | H20 | dense (graph) | 131072 | **88.6** | 0.676 | **58.28** | **8.02** | 0 |
-| H20 | sparse k=128 (eager) | 131072 | **108.0** | 0.824 | **19.16** | 0.55 | 0 at finish |
+| H20 | sparse k=128 (eager) ⚠ pre-#546 | 131072 | **108.0** | 0.824 | **19.16** | 0.55 | 0 at finish |
 | V100 | dense f32 (eager) | 32768 | **594.6** | 18.15 | **8.28** | **4.04** | 0 |
-| V100 | sparse k=128 (eager) | 32768 | **341.3** | 10.42 | **1.252** | 1.16 | 0 at finish |
-| V100 | sparse k=128 (eager) | 131072 | **2271.1** | 17.33 | **0.556** | 1.16 | 0 at finish |
+| V100 | sparse k=128 (eager) ⚠ pre-#546 | 32768 | **341.3** | 10.42 | **1.252** | 1.16 | 0 at finish |
+| V100 | sparse k=128 (eager) ⚠ pre-#546 | 131072 | **2271.1** | 17.33 | **0.556** | 1.16 | 0 at finish |
 
 Dense controls: H20 128k prefill 88.621 s / decode 58.279 tok/s (17.2 ms/tok) /
 KV 8612478976 B; V100 32k prefill 594.578 s / decode 8.278 tok/s
@@ -82,7 +97,7 @@ quadratically. Decode 0.556 tok/s = 1797 ms/tok, worse than the 32k sparse's
 across a deeper cold tier, so sparse decode on a slow interconnect degrades
 with context, the opposite of dense. This is the row the hot-pin PR must move.
 
-**Hot-pin 32k on H20** (head 5b8df74d, card 6, eager): cross-tick residency
+**Hot-pin 32k on H20** ⚠ pre-#546 (head 5b8df74d, card 6, eager): cross-tick residency
 works — per steady decode tick **promotions = 0** (sum 0), demotions 0.1/tick,
 so a stable selection moves no pages; decode 21.783 tok/s = 45.9 ms/tok. With
 zero fetches the tick is still ~46 ms, which matches dense-eager ~48 ms, not
@@ -178,9 +193,9 @@ under-counts the non-hot pages.
 
 | run (head) | prefill s / ms·tok | decode tok/s / ms/tok | promotions per dec tick |
 |---|---|---|---|
-| **ladder 256k** (#533 f0a45485, pre-#524) | 4806.9 / 18.34 (80.1 min, 512 ticks) | 0.957 / 1045 | 274.4 (+274.5 demote) |
-| **hot-pin 32k** (#534 dc19c3d1) | 208.8 / 6.37 | **5.653 / 176.9** | **0.0** (0.1 demote) |
-| **M-tile 256k** (main fadb2726, +#524) | 2841.8 / 10.84 (47.4 min, 512 ticks) | 0.968 / 1034 (demote-all, no pin) | 263.9 (+264 demote) |
+| **ladder 256k** (#533 f0a45485, pre-#524) ⚠ pre-#546 | 4806.9 / 18.34 (80.1 min, 512 ticks) | 0.957 / 1045 | 274.4 (+274.5 demote) |
+| **hot-pin 32k** (#534 dc19c3d1) ⚠ pre-#546 | 208.8 / 6.37 | **5.653 / 176.9** | **0.0** (0.1 demote) |
+| **M-tile 256k** (main fadb2726, +#524) ⚠ pre-#546 | 2841.8 / 10.84 (47.4 min, 512 ticks) | 0.968 / 1034 (demote-all, no pin) | 263.9 (+264 demote) |
 
 The 28-min prefill prediction is tested by the M-tile row only; the ladder row
 is its pre-#524 control (18.34 ms/tok carries the slow M=32 GEMM ladder), so
