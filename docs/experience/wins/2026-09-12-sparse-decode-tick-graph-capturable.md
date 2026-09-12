@@ -1,9 +1,14 @@
 # The sparse decode tick is device-tensor selection with a fixed-width table — 2026-09-12
 
-> Status: **CPU gates green; CUDA-graph replay of the sparse tick is
-> pending-remote.** This PR makes selection itself graph-capturable (no host
-> sync, one fixed shape); wrapping it in a `torch.cuda.CUDAGraph` and measuring
-> the decode ms is the sm90 card follow-up.
+> Status: **CPU gates green; the sparse tick is now WRAPPED and serves by
+> default — cuda capture + ms pending the sm90 card run.** #537 made
+> selection itself graph-capturable (no host sync, one fixed shape); this
+> follow-up adds `_SparseDecodeGraph` (the `torch.cuda.CUDAGraph` wrapper,
+> `_CpuSparseGraph` the CPU seam), a persistent refillable `SparseForward`,
+> and stops `build_engine` forcing the sparse decode graph off. The eager path
+> remains the fallback for prefill, a refresh tick, a promotion, or a failed
+> capture. The cuda capture, 32k B=1/B=8 token-parity across a refresh, and
+> the decode-ms row are the sm90 card validation.
 
 ## Context
 
@@ -59,8 +64,48 @@ measure against the k output-fidelity table (`R=1` vs larger).
 selection names, `R` how often a device-only tick is allowed to name a
 resident page it already held instead of pulling in a newly-cold one.
 
+## The graph wrapper (follow-up)
+
+#537 made the tick capture-safe but the dense `_DecodeGraph` could not serve a
+sparse row: it replays the FULL dense block table, while a sparse row holds
+only the hot frames and attention reads the packed [selected;own] table.
+Forcing the dense graph off (the pre-#537 behaviour) left production sparse
+decode running eager — the H20 measured ~3x the dense captured rate.
+
+The wrapper adds a PERSISTENT, refillable `SparseForward` (`reuse=True`):
+one object per `(B, W, cmax_bucket, own_width)` graph key whose buffers never
+change shape. A per-tick `fill()` runs OUTSIDE capture and gathers each row's
+candidate logical ids, the resident l2p (`s_l2p [B,C], -1` for non-resident)
+and per-source-plane candidate bounds (`s_bounds`) into fixed staging tensors.
+The captured region then reads only those staging buffers — never the
+tracker's per-rid dicts, whose shapes grow with context and which a graph
+keyed on one request could not hold. `cmax` (candidate count) is geometrically
+bucketed (64,128,…) like the prefill width, so a larger context causes one
+recapture, not a per-tick recompile.
+
+Routing: a pure-decode, non-refresh, bounds-scorer tick uses the graph;
+prefill, every R-th refresh, any promotion, the index scorer, or a failed
+capture runs the unchanged eager path. sm70 stays graph-off through
+`_graph_on`. A captured graph's persistent staging buffers are held device
+memory, so they get their own `sparse_graph` ledger row (measured==derived).
+
 ## Gates
 
+- `test_sparse_captured_decode_tick_tokens_equal_eager_across_refresh` — the
+  graph path is token-for-token equal to eager sparse at full k across three
+  full R-tick refresh cycles (graph → eager re-pin → graph), and the runner
+  takes at least R graph ticks. The comparison is at full k where the
+  resident-only device selection is exact; at small k its deliberate
+  between-refresh staleness moves tokens (priced by the k fidelity table), and
+  the graph path was separately shown byte-identical to the one-shot device
+  path there.
+- `test_sparse_graph_fill_allocates_nothing_inside_the_captured_region` —
+  after `fill()`, selection + attention_args allocate zero new tensors
+  (TorchDispatchMode over every tensor-creating aten op): a graph bakes
+  pointers, so a fresh allocation would corrupt the replay.
+- `test_sparse_graph_verify_tick_w2_tokens_equal_dense` — an always-accepted
+  tq=2 spec chain through the W=2 graph bucket (+1 own page, kept GDN state)
+  equals a dense engine.
 - `test_device_select_packed_table_matches_eager_at_b1_and_b8` — the device
   table's leading compact physical columns and seq_len equal the eager packed
   table at B=1 and B=8.
@@ -98,4 +143,5 @@ run without syncing.
 
 Raw artifacts: `src/tilerl/sparse_engine.py`, `src/tilerl/engine.py`,
 `tests/test_sparse_engine.py`. CUDAGraph capture and the sparse-vs-dense
-captured decode ms on sm90 pending a free card.
+captured decode ms on sm90 pending the H20 card-2 validation run
+(32k B=1/B=8, bit-equal over 64 steps across a refresh, ms/tick).
