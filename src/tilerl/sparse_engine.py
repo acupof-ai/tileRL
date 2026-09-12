@@ -792,23 +792,28 @@ class SparsePrefixCache:
         self._snap.setdefault(req_id, {})[complete] = (states.cpu(), window)
 
     def _ensure_prefix(self, req_id: int, tokens):
-        """Cached (token tuple, per-page content keys) for a publisher. Each new
-        page EXTENDS the rolling hash over its 16 tokens once instead of rehashing
-        the whole prefix; a longer token vector (decode appends pages) extends it.
-        The keys are bit-identical to :func:`page_key` — same rolling recurrence."""
+        """Cached (token tuple, per-page content keys) for a publisher. The
+        request's token list only grows, so on a longer vector convert and hash
+        ONLY the new tail (amortized 16 conversions/hashes per new page) instead
+        of rebuilding the whole tuple from zero on every drop. The keys are
+        bit-identical to :func:`page_key` — same rolling recurrence."""
         tup = self._tok_tuple.get(req_id)
-        new = tuple(int(t) for t in tokens)
-        if tup is None or len(new) > len(tup):
-            self._tok_tuple[req_id] = new
-            ckeys = self._content_keys.setdefault(req_id, [])
-            h = ckeys[-1] if ckeys else 0
-            start = len(ckeys) * BLOCK_TOKENS
-            for i in range(start, (len(new) // BLOCK_TOKENS) * BLOCK_TOKENS):
-                h = _page_hash(h, new[i])
-                if (i + 1) % BLOCK_TOKENS == 0:
-                    ckeys.append(h)
-            return new, ckeys
-        return tup, self._content_keys[req_id]
+        if tup is not None and len(tokens) == len(tup):
+            return tup, self._content_keys[req_id]
+        if tup is None:
+            tail = tuple(int(t) for t in tokens)
+        else:
+            tail = tuple(int(t) for t in tokens[len(tup):])
+            tail = tup + tail
+        self._tok_tuple[req_id] = tail
+        ckeys = self._content_keys.setdefault(req_id, [])
+        h = ckeys[-1] if ckeys else 0
+        start = len(ckeys) * BLOCK_TOKENS
+        for i in range(start, (len(tail) // BLOCK_TOKENS) * BLOCK_TOKENS):
+            h = _page_hash(h, tail[i])
+            if (i + 1) % BLOCK_TOKENS == 0:
+                ckeys.append(h)
+        return tail, ckeys
 
     def publish_dropped(self, req_id: int, tokens, bounds, page: int,
                         offered) -> dict[int, int]:
