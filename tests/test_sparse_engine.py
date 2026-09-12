@@ -2120,3 +2120,116 @@ def test_sparse_warm_follower_with_an_exact_page_aligned_prompt_matches_cold():
     got = _drain(warm, rid, 8)
     warm.shutdown()
     assert got == cold_got, f"zero-tail warm {got} != cold {cold_got}"
+def test_sparse_mixed_length_rows_prefilling_one_tick_match_their_solo_g0():
+    """H20 MMLU surface (cc bisect): the standalone FIFO probe was bit-exact but
+    the harness drains several prompts whose PREFILL CHUNKS SHARE A TICK, mixed
+    ragged lengths, and g0 argmax flips on 3/5 rows. Each row's last-prefill
+    logits (which predict g0) must equal the same prompt's solo run. Prompts are
+    34-47 pages so the finishing chunk attends through the sparse selected+own
+    path (k=2 + the 8-page window), not only a dense first chunk; the
+    ragged 4/12/4-token finishing chunks ship in ONE tick. Pins engine
+    geometry (per-row own-table/page_base, neighbor assignment); an sm90
+    packed-read defect is the card-only residual this separates from it."""
+    import torch as _torch
+
+    from tilerl.engine import Engine
+
+    cfg = tiny()
+    # All first chunks align to the 512 bucket and pack into tick 1; the page
+    # tails pack at 32 into tick 2; the ragged 4/12/20-token finishers all pad
+    # to the 64 bucket and pack into tick 3 (the g0 capture tick).
+    prompts = [
+        (np.arange(548, dtype=np.int64) % 300) + 7,
+        (np.arange(556, dtype=np.int64) % 310) + 23,
+        (np.arange(564, dtype=np.int64) % 290) + 41,
+    ]
+
+    def build(batch):
+        from tilerl_kernels.backend import get_backend
+
+        return build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=256, num_slots=6, max_batch=batch, max_total_tokens=8192,
+            max_num_batched_tokens=2048, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30)
+
+    # Class-level seams (the engine calls unbound methods); instrument() returns
+    # the per-engine capture dict plus an uninstall.
+    orig_finish = Engine._finish_prefills
+    orig_plan = Engine._build_plan
+
+    def instrument(engine):
+        gid = id(engine)
+        state = {"g": {}, "ticks": []}
+        Engine._instruments = getattr(Engine, "_instruments", {})
+        Engine._instruments[gid] = state
+
+        def wrap_finish(self, prefills, chunks, logits, base):
+            st = Engine._instruments.get(id(self))
+            for k, (pf, c) in enumerate(zip(prefills, chunks)):
+                if st is not None and pf.prefill_from + c >= len(pf.tokens):
+                    st["g"][pf.req_id] = _torch.clone(
+                        logits[base + k, min(c, logits.shape[1]) - 1])
+            orig_finish(self, prefills, chunks, logits, base)
+
+        def wrap_plan(self):
+            dec, pf, ch = orig_plan(self)
+            st = Engine._instruments.get(id(self))
+            if st is not None and pf:
+                st["ticks"].append(
+                    [(r.req_id, r.prefill_from, int(c)) for r, c in zip(pf, ch)])
+            return dec, pf, ch
+
+        Engine._finish_prefills = wrap_finish
+        Engine._build_plan = wrap_plan
+
+        def uninstall():
+            if getattr(Engine, "_instruments", None):
+                Engine._instruments.pop(gid, None)
+            Engine._finish_prefills = orig_finish
+            Engine._build_plan = orig_plan
+
+        return state, uninstall
+
+    try:
+        want = []
+        for p in prompts:
+            e = build(1)
+            st, off = instrument(e)
+            (rid,) = [e.submit(p, SamplingParams(temperature=0.0, max_new_tokens=1))]
+            for _ in range(64):
+                if rid in st["g"]:
+                    break
+                e.step()
+            want.append(st["g"][rid])
+            off()
+            e.shutdown()
+
+        e = build(4)
+        st, off = instrument(e)
+        rids = [e.submit(p, SamplingParams(temperature=0.0, max_new_tokens=1))
+                for p in prompts]
+        for _ in range(64):
+            if all(rid in st["g"] for rid in rids):
+                break
+            e.step()
+        ticks = st["ticks"]
+        got = [st["g"][rid] for rid in rids]
+        off()
+        e.shutdown()
+    finally:
+        Engine._finish_prefills = orig_finish
+        Engine._build_plan = orig_plan
+
+    # The gate must actually run the surface: a tick shared by all three rows'
+    # first chunks, and the tick each g0 was captured on likewise shared.
+    assert any(len(t) == 3 for t in ticks), f"no 3-row prefill tick: {ticks}"
+    capture_ticks = [t for t in ticks if len(t) >= 2]
+    assert capture_ticks, f"g0 rows never finished on a shared tick: {ticks}"
+    for i in range(3):
+        assert got[i].shape == want[i].shape
+        if not _torch.equal(got[i], want[i]):
+            raise AssertionError(
+                f"row {i} g0 logits differ from solo: max|d|="
+                f"{float((got[i] - want[i]).abs().max()):.3e}, argmax flip="
+                f"{int(_torch.argmax(got[i])) != int(_torch.argmax(want[i]))}")
