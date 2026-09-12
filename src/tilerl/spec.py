@@ -395,14 +395,16 @@ class DraftHead:
             lo = max(lo, base + 1)
             if hi < lo:
                 continue
+            # Sparse+spec uses the draft's own DENSE blocks; dense mode reuses trunk.
+            dblocks = r.draft_blocks if r.draft_blocks else r.blocks
             # A block shortfall here is silent: the write lands on the wrong page and the
             # next position attends over garbage. Both engine paths reason to this
             # separately; this is the one place that knows `hi`.
-            assert len(r.blocks) * BLOCK_TOKENS > hi, (
-                f"draft would write position {hi} but the row owns {len(r.blocks)} "
-                f"blocks x {BLOCK_TOKENS} = {len(r.blocks) * BLOCK_TOKENS} positions "
+            assert len(dblocks) * BLOCK_TOKENS > hi, (
+                f"draft would write position {hi} but the row owns {len(dblocks)} "
+                f"blocks x {BLOCK_TOKENS} = {len(dblocks) * BLOCK_TOKENS} positions "
                 f"(seq_len={r.seq_len}, draft_pos={r.draft_pos})")
-            plan.append((r, lo, hi))
+            plan.append((r, lo, hi, dblocks))
         if not plan:
             return
         # Bucket the draft's prefill width the way the trunk does (engine.py:741).
@@ -411,7 +413,7 @@ class DraftHead:
         # length paid 14 compiles / 15.5 s inline, 4.4 tok/s against 45.0 on the
         # repeat. The padding rows are free of correctness risk because the kernels
         # already gate on SeqQLens (kernels_mma.py:71), and `sq` below stays exact.
-        w = max(hi - lo + 1 for _, lo, hi in plan)
+        w = max(hi - lo + 1 for _, lo, hi, _ in plan)
         if w > 1:
             w = -(-w // _PREFILL_BUCKET) * _PREFILL_BUCKET
         # Table width = pool size, for the same reason as engine.py:666 -- the kernels
@@ -425,11 +427,11 @@ class DraftHead:
         pos = np.zeros((n, w), dtype=np.int64)
         bt = torch.zeros(n, nb, dtype=torch.long)
         hs, sl, sq = [], [], []
-        for i, (r, lo, hi) in enumerate(plan):
+        for i, (r, lo, hi, dblocks) in enumerate(plan):
             q = hi - lo + 1
             ids[i, :q] = r.tokens[lo : hi + 1]
             pos[i, :q] = np.arange(lo, hi + 1)
-            bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
+            bt[i, : len(dblocks)] = torch.tensor(dblocks, dtype=torch.long)
             sl.append(hi + 1)
             sq.append(q)
             # hidden at [lo-1 .. hi-1]; hidden_prev supplies the previous forward's position
@@ -468,11 +470,11 @@ class DraftHead:
             for i, c in enumerate(conf[:, -1].tolist()):
                 confs[i].append(float(c))
         chains = [[int(t)] for t in tok[:, -1].tolist()]
-        for i, (r, _, hi) in enumerate(plan):
+        for i, (r, _, hi, dblocks) in enumerate(plan):
             if r.draft_pos == 0:
                 # Position 0 is never drafted but attention still reads its page,
                 # which a recycled block leaves holding another request's.
-                b = r.blocks[0]
+                b = dblocks[0]
                 self.kv.k_pool[:, b, :, 0, :] = 0
                 self.kv.v_pool[:, b, :, 0, :] = 0
             r.draft_pos = hi
@@ -480,8 +482,8 @@ class DraftHead:
         # Remaining chain steps, one position each, bounded by the blocks the row owns.
         # ponytail: clamps the chain instead of allocating; a row at a block boundary drafts shorter.
         for j in range(1, (self.width - 1)):
-            live = [i for i, (r, _, hi) in enumerate(plan)
-                    if hi + j < len(plan[i][0].blocks) * BLOCK_TOKENS]
+            live = [i for i, (r, _, hi, dblocks) in enumerate(plan)
+                    if hi + j < len(dblocks) * BLOCK_TOKENS]
             if not live:
                 break
             li = torch.tensor(live, device=dev)
@@ -508,7 +510,7 @@ class DraftHead:
 
         keep = verify_lens([survival(c) for c in confs]) if (self.width - 1) > 1 \
             else [1] * len(plan)
-        for i, (r, _, _) in enumerate(plan):
+        for i, (r, *_) in enumerate(plan):
             p = r.params
             if p.max_think_tokens is not None and p.end_think_ids and not r.thought_closed:
                 keep[i] = 0  # a forced end-think token is not the sampler's
