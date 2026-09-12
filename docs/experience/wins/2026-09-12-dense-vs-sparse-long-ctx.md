@@ -180,11 +180,21 @@ under-counts the non-hot pages.
 |---|---|---|---|
 | **ladder 256k** (#533 f0a45485, pre-#524) | 4806.9 / 18.34 (80.1 min, 512 ticks) | 0.957 / 1045 | 274.4 (+274.5 demote) |
 | **hot-pin 32k** (#534 dc19c3d1) | 208.8 / 6.37 | **5.653 / 176.9** | **0.0** (0.1 demote) |
-| **M-tile 256k** (main fadb2726, +#524) | _running_ | _running_ | — |
+| **M-tile 256k** (main fadb2726, +#524) | 2841.8 / 10.84 (47.4 min, 512 ticks) | 0.968 / 1034 (demote-all, no pin) | 263.9 (+264 demote) |
 
 The 28-min prefill prediction is tested by the M-tile row only; the ladder row
 is its pre-#524 control (18.34 ms/tok carries the slow M=32 GEMM ladder), so
-80 min there is expected, not a miss. The decode 8.5 tok/s prediction was made
+80 min there is expected, not a miss. **The M-tile result is 47.4 min /
+10.84 ms/tok — the 28-min point prediction missed high (1.7×), and even the
+25–32 min band missed.** Decomposing: 10.84 ms/tok is still above the
+predicted 4.36 ms/tok flat non-attention term, so ~6.5 ms/tok is attention —
+higher than the 2.0 ms/tok estimated from the dense per-key rate, because at
+256k the selector scores and promotes from a cold tier (the first pass pays
+the D2H demote + H2D promote for pages not yet resident), not the steady
+amortized rate the estimate assumed. The M-tile still gives 1.69× over the
+ladder (80.1→47.4 min), so #524's linear win is real; the sparse attention
+term at full cold context was simply under-priced. The decode 8.5 tok/s
+prediction was made
 for the **hot-pin** engine and 32k is its first check: 5.653 tok/s. Hot-pin
 eliminates the fetch exactly (0 promotions, 0.1 demotions per steady tick) and
 recovers 4.5x over demote-all (1.252 tok/s) but is still 0.68x the dense-eager
