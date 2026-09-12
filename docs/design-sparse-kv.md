@@ -206,18 +206,33 @@ the current `l2p >= 0` mask AND "the page survives the marginality clipping",
 computed from the same batched scores with no new host sync. Demotion still
 goes through the one-batch D2H context.
 
-**Ledger.** The `kv_hot` derived row changes from `n_groups*k + W + chunk` to
-`union_cap` per slot (the allocated ceiling, as today), and stats gains one
-measured counter, the tick union size, so the bench prints ceiling vs held
-distribution. The eager refresh promotes the highest-aggregate-score missing
-pages up to free union slots.
+**Ledger.** There is no existing row equal to the pool ceiling; today's two
+`kv_hot` readings are:
+- *Plan/dry-run row* (`memory.sparse_rows`): `k + WINDOW_PAGES` — no
+  `n_groups` factor, and `hot_extra_pages` (the chunk) has no nonzero caller in
+  `src/`. At k=128 on the 27B that is 136 pages while the pool allocates
+  `4*128+8+33 = 553`, so the plan-derived `kv_hot` under-prices the real device
+  pool by ~n_groups on multi-group models (and misses the chunk).
+- *Live engine row* (`_memory_rows`): per-tick residency (`sum(len(r.blocks))`
+  / `_measured_peak` on current residents), held pages this tick, not allocated
+  capacity.
+
+Introducing `union_cap` fixes the plan row: thread the real pool sizing (the
+union, or the worst case `n_groups*k + W + chunk`) into `sparse_rows` /
+`_sparse_spec` so the dry-run row matches the pool's `num_blocks`, and price
+`union_cap` per slot. The live row stays per-tick residency; stats gains one
+measured counter, the tick union size, so the bench prints the planned ceiling
+vs held-union distribution. The eager refresh promotes the
+highest-aggregate-score missing pages up to free union slots.
 
 **Gates (CPU tiny):** (1) `h_pages` large enough that the union never clips —
 token-identical to the current per-group sizing; (2) `union_cap = k` with
 fixtures giving disjoint group preferences clips exactly the named
 lowest-marginal picks, symmetric across groups, and tokens equal an oracle
-that clips each group's list the same way; (3) ledger derived == measured at a
-fixed `union_cap`; (4) full-k (`k >= pages`) still equals dense. Implementation
+that clips each group's list the same way; (3) plan `kv_hot` == allocated pool
+bytes at a fixed `union_cap` (the CEILING), separately from the live row which
+equals measured tick residency (the HELD set) — never assert those two equal;
+(4) full-k (`k >= pages`) still equals dense. Implementation
 lands only after the 8k row fixes the k this serves.
 
 ## Cost model rows
@@ -226,7 +241,7 @@ lands only after the 8k row fixes the k this serves.
 
 ```
 index_keys  device  count = pages_resident x 4 source layers x 4 heads, fmt = Format(bits=8, scales=((128, f32),)), shape [128]   (learned indexer; bounds scorer: pages x 16 layers x [2, 4, 256] bf16)
-kv_hot      device  count = rows x (k_pages + 8 window) x 4 groups, bytes = per_kv_block_bytes / 4  (a group is 4 of the 16 layers' planes)
+kv_hot      device  count = rows x (k_pages + 8 window) hot pages, bytes = one whole KV block per hot page   (today: no n_groups factor — under-prices the multi-group pool by ~n_groups; the union_cap change above makes this rows x union_cap == pool num_blocks)
 kv_cold     host|ssd count = pages_written - pages_on_device, per_kv_block_bytes
 ```
 
