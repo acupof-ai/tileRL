@@ -30,7 +30,7 @@ def _engine(cfg, tmp, store: bool):
     return build_engine(
         cfg, build_random(cfg, seed=11), RefBackend(), num_blocks=64,
         num_slots=4, max_batch=1, max_total_tokens=2048,
-        prefix_store=NoPrefixStore(),
+        prefix_store=NoPrefixStore(), sparse_k=0,  # dense cold-start boot suite
         **({"kv_store": str(tmp)} if store else {}))
 
 

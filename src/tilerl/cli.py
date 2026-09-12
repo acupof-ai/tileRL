@@ -203,13 +203,15 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
         kw["decode"] = decode
     if max_batched_tokens:
         kw["max_num_batched_tokens"] = max_batched_tokens
+    # Always forward sparse_k: --sparse-k 0 is the dense opt-out and must reach
+    # build_engine to override its sparse default.
+    kw["sparse_k"] = sparse_k
+    kw["scorer"] = scorer
     if sparse_k:
         import torch
 
         from . import memory as _mem
 
-        kw["sparse_k"] = sparse_k
-        kw["scorer"] = scorer
         # Cold pages need somewhere to demote: default the pinned host tier to the whole
         # written context at its per-block bytes if the caller gave no budget.
         kw["kv_cold_bytes"] = kv_cold_bytes or (
@@ -2509,9 +2511,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "+ the always-on 8-page window); sparse Quest selection is the "
                               "Pass 0 for the legacy dense engine. With --dry-run --checkpoint "
                               "it instead prices the derived ledger. docs/design-sparse-kv.md")
-    p_serve.add_argument("--scorer", choices=["index", "bounds"], default="index",
-                         help="sparse-KV page scorer: learned V4.1 indexer keys (default) "
-                              "or training-free Quest page bounds")
+    p_serve.add_argument("--scorer", choices=["index", "bounds"], default="bounds",
+                         help="sparse-KV page scorer: training-free Quest page bounds "
+                              "(default) or the learned V4.1 indexer keys")
     p_serve.add_argument("--max-batch", type=int, default=8,
                          help="concurrent rows; drop to 2 for a single-user endpoint (a decode "
                               "graph is captured per bucket x chain width, so a lower "

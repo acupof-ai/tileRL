@@ -461,7 +461,7 @@ def test_a_rejected_submit_does_not_release_the_prefix_stores_blocks():
 
     cfg, model = _build_model("tiny", seed=0)
     engine = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=2,
-                          max_batch=2)
+                          max_batch=2, sparse_k=0)
     base = list(range(1, 49))
     rid = engine.submit(base, SamplingParams(max_new_tokens=2, seed=0))
     for _ in range(40):
@@ -517,7 +517,7 @@ def test_a_second_client_waits_for_capacity_instead_of_503ing():
 
     cfg = tiny(max_position_embeddings=4096)
     engine = build_engine(cfg, build_random(cfg, seed=9), RefBackend(), num_blocks=64,
-                          num_slots=4, max_batch=2, max_total_tokens=4096)
+                          num_slots=4, max_batch=2, max_total_tokens=4096, sparse_k=0)
     big = [1 + (j % 150) for j in range(944)]          # 59 blocks of 64 = 92.2%
     other = [200 + (j % 100) for j in range(944)]
     # Wrapped so a drop can be attributed to an admission attempt rather than to the process.
@@ -605,7 +605,7 @@ def test_a_prompt_larger_than_an_empty_pool_still_refuses_at_submit():
 
     cfg = tiny(max_position_embeddings=8192)
     engine = build_engine(cfg, build_random(cfg, seed=11), RefBackend(), num_blocks=16,
-                          num_slots=2, max_batch=1, max_total_tokens=8192)
+                          num_slots=2, max_batch=1, max_total_tokens=8192, sparse_k=0)
     with pytest.raises(ValueError, match="KV pool capacity"):
         engine.submit(list(range(1, 600)), SamplingParams(max_new_tokens=8, seed=0))
     assert not engine._waiting, "an impossible prompt was queued instead of refused"
@@ -631,7 +631,7 @@ def test_a_failed_admission_returns_every_refcount_it_took():
 
     cfg = tiny(max_position_embeddings=4096)
     engine = build_engine(cfg, build_random(cfg, seed=13), RefBackend(), num_blocks=64,
-                          num_slots=4, max_batch=2, max_total_tokens=4096)
+                          num_slots=4, max_batch=2, max_total_tokens=4096, sparse_k=0)
     base = [1 + (j % 150) for j in range(160)]
     rid = engine.submit(base, SamplingParams(max_new_tokens=2, seed=0))
     engine.run()
@@ -691,7 +691,7 @@ def test_every_key_the_store_publishes_reaches_health_or_is_named_as_dropped():
 
     cfg = tiny(max_position_embeddings=512)
     engine = build_engine(cfg, build_random(cfg, seed=3), RefBackend(), num_blocks=16,
-                          num_slots=2, max_batch=1, max_total_tokens=512)
+                          num_slots=2, max_batch=1, max_total_tokens=512, sparse_k=0)
     assert isinstance(engine._prefix, PrefixStore), "needs a real store, not the null one"
 
     # Non-trivial first: equal zeros cannot tell a forwarded value from a hardcoded one.
@@ -742,7 +742,7 @@ def test_blocks_freed_moves_on_the_wire_when_the_store_frees_a_block():
 
     cfg = tiny(max_position_embeddings=512)
     engine = build_engine(cfg, build_random(cfg, seed=5), RefBackend(), num_blocks=16,
-                          num_slots=2, max_batch=1, max_total_tokens=512)
+                          num_slots=2, max_batch=1, max_total_tokens=512, sparse_k=0)
     store = engine._prefix
     tokens = list(range(1, 65))
     blocks = [engine._kv.alloc_block()
@@ -802,7 +802,7 @@ def test_last_prefill_boundary_is_a_real_chunk_end(n, budget):
     cfg = tiny(max_position_embeddings=4096)
     engine = build_engine(cfg, build_random(cfg, seed=5), RefBackend(), num_blocks=512,
                           num_slots=2, max_batch=1, max_total_tokens=4096,
-                          max_num_batched_tokens=budget)
+                          max_num_batched_tokens=budget, sparse_k=0)
     engine.submit(list(range(n)), SamplingParams(max_new_tokens=1, seed=0))
     ends, at = [], 0
     while at < n:                          # drive the planner, the only source of chunk ends
