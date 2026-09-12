@@ -1267,3 +1267,26 @@ def test_refresh_r8_routes_device_for_seven_ticks_then_eager_promotes():
     assert True in decode_routes and False in decode_routes, decode_routes
     # an eager refresh promoted at least one cold page (the device path never does)
     assert promoted >= 1, promoted
+
+
+def test_sparse_is_off_by_default_after_the_sm90_hotfix():
+    """DEFAULT_SPARSE_K=0: a no-flag build_engine/serve build is the DENSE engine
+    (sparse opt-in only via --sparse-k N). Reverted from 128 on 2026-09-13: the
+    sm90 sparse path was discontinuous even with spec off."""
+    from tilerl.sparse_index import DEFAULT_SPARSE_K
+
+    assert DEFAULT_SPARSE_K == 0
+    dense = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore())
+    assert dense._sparse is None
+    dense.shutdown()
+
+    sparse = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+        sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
+    assert sparse._sparse is not None and sparse._sparse.k_pages == 2
+    sparse.shutdown()

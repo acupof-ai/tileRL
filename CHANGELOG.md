@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-13
+
+- **default reverted (hotfix)** — **sparse KV is OFF by serving/build_engine default again (`DEFAULT_SPARSE_K` 128 → 0); sparse is opt-in via `--sparse-k N`, speculative decode stays the default.** The sm90 sparse path is discontinuous even with spec OFF: 65's 400-token k=128 prompts (where k covers the whole prompt) diverge from dense on the first generated token (~0.45 acc vs 0.915 dense), and sparse+spec n=1282 was 0.2020 vs dense 0.8585 — so this is an sm90 sparse-engine continuity defect, not a k-too-small fidelity trade or a spec interaction. Test asserts a no-flag build is dense. Nonzero default returns only after the sm90 continuity gate passes. — [errors/2026-09-12-sparse-256k-spill-host-rss-oom.md](docs/experience/errors/2026-09-12-sparse-256k-spill-host-rss-oom.md) (paired MMLU rows, 65)
+
 One line per event — phase exit, default flip, accept-or-reject verdict — with
 its `docs/experience/` entry. Newest first.
 
