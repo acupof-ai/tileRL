@@ -12,7 +12,8 @@
 > time, so a fixed sparse re-run gives the same prefill/decode seconds and needs
 > no re-measure for this table; only the output is now correct. Dense rows are
 > unaffected. Details in the errors entry
-> `2026-09-12-sparse-write-tokens-ignored-page-base.md` shipped with #546.
+> [2026-09-12-sparse-write-tokens-ignored-page-base.md](../errors/2026-09-12-sparse-write-tokens-ignored-page-base.md)
+> shipped with #546.
 
 > Status: **ready — dense and sparse rows measured (timing); pre-#546 sparse
 > outputs carry the correctness caveat above.** The 256k prediction was tested
