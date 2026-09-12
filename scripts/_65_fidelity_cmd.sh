@@ -16,6 +16,14 @@ cd "$(dirname "$0")/.."
 # python is whatever the host tree already uses (cc's env); fall back to PATH.
 PY=${FIDELITY_PY:-python}
 
+# The V100 host has TWO nvcc: /usr/bin/nvcc is CUDA 11.8 (rejects -std=c++20,
+# TileLang emits it for the sm70 paged kernel) and /usr/local/cuda/bin/nvcc is
+# 12.4 (the login-shell one every other stage used). A non-login chainer puts
+# /usr/bin first, so force the 12.x toolkit ahead when present.
+if [ -x /usr/local/cuda/bin/nvcc ] && ! nvcc --version 2>/dev/null | grep -q "release 1[2-9]"; then
+  export PATH=/usr/local/cuda/bin:$PATH
+fi
+
 export TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-$HOME/.tilelang_cache}
 export PYTHONPATH=$PWD/scripts:$PWD/src:$PWD/packages/tilerl-kernels/src
 export TILERL_TARGET=cuda
