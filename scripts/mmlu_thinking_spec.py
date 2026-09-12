@@ -100,11 +100,12 @@ def _drain(engine, tok, prompts, sp, deadline_s, on_done=None):
 
 def run_arm(source: str, prompts: list[str], k: int, draft_path: str | None,
             tok, backend, max_ctx: int, deadline_s: float | None,
-            on_done=None, force_think: bool = True) -> dict:
+            on_done=None, force_think: bool = True, fuse_projections: bool = True) -> dict:
     from tilerl.cli import _build_model
     from tilerl.engine import build_engine
 
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True,
+    cfg, model = _build_model("qwen38-27b", seed=0,
+                              fuse_projections=fuse_projections,
                               backend=backend)
     draft = None
     if draft_path:
@@ -153,6 +154,7 @@ def run_arm(source: str, prompts: list[str], k: int, draft_path: str | None,
         "spec_accept_capcross": stats.get("spec_accept_capcross", 0),
         "spec_drafted_capcross": stats.get("spec_drafted_capcross", 0),
         "sparse_k": k,
+        "fuse_projections": fuse_projections,
     }
 
 
@@ -218,6 +220,8 @@ def main():
                     help="N plain-chat prompts (no forced think), spec on: acceptance control")
     ap.add_argument("--pair", nargs=2, metavar=("DENSE_JSON", "SPARSE_JSON"),
                     help="merge two single-arm JSONs into one paired result")
+    ap.add_argument("--no-fuse", action="store_true",
+                    help="fuse_projections=False: take the unfused attn_prep path")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -303,7 +307,8 @@ def main():
         if label not in wanted:
             continue
         a = run_arm(args.source, prompts, k, draft_path, tok, backend,
-                    args.max_ctx, args.deadline_min * 60, on_done=make_progress(label))
+                    args.max_ctx, args.deadline_min * 60, on_done=make_progress(label),
+                    fuse_projections=not args.no_fuse)
         gold = [golds[i] for i in a["done_idx"]]
         a["correct"] = sum(p == g for p, g in zip(a["predictions"], gold))
         a["accuracy"] = a["correct"] / max(1, a["n_done"])
