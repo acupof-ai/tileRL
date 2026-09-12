@@ -54,12 +54,14 @@ def thinking_prompts(raw_prompts: list[str]) -> list[str]:
     return out
 
 
-def _drain(engine, tok, prompts, sp, deadline_s):
+def _drain(engine, tok, prompts, sp, deadline_s, on_done=None):
     """Submit at most CONCURRENCY; stop starting questions past the deadline.
-    Returns completions in prompt order and wall seconds."""
+    Returns completions in prompt order. on_done(idx, text, n_done, elapsed_s)
+    fires per completed question for live progress / partial flushes."""
     t0 = time.time()
     out: list = [None] * len(prompts)
     pending, todo = {}, list(enumerate(prompts))
+    n_done = 0
     while pending or todo:
         while todo and len(pending) < CONCURRENCY:
             if deadline_s is not None and time.time() - t0 > deadline_s:
@@ -69,12 +71,18 @@ def _drain(engine, tok, prompts, sp, deadline_s):
             pending[engine.submit(tok.encode(p), sp)] = i
         engine.step()
         for wid, ids in engine.poll().items():
-            out[pending.pop(wid)] = tok.decode(ids)
+            idx = pending.pop(wid)
+            text = tok.decode(ids)
+            out[idx] = text
+            n_done += 1
+            if on_done is not None:
+                on_done(idx, text, n_done, time.time() - t0)
     return out, time.time() - t0
 
 
 def run_arm(source: str, prompts: list[str], k: int, draft_path: str | None,
-            tok, backend, max_ctx: int, deadline_s: float | None) -> dict:
+            tok, backend, max_ctx: int, deadline_s: float | None,
+            on_done=None) -> dict:
     from tilerl.cli import _build_model
     from tilerl.engine import build_engine
 
@@ -96,7 +104,7 @@ def run_arm(source: str, prompts: list[str], k: int, draft_path: str | None,
         end_think_ids=tuple(tok.encode("</think>\n\n")),
         stop_token_ids=tuple(getattr(tok, "stop_token_ids", ())))
     try:
-        texts, elapsed = _drain(engine, tok, prompts, sp, deadline_s)
+        texts, elapsed = _drain(engine, tok, prompts, sp, deadline_s, on_done)
         stats = engine.stats()
     finally:
         engine.shutdown()
@@ -206,11 +214,37 @@ def main():
     wanted = {"both": ["dense", "sparse"], "dense": ["dense"],
               "sparse": ["sparse"]}[args.arm]
     arms = [("dense", 0), ("sparse", args.k)]
+
+    def make_progress(label):
+        # Live per-question completion line + partial JSON flush every 50, so a
+        # deadline cutoff or kill leaves a readable n and accuracy.
+        preds: dict[int, str] = {}
+        texts: dict[int, str] = {}
+
+        def on_done(idx, text, n_done, elapsed_s):
+            preds[idx] = answer_letter(text or "")
+            texts[idx] = text or ""
+            correct = sum(preds[i] == golds[i] for i in preds)
+            print(f"progress {label} {n_done}/{args.n} acc={correct/max(1,n_done):.4f} "
+                  f"{elapsed_s:.0f}s", flush=True)
+            if n_done % 50 == 0:
+                done = sorted(preds)
+                ntok = sum(len(tok.encode(texts[i])) for i in done)
+                with open(args.out, "w") as fh:
+                    json.dump({"n": args.n, "seed": args.seed, "k": args.k,
+                               "arms": {label: {"n_done": len(done), "done_idx": done,
+                                                "predictions": [preds[i] for i in done],
+                                                "correct": correct,
+                                                "accuracy": correct / max(1, n_done),
+                                                "tok_s": round(ntok / max(1e-9, elapsed_s), 2),
+                                                "partial": True}}}, fh)
+        return on_done
+
     for label, k in arms:
         if label not in wanted:
             continue
         a = run_arm(args.source, prompts, k, draft_path, tok, backend,
-                    args.max_ctx, args.deadline_min * 60)
+                    args.max_ctx, args.deadline_min * 60, on_done=make_progress(label))
         gold = [golds[i] for i in a["done_idx"]]
         a["correct"] = sum(p == g for p, g in zip(a["predictions"], gold))
         a["accuracy"] = a["correct"] / max(1, a["n_done"])
