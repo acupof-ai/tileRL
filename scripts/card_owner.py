@@ -17,7 +17,13 @@ def main() -> int:
     card = sys.argv[1]
     path = sys.argv[2] if len(sys.argv) > 2 else "/work/aupai/runs/card_assignment.json"
     with open(path) as f:
-        note = json.load(f).get("cards", {}).get(str(card), "")
+        entry = json.load(f).get("cards", {}).get(str(card), "")
+    # The controller writes either a bare owner/note string or an object
+    # {"owner": ..., "note": ...}; normalise to the text the prefix rules match.
+    if isinstance(entry, dict):
+        note = " ".join(str(entry.get(k, "")) for k in ("owner", "note"))
+    else:
+        note = str(entry)
     if OURS.match(note):
         print("ours")
     elif THEIRS.match(note):
