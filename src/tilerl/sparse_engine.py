@@ -168,10 +168,12 @@ class SparseTracker:
     survives its demotion to host:
 
     - ``bounds`` scorer: one preallocated fp16 tensor per request,
-      ``bounds_t[rid] = [cap, n_full, Hkv, 2, D]`` grown by doubling, not one
-      small tensor per page in a dict (at 128k a per-page dict forced _select to
-      torch.stack ~8192 tensors x4 planes every tick). A logical page addresses
-      its row directly; bounds_valid marks written rows.
+      ``bounds_t[rid] = [n_full, cap, Hkv, 2, D]`` (PLANE first) grown by
+      doubling, not one small tensor per page in a dict (at 128k a per-page dict
+      forced _select to torch.stack ~8192 tensors x4 planes every tick). Plane-first
+      lets scoring slice the plane before gathering the cap axis, so a call moves
+      one plane (64 MiB at 256k), not all 16 (1 GiB). A logical page addresses
+      its cap row directly; bounds_valid marks written rows.
     - ``keys`` (scorer="index"): req -> page -> fp8 indexer keys
       ``[n_src, Hkv, di]`` plus an f32 scale per key ``[n_src, Hkv]`` (one scale
       over di=128), projected from the page's mean K at append time by the
@@ -184,13 +186,20 @@ class SparseTracker:
     #: initial page-row capacity of a request's bounds tensor
     INIT_CAP = 64
 
-    def __init__(self, cfg, k_pages: int, scorer: str, weights: dict | None = None):
+    def __init__(self, cfg, k_pages: int, scorer: str, weights: dict | None = None,
+                 device=None):
         if scorer not in ("bounds", "index"):
             raise NotImplementedError(
                 f'sparse engine scorer {scorer!r}: want "bounds" or "index"')
         self.cfg = cfg
         self.k_pages = k_pages
         self.scorer = scorer
+        #: Device the preallocated bounds/l2p tensors live on. Must be the
+        #: BACKEND device: attach runs before any bound exists, so inferring it
+        #: from existing tensors put the first request's bounds_t/l2p_t on CPU on
+        #: a GPU build, and the next GPU q scored against CPU bounds raised a
+        #: cross-device error (289b28ca GPU regression; CPU CI cannot see it).
+        self.device = torch.device(device) if device is not None else torch.device("cpu")
         self.src_planes, self.group_of = group_map(cfg)
         self.src_index = {plane: j for j, plane in enumerate(self.src_planes)}
         #: number of full-attn PLANES (= PagedKvPool.num_layers): bounds are
@@ -251,15 +260,10 @@ class SparseTracker:
             self.bytes_per_page = (
                 len(self.src_planes) * ih * di + len(self.src_planes) * ih * 4)
 
-    @property
-    def _device(self):
-        return (next(iter(self.bounds_t.values())).device
-                if self.bounds_t else torch.device("cpu"))
-
     def attach(self, req_id: int) -> None:
-        dev = self._device
+        dev = self.device
         self.bounds_t[req_id] = torch.empty(
-            (self.INIT_CAP, self.n_full, self.hkv, 2, self.dim),
+            (self.n_full, self.INIT_CAP, self.hkv, 2, self.dim),
             dtype=torch.float16, device=dev)
         self.bounds_valid[req_id] = torch.zeros(self.INIT_CAP, dtype=torch.bool, device=dev)
         self.l2p_t[req_id] = torch.full(
@@ -285,10 +289,11 @@ class SparseTracker:
 
     def _grow(self, rid: int, need: int) -> None:
         t = self.bounds_t[rid]
-        cap = t.shape[0]
+        cap = t.shape[1]
         new_cap = max(need, cap * 2)
-        nt = torch.empty((new_cap, *t.shape[1:]), dtype=t.dtype, device=t.device)
-        nt[:cap] = t
+        nt = torch.empty((t.shape[0], new_cap, *t.shape[2:]),
+                         dtype=t.dtype, device=t.device)
+        nt[:, :cap] = t
         nv = torch.zeros(new_cap, dtype=torch.bool, device=t.device)
         nv[:cap] = self.bounds_valid[rid]
         nl = torch.full((new_cap,), -1, dtype=torch.long, device=t.device)
@@ -309,9 +314,9 @@ class SparseTracker:
 
     def set_bounds(self, req_id: int, page: int, b: Tensor) -> None:
         b = b.contiguous().to(torch.float16)
-        if page >= self.bounds_t[req_id].shape[0]:
+        if page >= self.bounds_t[req_id].shape[1]:
             self._grow(req_id, page + 1)
-        self.bounds_t[req_id][page] = b
+        self.bounds_t[req_id][:, page] = b
         self.bounds_valid[req_id][page] = True
         if page >= self.bounds_count[req_id]:
             self.bounds_count[req_id] = page + 1
@@ -323,15 +328,18 @@ class SparseTracker:
         v = self.bounds_valid.get(req_id)
         return v is not None and page < v.shape[0] and bool(v[page])
 
-    def bounds_rows(self, req_id: int, pages: list[int]) -> Tensor:
-        """Bounds of ``pages`` across every source plane in ``pages`` order:
-        ``[n_pages, n_full, Hkv, 2, D]`` via ONE index_select (no Python stack)."""
-        idx = torch.as_tensor(pages, dtype=torch.long, device=self.bounds_t[req_id].device)
-        return self.bounds_t[req_id].index_select(0, idx)
+    def bounds_rows(self, req_id: int, plane: int, pages: list[int]) -> Tensor:
+        """One plane's bounds over ``pages`` in pages order:
+        ``[n_pages, Hkv, 2, D]`` via ONE index_select on the CAP axis. The plane
+        is sliced BEFORE the gather so a 256k scoring call moves one plane
+        (64 MiB), not all 16 (1 GiB) to read 1/16 of it."""
+        t = self.bounds_t[req_id]
+        idx = torch.as_tensor(pages, dtype=torch.long, device=t.device)
+        return t[plane].index_select(0, idx)
 
     def bounds_one(self, req_id: int, page: int) -> Tensor:
         """One page's bounds ``[n_full,Hkv,2,D]`` (prefix-publish clone face)."""
-        return self.bounds_t[req_id][page].clone()
+        return self.bounds_t[req_id][:, page].clone()
 
     def set_index_keys(self, req_id: int, page: int, keys: Tensor,
                        scales: Tensor) -> None:
@@ -471,9 +479,9 @@ class SparseForward:
         chosen: list[int] = []
         if cand:
             if self.tracker.scorer == "bounds":
-                # one index_select gathers all candidate rows, then the plane
-                # slice; no torch.stack over up-to-8192 per-page tensors per tick.
-                bounds = self.tracker.bounds_rows(r["req_id"], cand)[:, plane]
+                # one index_select gathers this plane's candidate rows (the plane
+                # is sliced inside bounds_rows, so only 1/16 of the bounds moves).
+                bounds = self.tracker.bounds_rows(r["req_id"], plane, cand)
                 scores = quest_scores(q, bounds).reshape(1, 1, len(cand))
             else:
                 # learned indexer: score from the source plane's layer input h
@@ -516,11 +524,12 @@ class SparseForward:
             self._dnsel[g] = nsel
             self._dchosen[g] = chosen
             return phys, nsel
-        # gather candidate bounds per row (B fixed index_selects — constant in the
-        # context length), then this plane's slice: [B,Cmax,Hkv,2,D].
+        # gather this plane's candidate bounds per row (B fixed index_selects,
+        # constant in context length): [B,Cmax,Hkv,2,D]. The plane slice happens
+        # inside bounds_rows, so each gather is one plane, not all n_full.
         br = [
-            self.tracker.bounds_rows(self.rows[bi]["req_id"], self.rows[bi]["cand"])
-            [:, plane]
+            self.tracker.bounds_rows(self.rows[bi]["req_id"], plane,
+                                     self.rows[bi]["cand"])
             for bi in range(self.b)]
         # rows have equal Cmax candidate slots; pad short rows' bounds along axis 1.
         bounds = torch.stack([

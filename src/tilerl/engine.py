@@ -2473,7 +2473,7 @@ def build_engine(
         # First cut: selection buffers change width per tick and promote through host
         # memory; a captured decode graph cannot hold that. Eager only until cc's cells.
         decode_graph = False
-        sparse_tracker = SparseTracker(cfg, sparse_k, scorer)
+        sparse_tracker = SparseTracker(cfg, sparse_k, scorer, device=backend.device)
         # An explicitly-passed NoPrefixStore means "sharing off" (training/old
         # tests); otherwise the sparse prefix index attaches once the cold tier
         # exists.

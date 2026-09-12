@@ -587,9 +587,47 @@ def test_bounds_tensor_holds_every_full_attn_plane_not_every_source_group():
     tr.attach(0)
     b = torch.randn(16, tr.hkv, 2, tr.dim, dtype=torch.float16)
     tr.set_bounds(0, 0, b)  # raised: size (4) vs (16) before the fix
-    row = tr.bounds_rows(0, [0])  # raised: index 15 out of bounds before the fix
-    assert row.shape == (1, 16, tr.hkv, 2, tr.dim)
-    assert torch.equal(row[0, 15], b[15])
+    # bounds_t is plane-first [n_full, cap, ...]; plane 15 must be indexable.
+    assert tr.bounds_t[0].shape[0] == 16
+    one = tr.bounds_one(0, 0)  # raised: index 15 out of bounds before the fix
+    assert one.shape == (16, tr.hkv, 2, tr.dim)
+    assert torch.equal(one[15], b[15])
+    # scoring one plane gathers only that plane's page rows
+    row = tr.bounds_rows(0, 15, [0])
+    assert row.shape == (1, tr.hkv, 2, tr.dim)
+    assert torch.equal(row[0], b[15])
+
+
+def test_bounds_tracker_allocates_on_the_backend_device_not_cpu_for_first_request():
+    """GPU regression in the contiguous-bounds commit: the tracker inferred its
+    device from already-allocated bounds_t and fell back to CPU, so the FIRST
+    request's bounds_t/l2p_t were allocated on CPU even on a cuda backend; a GPU
+    query scored against CPU bounds -> cross-device RuntimeError at the second
+    prefill chunk. CI has no GPU, so use a non-CPU fake-device seam: the tensors
+    must be allocated on the device the tracker was constructed with, before any
+    bound exists. Red on the old _device-fallback constructor (forced CPU)."""
+    from types import SimpleNamespace
+
+    from tilerl.sparse_engine import SparseTracker
+
+    # A device object that is not CPU, distinct across attach calls. torch meta
+    # allocates without compute, which is all the seam needs (device placement).
+    dev = torch.device("meta")
+    cfg = SimpleNamespace(full_attn_layers=(0,), num_kv_heads=2, head_dim=16)
+    tr = SparseTracker(cfg, k_pages=2, scorer="bounds", device=dev)
+    tr.attach(0)                       # first request, no prior bounds to infer from
+    assert tr.bounds_t[0].device == dev, tr.bounds_t[0].device
+    assert tr.bounds_valid[0].device == dev
+    assert tr.l2p_t[0].device == dev
+    # growing past INIT_CAP keeps the device too
+    page = tr.INIT_CAP + 1
+    tr.map_resident(0, page, 7)
+    assert tr.l2p_t[0].device == dev
+    assert int(tr.l2p_t[0].shape[0]) > page
+    # default (tests, CPU backends) is still CPU
+    tr_cpu = SparseTracker(cfg, k_pages=2, scorer="bounds")
+    tr_cpu.attach(1)
+    assert tr_cpu.bounds_t[1].device.type == "cpu"
 
 
 # ---------------------------------------------------------------- graph-capturable decode tick
