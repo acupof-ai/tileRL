@@ -169,6 +169,8 @@ class SparseTracker:
         self.last_selected.pop(req_id, None)
         self.resident.pop(req_id, None)
         self.shared.pop(req_id, None)
+        if self.prefix is not None:
+            self.prefix.drop_request(req_id)
 
     def set_bounds(self, req_id: int, page: int, b: Tensor) -> None:
         b = b.contiguous().to(torch.float16)
@@ -370,11 +372,18 @@ class SparsePrefixCache:
     blob through :meth:`HostKvPages.share_hold` (keyed by the page content hash)
     plus the page's Quest bounds and, per whole-prefix entry, the GDN snapshot.
 
-    An entry covers a block-aligned prefix: ``length`` tokens, ``keys[p]`` the
-    content hash of page p, ``bounds[p]`` its fp16 bounds tensor, and one GDN
-    ``state`` snapshot taken at the boundary. On a hit the engine adopts the
-    bounds (zero recompute), restores the state, and promotes a page's K/V into
-    a private fresh block only when the selector names it (lazy).
+    An entry covers a CONTIGUOUS block-aligned prefix 0..n_pages-1: every page
+    has a held blob, a content key and bounds, plus one GDN ``state`` snapshot
+    at the n-page boundary. Pages leave the resident union one at a time and not
+    in order (the cross-tick pin keeps a selected page hot for arbitrary ticks),
+    so dropped pages are buffered; once 0..m-1 have ALL dropped AND a state
+    snapshot at m exists, the publisher's entry covers m pages. Only that one
+    longest-frontier entry exists per publisher — intermediate lengths are never
+    published (same trade the dense store makes: it snapshots state only at
+    aligned chunk boundaries, not per page). A follower adopts exactly the pages
+    the entry lists — no hole can shift the page->key mapping. On a hit the
+    engine adopts the bounds (zero recompute), restores the state, and promotes
+    a page's K/V into a private fresh block only when the selector names it.
     """
 
     def __init__(self, cold, states, capacity: int = 4096):
@@ -385,53 +394,157 @@ class SparsePrefixCache:
         self._by_id: OrderedDict[int, dict] = OrderedDict()
         self._next_id = 0
         self.capacity = capacity
+        # Per-publisher incremental state, cleared on drop_request:
+        # _snap[rid][m] = host GDN snapshot at boundary m, captured only on a
+        # tick that lands exactly on it (aligned prefill chunk / decode page
+        # crossing — the only ticks the recurrent state equals the boundary);
+        # _pending[rid][p] host blob from when page p LEFT the resident union;
+        # _grow[rid] the one live entry advancing as pages drop; _prompt[rid]
+        # the request's own prompt length in pages. Frozen, LRU-managed copies of
+        # the grow entry are retained at TWO boundaries, mirroring the dense
+        # PrefixStore (first frontier closure + prompt end): one grow entry is
+        # not enough because once decode advances it ends in generated-token
+        # territory and a same-prompt follower with a different continuation
+        # cannot match it.
+        self._snap: dict[int, dict[int, tuple]] = {}
+        self._pending: dict[int, dict[int, dict]] = {}
+        self._grow: dict[int, dict] = {}
+        self._prompt_pages: dict[int, int] = {}
+        self._frozen: dict[int, set[int]] = {}  # req -> boundaries frozen
         self.published = 0
         self.hits = 0
         self.evictions = 0
 
-    def publish(self, tokens, page_blobs, bounds, state) -> bool:
-        """Publish one block-aligned prefix.
+    def set_request(self, req_id: int, prompt_pages: int) -> None:
+        """Record the request's prompt length in pages so the grow entry is
+        frozen at that boundary (the sparse counterpart of the dense store's
+        prompt-end publish)."""
+        self._prompt_pages[req_id] = prompt_pages
 
-        ``page_blobs``: {logical page: host blob} for every whole page in the
-        prefix (the sparse finalize already demoted them to host blobs).
-        ``bounds``: {page: bounds tensor}. ``state``: (states, windows) snapshot.
-        Each blob is share_held under its content key; duplicate prefixes no-op.
-        """
+    def note_boundary(self, req_id: int, complete: int, state) -> None:
+        """Capture the GDN snapshot at the current whole-page boundary, one per
+        finalize that lands EXACTLY on one (a decode page crossing or an aligned
+        prefill chunk). The recurrent state then advances past the boundary and
+        is unrecoverable, so an unaligned chunk leaves no snapshot and its length
+        is never published. Snapshots live on the host: the device copy is
+        ~144 MiB at 27B and the lag between a boundary and the contiguous drop of
+        its lowest still-pinned page can span many ticks.
+        # ponytail: retained per request without a byte budget (bounded by the pin
+        # lag); add an LRU eviction freezing the prefix at that boundary if a
+        # long-pinned frontier page ever makes this large."""
+        if complete <= 0:
+            return
+        # Only boundaries up to the prompt end can freeze an entry; decode-cross
+        # boundaries beyond it are generated-token state nobody adopts.
+        if req_id in self._prompt_pages and complete > self._prompt_pages[req_id]:
+            return
+        states, window = state
+        window = None if window is None else window.cpu()
+        self._snap.setdefault(req_id, {})[complete] = (states.cpu(), window)
+
+    def publish_dropped(self, req_id: int, tokens, bounds, page: int,
+                        blob: dict) -> dict[int, int]:
+        """Offer one page's host blob the moment it LEFT the resident union
+        (finalize demote). ``bounds`` is the tracker's live bound for the page.
+        A page need only have dropped ONCE: its captured clone is independent of
+        the private blob, so a later re-selection that promotes the private copy
+        does not invalidate it. Once pages 0..m-1 have all dropped at least once
+        and the boundary-m state snapshot exists, the publisher's single entry
+        (re)attaches at length m and every newly covered page is share_held;
+        returns {page: content key} for those pages. Pages dropping out of order
+        or ahead of the frontier publish nothing until it catches up; the longest
+        length whose snapshot exists is the ceiling. When another publisher
+        already holds the identical prefix at m the entry stays off the lookup
+        chains for that length (its blobs stay share_held for the publisher's own
+        eviction fallback)."""
+        self._pending.setdefault(req_id, {})[page] = blob
         tokens = tuple(int(t) for t in tokens)
-        n_pages = len(tokens) // BLOCK_TOKENS
-        if n_pages == 0:
-            return False
-        h = page_key(tokens, n_pages - 1)
-        for e in self._entries.get(h, ()):
-            if e["tokens"] == tokens:
-                return False
-        keys, key_by_page, kept_bounds = [], {}, {}
-        for p in range(n_pages):
-            if p not in page_blobs:
-                continue  # a selected-candidate page with no own blob: not publishable
-            blob = dict(page_blobs[p])
-            if p in bounds:
-                blob["bounds"] = bounds[p]
+        pend = self._pending[req_id]
+        snaps = self._snap.get(req_id, {})
+        e = self._grow.get(req_id)
+        old_len = 0 if e is None else len(e["keys"])
+        # Contiguous captured-blob frontier, then pull back to the last boundary
+        # whose exact state snapshot exists (an interior length has no snapshot).
+        m = old_len
+        while m in pend and m in bounds:
+            m += 1
+        while m > old_len and m not in snaps:
+            m -= 1
+        if m == old_len:
+            return {}
+        out: dict[int, int] = {}
+        for p in range(old_len, m):
+            page_blob = dict(pend.pop(p))
+            page_blob["bounds"] = bounds[p]
             key = page_key(tokens, p)
-            self._cold.share_hold(key, blob, _blob_nbytes(blob))
-            keys.append(key)
-            key_by_page[p] = key
-            kept_bounds[p] = bounds[p]
-        eid = self._next_id
-        self._next_id += 1
-        entry = {"eid": eid, "tokens": tokens, "keys": keys,
-                 "bounds": kept_bounds, "state": state}
-        self._entries.setdefault(h, []).append(entry)
-        self._by_id[eid] = entry
+            self._cold.share_hold(key, page_blob, _blob_nbytes(page_blob))
+            out[p] = key
+        ptokens = tokens[: m * BLOCK_TOKENS]
+        if e is None:
+            e = {"eid": self._next_id, "tokens": (), "keys": [],
+                 "bounds": {}, "state": None}
+            self._next_id += 1
+            self._grow[req_id] = e
+            self._by_id[e["eid"]] = e
+        self._detach(e)
+        e["tokens"] = ptokens
+        e["keys"].extend(out[p] for p in range(old_len, m))
+        for p in range(old_len, m):
+            e["bounds"][p] = bounds[p]
+        e["state"] = snaps[m]
+        dup = any(
+            x is not e and x["tokens"] == ptokens
+            for x in self._entries.get(page_key(ptokens, m - 1), ()))
+        if not dup:
+            self._entries.setdefault(page_key(ptokens, m - 1), []).append(e)
+        # Freeze an immutable, LRU-managed copy at the first frontier closure and
+        # at the prompt end: the grow entry moves into generated-token territory,
+        # but a follower shares the PROMPT, which ends at these boundaries.
+        at_first = old_len == 0
+        at_prompt_end = m == self._prompt_pages.get(req_id)
+        if at_first or at_prompt_end:
+            self._freeze(req_id, m, e)
         self.published += 1
-        while len(self._by_id) > self.capacity:
-            self._evict_one()
-        return key_by_page  # {page: content key} for the publisher's own resolve
+        while len(self._by_id) > self.capacity and self._evict_one():
+            pass
+        return out
 
-    def _evict_one(self) -> None:
-        _, entry = next(iter(self._by_id.items()))
-        self._drop(entry)
-        self.evictions += 1
+    def _freeze(self, req_id: int, m: int, e: dict) -> None:
+        """Retain an immutable copy of the grow entry at length m on the lookup
+        chains, with its own share refs so it ages independently of the growing
+        entry. The first closure and the prompt end may be the same boundary."""
+        done = self._frozen.setdefault(req_id, set())
+        if m in done:
+            return
+        snap = {"eid": self._next_id, "tokens": e["tokens"],
+                "keys": list(e["keys"]), "bounds": dict(e["bounds"]),
+                "state": e["state"]}
+        self._next_id += 1
+        for key in snap["keys"]:
+            self._cold.share_ref(key)
+        self._entries.setdefault(page_key(snap["tokens"], m - 1), []).append(snap)
+        self._by_id[snap["eid"]] = snap
+        done.add(m)
+
+    def _detach(self, entry: dict) -> None:
+        if entry["tokens"]:
+            chain = self._entries.get(self._entry_hash(entry["tokens"]))
+            if chain is not None and entry in chain:
+                chain.remove(entry)
+
+    def _evict_one(self) -> bool:
+        """Evict the oldest entry not still growing with a live publisher. False
+        when every entry is a live grow entry (fewer long-lived publishers than
+        capacity in practice): the limit is soft there, dropping a grow entry
+        would strand its publisher's next extension."""
+        growing = {id(e) for e in self._grow.values()}
+        for eid, entry in self._by_id.items():
+            if id(entry) not in growing:
+                self._by_id.pop(eid)
+                self._drop(entry)
+                self.evictions += 1
+                return True
+        return False
 
     def _drop(self, entry: dict) -> None:
         """Remove one entry and release every shared page blob it references. A
@@ -463,12 +576,24 @@ class SparsePrefixCache:
                     return e
         return None
 
-    def drop_request(self, *_):
-        """Shared blobs are owned by PREFIX entries, not requests; nothing per-request."""
+    def drop_request(self, req_id: int) -> None:
+        """A finished publisher stops growing; its frozen prompt entries stay on
+        the lookup chains and age out under the normal LRU. Gapped buffers,
+        unconsumed snapshots and the grow link are dropped."""
+        self._snap.pop(req_id, None)
+        self._pending.pop(req_id, None)
+        self._grow.pop(req_id, None)
+        self._prompt_pages.pop(req_id, None)
+        self._frozen.pop(req_id, None)
 
     def clear(self) -> None:
         for entry in list(self._by_id.values()):
             self._drop(entry)
+        self._snap.clear()
+        self._pending.clear()
+        self._grow.clear()
+        self._prompt_pages.clear()
+        self._frozen.clear()
         self.evictions = 0
 
 

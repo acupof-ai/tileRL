@@ -765,6 +765,11 @@ class HostKvPages:
         if rec[2] <= 0:
             self._shared.pop(key, None)
 
+    def share_ref(self, key: int) -> None:
+        """Add one store reference to an already-shared key (a frozen prefix
+        copy shares the blob of the entry it was snapshotted from)."""
+        self._shared[key][2] += 1
+
     def share_keys(self) -> frozenset[int]:
         return frozenset(self._shared)
 

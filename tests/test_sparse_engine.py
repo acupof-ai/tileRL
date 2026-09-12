@@ -314,22 +314,168 @@ def test_serve_build_path_wires_the_sparse_engine(tmp_path, capsys):
     assert "kv_pool" not in owners, owners
 
 
-def test_sparse_engine_publishes_nothing_while_pages_are_pinned():
-    """Under the cross-tick hot pin #526's demote-time publish fires only when a
-    page LEAVES the resident union. A prompt wholly inside the k+window hot set
-    keeps every page resident, so it crosses the publish boundary yet shares
-    nothing. (The long-context follower HIT and its shared-bounds ledger are
-    #542's drop-only frontier gate.)"""
-    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)  # 6 pages
-    sparse = build_engine(
-        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
-        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-        max_num_batched_tokens=512, sparse_k=6, scorer="bounds",
-        kv_cold_bytes=1 << 30)
-    r1 = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
-    _drain(sparse, r1, 8)
-    assert sparse._sparse.prefix.published == 0
+def test_sparse_prefix_publishes_only_when_pages_leave_the_hot_union():
+    """Drop-only publishing under the cross-tick hot pin (#534): a page is shared
+    only when it LEAVES the resident union, and only once pages 0..m-1 have all
+    dropped at least once and an exact boundary-m state snapshot exists. A short
+    prompt wholly inside the hot set publishes NOTHING; a long prompt whose early
+    pages drop publishes an entry, and a follower sharing it HITS (adopts the
+    block-aligned prefix, prefills only the tail) and matches a dense engine."""
+    # tiny has one source group; k=2 + the forced 8-page window keep ~10 pages
+    # hot, so decoding the 24-page prompt demotes its early pages and the
+    # contiguous dropped frontier closes over the whole page-aligned prompt.
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    follow = np.concatenate([prompt, np.arange(100, 120, dtype=np.int64)])
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    # k=2 is approximate by design, so the equality oracle is a SPARSE engine
+    # decoding follow with a MISS (no publisher): sharing must be transparent.
+    def _sparse():
+        return build_engine(
+            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30)
+
+    miss = _sparse()
+    ts_miss = _drain(miss, miss.submit(follow, params), 8)
+    miss.shutdown()
+
+    sparse = _sparse()
+    # A 5-page prompt fits entirely inside k+window: nothing leaves the union, so
+    # the pin publishes no prefix at all.
+    short = sparse.submit(np.arange(7, 7 + 5 * BLOCK_TOKENS, dtype=np.int64),
+                          SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+    _drain(sparse, short, 4)
+    assert sparse._sparse.prefix.published == 0, sparse._sparse.prefix.published
+
+    r1 = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    _drain(sparse, r1, 200)
+    entry = sparse._sparse.prefix.lookup(follow)
+    assert entry is not None and len(entry["keys"]) == 24, \
+        None if entry is None else len(entry["keys"])
+
+    r2 = sparse.submit(follow, params)
+    sparse.step()
+    req = next(x for x in sparse._running if x.req_id == r2)
+    assert req.sparse_matched == 24 * BLOCK_TOKENS, req.sparse_matched
+    ts = _drain(sparse, r2, 8)
     sparse.shutdown()
+    assert ts == ts_miss, f"prefix-hit follower {ts} != prefix-miss sparse {ts_miss}"
+
+
+def test_sparse_prefix_out_of_order_drops_never_publish_a_hole():
+    """Pages leave the pinned resident union in arbitrary order. The index may
+    publish an entry only over a CONTIGUOUS 0..m-1 run with a held blob, a bound
+    and the boundary-m snapshot for every page; and every content key the entry
+    lists must resolve to a held blob (the old hole: a full-length entry skipped
+    missing blobs, so a follower silently never attended those pages)."""
+    import torch
+
+    from tilerl.kv_cache import HostKvPages
+    from tilerl.sparse_engine import SparsePrefixCache
+
+    cold = HostKvPages(budget_bytes=1 << 30)
+    cache = SparsePrefixCache(cold, states=None)
+    rid, P = 0, 4
+    tokens = tuple(range(P * BLOCK_TOKENS))
+    cache.set_request(rid, P)
+    for m in range(1, P + 1):
+        cache.note_boundary(rid, m, (torch.zeros(2), None))
+    bounds = {p: torch.zeros(1) for p in range(P)}
+
+    def blob(p):
+        t = torch.full((2,), float(p))
+        return {"k": t, "v": t}
+
+    # Drop pages 2 then 1 while page 0 is still pinned: the frontier is blocked,
+    # nothing may be published even though longer boundary snapshots exist.
+    assert cache.publish_dropped(rid, tokens, bounds, 2, blob(2)) == {}
+    assert cache.publish_dropped(rid, tokens, bounds, 1, blob(1)) == {}
+    assert cache.lookup(tokens) is None
+    # Page 0 leaves: a contiguous 3-page entry freezes. Every key it lists must
+    # resolve to a held blob, and bounds cover exactly the listed pages.
+    cache.publish_dropped(rid, tokens, bounds, 0, blob(0))
+    hit3 = cache.lookup(tokens)
+    assert hit3 is not None and len(hit3["keys"]) == 3
+    assert set(hit3["bounds"]) == set(range(3))
+    for p, key in enumerate(hit3["keys"]):
+        held = cold.share_take(key)
+        assert held is not None and torch.equal(held["k"], torch.full((2,), float(p)))
+    # The prompt-end page closes the full prefix.
+    cache.publish_dropped(rid, tokens, bounds, 3, blob(3))
+    hit4 = cache.lookup(tuple(tokens) + (9, 9))
+    assert hit4 is not None and len(hit4["keys"]) == P
+
+
+def test_sparse_prefix_republished_after_repin_keeps_the_first_blob():
+    """A page drops (published), the pin re-selects it, and it drops again with a
+    new private blob: the shared prefix must keep serving the FIRST captured
+    blob — the clone is independent of the private frame across a pin boundary."""
+    import torch
+
+    from tilerl.kv_cache import HostKvPages
+    from tilerl.sparse_engine import SparsePrefixCache
+
+    cold = HostKvPages(budget_bytes=1 << 30)
+    cache = SparsePrefixCache(cold, states=None)
+    tokens = tuple(range(BLOCK_TOKENS))
+    cache.set_request(0, 1)
+    cache.note_boundary(0, 1, (torch.zeros(2), None))
+    bounds = {0: torch.zeros(1)}
+    first = torch.full((2,), 7.0)
+    cache.publish_dropped(0, tokens, bounds, 0, {"k": first, "v": first})
+    # Same logical page leaves again with different data after being re-pinned.
+    again = torch.full((2,), 9.0)
+    assert cache.publish_dropped(0, tokens, bounds, 0, {"k": again, "v": again}) == {}
+    hit = cache.lookup(tokens)
+    assert hit is not None
+    assert torch.equal(cold.share_take(hit["keys"][0])["k"], first)
+
+
+def test_prefix_clone_reads_blob_only_after_demotions_scope_exits():
+    """The #538 batched-demote ordering: inside `with pool.demotions()` the D2H is
+    still in flight and the blob is NOT in the cold tier yet; it is held only at
+    the context's sync. Prefix cloning inside the scope therefore peeks None and
+    publishes nothing — the engine must offer dropped pages AFTER the scope exits.
+
+    This drives a real PagedKvPool whose demotions() defers the hold (mimicking
+    #538) and asserts peek is None in-scope but the blob is present out-of-scope.
+    The full engine test above (24-page prompt) exercises the synchronous path;
+    together they pin the offer to after the scope for both implementations."""
+    import contextlib
+
+    from tilerl.kv_cache import HostKvPages, PagedKvPool
+
+    pool = PagedKvPool(8, 1, 16, device=torch.device("cpu"), layer_map=(0,))
+    pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
+    b = pool.alloc_block()
+
+    # Replace demotions() with a context that defers the hold to exit, the exact
+    # invariant batched demote relies on: demote_page stages, hold happens last.
+    staged = []
+    real_demote = pool.demote_page
+
+    @contextlib.contextmanager
+    def deferred_demotions():
+        def stage(block, key=None):
+            staged.append((block, key))
+        pool.demote_page = stage
+        try:
+            yield pool
+        finally:
+            pool.demote_page = real_demote
+            for block, key in staged:
+                real_demote(block, key=key)
+
+    pool.demotions = deferred_demotions
+    with pool.demotions():
+        pool.demote_page(b, key=(7, 3))
+        # in-flight: not held yet -> a prefix clone here would see nothing
+        assert pool.cold.peek((7, 3)) is None
+    # after the scope's sync/hold the blob is present, so an after-scope clone works
+    assert pool.cold.peek((7, 3)) is not None
+    assert pool.free_blocks >= 1  # frames returned at exit too
 
 
 def test_cold_tier_spills_past_the_host_budget_and_the_ledger_splits_tiers(tmp_path):
