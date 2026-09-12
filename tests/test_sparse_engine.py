@@ -400,7 +400,8 @@ def test_sparse_prefix_out_of_order_drops_never_publish_a_hole():
     cache.publish_dropped(rid, tokens, bounds, 0, blob(0))
     hit3 = cache.lookup(tokens)
     assert hit3 is not None and len(hit3["keys"]) == 3
-    assert set(hit3["bounds"]) == set(range(3))
+    # bounds ride in each shared blob, read by field rather than pinned in the entry
+    assert all(cache.bound_of_key(k) is not None for k in hit3["keys"])
     for p, key in enumerate(hit3["keys"]):
         held = cold.share_take(key)
         assert held is not None and torch.equal(held["k"], torch.full((2,), float(p)))
@@ -1290,3 +1291,37 @@ def test_sparse_is_off_by_default_after_the_sm90_hotfix():
         sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
     assert sparse._sparse is not None and sparse._sparse.k_pages == 2
     sparse.shutdown()
+
+
+def test_prefix_publish_consumes_boundary_snapshots_no_second_copy():
+    """The 256k host OOM had a SECOND uncapped container beside the shared-blob
+    clone: SparsePrefixCache._snap kept every consumed chunk-boundary GDN snapshot
+    until request end. After a frontier closes, the boundary snapshot it used
+    must be popped (the entry now owns it); only unconsumed snapshots remain."""
+    import torch as _torch
+
+    from tilerl.kv_cache import HostKvPages
+    from tilerl.sparse_engine import SparsePrefixCache
+
+    cold = HostKvPages(budget_bytes=1 << 30)
+    cache = SparsePrefixCache(cold, states=None)
+    rid, P = 0, 4
+    tokens = tuple(range(P * BLOCK_TOKENS))
+    cache.set_request(rid, P)
+    bounds = {p: _torch.zeros(1) for p in range(P)}
+
+    def blob(p):
+        t = _torch.full((2,), float(p))
+        return {"k": t, "v": t}
+
+    # offer every page, supplying an exact snapshot at each boundary
+    for m in range(1, P + 1):
+        cache.note_boundary(rid, m, (_torch.zeros(2), None))
+    for p in range(P):
+        cache.publish_dropped(rid, tokens, bounds, p, blob(p))
+
+    # the full 4-page prefix froze; no snapshot it consumed is retained twice
+    snap = cache._snap.get(rid, {})
+    assert snap == {}, f"consumed boundary snapshots retained: {sorted(snap)}"
+    hit = cache.lookup(tokens)
+    assert hit is not None and len(hit["keys"]) == P

@@ -1,11 +1,20 @@
 # Sparse 256k prefill host-OOMs on the SSD spill path: anonymous RSS grows to 31 GiB regardless of the host/SSD split — 2026-09-12
 
-> Status: **open.** Two V100 runs of the 27B sparse 256k prefill with SSD
-> spill died on the host OOM killer (SIGKILL, rc=137) at ~16–19 min; the
-> no-SSD run with a 20 GiB host tier completed the same prefill in 47.4 min.
-> The growth is therefore on the spill path, not a function of cold-pool size.
-> Fix owner: 5f, `src/tilerl/kv_cache.py`. No further 256k run until it lands;
-> the fixed run is that PR's bench line.
+> Status: **fixed (CPU gates; H20 256k rerun pending-remote).** The retaining
+> site was not the private SSD tier but the sparse PREFIX path (serve attaches
+> `SparsePrefixCache` by default; the fidelity driver's `NoPrefixStore` does
+> not, which is why its runs did not show it). Two uncapped anonymous
+> containers: (1) `HostKvPages._shared` — every page leaving the resident
+> union was cloned once for the shared prefix index and held with no byte
+> budget and no spill (a second full f16 KV copy, the ~3.6x/window);
+> (2) `SparsePrefixCache._snap` retained every consumed chunk-boundary GDN
+> snapshot until request end. Fix: private→shared is a blob TRANSFER under one
+> pinned budget with one RAM LRU, shared pages spill to a prefix `ColdSsdFile`
+> with read-through, and consumed snapshots are popped. CPU gate demotes 4096
+> pages through SSD with sharing on and asserts total host bytes ≤ budget + one
+> page. The H20 card-3 256k rerun is this entry's closing bench line.
+>
+> Original report below.
 
 ## Context
 
