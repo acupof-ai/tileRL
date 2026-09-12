@@ -115,7 +115,7 @@ def metrics(dense_lp, sparse_lp):
     return {"kl": round(kl / n, 6), "top1": round(top / n, 4)}
 
 
-def make_engine(model, backend, t, k, num_blocks):
+def make_engine(model, backend, t, k, num_blocks, cold_format=""):
     common = dict(
         cfg=model.cfg,
         model=model,
@@ -133,16 +133,21 @@ def make_engine(model, backend, t, k, num_blocks):
         decode_graph=False,
     )
     if k == 0:
-        return build_engine(num_blocks=num_blocks, **common)
+        return build_engine(num_blocks=num_blocks, cold_format=cold_format, **common)
     return build_engine(
-        sparse_k=k, scorer="bounds", kv_cold_bytes=1 << 34, num_blocks=num_blocks, **common
+        sparse_k=k,
+        scorer="bounds",
+        kv_cold_bytes=1 << 34,
+        num_blocks=num_blocks,
+        cold_format=cold_format,
+        **common,
     )
 
 
-def run_arm(model, backend, ids, k, wanted, n_greedy, num_blocks):
+def run_arm(model, backend, ids, k, wanted, n_greedy, num_blocks, cold_format=""):
     """One full prefill: capture prefill logits at `wanted`, then take the
     engine's native greedy continuation from the span end. Production path only."""
-    eng = make_engine(model, backend, len(ids), k, num_blocks)
+    eng = make_engine(model, backend, len(ids), k, num_blocks, cold_format)
     cap, restore = attach_capture(model, model.cfg, backend, set(wanted.tolist()))
     rid = eng.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=n_greedy, seed=0))
     drain_prefill(eng, rid)
@@ -155,16 +160,27 @@ def run_arm(model, backend, ids, k, wanted, n_greedy, num_blocks):
     return prefill, cont
 
 
-def compare(model, backend, ids, t, qpos, ks, n_greedy, num_blocks, out):
+def first_divergence(a, b):
+    """Index of the first mismatching greedy token, or None if identical."""
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i
+    return None
+
+
+def compare(model, backend, ids, t, qpos, ks, n_greedy, num_blocks, out, cold_format=""):
     result = {}
-    dc, dg = run_arm(model, backend, ids, 0, qpos, n_greedy, num_blocks)
+    dc, dg = run_arm(model, backend, ids, 0, qpos, n_greedy, num_blocks, cold_format)
     dlp = [torch.log_softmax(dc[int(p)], -1) for p in qpos.tolist()]
     for k in ks:
         print(f"arm sparse_k={k}", flush=True)
-        sc, sg = run_arm(model, backend, ids, k, qpos, n_greedy, num_blocks)
+        sc, sg = run_arm(model, backend, ids, k, qpos, n_greedy, num_blocks, cold_format)
         slp = [torch.log_softmax(sc[int(p)], -1) for p in qpos.tolist()]
         m = metrics(dlp, slp)
         m["greedy_agreement"] = round(sum(int(a == b) for a, b in zip(dg, sg)) / max(1, len(dg)), 4)
+        m["diff_idx"] = first_divergence(dg, sg)
+        m["dense_greedy"] = dg
+        m["sparse_greedy"] = sg
         m["greedy_equal"] = dg == sg
         result[f"sparse_k={k}"] = m
         print("METRIC", f"k={k}", {kk: vv for kk, vv in m.items()}, flush=True)
@@ -214,7 +230,18 @@ def main27b(args):
     ks = [int(x) for x in args.ks.split(",")]
     # num_blocks=0: dense fits the pool by _fit_blocks; sparse forces its own
     # n_groups*k+window+chunk pool regardless of this.
-    compare(model, backend, ids, t, qpos, ks, 64, num_blocks=0, out=args.out)
+    compare(
+        model,
+        backend,
+        ids,
+        t,
+        qpos,
+        ks,
+        64,
+        num_blocks=0,
+        out=args.out,
+        cold_format=args.cold_format,
+    )
 
 
 if __name__ == "__main__":
@@ -225,6 +252,8 @@ if __name__ == "__main__":
     # V100 32GB: only k=128 fits the 4-group hot pool at slots=1 (1107 blocks);
     # k=1024 is ~8 GiB K+V over the ~4.9 GiB post-weights headroom. H20 takes more.
     ap.add_argument("--ks", default="128")
+    # ""=engine default (f16 cold on an f32 sm70 pool), "native"=pool dtype.
+    ap.add_argument("--cold-format", default="", choices=["", "f16", "native"])
     ap.add_argument("--out", default="/tmp/fidelity-engine.json")
     ap.add_argument("--tiny", action="store_true")
     a = ap.parse_args()
