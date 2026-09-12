@@ -3480,11 +3480,16 @@ def test_a_fetch_still_in_flight_is_waited_for_not_re_read_on_the_tick(tmp_path)
     """The path that only exists while the reader thread is slow.
 
     The two arms above let the prefetch finish first, so the in-flight branch never
-    ran and a mutation deleting it left them green. Here the load is stalled, so
-    lookup() meets a fetch that has not landed -- and must decline rather than do
-    the 1.7 s read itself under the engine lock. When the slow read lands it must
-    PARK anyway: a fetch that lost the deadline race still serves the next lookup
-    of the same prefix (the read is already paid for -- never discard it).
+    ran and a mutation deleting it left them green. Here the read is parked by the
+    KvTier test seam (an Event the test waits on, not a sleep), so lookup() meets a
+    fetch that has not landed -- and must decline rather than do the 1.7 s read
+    itself under the engine lock. When the held read lands it must PARK anyway: a
+    fetch that lost the deadline race still serves the next lookup of the same
+    prefix (the read is already paid for -- never discard it).
+
+    This used to mock torch.load and poll for the reader to enter it, which raced
+    a slow macos runner (the dequeue need not happen inside the poll window) and
+    flaked on #538. The seam parks the reader with the key already in _fetching.
     """
     torch.manual_seed(0)
     toks = list(range(8 * BLOCK_TOKENS))
@@ -3500,21 +3505,14 @@ def test_a_fetch_still_in_flight_is_waited_for_not_re_read_on_the_tick(tmp_path)
     cold = PrefixStore(cold_pool, ssd=cold_tier)
     assert cold_tier.recovered == 1, "fixture: nothing recovered, so no fetch can be slow"
 
-    release = threading.Event()
-    real_load = torch.load
-
-    def stalled(*a, **k):
-        release.wait(timeout=10)
-        return real_load(*a, **k)
-
-    with unittest.mock.patch.object(torch, "load", stalled):
+    # Arm BEFORE the prefetch: the reader parks with the dequeued key already in
+    # _fetching and never calls torch.load until the gate is released.
+    started, gate = cold_tier.hold_fetches_for_test()
+    try:
         assert cold.prefetch_if_worth_it(toks, 1e-3), "probe refused"
         key = cold._hash_all(toks)
-        for _ in range(200):          # wait for the reader thread to be INSIDE the load
-            if cold_tier.fetch_pending(key):
-                break
-            time.sleep(0.005)
-        assert cold_tier.fetch_pending(key), "the fetch finished; this arm needs it in flight"
+        assert started.wait(5.0), "the queued fetch never reached the reader"
+        assert cold_tier.fetch_pending(key), "fixture: the parked fetch is not in flight"
 
         assert cold.lookup(toks) is None, (
             "lookup served a hit while the fetch was still reading, so it did the read "
@@ -3526,12 +3524,14 @@ def test_a_fetch_still_in_flight_is_waited_for_not_re_read_on_the_tick(tmp_path)
         )
         assert cold.fetch_waits == 1, "the wait was not counted, so the branch did not run"
 
-        # Let the slow read finish. No deadline mechanism touches it: it parks anyway.
-        release.set()
-        for _ in range(500):
-            if not cold_tier.fetch_pending(key):
-                break
-            time.sleep(0.01)
+        # Release the held read. No deadline mechanism touches it: it parks anyway.
+        gate.set()
+        deadline = time.time() + 5.0
+        while cold_tier.fetch_pending(key) and time.time() < deadline:
+            time.sleep(0.005)
+        assert not cold_tier.fetch_pending(key), "the released fetch never landed"
+    finally:
+        gate.set()  # idempotent: never leave the reader parked if an assert above raised
 
     assert cold_tier.stats()["ssd_fetches_ready"] >= 1, "the finished read did not park"
     assert cold_tier.stats()["ssd_fetch_drops"] == 0, (
