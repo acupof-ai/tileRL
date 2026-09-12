@@ -933,9 +933,9 @@ class Engine:
         req.blocks = blocks
         req.state_slot = slot
         if sparse and self._draft is not None:
-            # Sparse+spec return-miss on a prefix (see the lookup skip above):
-            # ignore any dense match too and prefill the whole prompt, so the
-            # draft head builds its KV over every position.
+            # A dense match cannot serve a draft row (no draft KV saved); start at
+            # zero and let the sparse prefix lookup below adopt a WARM entry (one
+            # carrying draft K/V + boundary hidden) when it has one.
             matched = 0
         req.seq_len = matched  # materialized length (adopted prefix; 0 on a miss)
         # A bulk boot covering the WHOLE prompt leaves a zero-token residual, so no prefill
@@ -973,9 +973,16 @@ class Engine:
             # prefix position (the forward the prefix save skips) or storing those
             # hiddens; neither is cheap. Return-miss instead (never raise): the
             # follower prefills from zero, which builds trunk and draft KV correctly.
-            if self._draft is None:
-                entry = self._sparse.prefix.lookup(req.tokens) if self._sparse.prefix else None
-            else:
+            # Spec adoption: a follower can adopt only a WARM entry whose blobs
+            # carry the draft head's K/V and whose boundary snapshot carries the
+            # trunk hidden at matched-1 (the first tail draft conditions on it);
+            # an old/trunk-only entry is a miss (prefill from zero).
+            entry = self._sparse.prefix.lookup(req.tokens) if self._sparse.prefix else None
+            if entry is not None and self._draft is not None and (
+                    entry.get("hidden") is None or any(
+                        self._kv.cold.share_take_field(k, "dk") is None
+                        for k in entry["keys"])):
+                # field probes avoid pinning the whole trunk blob to check warmness
                 entry = None
             if entry is not None:
                 matched = len(entry["tokens"])
@@ -993,6 +1000,8 @@ class Engine:
                 self._states.states[slot].copy_(snap_states)
                 if snap_windows is not None:
                     self._states.window_restore(slot, snap_windows)
+                if self._draft is not None:
+                    self._sparse_warm_draft(req, entry, matched)
                 self._prefix_hits += 1
                 req.sparse_matched = matched
         if matched and not sparse:
@@ -1222,8 +1231,12 @@ class Engine:
             measured["index_keys" if self._sparse.scorer == "index"
                      else "page_bounds"] = self._sparse.bounds_bytes()
             measured["kv_hot"] = hot
-            if getattr(kv, "cold", None) is not None and kv.cold.bytes_held:
-                measured["kv_cold"] = kv.cold.bytes_held
+            if getattr(kv, "cold", None) is not None:
+                shared_n = kv.cold.shared_bytes()
+                if kv.cold.bytes_held - shared_n:
+                    measured["kv_cold"] = kv.cold.bytes_held - shared_n
+                if shared_n:
+                    measured["kv_prefix"] = shared_n
         if draft is not None:
             measured["draft_pool"] = pool(draft)
         return measured
@@ -1289,15 +1302,20 @@ class Engine:
                 scorer_n = page_bounds_bytes(cfg, pages_total)
                 owner = "page_bounds"
                 note = f"{pages_total} complete pages, bounds scorer"
-            cold_n = ssd_n = ssd_cap = 0
+            cold_n = ssd_n = ssd_cap = prefix_n = 0
             if getattr(kv, "cold", None) is not None:
-                cold_n = kv.cold.bytes_held
+                prefix_n = kv.cold.shared_bytes()
+                cold_n = kv.cold.bytes_held - prefix_n
                 ssd_n = kv.cold.ssd_bytes
                 ssd_cap = kv.cold.ssd_capacity_bytes
             derived.append(Row("device", owner, scorer_n, note))
             derived.append(Row("device", "kv_hot", hot_n, "resident private blocks this tick"))
             if cold_n:
                 derived.append(Row("host", "kv_cold", cold_n, "demoted pages in pinned host RAM"))
+            if prefix_n:
+                # shared prefix blobs: trunk K/V + bounds (+ draft K/V under warm spec)
+                derived.append(Row("host", "kv_prefix", prefix_n,
+                                   "shared published-prefix pages in pinned host RAM"))
             if ssd_n:
                 derived.append(Row("ssd", "kv_cold_ssd", ssd_n, "demoted pages spilled past the host budget"))
             if ssd_cap:
@@ -1557,42 +1575,118 @@ class Engine:
         tr.map_resident(r.req_id, page, new)
         return new
 
-    def _sparse_offer_drop(self, r: _Req, page: int) -> None:
+    def _sparse_warm_draft(self, r: _Req, entry: dict, matched: int) -> None:
+        """Restore a WARM prefix into a spec follower's dense draft pool: copy the
+        publisher's per-page draft K/V into this row's reserved draft blocks,
+        zero the boundary slot, and prime draft state so the first tail draft
+        conditions on the saved boundary trunk hidden. Bit-equal to a cold
+        follower: cold zeroed position 0 in block 0; warm zeroes position
+        ``matched`` in block M, and every earlier draft slot is the publisher's
+        own value (already zero at its position 0)."""
+        dpool = self._draft.kv
+        dev = dpool.k_pool.device
+        keys = entry["keys"]
+        for p, key in enumerate(keys):
+            # field-only read: restore the draft planes without pinning the page's
+            # trunk K/V blob into host RAM
+            dk = self._kv.cold.share_take_field(key, "dk")
+            dv = self._kv.cold.share_take_field(key, "dv")
+            if dk is None or dv is None:
+                raise RuntimeError(
+                    f"warm prefix entry lost draft KV for page {p} (key {key})")
+            blk = r.draft_blocks[p]
+            dpool.k_pool[:, blk].copy_(dk.to(dev))
+            dpool.v_pool[:, blk].copy_(dv.to(dev))
+        # boundary slot: no draft attends past the matched prefix there
+        boundary_blk = r.draft_blocks[matched // BLOCK_TOKENS]
+        dpool.k_pool[:, boundary_blk, :, 0, :].zero_()
+        dpool.v_pool[:, boundary_blk, :, 0, :].zero_()
+        # condition the first tail draft (position matched) on hidden matched-1
+        r.hidden = entry["hidden"].to(dev).reshape(1, 1, -1)
+        r.hidden_prev = None
+        r.hidden_from = matched - 1
+        r.draft_pos = matched - 1
+
+    def _sparse_offer_drop(self, r: _Req, page: int, draft_pages: dict | None = None) -> None:
         """Page ``page`` just LEFT the resident union: offer it to the prefix index.
         Drop-only — a stable pin never reaches here. No blob is copied or moved
         yet: the index buffers out-of-order drops behind the contiguous frontier
         and skips a page with no bound, so an entry never names a page it cannot
         serve. When the frontier closes, :meth:`SparsePrefixCache.publish_dropped`
         hands back the content keys and :meth:`_sparse_transfer_to_shared`
-        REHOMES each private blob to its content key (one copy, not two)."""
+        REHOMES each private blob to its content key (one copy, not two). A
+        newly published page's draft K/V is copied from the request's draft pool
+        (warm spec adoption)."""
         tr = self._sparse
         if tr.prefix is None or not tr.has_bounds(r.req_id, page):
             return
         keys = tr.prefix.publish_dropped(
             r.req_id, r.tokens, tr.bounds_view(r.req_id), page, (r.req_id, page))
+        # The frontier can close over MANY pages though only ``page`` dropped
+        # this tick, so resolve each new page's draft block from the reserved
+        # draft span, not from the one dropped page.
+        written_page = ((r.draft_pos + 1) // BLOCK_TOKENS
+                        if self._draft is not None and r.draft_blocks else -1)
         for p, content_key in keys.items():
-            self._sparse_transfer_to_shared(r, p, content_key)
+            draft_block = r.draft_blocks[p] if p <= written_page else None
+            self._sparse_transfer_to_shared(r, p, content_key, draft_block)
         for content_key in tr.prefix.take_freeze_refs():
             self._kv.cold.share_ref(content_key)
 
-    def _sparse_transfer_to_shared(self, r: _Req, page: int, content_key: int) -> None:
-        """Rehome one page's PRIVATE blob to the shared content key (transfer, not
-        clone) and attach its bounds. The publisher keeps the page addressable
-        (cold_pages -> shared key map); if the page is already spilled the
-        private blob is gone, so the shared key just starts at ref 0-byte and gets
-        promoted from the private SSD on its own next read."""
-        tr = self._sparse
-        # Host clone: the bound rides in the shared blob, which can spill through
-        # ColdSsdFile.write (numpy), so it must not be a device tensor.
-        bound = tr.bounds_view(r.req_id)[page].cpu()
-        self._kv.cold.share_hold_kv(
-            (r.req_id, page), content_key, extra={"bounds": bound})
-        tr.shared.setdefault(r.req_id, {})[page] = content_key
+    def _sparse_transfer_to_shared(self, r: _Req, page: int, content_key: int,
+                                   draft_block: int | None = None) -> None:
+        """Publish one page under its content key: attach bounds (+ draft K/V for
+        a warm spec entry) to the page's trunk K/V.
 
-    def _sparse_finalize(self, sf, rows: list[_Req]) -> None:
+        Three states the page can be in when its frontier closes:
+        - held on the host as the PRIVATE (rid,page) blob: transfer it (no copy);
+        - on the private SSD: share_hold_kv lifts it into the prefix spill file;
+        - still DEVICE-resident (in the own window, never dropped): build the host
+          blob from its live physical frame here.
+        Returning without a blob would leave a lookup entry naming a dead key."""
+        tr = self._sparse
+        extra = {"bounds": tr.bounds_view(r.req_id)[page].cpu()}
+        if draft_block is not None and self._draft is not None:
+            dpool = self._draft.kv
+            # clone: .cpu() is a no-op on the CPU cell, so without it the blob
+            # aliases a draft block that gets recycled and overwritten
+            extra["dk"] = dpool.k_pool[:, draft_block].detach().cpu().clone()
+            extra["dv"] = dpool.v_pool[:, draft_block].detach().cpu().clone()
+        tr.shared.setdefault(r.req_id, {})[page] = content_key
+        if (r.req_id, page) in self._kv.cold:
+            n = self._kv.cold.share_hold_kv(
+                (r.req_id, page), content_key, extra=extra)
+            if n:
+                return
+            # private blob was past the host budget and consumed into the prefix
+            # spill; future demotes re-home under the content key
+            r.cold_pages = [
+                content_key if (isinstance(p, tuple) and p == (r.req_id, page))
+                else p for p in r.cold_pages]
+            return
+        phys = tr.resident.get(r.req_id, {}).get(page)
+        if phys is None:
+            raise RuntimeError(
+                f"publish page {page}: neither a private host blob nor a resident "
+                f"frame exists (req {r.req_id}, content key {content_key})")
+        # Device-resident: snapshot the frame directly (it stays live; the page
+        # did not leave the union this tick). No pool block is freed.
+        blob, n = self._kv._page_blob(phys)
+        blob.update(extra)
+        n += sum(t.numel() * t.element_size() for t in extra.values()
+                 if torch.is_tensor(t))
+        self._kv.cold.share_hold(content_key, blob, n)
+
+    def _sparse_finalize(self, sf, rows: list[_Req], hidden=None) -> list:
         """After the forward: store Quest bounds of every now-complete page, then
         keep resident the pages selected THIS tick (the union of the source groups
         plus the own span) and demote only resident pages that LEFT that set.
+
+        Returns (row, dropped pages) offers the caller processes LATER — after
+        ``draft.step`` — so a published blob can also carry the page's draft K/V
+        (this chunk's draft forward runs after the trunk forward). ``hidden`` is
+        the forward's per-row trunk hidden [1,q,H], used to save the boundary
+        vector a spec follower's first tail draft conditions on.
 
         Cross-tick pin: a stable selection keeps the same physical frames pinned,
         so the next tick promotes nothing; a changed selection demotes only the
@@ -1649,10 +1743,14 @@ class Engine:
                 if tr.scorer == "bounds" and tr.prefix is not None \
                         and q_hi % BLOCK_TOKENS == 0:
                     sp = self._states
+                    # vector at position q_hi-1; note_boundary moves it to host
+                    boundary_h = (None if hidden is None or self._draft is None
+                                 else hidden[bi, sf.rows[bi]["tq"] - 1])
                     tr.prefix.note_boundary(
                         rid, complete,
                         (sp.states[r.state_slot].clone(),
-                         sp.window_snapshot(r.state_slot)))
+                         sp.window_snapshot(r.state_slot)),
+                        boundary_h)
                 kept = sf.selected_pages(bi)
                 dropped = [p for p in live if p not in kept]
                 for p in dropped:
@@ -1670,6 +1768,11 @@ class Engine:
                 if dropped:
                     dropped_offers.append((r, dropped))
 
+        return dropped_offers
+
+    def _sparse_process_offers(self, dropped_offers) -> None:
+        """Publish dropped pages AFTER ``draft.step``: this chunk's draft K/V now
+        exist in the request's draft pool for the transfer to copy."""
         for r, pages in dropped_offers:
             for p in pages:
                 self._sparse_offer_drop(r, p)
@@ -1820,7 +1923,8 @@ class Engine:
         )
         if sparse:
             promote_ctx.__exit__(None, None, None)
-            self._sparse_finalize(sf, rows)
+            sparse_offers = self._sparse_finalize(
+                sf, rows, None if hid is None else hid[-1])
             # retain the last tick's served candidates+selection so a recall probe
             # reads it after the SparseForward is discarded:
             # req -> {group: (candidate_pages, chosen_candidate_pages)}.
@@ -1879,6 +1983,11 @@ class Engine:
                 self._draft.step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
             else:
                 self._draft_step_timed(rows)
+            if sparse:
+                # draft K/V for this tick's dropped pages now exist: publish them
+                self._sparse_process_offers(sparse_offers)
+        elif sparse:
+            self._sparse_process_offers(sparse_offers)
 
     def _finish_prefills(self, prefills: list[_Req], chunks: list[int], logits, base: int) -> None:
         done = []

@@ -1,9 +1,9 @@
 # Under spec decode a sparse prefix hit cannot serve a follower — 2026-09-12
 
-> Status: **open.** #530 fixes the correctness bug by returning-miss (prefill
-> from zero) whenever a draft head is attached. The warm path is not built:
-> under the production defaults (sparse + spec) the prefix cache publishes but
-> never serves a follower. The PR that lands the warm path removes this line.
+> Status: **closed (tiny CPU; sm90 card parity pending-remote).** #530
+> returned-miss for correctness; the warm path now lands — a spec follower
+> ADOPTS a warm published prefix and is bit-equal to a cold spec follower. See
+> [wins/2026-09-13-warm-spec-prefix-adoption.md](../wins/2026-09-13-warm-spec-prefix-adoption.md).
 
 ## Context
 
@@ -40,15 +40,16 @@ lookup and forces `matched = 0`, including a dense-store hit. The follower
 prefills the whole prompt, both KVs build, outputs equal the cold path
 exactly. Non-spec adoption is unchanged.
 
-## Remaining work
+## Fix (warm path, landed)
 
-Warm adoption under spec needs the trunk hidden at every matched position.
-Two routes, both more than a few lines:
-
-- run the draft model's own prefill over `[0..matched)` conditioned on trunk
-  hidden — which requires the trunk forward the adoption skips (no save), or
-- store per-position trunk hidden with the published entry and replay it into
-  the draft — snapshot storage + a second restore path.
+The landed design is a hybrid, cheaper than either route above: store ONE
+trunk hidden per frozen boundary (the vector at `matched-1`) plus the
+publisher's per-page DRAFT K/V in each shared prefix blob; the follower copies
+the draft pages into its reserved dense draft pool and runs its first tail
+draft conditioned on the saved boundary vector — no rerun, and not
+per-position hidden storage. Only the one boundary slot is zeroed (the exact
+analog of cold's position-0 zeroing in `DraftHead.step`). Full details in the
+win entry.
 
 ## Rule
 
