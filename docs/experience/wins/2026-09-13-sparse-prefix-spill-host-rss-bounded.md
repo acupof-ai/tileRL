@@ -1,7 +1,10 @@
 # Sparse prefix spill no longer copies every cold page into anonymous host RAM — 2026-09-13
 
-> Status: **fix landed on the CPU cell; the H20 256k rerun is
-> pending-remote** and closes [the OOM entry](../errors/2026-09-12-sparse-256k-spill-host-rss-oom.md).
+> Status: **fixed and verified on H20 card 3 (2026-09-13).** 256k sparse
+> prefill with a 6 GiB host tier + 12 GiB SSD keeps cold host bytes pinned at
+> 6.00 GiB and total process RSS at ~7.9 GiB through the whole prefill+decode
+> (the pre-fix run reached VmRSS 30.7 GiB and SIGKILL at 16–19 min). Closes
+> [the OOM entry](../errors/2026-09-12-sparse-256k-spill-host-rss-oom.md).
 
 ## Context
 
@@ -66,3 +69,33 @@ so a follower can reuse a page is still anonymous RSS. When a blob moves
 between namespaces, transfer the allocation; when it can't fit RAM, spill it;
 and assert total host bytes across all containers, not each container in
 isolation.
+
+## H20 card-3 256k measured (2026-09-13, head 2fb12451)
+
+262144 tokens, sparse k=128 bounds, slots=1, host cold 6 GiB, SSD capacity
+12 GiB, `scripts/trace_256k_spill_rss.py`, VmRSS + cold COLD_STATS every 10 s.
+
+| t (s) | phase | RSS GiB | cold-host GiB | shared-SSD GiB | demotions |
+|---:|---|---:|---:|---:|---:|
+| 20 | prefill | 2.54 | 0.83 | 0.00 | 800 |
+| 120 | prefill | 5.61 | 4.02 | 0.00 | 3872 |
+| 220 | prefill | 7.64 | 6.00 | 0.31 | 6080 |
+| 420 | prefill | 7.89 | 6.00 | 3.79 | 9440 |
+| 620 | prefill | 7.91 | 6.00 | 6.62 | 12160 |
+| 821 | prefill | 7.77 | 6.00 | 9.04 | 14496 |
+| 1022 | decode | 7.82 | 6.00 | 10.99 | 16379 |
+| 1028 | done | 7.68 | 5.97 | 10.99 | 16380 |
+
+max cold-host over 103 samples **6.001 GiB** (budget 6.0 + one-batch slack);
+zero over-budget samples; max RSS **7.91 GiB**, flat from ~t=200 while shared
+SSD climbed 0.3 → 11.0 GiB. Pre-fix the same run reached 30.7 GiB RSS and
+died SIGKILL at 16–19 min.
+
+**256k sparse prefill: 997.6 s ≈ 16.6 min** (H20 eager sm90, post-#546) —
+the long-ctx sparse wall-clock row cc could not take on V100 (the V100 was
+host-RAM bound for 128k/256k regardless of speed). 64 decode tokens appended;
+total 1027.5 s.
+
+The card run also caught one CUDA-only defect the CPU gates miss: the shared
+Quest bound is a device tensor and broke `ColdSsdFile.write` (numpy) on spill;
+fixed by `.cpu()` at transfer plus a defensive host-move in `ColdSsdFile.write`.

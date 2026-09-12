@@ -5,7 +5,7 @@ its `docs/experience/` entry. Newest first.
 
 ## 2026-09-13
 
-- **fix (CPU gates; H20 256k rerun pending-remote)** — **the sparse SSD-spill 256k host OOM was an uncapped second KV copy on the prefix path, not the private spill tier.** Every page leaving the hot union was cloned into the unbudgeted, never-spilled `HostKvPages._shared` (a full f16 KV copy, ~3.6 GiB/window → VmRSS 30.7 GiB), and `SparsePrefixCache._snap` retained consumed GDN boundary snapshots. Fix: private→shared is a blob TRANSFER under one pinned budget + one RAM LRU, shared pages spill to a prefix file with read-through (bounds by field, not pinned in the entry), consumed snapshots pop. 4096-page gate holds total host bytes ≤ budget+one page. — [wins/2026-09-13-sparse-prefix-spill-host-rss-bounded.md](docs/experience/wins/2026-09-13-sparse-prefix-spill-host-rss-bounded.md)
+- **fix (H20 card-3 256k verified)** — **the sparse SSD-spill 256k host OOM was an uncapped second KV copy on the prefix path, not the private spill tier.** Every page leaving the hot union was cloned into the unbudgeted, never-spilled `HostKvPages._shared` (a full f16 KV copy, ~3.6 GiB/window → VmRSS 30.7 GiB), and `SparsePrefixCache._snap` retained consumed GDN boundary snapshots. Fix: private→shared is a blob TRANSFER under one pinned budget + one RAM LRU, shared pages spill to a prefix file with read-through (bounds by field, not pinned in the entry), consumed snapshots pop. 4096-page gate holds total host bytes ≤ budget+one page; H20 256k keeps cold host at the 6.0 GiB budget and RSS at ~7.9 GiB (was 30.7 GiB/SIGKILL); sparse 256k prefill 997.6 s. — [wins/2026-09-13-sparse-prefix-spill-host-rss-bounded.md](docs/experience/wins/2026-09-13-sparse-prefix-spill-host-rss-bounded.md)
 
 ## 2026-09-12
 
