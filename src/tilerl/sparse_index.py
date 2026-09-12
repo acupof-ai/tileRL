@@ -40,10 +40,15 @@ INDEX_SOURCE_LAYERS = 4
 #: Local window always attended: 128 tokens = 8 pages.
 WINDOW_TOKENS = 128
 WINDOW_PAGES = WINDOW_TOKENS // BLOCK_TOKENS
-#: Default selected hot pages per row for serve/build_engine. The shipped value
-#: tracks the output-fidelity-vs-k table (27B recall at 32k: bounds 0.158 / oracle
-#: 0.296 at k=128); bump the one constant when the table picks a larger k.
-DEFAULT_SPARSE_K = 128
+#: Default selected hot pages per row for serve/build_engine. 0 = sparse OFF
+#: (dense engine); sparse is opt-in via --sparse-k N. Reverted from 128 on
+#: 2026-09-13: the sm90 sparse path is discontinuous even with spec off — 65's
+#: 400-token k=128 rows (where k covers the whole prompt) diverge from dense on
+#: the FIRST generated token (~0.45 acc vs 0.915 dense); sparse+spec was worse
+#: (0.2020 vs 0.8585). The dense baseline at these prompts is exact, so this is
+#: a sparse engine continuity defect, not a k-too-small fidelity trade. Restore
+#: a nonzero default only after the sm90 continuity gate passes.
+DEFAULT_SPARSE_K = 0
 
 
 def index_source_groups(n_full_layers: int,
