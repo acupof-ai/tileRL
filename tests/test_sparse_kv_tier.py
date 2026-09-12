@@ -668,3 +668,40 @@ def test_shared_transfer_of_an_already_spilled_private_page_reads_back(tmp_path)
     # the private copy is gone
     assert cold.take(p - 1) is None
     cold.close()
+
+
+def test_two_spilled_publishers_of_one_content_key_share_one_slot(tmp_path):
+    """52 CHANGE-REQ: two identical-prompt requests whose pages are BOTH already
+    on the private SSD transfer to the same content key. The second transfer must
+    ref++, not reset refs to 1, allocate a second prefix-file slot, or let one
+    release forget the slot the other publisher still serves."""
+    p, hkv, d, layers = 8, 2, 8, 2
+    pool = PagedKvPool(p, hkv, d, num_layers=layers, device=_device())
+    per = (pool.k_pool[0, 0].numel() * pool.k_pool.element_size()
+           + pool.v_pool[0, 0].numel() * pool.v_pool.element_size()) * layers
+    cold = HostKvPages(budget_bytes=per, ssd_path=str(tmp_path / "cold.bin"))
+    pool.attach_cold(cold)
+
+    blocks = [pool.alloc_block() for _ in range(p)]
+    for i, b in enumerate(blocks):
+        pool.k_pool[:, b].fill_(i)
+        pool.v_pool[:, b].fill_(-i)
+        pool.demote_page(b, key=i)
+    assert cold.ssd_bytes >= per * (p - 1)
+
+    bound = torch.zeros(2, dtype=torch.float16)
+    cold.share_hold_kv(p - 1, 777, extra={"bounds": bound})
+    cold.share_hold_kv(p - 2, 777, extra={"bounds": bound})
+
+    assert cold._shared[777][1] == 2            # refs, not reset to 1
+    assert len(cold._shared_ssd) == 1           # exactly one prefix-file slot
+    # read-through by field does not consume the spilled slot
+    assert cold.share_take_field(777, "bounds") is not None
+    assert len(cold._shared_ssd) == 1
+    cold.share_release(777)
+    assert 777 in cold.share_keys()             # B's entry still served
+    assert ("s", 777) in cold._shared_ssd       # its slot survived A's release
+    assert cold.share_take(777) is not None     # full read-through resolves
+    cold.share_release(777)
+    assert 777 not in cold.share_keys()
+    cold.close()

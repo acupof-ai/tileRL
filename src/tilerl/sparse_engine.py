@@ -842,7 +842,11 @@ class SparsePrefixCache:
         # be bumped now; private-key offers leave the bump to the engine after it
         # transfers the blobs (take_freeze_refs).
         for _rid, eid in list(self._freeze_pending):
-            entry = self._by_id[eid]
+            entry = self._by_id.get(eid)
+            if entry is None:
+                # capacity eviction above can remove the just-frozen non-growing entry
+                self._freeze_pending.remove((_rid, eid))
+                continue
             if all(k in self._cold.share_keys() for k in entry["keys"]):
                 self._freeze_pending.remove((_rid, eid))
                 for k in entry["keys"]:
@@ -879,7 +883,9 @@ class SparsePrefixCache:
         keys: list[int] = []
         pending, self._freeze_pending = self._freeze_pending, []
         for _rid, eid in pending:
-            keys.extend(self._by_id[eid]["keys"])
+            entry = self._by_id.get(eid)
+            if entry is not None:
+                keys.extend(entry["keys"])
         return keys
 
     def _detach(self, entry: dict) -> None:

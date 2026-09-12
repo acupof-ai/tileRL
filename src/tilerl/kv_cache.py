@@ -667,9 +667,6 @@ class HostKvPages:
     def _shared_ram_bytes(self) -> int:
         return sum(rec[0] for rec in self._shared.values() if rec[2] is not None)
 
-    def _ram_over(self) -> bool:
-        return self._used + self._shared_ram_bytes() > self.budget_bytes
-
     @property
     def ssd_bytes(self) -> int:
         return self._ssd_bytes
@@ -832,7 +829,9 @@ class HostKvPages:
         copy): the caller has already popped it from ``_blobs``. It enters the
         one pinned budget and LRU-spills to the prefix file when the budget
         binds; bounds ride in ``blob['bounds']`` and spill with it.
-        Idempotent on key — just adds a reference."""
+        Idempotent on key — just adds a reference. With no ssd_path a shared page
+        cannot spill or drop, so it pins in RAM until its entry ages out and all
+        refs release — the host bound is then the published-prefix working set."""
         rec = self._shared.get(key)
         if rec is not None:
             rec[1] += 1
@@ -859,6 +858,18 @@ class HostKvPages:
             # the shared spill namespace - nothing added to host RAM.
             if self._ssd is None or private_key not in self._ssd:
                 return 0
+            # Dedupe BEFORE the lift: a second publisher of the same content key
+            # (identical prompts both past the host budget) consumes its private
+            # copy and ref++s, instead of resetting refs / leaking the first
+            # prefix-file slot under live refs. Bounds are deterministic per
+            # content, so the existing record already carries them.
+            existing = self._shared.get(shared_key)
+            if existing is not None:
+                n = self._ssd_page_bytes.pop(private_key, self._ssd.stride)
+                self._ssd.forget(private_key)
+                self._ssd_bytes -= n
+                existing[1] += 1
+                return existing[0]
             n = self._ssd_page_bytes.pop(private_key, self._ssd.stride)
             blob = self._ssd.read(private_key, False)
             self._ssd.forget(private_key)
