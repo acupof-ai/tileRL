@@ -99,3 +99,22 @@ total 1027.5 s.
 The card run also caught one CUDA-only defect the CPU gates miss: the shared
 Quest bound is a device tensor and broke `ColdSsdFile.write` (numpy) on spill;
 fixed by `.cpu()` at transfer plus a defensive host-move in `ColdSsdFile.write`.
+
+### Caveat — the SSD spill write is the post-budget prefill bound
+
+The 997.6 s 256k prefill is **3.8 ms/1k-token**, 4.5x the 128k sparse row's
+0.84 ms/1k-token (108 s); doubling the context should not cost that per token,
+and the curve shows why. The host tier fills to 6 GiB by t≈200 s; from then on
+every newly demoted 1 MiB f16 page is written synchronously to the mmap file.
+Post-budget throughput holds at ~262 tok/s ≈ 16.4 pages/s, i.e. ~16 MiB/s of
+spill write per second — matching the observed interval write rate
+(19 MiB/s at t=220 declining to 11–12 MiB/s by t=921; shared SSD 0.3 → 11.0
+GiB). So after the host budget binds, prefill is spill-write-bound, not
+compute-bound: the wall-clock is set by the serving spill disk (~15 MiB/s
+synchronous mmap), exactly the tier the serve path measures 1.65x slower on
+(and keeps `--ssd-path` off by default). The pre-budget phase (0–200 s,
+cold set under 6 GiB) runs at the unscaled rate. This is the #532 long-ctx
+caveat: a bigger host cold budget removes the bound until its own capacity,
+and the spill is a capacity floor, not a speed-neutral extension. The fix in
+this entry bounds RSS (it no longer OOMs); it does not make the slow spill
+fast.
