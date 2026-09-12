@@ -285,9 +285,25 @@ dense's own** greedy is **+0.013 nats/token at k=128** and **+0.018 nats/token
 at k=256** (nats, not tokens; sparse greedy tokens teacher-forced through
 dense), top-5 agreement 1.0 for both. Per-window lines:
 `~/tilerl-logs/fid-nll.log` (the 10800s cap killed the sweep before its
-aggregate JSON dump). On n=3 k=128 is no worse than k=256 on generated tokens,
-so the serving default stays k=128 and the cross-group union hot pool is
-parked — revisited after n=8. The low prefill greedy-agreement (0.4062 /
-0.0625) does not gate: prefill positions are forced teacher tokens, never
-sampled; the nats/token gap and top-5 agreement on the continuation are the
-output quality that ships.
+aggregate JSON dump). These short sm70 rows are **not the gate the default
+rested on**: they are B=1, 64-token, teacher-forced (every continuation token
+is dense's, so the sparse trajectory cannot drift), and the trajectory can't
+wander.
+
+> **REVERTED by #558 the same day — sparse is opt-in again (`DEFAULT_SPARSE_K
+> 0`).** End-to-end MMLU on the 27B H20 (the regime this entry never measured:
+> sm90, B=8, free-running multi-hundred-token generations) showed sparse
+> generation is badly wrong despite the short sm70 rows above: greedy spec-OFF
+> sparse k=128 scored **0.3475 vs dense 0.9150** on the same 400 thinking
+> questions (mean 604 tok/q, many emitting no answer letter); spec-ON n=1282
+> was 0.202 vs dense 0.859 (paired McNemar delta −0.624 ±0.045). At MMLU
+> lengths (≤128 pages) k=128 selects the FULL page set, so this is not
+> expected near-tie divergence. sm70 first-token dense-vs-sparse logits are
+> bit-identical at B=1 and B=8 (max abs 0.0; `firsttok_{dense1,sparse1,
+> sparse8}.json`, 65, V100), localizing the defect to the **sm90 B=8
+> long-generation** path (under bisection), not selection or the packed tile in
+> the abstract. The 0.4062/0.0625 free-greedy agreement in the table above was
+> an earlier warning that the short NLL gate was insufficient; it was read as
+> benign and was not. Re-enable only after an sm90 B=8 long-generation
+> continuity gate passes. (#530 originally shipped the default; #558 reverted;
+> harness `scripts/mmlu_thinking_spec.py`, paired JSONs on the H20 pod.)

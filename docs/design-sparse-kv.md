@@ -279,20 +279,25 @@ the P1 eval delta between sparse and dense <= the run-to-run noise measured by
 two dense seeds. A miss on recall is a science result (the single-card token
 budget was not enough), recorded in `errors/` with the token count.
 
-> 2026-09-12: the 27B measurements below supersede this mass gate — the SLO is
-> now output fidelity vs dense. **The default k is decided at 128, interim on
-> n=3 windows** of one held 32k stream (n=8 running on the V100). On the V100
-> production path after the #546 page_base fix, k=all is token-identical, and
-> k=128 gives prefill KL 0.0023 / top-1 0.981 at 8k, 0.019 / 0.949 at 32k.
-> The continuation's mean per-token NLL gap to dense is **+0.013 nats/token at
-> k=128** and **+0.018 nats/token at k=256** (nats, not tokens; top-5
-> agreement 1.0), so on n=3 generated tokens do not improve from 128 to 256;
-> the
-> cross-group union hot pool [below](#the-resident-pool-is-a-cross-group-union-sized-union_cap)
-> stays **parked** — no default k needs it, the worst-case `n_groups*k` pool
-> fits at k=128, and the decision is revisited after the n=8 windows. Sparse
-> Quest selection + spec decode are the serving default (#530); `--sparse-k 0`
-> opts back to dense. See [Measured on the 27B](#measured-on-the-27b).
+> 2026-09-12 (updated after the same-day revert #558): sparse Quest selection
+> is **opt-in, not the serving default** (`DEFAULT_SPARSE_K = 0`). It shipped as
+> default in #530 on short-context sm70 continuity rows and was reverted when
+> end-to-end MMLU on the 27B H20 exposed a generation defect those rows did not
+> cover: greedy spec-off sparse k=128 scored **0.3475 vs dense 0.9150** on the
+> same 400 thinking questions (spec-on n=1282: 0.202 vs 0.859, paired delta
+> −0.624 ±0.045). At MMLU lengths k=128 selects the full page set, so the
+> divergence is not expected near-tie selection loss; sm70 first-token logits
+> are bit-identical dense-vs-sparse at B=1 and B=8 (max abs 0.0), localizing
+> the defect to the **sm90 B=8 long-generation** path under bisection
+> (`fuse_projections` / host-cold f16-narrow / B=8 kwargs). The sm70 rows below
+> remain valid but only for short, B=1/forced-teacher conditions: after #546
+> k=all is token-identical, k=128 prefill KL 0.0023/top-1 0.981 at 8k and
+> 0.019/0.949 at 32k, and a 64-token teacher-forced NLL gap was ~+0.013
+> nats/token (n=3). None of those predicts free-running sm90 B=8 generation.
+> The cross-group union hot pool
+> [below](#the-resident-pool-is-a-cross-group-union-sized-union_cap) stays
+> **parked**. Re-enable a sparse default only after an sm90 B=8 long-generation
+> continuity gate passes. See [Measured on the 27B](#measured-on-the-27b).
 
 ## Kernels
 
