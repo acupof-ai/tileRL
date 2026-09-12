@@ -1,9 +1,12 @@
 # A failed sm70 decode-graph capture poisons torch's caching allocator for the process — 2026-09-12
 
-> Status: **fixed on `fix/sm70-decode-graph-allocator`** by prevention (auto
-> capture off on sm70). The CPU gate covers the guard; the end-to-end V100
-> point (dense→sparse two-arm harness, empty_cache between arms) is
-> pending-remote, cc runs it after the write_tokens PR.
+> Status: **fixed by prevention (auto capture off on sm70), shipped with #545
+> (main 6b714563).** The end-to-end V100 point ran 2026-09-12: the auto arm is
+> verified (graph off, warning, both empty_cache calls survive). The explicit
+> opt-in arm did NOT reproduce the poison in a short probe — capture succeeded
+> there — so the opt-in failure stays an observed, not-on-demand-reproduced,
+> property (details in the measured section). The CPU gate still covers the
+> guard.
 
 ## Context
 
@@ -55,6 +58,30 @@ debugging. All three sizing callers (Engine init, `build_engine` pad row,
 the CLI slot fit) share the one answer, so the pool is sized consistently
 with no capture.
 
+## Measured V100 point (2026-09-12, main 75d1788e)
+
+Two separate processes, each a 27B dense engine then `empty_cache` (the
+auto arm adds a sparse engine and a second `empty_cache`), 2048 prompt tokens
++ 8 greedy on Tesla V100-SXM2-32GB, torch 2.5.1+cu121. Driver
+`scripts/probe_sm70_graph_poison.py`.
+
+- **Auto (`decode_graph=None`): verified.** The one-time warning fired once,
+  `_decode_graph_on=False`, dense generated, `EMPTY_CACHE_AFTER_DENSE OK`,
+  sparse generated the same greedy prefix, `EMPTY_CACHE_AFTER_SPARSE OK`
+  (`AUTO_ARM_PASS`). This is the exact dense→`empty_cache`→sparse shape that
+  asserted pre-#545; the guard prevents it.
+- **Explicit opt-in (`decode_graph=True`): poison NOT reproduced in this
+  probe.** `_decode_graph_on=True` stayed on, decode ran, and the post-run
+  `empty_cache` survived. Capture evidently did not fail at this small
+  standalone context (2048 tokens, fresh process, no prior arm in the same
+  process). The original poison came from 65's full fidelity harness — a
+  32k flow after the harness's own allocator history — so the failing
+  conditions are broader than this probe sets up. The opt-in path remains
+  "honour the flag, user accepts capture debugging"; the non-reproduction
+  does not exonerate it, it only says the failure is not a short-context
+  deterministic one. A repro at 32k inside the fidelity harness is still
+  owed before anyone relies on `decode_graph=True` on sm70.
+
 ## Rule
 
 A failure inside a non-reentrant global resource (a CUDA stream capture, a
@@ -62,3 +89,8 @@ process-wide allocator mode) is not local to its try/except: find what state
 the exit path leaves behind on the exception branch before relying on eager
 fallback. When a C++ resource exposes no Python reset, the only fix is to
 not enter the failing state.
+
+Operational: a "poison on failure" claim needs the failure to actually fire.
+The fix here is verified on the prevention arm; the opt-in failure only
+reproduces under the production harness, so record it as observed-but-
+not-reproduced-on-demand rather than padding a short probe to a confirmation.
