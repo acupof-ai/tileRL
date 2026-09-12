@@ -38,7 +38,7 @@ from tilerl.spec import load_draft
 #: Every point costs THREE full prefills (two warmups + the measure) at ~31 ms per
 #: prompt token, so 32768 is ~51 min on its own — pair --min-ctx/--max-ctx to walk
 #: the long end one point per run rather than sweeping into a multi-hour job.
-CTXS = [32, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+CTXS = [32, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
 
 
 def _sync() -> None:
@@ -227,6 +227,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True)
     ap.add_argument("--draft")
+    ap.add_argument("--sparse-k", type=int, default=0,
+                    help="0=dense; >0 sparse hot pages/row (serving default 128). Eager.")
+    ap.add_argument("--scorer", default="bounds", choices=["bounds", "index"])
+    ap.add_argument("--cold-bytes", type=int, default=1 << 34)
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--tokens", type=int, default=128)
     ap.add_argument("--repeats", type=int, default=2,
@@ -305,7 +309,9 @@ def main() -> None:
                      # Follows the sweep, not a constant: a hardcoded 8192 rejected the
                      # ctx=8192 row itself, since a request is ctx + tokens + drafts.
                      max_total_tokens=max(ctxs) + args.tokens + 2 * (1 + args.depth),
-                     draft=draft, spec_depth=args.depth if draft else 1)
+                     draft=draft, spec_depth=args.depth if draft else 1,
+                     **({"sparse_k": args.sparse_k, "scorer": args.scorer,
+                         "kv_cold_bytes": args.cold_bytes} if args.sparse_k else {}))
     # Capture every (bucket, width) up front. The trim varies W per tick, so waiting for
     # warmup to happen to hit each one is a lottery: at B=1 there are 4 graphs and two
     # warmups absorbed them, but B=4 needs 12 (~14 s each) and the first row came back
@@ -314,10 +320,12 @@ def main() -> None:
     n_graphs = e.precapture()
     if n_graphs:
         print(f"precapture: {n_graphs} graphs in {time.perf_counter() - t0:.0f}s")
-    label = f"spec d{args.depth}" if draft else "dense"
+    _arm = f"sparse-k{args.sparse_k}-eager" if args.sparse_k else "dense-graph"
+    label = f"{_arm} spec d{args.depth}" if draft else _arm
     w = 1 + args.depth if draft else 1
     rows = args.batch * w
-    build = "fused+graph+draft" if draft else "fused+graph"
+    build = (f"sparse-k{args.sparse_k}+eager" + ("+draft" if draft else "")
+             if args.sparse_k else ("fused+graph+draft" if draft else "fused+graph"))
     common = benchrec.record_common(args, build=build)
     print(f"\n{label} B={args.batch} ({rows} rows/tick), {args.repeats} timed draws/point: "
           f"{'ctx':>6} {'tok/s':>8} {'ms/tok':>8} {'tok/fwd':>8} {'s_tps':>7} {'s_tpf':>7}")
