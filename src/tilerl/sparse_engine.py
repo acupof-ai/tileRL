@@ -607,15 +607,14 @@ class SparseForward:
         sl = nsel * BLOCK_TOKENS + self.own_len_t
         return table, sl
 
-    def chosen(self, bi: int) -> set[int]:
-        """Union of the row's group selections (kept for diagnostics)."""
-        out: set[int] = set()
-        for g in range(self.n_groups):
-            out.update(self._chosen.get((bi, g), ()))
-        return out
-
     def selected(self, bi: int, g: int) -> list[int]:
-        """Chosen LOGICAL candidate pages for one row/group (set after _select)."""
+        """Chosen LOGICAL candidate pages for one row/group this tick (set after
+        the group's _select). Reads the device cache on a captured tick."""
+        if self.device_select:
+            ch, ns = self._dchosen.get(g), self._dnsel.get(g)
+            if ch is None:
+                return []
+            return [int(x) for x in ch[bi, : int(ns[bi])].tolist()]
         return list(self._chosen.get((bi, g), ()))
 
 
