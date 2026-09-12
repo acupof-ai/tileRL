@@ -15,6 +15,7 @@ chunked sparse prefill. Two gates the design names:
 from __future__ import annotations
 
 import numpy as np
+import torch
 
 from tilerl.config import tiny
 from tilerl.engine import SamplingParams, build_engine
@@ -23,13 +24,13 @@ from tilerl.model import build_random
 from tilerl.testing import RefBackend
 
 
-def _engine(sparse: bool, k: int = 0):
+def _engine(sparse: bool, k: int = 0, scorer: str = "bounds"):
     kw = dict(
         cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
         num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
         max_num_batched_tokens=512, prefix_store=NoPrefixStore())
     if sparse:
-        kw.update(sparse_k=k, scorer="bounds", kv_cold_bytes=1 << 30)
+        kw.update(sparse_k=k, scorer=scorer, kv_cold_bytes=1 << 30)
     return build_engine(**kw)
 
 
@@ -146,6 +147,86 @@ def test_sparse_prompt_longer_than_device_hot_pool_admits_via_cold():
     # phys-key collision. Stable (req, page) keys are what let this finish.
     assert ndemote > nframes, (ndemote, nframes)
     assert len(tok) == 4 and all(isinstance(t, int) for t in tok)
+def test_index_scorer_equals_dense_token_for_token_at_full_k():
+    """The learned scorer="index" through the SAME seam as bounds must select
+    every candidate page at full k and reproduce dense tokens prefill+decode
+    (untrained weights; equality holds only at full k)."""
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    dense = _engine(False)
+    td = _drain(dense, dense.submit(prompt, params), 8)
+    dense.shutdown()
+
+    sparse = _engine(True, 6, scorer="index")
+    ts = _drain(sparse, sparse.submit(prompt, params), 8)
+    sparse.shutdown()
+
+    assert ts == td, f"index sparse {ts} != dense {td}"
+
+
+def test_live_selection_recall_is_one_at_full_k():
+    """Engine.sparse_selection_recall scores the last tick's served selection vs
+    an offline dense top-k; at full k every candidate is chosen -> 1.0 per source
+    group (the card run's live-selection recall hook)."""
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    e = _engine(True, 6, scorer="index")
+    rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+    checked = False
+    for _ in range(256):
+        e.step()
+        sel = e._sparse.last_selected.get(rid)
+        # wait for a decode tick that actually selected earlier candidate pages
+        if sel and any(cand for cand, _ in sel.values()):
+            pages = prompt.shape[0] // BLOCK_TOKENS
+            mass = torch.zeros(1, len(sel), 1, pages)
+            for g, (cand, _chosen) in sel.items():
+                for j, p in enumerate(cand):
+                    mass[0, g, 0, p] = 1.0 / (j + 1)  # distinct ordered target
+            rec = e.sparse_selection_recall(rid, mass)
+            assert set(rec) == set(sel)
+            assert all(abs(v - 1.0) < 1e-6 for v in rec.values()), rec
+            checked = True
+            break
+        done = e.poll()
+        if rid in done and len(done[rid]) >= 2:
+            break
+    e.shutdown()
+    assert checked
+
+
+
+def test_index_scorer_writes_fp8_keys_and_reconciles_measured_bytes():
+    """The index scorer persists fp8 page keys (not bounds), demotes/promotes
+    them, and stats' measured index_keys matches the derived row at tiny di=16
+    (20 B/key: 16 fp8 payload + 4 B scale)."""
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    e = _engine(True, 2, scorer="index")
+    rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+    saw_key = False
+    for _ in range(128):
+        done = e.poll()
+        if rid in done and len(done[rid]) >= 4:
+            break
+        e.step()
+        tr = e._sparse
+        assert tr.bounds is None and tr.keys is not None
+        if any(tr.keys.get(r.req_id, {}) for r in e._running):
+            page, (keys, scales) = next(
+                (p, kv) for rid2, pages in tr.keys.items() if pages
+                for p, kv in pages.items())
+            assert keys.dtype == torch.float8_e4m3fn and keys.shape[-1] == tr.di
+            assert keys.shape[:2] == (len(tr.src_planes),
+                                      tr.ih)
+            assert scales.shape == keys.shape[:2]
+            # measured == derived at the live (tiny di) face
+            stored = e.stats()["memory"]
+            row = [r for r in stored if r["owner"] == "index_keys"]
+            assert row and row[0]["derived"] == row[0]["measured"], row
+            assert row[0]["measured"] == tr.index_keys_bytes()
+            saw_key = True
+    e.shutdown()
+    assert saw_key
 
 
 def test_serve_build_path_wires_the_sparse_engine(tmp_path, capsys):
