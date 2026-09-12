@@ -162,6 +162,64 @@ Prefill is chunked already; a chunk's queries select from pages written by
 earlier chunks, and the chunk's own pages stay on the device until the chunk
 ends. The union of a chunk's selected sets is fetched once, not per query.
 
+### The resident pool is a cross-group UNION, sized `union_cap`
+
+The hot pool is currently sized for the worst case — groups choosing disjoint
+page sets:
+
+```
+pages/slot = n_groups * k + WINDOW_PAGES + chunk_pages
+```
+
+The residency boundary is already the union (finalize keeps exactly the union
+of the groups' picks plus the own span; #534), but the pool pays for `n_groups`
+independent k's. On the 27B `n_groups = 4`; at k=1024 that is 4096 + 8 + 33 =
+4137 pages/slot. One sm70 f32 block is `2 * 16 * 4 * 16 * 256 * 4` = 2,097,152
+B, so this is 8.08 GiB/slot — 64.6 GiB at 8 slots; k=512 is 4.08 GiB/slot
+(32.6 GiB at 8). If the 8k fidelity row says the model needs that k, the
+per-group sizing makes sparse unusable at batch even though the four groups'
+top-k sets overlap heavily in practice.
+
+The pool becomes one shared per-slot pool of resident pages sized
+
+```
+union_cap = k + WINDOW_PAGES + chunk_pages + h_pages(overlap headroom)
+```
+
+where `h_pages` is fixed from measurement, not guessed: cc's 32k/8k runs log
+the per-tick union size `|∪_g S_g ∪ own|` (a one-counter probe alongside the
+fidelity runs), and `h_pages` is the observed high-water minus k over the run
+plus a named slack. `union_cap = n_groups*k + ...` must remain a legal setting
+and reproduce current outputs exactly (the continuity gate).
+
+**Eviction when the union exceeds `union_cap`.** Today the within-tick victim
+guarantees every reserved pick a frame (the "no unreserved victim" error) — that
+guarantee cannot hold below `n_groups*k`. Picks then contest the cap by one
+rule: order every `(group, page)` pick by how marginal it is to its OWN group —
+its score gap over that group's k-th pick — and drop the smallest-gap picks
+until the union fits. The forced window and the own span never compete. A group
+that loses a pick attends to its remaining picks, i.e. it reads as that group
+running a smaller k for the tick; the rule is max-min on within-group rank, so
+no group loses two picks while another keeps a pick more marginal to it. This
+is deterministic and score-only, so it runs in the device path: eligibility is
+the current `l2p >= 0` mask AND "the page survives the marginality clipping",
+computed from the same batched scores with no new host sync. Demotion still
+goes through the one-batch D2H context.
+
+**Ledger.** The `kv_hot` derived row changes from `n_groups*k + W + chunk` to
+`union_cap` per slot (the allocated ceiling, as today), and stats gains one
+measured counter, the tick union size, so the bench prints ceiling vs held
+distribution. The eager refresh promotes the highest-aggregate-score missing
+pages up to free union slots.
+
+**Gates (CPU tiny):** (1) `h_pages` large enough that the union never clips —
+token-identical to the current per-group sizing; (2) `union_cap = k` with
+fixtures giving disjoint group preferences clips exactly the named
+lowest-marginal picks, symmetric across groups, and tokens equal an oracle
+that clips each group's list the same way; (3) ledger derived == measured at a
+fixed `union_cap`; (4) full-k (`k >= pages`) still equals dense. Implementation
+lands only after the 8k row fixes the k this serves.
+
 ## Cost model rows
 
 `memory.plan` adds three owners, priced by `nbytes` like every other row:
