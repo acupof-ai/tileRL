@@ -58,6 +58,7 @@ from .kv_cache import (
     PagedKvPool,
     PrefixStore,
 )
+from .sparse_index import DEFAULT_SPARSE_K
 from .spec import _PREFILL_BUCKET, LADDER_WIDTHS
 
 
@@ -282,6 +283,11 @@ class _Req:
     cold_pages: list = field(default_factory=list)
     #: sparse prefix hit: token length adopted from the shared index (0 = full miss)
     sparse_matched: int = 0
+    #: sparse + spec: the DRAFT pool's dense block ids. The trunk tier demotes
+    #: ``blocks`` every tick, but the draft head stays dense for the whole
+    #: context, so under sparse it gets its own id space (empty in dense mode,
+    #: where the draft table reuses ``blocks``).
+    draft_blocks: list[int] = field(default_factory=list)
     #: block drafter: the trunk's aux-layer taps over the same positions as ``hidden``,
     #: [1,w,len(target_layers)*H]. Tick-scoped — ``_draft_block`` consumes it and it dies.
     aux: torch.Tensor | None = None
@@ -424,6 +430,7 @@ class Engine:
         sparse_k: int = 0,
         boot_store: Any = None,
         sparse_device_select: bool = False,
+        draft_num_blocks: int | None = None,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -530,7 +537,13 @@ class Engine:
                 self._warn_sm70_ladder(limits.max_batch, self._width)
             # .dtype, not k_pool.dtype: under kv_fp8 the latter is the fp8 store dtype, and
             # the draft pool has no scale plane, so it would hold a scale-less cast.
-            draft.attach(backend, kv_pool.num_blocks, dtype=kv_pool.dtype)
+            # Sparse: the draft stays dense, so its pool spans a whole context per slot
+            # (draft_num_blocks), not the sparse hot pool.
+            draft.attach(
+                backend,
+                draft_num_blocks if draft_num_blocks is not None else kv_pool.num_blocks,
+                dtype=kv_pool.dtype,
+            )
 
         self._pin = backend.device.type == "cuda"
         self._lock = threading.RLock()
@@ -597,11 +610,14 @@ class Engine:
         """Admission capacity in logical pages. Dense: device blocks. Sparse: the
         device hot pool plus the pages the host cold tier can hold — older pages
         demote there, so a request far longer than the device pool still admits.
-        ponytail: sparse+spec (a DENSE draft pool on device) is still rejected in
-        build_engine; when that lands, min this with the draft pool's blocks."""
+        Under sparse+spec the draft head stays DENSE in its own on-device pool, so
+        that pool is a tighter bind than hot+cold and wins (the device draft pool
+        cannot spill to host)."""
         cap = self.usable_blocks
         if self._sparse is not None:
             cap += self._kv.cold_capacity_blocks()
+            if self._draft is not None:
+                cap = min(cap, self._draft.kv.num_blocks)
         return cap
 
     @property
@@ -909,6 +925,11 @@ class Engine:
             req.own_blocks = total_blocks if boot_loaded else total_blocks - matched // BLOCK_TOKENS
         self._blocks_used += req.own_blocks
         self._slots_used += 1
+        # Sparse + spec: the draft stays dense, so its own pool must hold this
+        # row's whole context (grown lazily below); the hot pool cannot back it.
+        if sparse and self._draft is not None and self._draft.kv.free_blocks < total_blocks:
+            self._states.free_slot(slot)
+            return False
         if sparse:
             self._sparse.attach(req.req_id)
             if self._sparse.prefix is not None:
@@ -1193,11 +1214,20 @@ class Engine:
             derived = plan(self._model.cfg, self._model.params, 0, num_slots=sp.num_slots,
                            num_blocks=kv.num_blocks, spec_steps=0,
                            state_dtype=sp.states.dtype, kv_io=kv.dtype, kv_fp8=kv.kv_fp8,
-                           draft_layers=draft_layers, sparse=None)
+                           draft_layers=0, sparse=None)
             derived = [r for r in derived if r.owner != "kv_pool"]
             cfg = self._model.cfg
             block_n = per_kv_block_bytes(cfg, kv.dtype, kv.kv_fp8)
             hot_n = cold_n = 0
+            # Sparse draft pool is dense-sized (a whole context per slot), unlike the
+            # hot trunk pool, so its row is computed from the draft pool's own blocks.
+            if draft_pool is not None:
+                from .memory import draft_per_block_bytes
+
+                derived.append(Row(
+                    "device", "draft_pool",
+                    draft_per_block_bytes(cfg, kv.dtype, draft_layers) * draft_pool.num_blocks,
+                    f"{draft_layers} draft layers x {draft_pool.num_blocks} dense blocks"))
             pages_total = 0
             for r in self._running:
                 complete = r.seq_len // BLOCK_TOKENS
@@ -1367,11 +1397,17 @@ class Engine:
             q_hi = int(r.seq_len) if decoding else int(r.prefill_from + tq)
             q_lo = q_hi - tq
             if decoding:
+                # Chain query positions are [seq_len-1 .. seq_len-1+tq): the
+                # verify tick includes the W-1 draft queries, so a chain crossing
+                # a page boundary must allocate that next own page.
+                q_lo, q_hi = r.seq_len - 1, r.seq_len - 1 + tq
                 # own span = the trailing 8-page window the new token writes into
                 own_first = max(0, (q_lo // BLOCK_TOKENS) - (_WP - 1))
                 own_last = (q_hi - 1) // BLOCK_TOKENS
                 force_window = 0                      # the window IS the own span
             else:
+                q_hi = int(r.prefill_from + tq)
+                q_lo = q_hi - tq
                 own_first = q_lo // BLOCK_TOKENS
                 own_last = (q_hi - 1) // BLOCK_TOKENS
                 force_window = _WP                    # force the 8 pre-chunk pages
@@ -1389,7 +1425,7 @@ class Engine:
                 reserved.add(p)
                 resolve(p)
             srows.append(dict(req_id=r.req_id, own=own, own_len=own_len,
-                              q_hi=q_hi, tq=tq,
+                              q_hi=q_hi, tq=tq, decoding=decoding,
                               cand=cand, force_window=force_window, resolve=resolve,
                               reserved=reserved))
         # Pure-decode ticks run the device (resident-only) path except every
@@ -1769,6 +1805,15 @@ class Engine:
             # instead leaves a hole in its KV and the next position attends over it:
             # measured, the engine then drafted token 79 where full context drafts 61.
             for r in rows:
+                if self._sparse is not None:
+                    # Dense draft KV grows in the DRAFT pool's own id space; the
+                    # trunk's r.blocks was just emptied by _sparse_finalize. Cover
+                    # the committed tail plus the width-1 draft proposals step() writes.
+                    dpool = self._draft.kv
+                    end = r.seq_len - 1 + self._width - 1
+                    while len(r.draft_blocks) * BLOCK_TOKENS <= end:
+                        r.draft_blocks.append(dpool.alloc_block())
+                    continue
                 while r.blocks and len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 1:
                     r.blocks.append(self._kv.alloc_block())
                     r.own_blocks += 1
@@ -2168,6 +2213,16 @@ class Engine:
                 for p in req.cold_pages:
                     cold.forget((req.req_id, p))
             self._sparse.drop(req.req_id)
+        elif self._kv.cold is not None and req.cold_pages:
+            # #500 manual sparse_retier seam: _sparse is None, cold_pages are (idx, phys).
+            for _idx, b in req.cold_pages:
+                if b in self._kv.cold:
+                    self._kv.cold.forget(b)
+        if req.draft_blocks:
+            # Sparse+spec: dense draft KV lives in the draft pool's own id space.
+            dpool = self._draft.kv
+            for b in req.draft_blocks:
+                dpool.free_block(b)
         for b in req.blocks:
             self._kv.free_block(b)
         self._blocks_used -= req.own_blocks
@@ -2442,11 +2497,13 @@ def build_engine(
     #: reduce (docs/design-fp8-kv.md). Off because the attention kernels still read a
     #: dequantized plane, so this is capacity, not yet bandwidth.
     kv_fp8: torch.dtype | None = None,
-    #: sparse-KV selection. sparse_k>0 builds the sparse engine: the device pool holds
-    #: only each row's (sparse_k + 8-window) hot pages plus chunk headroom; cold pages
-    #: demote to the pinned host tier and promote on selection. scorer "bounds" is the
-    #: training-free Quest path (Unit F); "index" is a later PR. Requires kv_cold_bytes.
-    sparse_k: int = 0,
+    #: sparse-KV selection, now the DEFAULT. sparse_k>0 selects this many earlier pages
+    #: per row + the 8-page window; the device pool holds just that hot set plus chunk
+    #: headroom, cold pages demote to a pinned host tier and promote on selection.
+    #: scorer "bounds" is the training-free Quest path (Unit F); "index" is a later PR.
+    #: Pass sparse_k=0 for the legacy dense engine. A host cold tier is auto-attached
+    #: when sparse_k>0 and kv_cold_bytes is unset.
+    sparse_k: int = DEFAULT_SPARSE_K,
     scorer: str = "bounds",
     sparse_device_select: bool = False,
     decode_graph: bool | None = None,
@@ -2464,15 +2521,13 @@ def build_engine(
     from .sparse_index import WINDOW_PAGES
 
     sparse_tracker: SparseTracker | None = None
+    draft_num_blocks: int | None = None
     if sparse_k:
         if scorer not in ("bounds", "index"):
             raise ValueError(f'sparse engine scorer {scorer!r}: want bounds|index')
-        if not kv_cold_bytes:
-            raise ValueError("sparse_k needs kv_cold_bytes: dropped pages demote to the host tier")
-        if draft is not None:
-            raise NotImplementedError("sparse_k + spec draft: the draft pool is dense; later PR")
-        # First cut: selection buffers change width per tick and promote through host
-        # memory; a captured decode graph cannot hold that. Eager only until cc's cells.
+        # Selection buffers change width per tick and promote through host
+        # memory; a captured decode graph cannot hold that — the sparse tick is
+        # eager (the graph-captured sparse verify tick is a later card follow-up).
         decode_graph = False
         sparse_tracker = SparseTracker(cfg, sparse_k, scorer, device=backend.device)
         # An explicitly-passed NoPrefixStore means "sharing off" (training/old
@@ -2547,6 +2602,13 @@ def build_engine(
                 "silently lost, and this cell registers no fp8 twin (docs/design-fp8-kv.md)."
             )
     if sparse_k:
+        if not kv_cold_bytes:
+            # Cap the host tier at every batch token's page being cold at once.
+            # Lazy allocation: this is the LRU ceiling, not bytes reserved.
+            from .memory import per_kv_block_bytes
+
+            kv_cold_bytes = (max_total_tokens // BLOCK_TOKENS + 1) * per_kv_block_bytes(
+                cfg, kv_io, kv_fp8)
         # Per-tick resident peak per slot. Quest selects independently per source
         # group (groups of 4 full-attn layers), and each group's chosen pages
         # co-reside in one shared live map through the forward before finalize
@@ -2589,6 +2651,21 @@ def build_engine(
         kv_fp8=kv_fp8,
         cold_dtype=cold_dtype,
     )
+    if sparse_k and draft is not None:
+        # The draft head stays DENSE under sparse, so its pool is independent of the
+        # hot set: on a card, fit it to the memory left after weights/state/hot pool
+        # (one draft layer is 1/16 of the trunk planes at 27B), capped at a whole
+        # context per slot; off cuda the tests are tiny, take the full ceiling.
+        from .memory import POOL_FRACTION, draft_per_block_bytes
+
+        cap = num_slots * (max_total_tokens // BLOCK_TOKENS + 1)
+        if backend.device.type == "cuda":
+            torch.cuda.empty_cache()
+            per = draft_per_block_bytes(cfg, kv_io, draft.cfg.num_layers)
+            draft_num_blocks = min(cap, max(1, int(
+                torch.cuda.mem_get_info()[0] * POOL_FRACTION) // per))
+        else:
+            draft_num_blocks = cap
     # A resident store entry owns a GDN state snapshot in HBM (144 MiB at 27B f32)
     # and a decode publishes one every BLOCK_TOKENS, so the store's byte budget must
     # fit the card: the 8 GiB default is most of a 32 GB V100's post-weights headroom.
@@ -2657,4 +2734,5 @@ def build_engine(
         sparse_k=sparse_k,
         boot_store=boot_store,
         sparse_device_select=sparse_device_select,
+        draft_num_blocks=draft_num_blocks,
     )

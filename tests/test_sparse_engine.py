@@ -524,6 +524,119 @@ def test_cold_tier_spills_past_the_host_budget_and_the_ledger_splits_tiers(tmp_p
     _drain(e, rid, 6)  # finish releases the request's cold pages (both tiers)
     e.shutdown()
 
+def _draft(cfg, trunk):
+    """A one-layer DraftHead over the tiny trunk (same builder as test_decode_graph)."""
+    from dataclasses import replace
+
+    import torch
+
+    from tilerl.model import build_random
+    from tilerl.spec import DraftHead
+
+    dcfg = replace(cfg, num_layers=1, full_attn_layers=(0,), fp4=False)
+    params = {k: v for k, v in build_random(dcfg, seed=3).params.items()
+              if k.startswith("layers.")}
+    gen = torch.Generator().manual_seed(3)
+    h = cfg.hidden_size
+    params["fc"] = (torch.randn(h, 2 * h, generator=gen) * 0.02).to(torch.bfloat16)
+    params["norm"] = torch.ones(h, dtype=torch.bfloat16)
+    params["pre_fc_norm_hidden"] = torch.ones(h, dtype=torch.bfloat16)
+    return DraftHead(trunk, params, num_layers=1)
+
+
+def _sparse_engine(sparse_k, draft=False, cfg=None):
+    from tilerl_kernels.backend import get_backend
+
+    cfg = cfg or tiny()
+    model = build_random(cfg, seed=11)
+    # Both arms of an exact-token gate must use one backend: a real draft goes
+    # through _serve_draft -> has_kernel, which RefBackend does not declare.
+    # The CPU cell backend is the spec harness test_e2e uses.
+    backend = get_backend()
+    kw = dict(num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+              max_num_batched_tokens=512, sparse_k=sparse_k, scorer="bounds",
+              kv_cold_bytes=1 << 30)
+    if draft:
+        kw["draft"] = _draft(cfg, model)
+        kw["spec_depth"] = 1
+    return build_engine(cfg=cfg, model=model, backend=backend, **kw)
+
+
+def test_sparse_with_draft_matches_sparse_without_draft_greedy():
+    """Exact-acceptance: greedy speculative decode emits the SAME tokens as greedy
+    non-spec decode under the same sparse selection (sparse_k=2). The W verify
+    queries are scored jointly (max across queries), so every draft position
+    attends the same selected pages plus its own causal block."""
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+    plain = _sparse_engine(2, draft=False)
+    t_plain = _drain(plain, plain.submit(prompt, params), 8)
+    plain.shutdown()
+    spec = _sparse_engine(2, draft=True)
+    t_spec = _drain(spec, spec.submit(prompt, params), 8)
+    spec.shutdown()
+    assert t_spec == t_plain, f"spec {t_spec} != plain {t_plain}"
+
+
+def test_full_k_sparse_with_draft_matches_dense_with_draft():
+    """k>=pages selects everything: sparse + draft equals dense + draft."""
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+    dense = _sparse_engine(6, draft=True)  # k=6 covers every earlier page
+    t_dense = _drain(dense, dense.submit(prompt, params), 8)
+    dense.shutdown()
+    # a genuinely dense engine (sparse off) with a draft, same CPU-cell backend
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    from tilerl_kernels.backend import get_backend
+
+    full = build_engine(cfg=cfg, model=model, backend=get_backend(), num_blocks=64,
+                        num_slots=4, max_batch=1, max_total_tokens=4096,
+                        draft=_draft(cfg, model), spec_depth=1)
+    t_full = _drain(full, full.submit(prompt, params), 8)
+    full.shutdown()
+    assert t_dense == t_full, f"sparse+draft {t_dense} != dense+draft {t_full}"
+
+
+def test_verify_tick_packed_table_shape_is_fixed():
+    """Graph-capture structural gate: a CUDA graph bakes the block-table shape in.
+    The packed [selected;own] width must depend ONLY on the tick query width, not
+    on context length: every decode/verify row is k_pages + the 8-page window,
+    plus at most 1 if the W-1 draft chain crosses a page boundary (W-1 <= 15).
+    Run the same engine over prompts of different lengths and assert the observed
+    decode widths are one context-independent constant per query width. Capture
+    itself stays eager-only in the first cut."""
+    from tilerl import sparse_engine as se
+    from tilerl.sparse_index import WINDOW_PAGES
+
+    K = 2
+    engine = _sparse_engine(K, draft=True)  # verify ticks carry up to W+1=2 q
+    orig = se.SparseForward.attention_args
+    seen: dict[int, set[int]] = {}
+
+    def wrap(self, plane, q, h=None):
+        table, sl = orig(self, plane, q, h)
+        for r in self.rows:
+            if int(r["force_window"]) == 0:  # decode/verify tick (no forced window), never prefill
+                seen.setdefault(int(r["tq"]), set()).add(int(table.shape[1]))
+        return table, sl
+
+    # two contexts of different page counts (10 and 16); widths must not diverge
+    for n_pages in (10, 16):
+        prompt = np.arange(3, 3 + n_pages * BLOCK_TOKENS, dtype=np.int64)
+        rid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=6, seed=0))
+        se.SparseForward.attention_args = wrap
+        try:
+            _drain(engine, rid, 6)
+        finally:
+            se.SparseForward.attention_args = orig
+    engine.shutdown()
+
+    assert seen, "no decode/verify tick observed"
+    bound = K + WINDOW_PAGES
+    for tq, widths in seen.items():
+        assert widths <= {bound, bound + 1}, (tq, widths)
+
 
 if __name__ == "__main__":
     import sys
@@ -559,7 +672,8 @@ def test_select_tensor_op_count_is_constant_in_candidate_count():
             tr.set_bounds(0, p, b)
         cand = list(range(n_cand))
         row = dict(req_id=0, own=[n_cand], own_len=BLOCK_TOKENS, cand=cand,
-                   force_window=0, resolve=lambda p: p, reserved=set())
+                   force_window=0, resolve=lambda p: p, reserved=set(),
+                   decoding=True, tq=1)
         sf = SparseForward(tr, [row], torch.device("cpu"))
         q = torch.randn(1, cfg.num_attention_heads, cfg.head_dim)
         with _Count() as c:
