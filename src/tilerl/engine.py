@@ -1086,9 +1086,9 @@ class Engine:
                 if t is not None),
         }
         if self._sparse is not None:
-            # Sparse: held owners are the bounds tensors, the currently-resident hot
-            # pages, and the host cold tier. Between ticks every private page is demoted,
-            # so kv_hot counts live blocks during a tick (0 right after finalize).
+            # Sparse: held owners are the bounds tensors, the cross-tick pinned hot
+            # pages still resident after finalize, and the host cold tier. kv_hot
+            # counts the live blocks (the tick's selected set), not the pool total.
             from .memory import per_kv_block_bytes
 
             block_n = per_kv_block_bytes(self._model.cfg, kv.dtype, kv.kv_fp8)
@@ -1303,7 +1303,7 @@ class Engine:
                 reserved.add(p)
                 resolve(p)
             srows.append(dict(req_id=r.req_id, own=own, own_len=own_len,
-                              q_start=q_lo, q_hi=q_hi, decoding=decoding, tq=tq,
+                              q_hi=q_hi, tq=tq,
                               cand=cand, force_window=force_window, resolve=resolve,
                               reserved=reserved))
         # Pure-decode ticks run the device (resident-only) path except every
@@ -1380,6 +1380,7 @@ class Engine:
         Bounds stay device-resident regardless, so scoring a cold page needs no K."""
         tr = self._sparse
         pool = self._kv
+        from .sparse_engine import page_bounds_one
         with pool.demotions():
             for bi, r in enumerate(rows):
                 rid = r.req_id
@@ -1393,10 +1394,8 @@ class Engine:
                     if pool.kv_fp8 is not None:
                         raise NotImplementedError("sparse bounds over an fp8 pool: card PR")
                     b = torch.stack([
-                        torch.stack((
-                            pool.k_pool[plane, phys].amin(dim=1),
-                            pool.k_pool[plane, phys].amax(dim=1)), dim=1)
-                        for plane in range(pool.num_layers)]).to(torch.float16)
+                        page_bounds_one(pool.k_pool[plane, phys])
+                        for plane in range(pool.num_layers)])
                     tr.set_bounds(rid, p, b)
                 kept = sf.selected_pages(bi)
                 kept_live: dict[int, int] = {}
