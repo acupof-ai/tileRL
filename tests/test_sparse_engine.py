@@ -868,25 +868,25 @@ def test_union_clip_is_symmetric_and_the_engine_matches_the_oracle():
     prompt = np.arange(7, 7 + 20 * BLOCK_TOKENS, dtype=np.int64)
     params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
 
-    _, pooled = _engine16(sparse_k=2, union_h=0)
+    # chunk_pages=2 -> decode candidate budget k+chunk+h = 4: every group loses
+    # its gap-0 rank-2 pick and keeps the rank-1 page, one per group.
+    _, pooled = _engine16(sparse_k=2, union_h=0, max_num_batched_tokens=16)
     rid = pooled.submit(prompt, params)
     with _forced_group_scores(pooled, disjoint=True):
         toks_p = _drain(pooled, rid, 8)
-    # steady state (decode tick 2+): the only CANDIDATE pages resident are the
-    # fair clip's survivors; own window pages are 12..19.
     resident = set(pooled._sparse.resident[rid])
-    assert resident & set(range(12)) == {0, 2}, resident
+    assert resident & set(range(12)) == {0, 2, 4, 6}, resident
     pooled.shutdown()
 
     # Oracle: a worst-case-sized pool whose per-group scoring is masked to the
     # exact union_clip result.
-    _, oracle = _engine16(sparse_k=2)
+    _, oracle = _engine16(sparse_k=2, max_num_batched_tokens=16)
     tr = oracle._sparse
     plane_box = [-1]
     orig_rows, orig_scores = type(tr).bounds_rows, __import__(
         "tilerl.sparse_engine", fromlist=["quest_scores"]).quest_scores
     import tilerl.sparse_engine as se
-    allowed = {0: {0}, 1: {2}}
+    allowed = {0: {0}, 1: {2}, 2: {4}, 3: {6}}
 
     def rows_wrap(self, rid, plane, pages):
         plane_box[0] = plane
@@ -908,10 +908,10 @@ def test_union_clip_is_symmetric_and_the_engine_matches_the_oracle():
         type(tr).bounds_rows = orig_rows
         se.quest_scores = orig_scores
     oracle.shutdown()
-    # token 0 is the prefill output (online clip is ordered by group plane); the
-    # prefill finalize installs the fair survivor mask, so the seven decode
-    # tokens 1..7 match. The R=8 refresh is never reached inside 8 tokens.
-    assert toks_p[1:8] == toks_o[1:8], (toks_p, toks_o)
+    # token 0 is prefill and token 1 the first decode under the prefill-tick
+    # mask (forced window pages differ); from token 2 both ticks run the steady
+    # {0,2,4,6} mask. R=8 refresh is never reached inside 8 tokens.
+    assert toks_p[2:8] == toks_o[2:8], (toks_p, toks_o)
 
 
 def test_plan_kv_hot_union_cap_equals_the_allocated_pool_ceiling():
