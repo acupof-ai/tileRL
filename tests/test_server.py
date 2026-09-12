@@ -89,8 +89,8 @@ def _build_engine(seed: int) -> Engine:
     # a one-tool request is ~1.1k tokens. Shrinking the prompt to fit would be
     # measuring a format the 27B never sees.
     return build_engine(
-        cfg, model, backend, num_blocks=256, num_slots=4, max_batch=4, max_total_tokens=4096
-    )
+        cfg, model, backend, num_blocks=256, num_slots=4, max_batch=4, max_total_tokens=4096,
+        sparse_k=0)  # dense server feature suite (prefix cache, health, dram/state bytes)
 
 
 @pytest.fixture(scope="module")
@@ -1073,7 +1073,8 @@ def test_the_messages_clamp_honours_the_pool_not_only_the_context(tmp_path, monk
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "pool.jsonl"))
     cfg = tiny()
     engine = build_engine(cfg, build_random(cfg, seed=41), get_backend(),
-                          num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096)
+                          num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096,
+                          sparse_k=0)  # dense: the clamp reads the dense pool capacity
     engine.run()
     try:
         assert engine.room_for(1) < engine.limits.max_total_tokens - 1, (
@@ -1242,12 +1243,12 @@ def test_serve_sizes_its_pools_from_the_flags_not_the_context():
     # which made an intentional reservation look like an off-by-one in _fit_blocks.
     pad = int(_graph_on(be, None))
 
-    e = cli._build_engine(cfg, model, be, blocks=64, max_ctx=256, max_batch=2)
+    e = cli._build_engine(cfg, model, be, blocks=64, max_ctx=256, max_batch=2, sparse_k=0)
     assert e._kv.num_blocks - pad == 64
     assert e.limits.max_total_tokens == 256, "a request must not outgrow the pool"
     assert e.limits.max_batch == 2
 
-    d = cli._build_engine(cfg, model, be)
+    d = cli._build_engine(cfg, model, be, sparse_k=0)
     assert d._kv.num_blocks - pad == (4096 * d.limits.max_batch) // BLOCK_TOKENS, (
         "the default pool must cover max_batch rows of the context — no more "
         "(bytes are the long-context limit) and no less (a full batch must fit). "
@@ -1438,7 +1439,7 @@ def test_serve_dram_bytes_reaches_health(dram_bytes, monkeypatch, capsys):
         lambda app, **kw: served.update(health=TestClient(app).get("/health").json()),
     )
     argv = ["serve", "--slots", "2", "--max-batch", "2", "--blocks", "64",
-            "--max-ctx", "512", "--no-warmup"]
+            "--max-ctx", "512", "--no-warmup", "--sparse-k", "0"]
     if dram_bytes:
         argv += ["--dram-bytes", str(dram_bytes)]
     cli.cmd_serve(cli._build_parser().parse_args(argv))
@@ -1677,7 +1678,7 @@ def test_a_cancel_returns_the_blocks_a_disconnected_reader_was_holding():
     # a second request to sit in _waiting.
     cfg = tiny()
     one = build_engine(cfg, build_random(cfg, seed=71), get_backend(), num_blocks=256,
-                       num_slots=4, max_batch=1, max_total_tokens=4096)
+                       num_slots=4, max_batch=1, max_total_tokens=4096, sparse_k=0)
     a = one.submit(list(range(1, 40)), params)
     b = one.submit(list(range(1, 40)), params)
     one.step()
@@ -1763,7 +1764,7 @@ def test_serve_state_bytes_reaches_health(state_bytes, monkeypatch, capsys):
         lambda app, **kw: served.update(health=TestClient(app).get("/health").json()),
     )
     argv = ["serve", "--slots", "2", "--max-batch", "2", "--blocks", "64",
-            "--max-ctx", "512", "--no-warmup"]
+            "--max-ctx", "512", "--no-warmup", "--sparse-k", "0"]
     if state_bytes:
         argv += ["--state-bytes", str(state_bytes)]
     cli.cmd_serve(cli._build_parser().parse_args(argv))
