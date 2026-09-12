@@ -247,3 +247,47 @@ after the worktree switched mid-session, and the 256k run refused at submit
 (pool=339) instead of running. Checkout the pinned sha and verify the fix
 markers are present before the sync, or the chain runs the wrong tree silently.
 
+
+## Output fidelity vs dense after #546 (V100 sm70, production engine path)
+
+The pre-#546 output caveat above is resolved; these rows are the #530 ship
+gate, run through `scripts/fidelity_engine.py` — two real engines over one 27B
+(`sparse_k=0` dense vs `sparse_k=k, bounds`), full-vocab prefill logits at 256
+seeded positions (>=2048) plus 64 tokens of native greedy continuation. The
+k=all arm is token-identical (prefill KL 0.000000 / top-1 1.0 / 64-of-64
+greedy), the mechanism control: smaller-k divergence is the attention set, not
+an engine bug.
+
+8192 tokens (512 pages):
+
+| k pages | prefill KL | prefill top-1 | 64-tok greedy | first diff |
+|---:|---:|---:|---:|---:|
+| 512 (all) | 0.000000 | 1.0000 | 1.0000 (64/64) | — |
+| 256 | 0.000156 | 0.9961 | 0.4062 | 25 |
+| 128 | **0.002330** | **0.9805** | 0.4062 | 25 |
+
+32768 tokens, k=128:
+
+| k pages | prefill KL | prefill top-1 | 64-token greedy | first diff |
+|---:|---:|---:|---:|---:|
+| 128 | **0.018770** | **0.9492** | 0.0625 (4/64) | 3 |
+
+Rounded for cross-references: 8k k=128 prefill KL 0.0023 with top-1 0.981;
+32k k=128 prefill KL 0.019 with top-1 0.949 (the #530 ship rows).
+
+Artifacts `~/tilerl-logs/fidelity-engine-v100-8k-fixed.json` and
+`fidelity-engine-v100-32k-fixed.json` (cc, V100, #531) for the prefill/greedy
+table. Continuation naturalness (65, 32k, **interim n=3 windows** of one held
+stream; windows to n=8 were queued on the V100 — the mean gap below swings
+per-window from −0.068 to +0.096, and the k=128 vs k=256 means differ by only
+0.005): the sparse continuation's mean **per-token NLL under dense minus
+dense's own** greedy is **+0.013 nats/token at k=128** and **+0.018 nats/token
+at k=256** (nats, not tokens; sparse greedy tokens teacher-forced through
+dense), top-5 agreement 1.0 for both. Per-window lines:
+`~/tilerl-logs/fid-nll.log` (the 10800s cap killed the sweep before its
+aggregate JSON dump). On n=3 k=128 is no worse than k=256 on generated tokens,
+so the serving default stays k=128 and the cross-group union hot pool is
+parked — revisited after n=8. The low prefill greedy-agreement (0.4062 /
+0.0625) does not gate: prefill positions are forced teacher tokens, never
+sampled; the nats/token gap and top-5 agreement on the continuation are the
+output quality that ships.

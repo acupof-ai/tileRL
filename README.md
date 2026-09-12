@@ -79,20 +79,32 @@ context lines are derived from the same ledger, not measured on a card yet:
 **256K B=1 fits in bf16; 8×128K fits only with fp8 KV; 8×256K misses one card**
 ([entry](docs/experience/wins/2026-09-11-p6-long-context-budget-on-one-h20.md)).
 
-**Sparse KV is the long-context lever, and it is in flight.** The design
-([docs/design-sparse-kv.md](docs/design-sparse-kv.md)) selects 16-token pages
-per tick — top-128 pages plus an 8-page window, one softmax over both — so the
-device holds 0.10 GiB of KV at 256k B=1 with the learned V4.1-form indexer
-(1.07 GiB with the training-free Quest bounds scorer) against the dense fp8 KV that fills the card;
-the rest lives on host RAM or SSD. Merged so far: the bounds scorer and
-selector with `k >= pages` byte-equal to dense on CPU and the sm70 cell
-([entry](docs/experience/wins/2026-09-11-sparse-kv-page-bounds-cpu.md)), and
-page demote/promote through the pinned-host path
-([entry](docs/experience/wins/2026-09-11-sparse-kv-page-tier-cpu.md)). No
-attention kernel changed: the sparse tick is a packed block table. Selection
-inside the engine, the ledger rows, the learned indexer and the V100 128k/256k
-runs are open PRs; until they merge the numbers above are derived, not
-measured.
+**Sparse KV is the long-context lever, and it ships.**
+[`tilerl serve`](docs/design-sparse-kv.md) defaults to sparse Quest selection —
+top-128 16-token pages plus an 8-page causal window, one softmax over both —
+with speculative decode running under it; `--sparse-k 0` restores the dense
+engine. Pages not selected this tick demote through the pinned-host path and
+promote back through one batched H2D/D2H pair per tick, so long contexts hold
+in a small device hot pool. No attention kernel changed: the sparse tick is a
+packed block table.
+
+The ship gate is output fidelity vs dense on the V100 production path, not
+page-mass recall. After the #546 own-table `page_base` fix (pre-fix sparse
+output numbers are void — own K/V scattered into padding frames on sm70 and
+sm90), k=all is token-identical, and at k=128 prefill KL is 0.0023 / top-1
+0.981 at 8k and 0.019 / 0.949 at 32k. On the 32k continuation the mean
+per-token NLL gap to dense is +0.013 nats/token at k=128 and +0.018 at k=256
+(top-5 agreement 1.0) — k=128 is no worse than k=256 on generated tokens. That
+verdict is interim: n=3 windows of one held stream (per-window gaps −0.068 to
++0.096), with windows to n=8 running on the V100. On it k=128 is the default
+and the cross-group union hot pool (needed only past ~128) stays parked
+([entry](docs/experience/wins/2026-09-12-dense-vs-sparse-long-ctx.md),
+[#531 output table](https://github.com/acupof-ai/tileRL/pull/531)). Open
+defect: under sparse + spec a follower cannot adopt a published trunk prefix
+(the draft builds its dense KV only while forwarding), so the prefix cache
+publishes but does not serve in the production default; the follower
+return-misses and prefills from zero (open defect,
+[#530](https://github.com/acupof-ai/tileRL/pull/530)).
 
 **The self-judge retry recipe (P1) is rejected**: across two matched seeds the
 held-out GSM8K gain has opposite signs (458 → 448 and 456 → 482), so it does not
