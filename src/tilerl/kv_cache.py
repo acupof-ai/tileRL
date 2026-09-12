@@ -127,10 +127,12 @@ class PagedKvPool:
         return self.num_layers * per
 
     def cold_capacity_blocks(self) -> int:
-        """Whole demoted pages the host cold tier can hold (0 without one)."""
+        """Whole demoted pages the cold tier can hold: pinned host budget plus the
+        countable SSD spill budget (0 without a host tier / spill file)."""
         if self.cold is None:
             return 0
-        return self.cold.budget_bytes // self.cold_page_nbytes()
+        per = self.cold_page_nbytes()
+        return (self.cold.budget_bytes + self.cold.ssd_capacity_bytes) // per
 
     def plane_of(self, layer_idx: int) -> int:
         """Pool plane for a model layer. The fp8 writers need the raw plane, not kv_layer()."""
@@ -602,7 +604,8 @@ class HostKvPages:
     (they stay read-only wherever they live); :meth:`demote_page` refuses them.
     """
 
-    def __init__(self, budget_bytes: int = 4 << 30, ssd_path: str = "") -> None:
+    def __init__(self, budget_bytes: int = 4 << 30, ssd_path: str = "",
+                 ssd_capacity_bytes: int = 0) -> None:
         self.budget_bytes = budget_bytes
         #: opaque cold key -> held bytes / blob (int block on #500, (req,page) tuple on sparse)
         self._held: OrderedDict[Any, int] = OrderedDict()
@@ -617,6 +620,10 @@ class HostKvPages:
         self._ssd = None
         self._ssd_bytes = 0
         self._ssd_page_bytes: dict = {}
+        #: Countable SSD spill capacity for admission. 0 with a path means "auto":
+        #: the free space of the filesystem holding the spill file (read lazily so
+        #: constructing a cold tier never touches a not-yet-created file).
+        self._ssd_capacity_bytes = ssd_capacity_bytes
         self._staging: dict | None = None  # one reused pinned promote buffer
         #: SHARED prefix pages, content-addressed by the page-token rolling hash,
         #: held on behalf of a PrefixStore entry (sparse path). key -> [blob, n, refs].
@@ -633,6 +640,20 @@ class HostKvPages:
     @property
     def ssd_bytes(self) -> int:
         return self._ssd_bytes
+
+    @property
+    def ssd_capacity_bytes(self) -> int:
+        """Countable SSD spill budget used by admission. 0 when spilling is off.
+        Auto (no explicit cap) = free bytes on the filesystem holding the file."""
+        if not self._ssd_path:
+            return 0
+        if self._ssd_capacity_bytes:
+            return self._ssd_capacity_bytes
+        try:
+            stat = os.statvfs(os.path.dirname(self._ssd_path) or ".")
+            return stat.f_bavail * stat.f_frsize
+        except OSError:
+            return 0
 
     def _evict_to_ssd(self, victim: int) -> bool:
         """Move one host-resident page to the spill file. False (drop) when no file."""

@@ -1208,16 +1208,20 @@ class Engine:
                 scorer_n = page_bounds_bytes(cfg, pages_total)
                 owner = "page_bounds"
                 note = f"{pages_total} complete pages, bounds scorer"
-            cold_n = ssd_n = 0
+            cold_n = ssd_n = ssd_cap = 0
             if getattr(kv, "cold", None) is not None:
                 cold_n = kv.cold.bytes_held
                 ssd_n = kv.cold.ssd_bytes
+                ssd_cap = kv.cold.ssd_capacity_bytes
             derived.append(Row("device", owner, scorer_n, note))
             derived.append(Row("device", "kv_hot", hot_n, "resident private blocks this tick"))
             if cold_n:
                 derived.append(Row("host", "kv_cold", cold_n, "demoted pages in pinned host RAM"))
             if ssd_n:
                 derived.append(Row("ssd", "kv_cold_ssd", ssd_n, "demoted pages spilled past the host budget"))
+            if ssd_cap:
+                derived.append(Row("ssd", "kv_cold_ssd_capacity", ssd_cap,
+                                   "countable spill budget used by admission"))
         rows = memory_table(derived, self._held_storage(), self._measured_peak_bytes())
         # Dense engine with a cold tier driven by the manual sparse_retier seam (#500):
         # its host pages are not in plan(), so append the held allocation explicitly.
@@ -2394,6 +2398,9 @@ def build_engine(
     #: cold pages past the pinned host budget spill to this one mmap'd file (serving
     #: spill, block-id keyed; distinct from ssd_path which is the prefix-boot store).
     cold_ssd_path: str = "",
+    #: countable SSD spill capacity for admission in bytes. 0 with a spill path
+    #: means auto = free space on the spill filesystem; off when no path is set.
+    cold_ssd_bytes: int = 0,
     #: dtype for a demoted page's K/V in the host/SSD tier: "native" keeps the pool
     #: dtype, "f16" narrows an f32 pool (sm70, which has no f16 attention path) to
     #: f16 on the D2H copy and widens back on promote. "" picks f16 on an f32 pool
@@ -2597,7 +2604,8 @@ def build_engine(
         kw["dram"] = DramSnapshots(budget_bytes=dram_bytes)
     if kv_cold_bytes:
         kv_pool.attach_cold(
-            HostKvPages(budget_bytes=kv_cold_bytes, ssd_path=cold_ssd_path))
+            HostKvPages(budget_bytes=kv_cold_bytes, ssd_path=cold_ssd_path,
+                        ssd_capacity_bytes=cold_ssd_bytes))
     if ssd_path:
         # Not gated on cuda: the tier is target-independent, and the CPU target is where
         # its parity is checked.

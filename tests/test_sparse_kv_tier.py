@@ -384,6 +384,34 @@ def test_pages_past_the_host_budget_spill_to_ssd_and_promote_byte_equal(tmp_path
     assert pool.cold.bytes_held == 0 and pool.cold.ssd_bytes == 0
 
 
+def test_ssd_capacity_counts_toward_admission(tmp_path):
+    """A request whose pages exceed the pinned host budget but fit within
+    host+SSD must be admitted; cold_capacity_blocks adds the countable SSD
+    budget. Without the SSD term admission refuses a context SSD spill serves.
+    Explicit ssd_capacity_bytes keeps this independent of free disk space."""
+    p, hkv, d, layers = 5, 2, 8, 2
+    pool = PagedKvPool(p + 1, hkv, d, num_layers=layers, device=_device())
+    per = (pool.k_pool[0, 0].numel() * pool.k_pool.element_size()
+           + pool.v_pool[0, 0].numel() * pool.v_pool.element_size()) * layers
+    ssd = str(tmp_path / "cold_cap.bin")
+    # host holds 2 pages; SSD budget holds another 8
+    pool.attach_cold(HostKvPages(budget_bytes=per * 2, ssd_path=ssd,
+                                 ssd_capacity_bytes=per * 8))
+    assert pool.cold_capacity_blocks() == 10
+    # spill actually reaches the file: 3 pages past host land on SSD
+    blocks = [pool.alloc_block() for _ in range(3)]
+    for b in blocks:
+        kk, vv = _kv(b, p, hkv, d)
+        for plane in range(layers):
+            pool.write_block(b, 0, kk[0], vv[0], layer=plane)
+        pool.demote_page(b)
+    assert pool.cold.stats()["kv_cold_ssd_pages"] >= 1
+    # no spill file -> only the host budget counts (SSD capacity ignored)
+    pool2 = PagedKvPool(p + 1, hkv, d, num_layers=layers, device=_device())
+    pool2.attach_cold(HostKvPages(budget_bytes=per * 2))
+    assert pool2.cold_capacity_blocks() == 2
+
+
 def test_a_recycled_frame_spills_two_pages_to_ssd_under_distinct_keys(tmp_path):
     """The phys-id collision on the spill file: a pool of two frames reissues
     the freed id while the first page's blob is still cold, so a slot keyed by

@@ -150,7 +150,7 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
                   blocks=0, max_ctx=0, max_batch=8, ssd_path="", ssd_min_tokens=0,
                   dram_bytes=0, state_bytes=0, kv_fp8="", decode=None,
                   max_batched_tokens=0, kv_cold_bytes=0, cold_format="",
-                  cold_ssd_path="",
+                  cold_ssd_path="", cold_ssd_bytes=0,
                   sparse_k=0, scorer="bounds", kv_store=""):
     """Serving-size engine on one card. Multi-card serving is one process per card
     under CUDA_VISIBLE_DEVICES (see generate.py for the process-per-device pattern);
@@ -196,6 +196,8 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
         kw["kv_store"] = kv_store
     if cold_ssd_path:
         kw["cold_ssd_path"] = cold_ssd_path
+        if cold_ssd_bytes:
+            kw["cold_ssd_bytes"] = cold_ssd_bytes
     # Text stop sequences are matched on decoded ids, so the engine needs the
     # tokenizer's decode; without it `submit` refuses a request that carries one.
     if decode is not None:
@@ -342,6 +344,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            cold_format=getattr(args, "cold_format", ""),
                            kv_store=getattr(args, "kv_store", ""),
                            cold_ssd_path=getattr(args, "cold_ssd_path", ""),
+                           cold_ssd_bytes=getattr(args, "cold_ssd_bytes", 0),
                            decode=tokenizer.decode,
                            max_batched_tokens=args.max_batched_tokens,
                            sparse_k=getattr(args, "sparse_k", 0),
@@ -2500,6 +2503,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "this one mmap'd file (block-id keyed, no index); promote "
                               "reads them back through the same path. Serving spill for one "
                               "process; --ssd-path is the separate prefix-boot store.")
+    p_serve.add_argument("--cold-ssd-bytes", type=int, default=0, metavar="BYTES",
+                         help="countable SSD spill capacity for admission (0 with "
+                              "--cold-ssd-path = free space on the spill filesystem).")
 
 
     p_serve.add_argument("--sparse-k", type=int, default=0, metavar="PAGES",
