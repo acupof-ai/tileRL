@@ -2036,10 +2036,11 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
         spec_by_name = {k.split(".")[-1]: tuple(v) for k, v in param_specs(cfg).items()}
 
     def render(rows: list[dict], label: str, b: int, s: int, timed_s: int):
-        """``b,s`` name the PRICED tick (bytes/flops rows); ``timed_s`` is the token
-        rows per launch the timed GEMM actually runs — s on prefill, 1 on a decode
-        tick (decode streams one new token per row, not s; timing b*s timed a fat
-        prefill GEMM and printed a fictional ~10x decode tick)."""
+        """``b,s`` name the PRICED tick (bytes/flops rows); ``timed_s`` is the query
+        rows per launch the timed GEMM runs on — s on prefill, 1 per request on a
+        decode tick (decode streams one new token per row, not s; timing b*s timed a
+        fat prefill GEMM and printed a fictional ~10x decode tick). lm_head runs once
+        per request, so it times at M=b even when timed_s=1."""
         print(f"# {cfg.name} {label}, fp8 KV, {src}, floor device={device_name}")
         if floors is None:
             print("# (no calibration row for this device: ms/bound/%bound pending-remote)")
@@ -2065,8 +2066,10 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
                          if peak is not None else None)
             ms = None
             if backend is not None and r["name"] in spec_by_name:
+                # lm_head samples once per request (M=b); other rows at timed_s.
+                mm = b if r["name"] == "lm_head" else timed_s
                 ms = cal.time_row_ms(
-                    {**r, "_spec": spec_by_name[r["name"]]}, backend, b, timed_s)
+                    {**r, "_spec": spec_by_name[r["name"]]}, backend, mm)
             if bound_one is None:
                 bnd_col = f"{'pending':>9}ms"
             else:
@@ -2075,6 +2078,7 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {'pending':>11} {bnd_col:>11} {'pending':>11}")
             else:
+
                 pct = (bound_one / (ms / 1000.0) * 100.0) if bound_one is not None else float("nan")
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {ms:>9.3f}ms {bnd_col:>11} {pct:>10.1f}%")
@@ -2094,6 +2098,7 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
             print(f"{'TIMED TOTAL':<26} {timed_launches:>5} {'':>22} {'':>7} "
                   f"{'':>12} {'':>10} {ms_sum:>8.1f}ms {bound_sum:>8.1f}ms "
                   f"{bound_sum / ms_sum * 100.0:>10.1f}%")
+
         return tb_sum, tf_sum
 
     print(f"{'kernel':<26} {'count':>5} {'shape':>22} {'face':>7} {'bytes':>12} "
@@ -2306,13 +2311,16 @@ def _format_device_ledger(sections: list[dict]) -> str:
     lines = ["devices (newest measured floor + residency per card):"]
     for s in sections:
         bw, pk, res = s["hbm_bw_gbs"], s["bf16_peak_tflops"], s["residency"]
+        pk_name = "bf16_peak_tflops"
+        if pk is None:  # pre-Ampere cards are calibrated at f16 (no bf16 tensor path)
+            pk, pk_name = s["f16_peak_tflops"], "f16_peak_tflops"
         lines.append(f"  {s['device']}")
         if bw is None or pk is None:
-            lines.append("    hbm_bw / bf16_peak: pending-remote (run bench --calibrate)")
+            lines.append("    hbm_bw / tensor peak: pending-remote (run bench --calibrate)")
         else:
             lines.append(
                 f"    hbm_bw_gbs {bw['value']:.1f} (commit {str(bw['commit'])[:8]}, "
-                f"{bw['date']})  bf16_peak_tflops {pk['value']:.1f} "
+                f"{bw['date']})  {pk_name} {pk['value']:.1f} "
                 f"(commit {str(pk['commit'])[:8]}, {pk['date']})")
         if res is None:
             lines.append("    residency: pending-remote (run serve --dry-run --record-residency)")

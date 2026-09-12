@@ -88,7 +88,9 @@ def test_latest_floor_keys_on_the_physical_uuid_when_uuid_rows_exist(tmp_path):
     p2.write_text("".join(json.dumps(r) + "\n" for r in (ra, rb, bw)))
     got = cal.calibration(cal.load_rows(p2), H20, ua)
     assert got == {"bw_gbs": 3312.0, "peak_tflops": 136.5,
+                   "peak_metric": cal.PEAK_METRIC,
                    "fp8_peak_tflops": None, "pcie_gbs": None}
+
 
 def test_newest_row_wins_and_superseded_skipped(tmp_path):
     old = _row(cal.BW_METRIC, 3900.0, "GB/s", H20)
@@ -132,7 +134,19 @@ def test_calibration_returns_both_floors(tmp_path):
     got = cal.calibration(cal.load_rows(p), H20)
     # bf16 pair present; fp8 peak and pcie absent -> None (both render pending)
     assert got == {"bw_gbs": 4000.0, "peak_tflops": 989.0,
+                   "peak_metric": cal.PEAK_METRIC,
                    "fp8_peak_tflops": None, "pcie_gbs": None}
+
+
+def test_calibration_falls_back_to_f16_peak_on_sm70(tmp_path):
+    """A pre-Ampere card has an f16 peak row but no bf16 row: calibration falls
+    back to it and names it in peak_metric."""
+    V100 = "Tesla V100-SXM2-32GB"
+    p = _store(tmp_path, [_row(cal.BW_METRIC, 778.0, "GB/s", V100),
+                          _row(cal.F16_PEAK_METRIC, 88.8, "TFLOP/s", V100)])
+    assert cal.calibration(cal.load_rows(p), V100) == {
+        "bw_gbs": 778.0, "peak_tflops": 88.8, "peak_metric": cal.F16_PEAK_METRIC,
+        "fp8_peak_tflops": None, "pcie_gbs": None}
 
 
 def test_calibration_returns_fp8_peak_when_present(tmp_path):
@@ -140,7 +154,7 @@ def test_calibration_returns_fp8_peak_when_present(tmp_path):
                           _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20),
                           _row(cal.FP8_PEAK_METRIC, 1970.0, "TFLOP/s", H20)])
     assert cal.calibration(cal.load_rows(p), H20) == {
-        "bw_gbs": 4000.0, "peak_tflops": 989.0,
+        "bw_gbs": 4000.0, "peak_tflops": 989.0, "peak_metric": cal.PEAK_METRIC,
         "fp8_peak_tflops": 1970.0, "pcie_gbs": None}
 
 
@@ -155,18 +169,15 @@ def test_row_peak_keys_by_face(tmp_path):
     def row(face, name="q_proj"):
         return {"name": name, "face": face}
 
-    # fp8 weights: prefill M>=9 on fp8 peak, decode M<=8 on bf16
     assert cal.row_peak_tflops(bf, row(P.fp8_dev), 1, 4096) == 200.0
     assert cal.row_peak_tflops(bf, row(P.fp8_block_dev), 1, 4096) == 200.0
     assert cal.row_peak_tflops(bf, row(P.fp8_dev), 1, 1) == 100.0
     assert cal.row_peak_tflops(bf, row(P.fp8_dev), 8, 1) == 100.0
-    # nvfp4 weights: w4a8 prefill on fp8 peak (the 133.8% class), decode on bf16
     assert cal.row_peak_tflops(bf, row(P.nvfp4_dev), 1, 4096) == 200.0
     assert cal.row_peak_tflops(bf, row(P.nvfp4_dev_b32), 1, 4096) == 200.0
     assert cal.row_peak_tflops(bf, row(P.nvfp4_dev), 1, 1) == 100.0
-    # lm_head prices one vector per row: b=1 decode is M=1 -> bf16 even under prefill b,s
+    # lm_head prices one vector per row: b=1 decode is M=1 -> bf16
     assert cal.row_peak_tflops(bf, row(P.fp8_dev, "lm_head"), 1, 4096) == 100.0
-    # bf16 face never resolves a quant kernel
     assert cal.row_peak_tflops(bf, row(P.bf16), 1, 4096) == 100.0
     missing = {"bw_gbs": 4000.0, "peak_tflops": 100.0, "fp8_peak_tflops": None}
     assert cal.row_peak_tflops(missing, row(P.fp8_dev), 1, 4096) is None
@@ -178,7 +189,7 @@ def test_calibration_returns_pcie_when_present(tmp_path):
                           _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20),
                           _row(cal.PCIE_METRIC, 50.0, "GB/s", H20)])
     assert cal.calibration(cal.load_rows(p), H20) == {
-        "bw_gbs": 4000.0, "peak_tflops": 989.0,
+        "bw_gbs": 4000.0, "peak_tflops": 989.0, "peak_metric": cal.PEAK_METRIC,
         "fp8_peak_tflops": None, "pcie_gbs": 50.0}
 
 
@@ -295,7 +306,7 @@ def test_time_row_ms_pending_off_cuda_or_unknown_row(monkeypatch):
 
     monkeypatch.setattr(torch, "cuda", type("C", (), {"is_available": lambda self: False})())
     assert cal.time_row_ms(
-        {"name": "down_proj", "_spec": (4, 4), "face": None}, object(), 1, 8) is None
+        {"name": "down_proj", "_spec": (4, 4), "face": None}, object(), 8) is None
 
 
 def test_time_row_ms_identity_assert_survives_bound_methods(monkeypatch):
@@ -320,7 +331,7 @@ def test_time_row_ms_identity_assert_survives_bound_methods(monkeypatch):
             return None
 
     row = {"name": "down_proj", "_spec": (32, 32), "face": P.nvfp4_dev}  # inn 32 packs
-    assert cal.time_row_ms(row, BoundBackend(), 1, 1) == 1.0
+    assert cal.time_row_ms(row, BoundBackend(), 1) == 1.0
 
 
 def test_time_row_ms_shape_matches_priced_flops_decode_and_prefill(monkeypatch):
@@ -342,16 +353,15 @@ def test_time_row_ms_shape_matches_priced_flops_decode_and_prefill(monkeypatch):
             return None
 
     n, k = 32, 16
-    for name, b, s, m in (("q_proj", 1, 8, 8), ("q_proj", 1, 4096, 4096),
-                          ("q_proj", 8, 1, 8), ("lm_head", 8, 1, 8)):
+    for name, m in (("q_proj", 8), ("q_proj", 4096)):
         row = {"name": name, "_spec": (n, k), "face": P.fp8_dev,
                "flops": 2 * m * n * k}
-        assert cal.time_row_ms(row, Backend(), b, s) == 1.0
+        assert cal.time_row_ms(row, Backend(), m) == 1.0
 
     bad = {"name": "q_proj", "_spec": (n, k), "face": P.fp8_dev,
            "flops": 2 * 4096 * n * k}  # prices a 4096-token prefill launch
     with pytest.raises(AssertionError):
-        cal.time_row_ms(bad, Backend(), 1, 1)  # timed at m=1 — the m=1 mutant
+        cal.time_row_ms(bad, Backend(), 1)  # timed at m=1 — the m=1 mutant
 
 
 def test_kernels_checkpoint_guard_refuses_model_mismatch(tmp_path, monkeypatch):
@@ -399,8 +409,8 @@ def test_bench_kernels_decode_times_one_token_launch(monkeypatch):
 
     seen: list[tuple[str, int, int]] = []
 
-    def fake_time(row, backend, b, s):
-        seen.append((row["name"], b, s))
+    def fake_time(row, backend, m):
+        seen.append((row["name"], m))
         return None  # suppress ms columns; M only needs to be observed
 
     monkeypatch.setattr(cal, "time_row_ms", fake_time)
@@ -428,13 +438,15 @@ def test_bench_kernels_decode_times_one_token_launch(monkeypatch):
     args = argparse.Namespace(model="tiny", batches="1", context=512, prefill=0,
                               checkpoint=None, device_name=None)
     cli.cmd_bench_kernels(args)
-    assert seen and all(s == 1 for _, _, s in seen), seen
+    assert seen and all(m == 1 for _, m in seen), seen
 
     seen.clear()
     args2 = argparse.Namespace(model="tiny", batches=None, context=512, prefill=256,
                                checkpoint=None, device_name=None)
     cli.cmd_bench_kernels(args2)
-    assert seen and all(s == 256 for _, _, s in seen), seen
+    # prefill early-returns after the prefill table, so only prefill linear rows
+    # are timed here (lm_head renders in the non-prefill path) — all at M=256.
+    assert seen and all(m == 256 for _, m in seen), seen
 
 
 
@@ -494,12 +506,35 @@ def test_device_section_picks_newest_pair_and_residency_per_device(tmp_path):
     assert v100["hbm_bw_gbs"]["value"] == 900.0
     assert v100["residency"] is None
     # JSON shape the CLI pins.
-    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "fp8_peak_tflops",
-                        "pcie_h2d_gbs", "residency"}
+    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "f16_peak_tflops",
+                        "fp8_peak_tflops", "pcie_h2d_gbs", "residency"}
     assert h20["fp8_peak_tflops"] is None  # no fp8 row recorded in this fixture
     assert h20["pcie_h2d_gbs"] is None
+    assert h20["f16_peak_tflops"] is None  # this fixture's rows use the bf16 metric
     assert set(h20["hbm_bw_gbs"]) == {"value", "commit", "date"}
     assert set(h20["residency"]) == {"peak", "static", "transient", "commit", "date"}
+
+
+def test_calibration_uses_f16_peak_for_a_bf16_less_card(tmp_path):
+    """A device with an f16 peak but no bf16 peak (sm70 V100) still resolves a roofline
+    floor, through the f16 metric; bf16-present devices keep bf16 and ignore f16."""
+    rows = [
+        _cal_row("v-bw", cal.BW_METRIC, 900.0, V100, 0, "2026-09-11T00:00Z"),
+        _cal_row("v-f16", cal.F16_PEAK_METRIC, 125.0, V100, 0, "2026-09-11T00:00Z"),
+        _cal_row("h-bw", cal.BW_METRIC, 3292.0, H20, 0, "2026-09-11T00:00Z"),
+        _cal_row("h-bf", cal.PEAK_METRIC, 137.0, H20, 0, "2026-09-11T00:00Z"),
+        _cal_row("h-f16", cal.F16_PEAK_METRIC, 140.0, H20, 0, "2026-09-11T01:00Z"),
+    ]
+    p = _store(tmp_path, rows)
+    loaded = cal.load_rows(p)
+    v = cal.calibration(loaded, V100)
+    h = cal.calibration(loaded, H20)
+    assert v == {"bw_gbs": 900.0, "peak_tflops": 125.0, "peak_metric": cal.F16_PEAK_METRIC,
+                 "fp8_peak_tflops": None, "pcie_gbs": None}
+    assert h["bw_gbs"] == 3292.0 and h["peak_tflops"] == 137.0
+    assert h["peak_metric"] == cal.PEAK_METRIC  # bf16 wins where present
+    by = {s["device"]: s for s in cal.device_sections(loaded)}
+    assert by[V100]["bf16_peak_tflops"] is None and by[V100]["f16_peak_tflops"]["value"] == 125.0
 
 
 def test_device_sections_empty_store_is_all_pending(tmp_path):
@@ -514,7 +549,7 @@ def test_calibration_pcie_floor_is_optional_and_named(tmp_path):
                           _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20),
                           _row(cal.PCIE_METRIC, 24.0, "GB/s", H20)])
     assert cal.calibration(cal.load_rows(p), H20) == {
-        "bw_gbs": 4000.0, "peak_tflops": 989.0,
+        "bw_gbs": 4000.0, "peak_tflops": 989.0, "peak_metric": cal.PEAK_METRIC,
         "fp8_peak_tflops": None, "pcie_gbs": 24.0}
     # wrong device name does not pick up the pcie floor either
     assert cal.calibration(cal.load_rows(p), V100) is None
@@ -551,3 +586,19 @@ def test_kernels_sparse_table_renders_derived_hbm_and_pcie_bounds(tmp_path, monk
     assert score_l.count("ms") == 1 and "pending" in score_l
     assert fetch_l.count("ms") == 2 and "pending" not in fetch_l
     assert "24,576" in fetch_l  # tiny: 12 hot pages x 2048 B bf16 block
+
+
+def test_pack_fp4_chunked_matches_whole_pack():
+    """Row-chunked packing (the 32 GB-safe fixture path) is byte/value-identical to
+    packing the whole weight at once — pack and renorm are per-row."""
+    import torch
+    from tilerl_kernels import reference
+
+    torch.manual_seed(0)
+    w = torch.randn(137, 64) * 0.3  # non-multiple of the 32-row chunk forces a tail
+    wq_w, sc_w = reference.pack_fp4(w)
+    sc_w, os_w = reference.renorm_fp4_scale(sc_w)
+    wq_c, sc_c, os_c = cal._pack_fp4_chunked(w, row_chunk=32)
+    assert torch.equal(wq_c, wq_w)
+    assert torch.equal(sc_c, sc_w)
+    assert torch.equal(os_c, os_w)

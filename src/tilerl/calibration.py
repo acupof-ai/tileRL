@@ -19,6 +19,8 @@ BW_METRIC = "hbm_bw_gbs"
 PEAK_METRIC = "bf16_peak_tflops"
 FP8_PEAK_METRIC = "fp8_peak_tflops"
 PCIE_METRIC = "pcie_h2d_gbs"
+#: Pre-Ampere tensor cores (sm70 V100) have no bf16 MMA path; their peak is fp16.
+F16_PEAK_METRIC = "f16_peak_tflops"
 
 
 def store_path() -> Path:
@@ -75,9 +77,15 @@ def calibration(rows: list[dict], device_name: str,
     the renderer prints pending-remote rather than dividing by a half-calibration).
     The fp8 peak and the sparse ``pcie_gbs`` floor are both optional: absent → None,
     so fp8/pcie columns render pending rather than borrow the bf16 ceiling. A
-    physical ``uuid`` picks that card's own floors when a uuid row exists."""
+    physical ``uuid`` picks that card's own floors when a uuid row exists. The
+    tensor peak is bf16 where the arch has it and f16 on pre-Ampere cards (sm70
+    V100, no bf16 tensor path); ``peak_metric`` says which one the roofline used."""
     bw = latest_floor(rows, BW_METRIC, device_name, uuid)
     peak = latest_floor(rows, PEAK_METRIC, device_name, uuid)
+    peak_metric = PEAK_METRIC
+    if peak is None:
+        peak = latest_floor(rows, F16_PEAK_METRIC, device_name, uuid)
+        peak_metric = F16_PEAK_METRIC
     if bw is None or peak is None:
         return None
     fp8 = latest_floor(rows, FP8_PEAK_METRIC, device_name, uuid)
@@ -85,6 +93,7 @@ def calibration(rows: list[dict], device_name: str,
     return {
         "bw_gbs": float(bw["value"]),
         "peak_tflops": float(peak["value"]),
+        "peak_metric": peak_metric,
         "fp8_peak_tflops": None if fp8 is None else float(fp8["value"]),
         "pcie_gbs": float(pcie["value"]) if pcie else None,
     }
@@ -94,7 +103,8 @@ RESIDENT_METRIC = "device_resident_bytes"
 #: the metrics this section renders — a device appears only if it has at least one of
 #: these, so an unrelated bench row (e.g. a cpu decode_tok_s) never makes an all-pending
 #: section that implies a calibrated card.
-_SECTION_METRICS = (BW_METRIC, PEAK_METRIC, FP8_PEAK_METRIC, PCIE_METRIC, RESIDENT_METRIC)
+_SECTION_METRICS = (BW_METRIC, PEAK_METRIC, FP8_PEAK_METRIC, F16_PEAK_METRIC,
+                    PCIE_METRIC, RESIDENT_METRIC)
 
 
 def device_sections(rows: list[dict]) -> list[dict]:
@@ -123,6 +133,7 @@ def device_sections(rows: list[dict]) -> list[dict]:
             "device": name,
             "hbm_bw_gbs": pair(latest_floor(rows, BW_METRIC, name)),
             "bf16_peak_tflops": pair(latest_floor(rows, PEAK_METRIC, name)),
+            "f16_peak_tflops": pair(latest_floor(rows, F16_PEAK_METRIC, name)),
             "fp8_peak_tflops": pair(latest_floor(rows, FP8_PEAK_METRIC, name)),
             "pcie_h2d_gbs": pair(latest_floor(rows, PCIE_METRIC, name)),
             "residency": None if res is None else {
@@ -216,12 +227,25 @@ def measure_pcie_h2d_gbs(card: int, *, bytes_n: int = 1 << 30, iters: int = 20) 
 
 
 def measure_bf16_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> float:
-    """Sustained bf16 tensor peak from one large square GEMM: 2*n^3 flops / event sec."""
+    """Sustained bf16 tensor peak from one large square GEMM: 2*n^3 flops / event sec.
+    sm70 (V100) has no bf16 tensor path — use measure_f16_peak_tflops there."""
     import torch
 
     with torch.cuda.device(card):
         a = torch.randn(n, n, dtype=torch.bfloat16, device=f"cuda:{card}")
         b = torch.randn(n, n, dtype=torch.bfloat16, device=f"cuda:{card}")
+        secs = _event_seconds(lambda: torch.matmul(a, b), iters)
+    return (2 * n**3) / secs / 1e12
+
+
+def measure_f16_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> float:
+    """Sustained fp16 tensor peak from one large square GEMM. The floor for pre-Ampere
+    arches whose only tensor-core path is fp16 (sm70 Volta)."""
+    import torch
+
+    with torch.cuda.device(card):
+        a = torch.randn(n, n, dtype=torch.float16, device=f"cuda:{card}")
+        b = torch.randn(n, n, dtype=torch.float16, device=f"cuda:{card}")
         secs = _event_seconds(lambda: torch.matmul(a, b), iters)
     return (2 * n**3) / secs / 1e12
 
@@ -251,7 +275,7 @@ def measure_fp8_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> flo
 
 
 def _row(metric: str, value: float, unit: str, device_name: str, card: int,
-         derivation: str, uuid: str | None = None):
+         derivation: str, uuid: str | None = None, target: str = "sm90"):
     from .cli import _benchrec
 
     br = _benchrec()
@@ -291,18 +315,27 @@ def device_uuid(card: int) -> str:
     return str(torch.cuda.get_device_properties(card).uuid)
 
 
+def _arch(card: int) -> str:
+    """sm-tag of the card (sm70 V100, sm90 H20, ...)."""
+    import torch
+
+    major, minor = torch.cuda.get_device_capability(card)
+    return f"sm{major}{minor}"
+
+
 def calibrate_rows(card: int) -> list[dict]:
     """Measure the floors on one card and return the (un-appended) ledger rows.
+    sm90+: HBM, bf16 peak, fp8 peak, pinned H2D PCIe. sm70 (V100) has no bf16
+    tensor path and no fp8 _scaled_mm path, so it records HBM + the fp16 peak
+    only; its fp8/pcie columns render pending rather than a borrowed ceiling.
     Cuda-only; the CLI refuses before calling this off a card."""
     import torch
 
     device_name = torch.cuda.get_device_name(card)
     uuid = device_uuid(card)
+    arch = _arch(card)
     bw = measure_hbm_bw_gbs(card)
-    peak = measure_bf16_peak_tflops(card)
-    fp8_peak = measure_fp8_peak_tflops(card)
-    pcie = measure_pcie_h2d_gbs(card)
-    return [
+    rows = [
         _row(
             BW_METRIC,
             bw,
@@ -311,37 +344,51 @@ def calibrate_rows(card: int) -> list[dict]:
             card,
             "sustained D2D copy >=1 GiB, read+write, CUDA-event median; floor = this measurement",
             uuid,
-        ),
+            target=arch,
+        )]
+    if arch == "sm70":
+        rows.append(_row(
+            F16_PEAK_METRIC,
+            measure_f16_peak_tflops(card),
+            "TFLOP/s",
+            device_name,
+            card,
+            "one large fp16 square GEMM (2n^3 flops), CUDA-event median; sm70 has no bf16 tensor path",
+            uuid,
+            target=arch))
+        return rows
+    rows += [
         _row(
             PEAK_METRIC,
-            peak,
+            measure_bf16_peak_tflops(card),
             "TFLOP/s",
             device_name,
             card,
             "one large bf16 square GEMM (2n^3 flops), CUDA-event median; floor = this measurement",
             uuid,
-        ),
+            target=arch),
         _row(
             FP8_PEAK_METRIC,
-            fp8_peak,
+            measure_fp8_peak_tflops(card),
             "TFLOP/s",
             device_name,
             card,
             "one large fp8 (e4m3) scaled square GEMM (2n^3 flops) through torch._scaled_mm, "
             "CUDA-event median; the ceiling for fp8 GEMM rows",
             uuid,
-        ),
+            target=arch),
         _row(
             PCIE_METRIC,
-            pcie,
+            measure_pcie_h2d_gbs(card),
             "GB/s",
             device_name,
             card,
             "sustained pinned host->device copy >=1 GiB (one-way), CUDA-event median; "
             "the sparse cold-page PCIe fetch floor",
             uuid,
-        ),
+            target=arch),
     ]
+    return rows
 
 
 def append_rows(rows: list[dict], path: str | os.PathLike | None = None) -> list[str]:
@@ -391,6 +438,24 @@ def resolve_row_kernel(backend, row: dict):
     return fn if callable(fn) else None
 
 
+def _pack_fp4_chunked(w, row_chunk: int = 2048):
+    """pack_fp4 + renorm in row chunks on the weight's device. The pack builds a
+    nearest-grid LUT of 8 bytes/element (~8x the bf16 weight): a 248320-row
+    lm_head wants ~100 GiB whole. Both pack and renorm are per-row, so chunking
+    is bit-identical while bounding the transient to row_chunk*K*8 bytes."""
+    import torch
+    from tilerl_kernels import reference
+
+    wqs, scales, oscales = [], [], []
+    for i in range(0, w.shape[0], row_chunk):
+        wq, sc = reference.pack_fp4(w[i: i + row_chunk])
+        sc, os_ = reference.renorm_fp4_scale(sc)
+        wqs.append(wq)
+        scales.append(sc)
+        oscales.append(os_)
+    return torch.cat(wqs, 0), torch.cat(scales, 0), torch.cat(oscales, 0)
+
+
 def _pack_for(face, w_bf16):
     """(args, kwargs) weight tensors for the kernel the face resolves to. fp4 gets the
     block-32 pack + renorm split (scale + per-row oscale); fp8 gets the [128,128]
@@ -400,28 +465,30 @@ def _pack_for(face, w_bf16):
     from . import precision as P
 
     if face in (P.nvfp4, P.nvfp4_dev, P.nvfp4_dev_b32):
-        wq, scale = reference.pack_fp4(w_bf16)
-        scale, oscale = reference.renorm_fp4_scale(scale)
+        wq, scale, oscale = _pack_fp4_chunked(w_bf16)
         return (wq, scale), {"oscale": oscale}
     w8, wscale = reference.quant_fp8(w_bf16)
     return (w8, wscale), {}
 
 
 def row_launch_m(row: dict, b: int, s: int) -> int:
-    """The M (token rows) of ONE timed launch: decode rows price b*s tokens, lm_head
-    prices one vector per sequence (its s=1 weight math repeats per token but it runs
-    once after the gather). A decode tick (b rows, s=B per row) and a prefill row
-    (b=1, s=S) differ ONLY here — pinning it is what keeps a 1-token GEMM from being
-    timed against a full-prefill row."""
+    """The M (token rows) of ONE timed launch: decode rows run on b query rows
+    (one token per request), prefill on b*s; lm_head prices one vector per
+    sequence. Kept for row_peak_tflops; the timed path receives M from cli."""
     return b if row["name"] == "lm_head" else b * s
 
 
-def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
+def time_row_ms(row: dict, backend, m: int) -> float | None:
     """ms of the registry kernel the row's face DECLARES, or None to render
     pending-remote. Inputs are packed to that kernel's weight face, so the measured ms
     divides by the same packed bytes the roofline row declares — never a bf16
     surrogate for an nvfp4/fp8 row, and never linear_fp4 for an fp8 row. Fused
-    kernels needing engine-shaped inputs return None (card-only probes)."""
+    kernels needing engine-shaped inputs return None (card-only probes).
+
+    ``m`` is the ACTUAL query-row count the kernel runs on: M=b for a decode GEMV
+    (one token per request), M=b*s for a prefill GEMM. Passing b*s for decode
+    timed an M=4096 prefill kernel and read 0.1% bound — the wrong kernel.
+    """
     import torch
 
     if not torch.cuda.is_available():
@@ -430,7 +497,6 @@ def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     if fn is None or row.get("_spec") is None:
         return None
     out_n, inn = tuple(row["_spec"])
-    m = row_launch_m(row, b, s)
     dev = backend.device
     x = torch.randn(m, inn, dtype=torch.bfloat16, device=dev)
     w_bf16 = torch.randn(out_n, inn, dtype=torch.bfloat16, device=dev)
@@ -441,6 +507,10 @@ def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     if row.get("flops") is not None:
         assert row["flops"] == 2 * m * out_n * inn, (
             f"timed M={m} but row prices {row['flops'] // (2 * out_n * inn)} token rows")
+    # Packed in row chunks on-device: a whole-layer nearest-grid LUT is ~8x the
+    # weight (37.9 GiB for a GDN gate proj, ~100 GiB for lm_head), which OOMs a
+    # 32 GB card; pack/renorm are per-row, so chunking is bit-identical. Packing
+    # is untimed fixture prep and never enters ms.
     wargs, wkw = _pack_for(row["face"], w_bf16)
     # identity assertion: the thing we time is the kernel the row's face declared,
     # not a substitute. resolve_row_kernel is the single resolution point. A bound
