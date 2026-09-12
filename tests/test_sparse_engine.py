@@ -673,6 +673,89 @@ def test_sparse_draft_pool_is_reserved_at_admit_across_rows():
         e.shutdown()
 
 
+def test_sparse_verify_tick_populates_and_reads_the_plus_one_own_page_across_a_boundary():
+    """The +1 own-page column exists only for a verify tick (tq>1); a depth-1 run
+    on a short prompt never has a draft chain that STRADDLES a 16-token boundary,
+    so reserving the next own page was unexercised. A block-aligned prefill plus
+    an always-accepted (oracle) draft puts the first verify chain at committed
+    position L-1 (offset 15) and a draft on page L/16+1: the own span names the
+    +1 page, the write populates it, attention reads it, and committed tokens
+    equal a dense engine. An oracle head is essential — a random draft's crossing
+    proposals are rejected at position 0 and never change output."""
+    from dataclasses import replace as _replace
+
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl.spec import DraftHead
+
+    class _OracleDraft(DraftHead):
+        def __init__(self, cfg, expected):
+            self.cfg = _replace(cfg, num_layers=1, full_attn_layers=(0,))
+            self.params, self.expected = {}, expected
+            self.width = 2
+            self.has_confidence = False
+            self.trunk = None
+
+        def forward(self, hidden, ids, positions, kv, backend, hidden_out=None,
+                    last_only=False):
+            pos = np.atleast_2d(np.asarray(positions))
+            logits = torch.zeros(*pos.shape, self.cfg.vocab_size, device=backend.device)
+            for i in range(pos.shape[0]):
+                for j in range(pos.shape[1]):
+                    logits[i, j, self.expected.get(int(pos[i, j]) + 1, 0)] = 10.0
+            if hidden_out is not None:
+                hidden_out.append(torch.as_tensor(hidden))
+            return logits
+
+        def confidence(self, hidden, probs, backend):
+            return probs
+
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    backend = get_backend()
+    common = dict(num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+                  max_num_batched_tokens=512)
+    # 4 full pages + 15 tokens: after prefill the first verify's committed
+    # position lands on offset 15, so its tq=2 chain writes 79 (page 4) and 80
+    # (page 5) — the +1 column is page 5, beyond the page the committed token is on.
+    prompt = np.arange(7, 7 + 4 * BLOCK_TOKENS + 15, dtype=np.int64)
+    n_new = 8
+    params = SamplingParams(temperature=0.0, max_new_tokens=n_new, seed=0)
+
+    dense = build_engine(cfg=cfg, model=model, backend=backend, sparse_k=0, **common)
+    base = _drain(dense, dense.submit(prompt, params), n_new)
+    dense.shutdown()
+    expected = {i: t for i, t in enumerate(list(prompt) + base)}
+
+    crossed = {"n": 0}
+    e = build_engine(
+        cfg=cfg, model=model, backend=backend, sparse_k=2, scorer="bounds",
+        kv_cold_bytes=1 << 30, draft=_OracleDraft(cfg, expected), spec_depth=1, **common)
+    import tilerl.sparse_engine as se
+
+    orig = se.SparseForward.__init__
+
+    def watch(self, *a, **kw):
+        orig(self, *a, **kw)
+        for r in self.rows:
+            if r["decoding"] and r["tq"] > 1:
+                # chain queries are [q_hi-tq .. q_hi): a boundary straddle has
+                # first and last query on different pages, so own must name +1.
+                first_page = (r["q_hi"] - r["tq"]) // BLOCK_TOKENS
+                last_page = (r["q_hi"] - 1) // BLOCK_TOKENS
+                if last_page > first_page and last_page in r["own"]:
+                    crossed["n"] += 1
+
+    se.SparseForward.__init__ = watch
+    try:
+        got = _drain(e, e.submit(prompt, params), n_new)
+    finally:
+        se.SparseForward.__init__ = orig
+        e.shutdown()
+    assert crossed["n"] >= 1, "no verify chain straddled a page boundary into +1 own"
+    assert got == base, f"sparse+oracle crossing {got} != dense greedy {base}"
+
+
 def test_full_k_sparse_with_draft_matches_dense_with_draft():
     """k>=pages selects everything: sparse + draft equals dense + draft."""
     prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
