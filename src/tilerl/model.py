@@ -292,9 +292,17 @@ class Model:
     linears carry ``<key>.wq/.scale`` (fp4) or ``<key>.w8/.wscale`` (fp8) plus an
     optional per-row ``<key>.oscale``, with a bf16 master beside them only for training."""
 
-    def __init__(self, cfg: ModelConfig, params: dict[str, torch.Tensor]):
+    def __init__(self, cfg: ModelConfig, params: dict[str, torch.Tensor], *,
+                 materialized: bool = False):
         self.cfg = cfg
         self.params = params
+        #: True once these params are the tensors the backend forwards against.
+        #: build_engine's materialize REPLACES params that move device/dtype with
+        #: new-id tensors, so an adapter attached while False is silently orphaned
+        #: (zero grads / stale captured graph). build_random is born True: CPU
+        #: RefBackend.materialize is the identity. load_hf is born False and flips
+        #: True inside build_engine (or an explicit materialize + assignment).
+        self.materialized = materialized
         # When index_capture is set to a list, each listed full-attn layer's
         # warm-up inputs (layer input H, post-rope Q/K) are appended in forward.
         # index_capture_layers is the source-layer filter; serving/training leave
@@ -673,6 +681,13 @@ def add_lora(
     linear. Measured on an fp4 tiny before this: 32 of 64 adapters received a
     gradient, and the other 32 still cost two AdamW moments and checkpoint bytes.
     """
+    if not getattr(model, "materialized", False):
+        raise RuntimeError(
+            "add_lora called before the model was materialized: call build_engine "
+            "first (or backend.materialize and set model.materialized=True), then "
+            "add_lora. Materialize replaces params that move device/dtype with new-id "
+            "tensors, so an adapter attached now is orphaned — the tape records no "
+            "gradient for it and a captured decode graph reads the stale adapter.")
     g = torch.Generator().manual_seed(seed)
     new: dict[str, torch.Tensor] = {}
     for k in sorted(model.params):
@@ -732,7 +747,9 @@ def build_random(
                 del params[key]
     if fuse_projections:
         _fuse_projections(cfg, params)
-    return Model(cfg, params)
+    # CPU random model: RefBackend.materialize is the identity, so it is safe to add
+    # LoRA without an engine and the object is born materialized.
+    return Model(cfg, params, materialized=True)
 
 
 # Qwen3_5RMSNorm is zero-centered (y = x_normed * (1 + weight)); the +1 is folded in at load.

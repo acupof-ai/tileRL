@@ -129,6 +129,7 @@ def main() -> None:
     p = mark("load_hf", p)
     card_guard()
     model.params = b.materialize(model.params)
+    model.materialized = True
     p = mark("materialize", p)
     trainable = None if args.full else add_lora(model, rank=16)
     p = mark("add_lora", p)

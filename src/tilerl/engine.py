@@ -2355,7 +2355,11 @@ def build_engine(
             sparse_tracker.ik = sparse_tracker.ik.to(backend.device)
     if draft is not None:
         draft.set_depth(spec_depth)  # the state pool is sized by the width it settles on
+    # materialize moves/rebinds params that change device/dtype; adapters must be added
+    # AFTER this (add_lora raises on an unmaterialized model) so they bind to the tensors
+    # the forward reads.
     model.params = backend.materialize(model.params)
+    model.materialized = True
     # Serve the draft's own weights HERE, before anything reads free memory. They used
     # to be quantized inside Engine.__init__, i.e. after the KV fit had already spent
     # 2/3 of what was free and PrefixStore a quarter of the rest -- so the draft's fp4

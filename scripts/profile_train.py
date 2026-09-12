@@ -42,6 +42,7 @@ def main() -> None:
     model = load_hf(cfg, args.source, fuse_projections=False, num_layers=args.layers)
     card_guard()
     model.params = backend.materialize(model.params)
+    model.materialized = True
     trainable = add_lora(model, rank=16)
     opt = AdamW(lr=1e-3)
     ids = np.arange(1, args.len + 1, dtype=np.int64).reshape(1, args.len) % cfg.vocab_size
