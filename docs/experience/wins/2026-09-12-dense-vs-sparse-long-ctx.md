@@ -298,12 +298,26 @@ wander.
 > questions (mean 604 tok/q, many emitting no answer letter); spec-ON n=1282
 > was 0.202 vs dense 0.859 (paired McNemar delta −0.624 ±0.045). At MMLU
 > lengths (≤128 pages) k=128 selects the FULL page set, so this is not
-> expected near-tie divergence. sm70 first-token dense-vs-sparse logits are
-> bit-identical at B=1 and B=8 (max abs 0.0; `firsttok_{dense1,sparse1,
-> sparse8}.json`, 65, V100), localizing the defect to the **sm90 B=8
-> long-generation** path (under bisection), not selection or the packed tile in
-> the abstract. The 0.4062/0.0625 free-greedy agreement in the table above was
-> an earlier warning that the short NLL gate was insufficient; it was read as
-> benign and was not. Re-enable only after an sm90 B=8 long-generation
+> expected near-tie divergence. **sm90-kernel-only (isolated 2026-09-13):**
+> feeding the *exact same 115-token id sequence* (the n_sel=0 prompt that
+> flips on sm90 — 7 pages + 3 tail, B=1 cold single, spec off) to the V100
+> gives dense g0=40 vs sparse k=128 g0=40, **max abs logit diff exactly 0.0**
+> (`h20ids_{dense1,sparse1}.json`, 65, V100), while the same ids on sm90 give
+> dense 40 ('I') vs sparse 1596 ('We') — same ids, same layout, same kwargs,
+> different arch ⇒ an sm90 sparse kernel defect, not selection, the packed
+> table, batch, or an arch-independent path; consistent with the CPU
+> row-isolation gate passing. (58/cc sweep sm90 page/tail layouts to name the
+> exact kernel trigger.)
+>
+> **Tokenizer caveat on the V100 rows above:** the V100 checkpoint's
+> `tokenizer.json` was an older Aug-29 snapshot (12.8 MB) vs the pod's Sep-11
+> (19.99 MB); `vocab.json` matched, so a byte-identical rendered prompt
+> segmented differently (85 vs 115 tokens for MMLU index 2). All V100 numbers
+> in this entry are valid model inputs and correct for *that* segmentation,
+> but they are not token-for-token comparable to H20 runs; the clean sm70-vs-
+> sm90 comparison above feeds the H20 token ids directly and is unaffected.
+> The 0.4062/0.0625 free-greedy agreement in the table above was an earlier
+> warning that the short NLL gate was insufficient; it was read as benign and
+> was not. Re-enable only after an sm90 B=8 long-generation
 > continuity gate passes. (#530 originally shipped the default; #558 reverted;
 > harness `scripts/mmlu_thinking_spec.py`, paired JSONs on the H20 pod.)

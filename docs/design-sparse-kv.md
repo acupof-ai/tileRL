@@ -286,14 +286,22 @@ budget was not enough), recorded in `errors/` with the token count.
 > cover: greedy spec-off sparse k=128 scored **0.3475 vs dense 0.9150** on the
 > same 400 thinking questions (spec-on n=1282: 0.202 vs 0.859, paired delta
 > −0.624 ±0.045). At MMLU lengths k=128 selects the full page set, so the
-> divergence is not expected near-tie selection loss; sm70 first-token logits
-> are bit-identical dense-vs-sparse at B=1 and B=8 (max abs 0.0), localizing
-> the defect to the **sm90 B=8 long-generation** path under bisection
-> (`fuse_projections` / host-cold f16-narrow / B=8 kwargs). The sm70 rows below
+> divergence is not expected near-tie selection loss. The defect is an
+> **sm90 sparse-kernel path**: feeding the identical 115-token id sequence (the
+> n_sel=0 prompt that flips on sm90 at B=1 cold, 7 pages + 3 tail, spec off —
+> dense 40 'I' vs sparse 1596 'We') to the V100 gives dense=sparse, g0=40,
+> **max abs logit diff exactly 0.0**; sm70 is also bit-exact dense-vs-sparse
+> at B=1/B=8 on its own inputs. Same ids, same kwargs, only the arch differs.
+> The sm70 rows below
 > remain valid but only for short, B=1/forced-teacher conditions: after #546
 > k=all is token-identical, k=128 prefill KL 0.0023/top-1 0.981 at 8k and
 > 0.019/0.949 at 32k, and a 64-token teacher-forced NLL gap was ~+0.013
-> nats/token (n=3). None of those predicts free-running sm90 B=8 generation.
+> nats/token (n=3). **Tokenizer caveat:** the V100 checkpoint carried an older
+> `tokenizer.json` (Aug-29 12.8 MB vs the pod's Sep-11 19.99 MB; `vocab.json`
+> matched), so a byte-identical prompt segmented differently (85 vs 115 tok);
+> the V100 rows are valid for that segmentation, not token-comparable to H20 —
+> the arch fork above feeds H20 token ids directly and is unaffected. None of
+> those predicts free-running sm90 generation.
 > The cross-group union hot pool
 > [below](#the-resident-pool-is-a-cross-group-union-sized-union_cap) stays
 > **parked**. Re-enable a sparse default only after an sm90 B=8 long-generation
