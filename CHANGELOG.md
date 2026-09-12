@@ -3,6 +3,10 @@
 One line per event — phase exit, default flip, accept-or-reject verdict — with
 its `docs/experience/` entry. Newest first.
 
+## 2026-09-13
+
+- **fix (CPU gates; H20 256k rerun pending-remote)** — **the sparse SSD-spill 256k host OOM was an uncapped second KV copy on the prefix path, not the private spill tier.** Every page leaving the hot union was cloned into the unbudgeted, never-spilled `HostKvPages._shared` (a full f16 KV copy, ~3.6 GiB/window → VmRSS 30.7 GiB), and `SparsePrefixCache._snap` retained consumed GDN boundary snapshots. Fix: private→shared is a blob TRANSFER under one pinned budget + one RAM LRU, shared pages spill to a prefix file with read-through (bounds by field, not pinned in the entry), consumed snapshots pop. 4096-page gate holds total host bytes ≤ budget+one page. — [wins/2026-09-13-sparse-prefix-spill-host-rss-bounded.md](docs/experience/wins/2026-09-13-sparse-prefix-spill-host-rss-bounded.md)
+
 ## 2026-09-12
 
 - **fix (CPU guard; V100 auto arm verified 2026-09-12; explicit opt-in poison not reproduced in a short probe)** — **a failed sm70 decode-graph capture poisoned torch's caching allocator for the whole process, so a later `empty_cache` INTERNAL-assert-failed.** On the V100 dense decode capture fails mid-kernel; torch 2.5.1's `graph.__exit__` calls `capture_end()` before popping allocator capture state, and on the poisoned capture that raise strands `captures_underway` with no Python API to clear it — the engine's eager-fallback warning looked healthy but every later allocator assert in the process died (hit by 65's dense→sparse fidelity harness between arms). Fix is prevention at `_graph_on`: the auto path stays eager on sm70 with a one-time warning; explicit `decode_graph=True` is still honoured. Negative control (remove the guard → red) included. — [errors/2026-09-12-failed-graph-capture-poisons-allocator-sm70.md](docs/experience/errors/2026-09-12-failed-graph-capture-poisons-allocator-sm70.md)

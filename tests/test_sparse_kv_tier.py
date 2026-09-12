@@ -631,3 +631,40 @@ def test_ssd_spill_with_prefix_sharing_keeps_host_bytes_under_budget(tmp_path):
         cold.share_release(key)
     assert cold.shared_bytes() == 0 and cold._shared_ssd_bytes == 0
     cold.close()
+
+
+def test_shared_transfer_of_an_already_spilled_private_page_reads_back(tmp_path):
+    """256k case: when the contiguous frontier closes the page's private blob is
+    already on the private SSD (past the host budget). The private->shared
+    transfer must still produce a readable shared blob - lifted off the private
+    file and written to the prefix spill file, with bounds attached, adding
+    nothing to host RAM."""
+    p, hkv, d, layers = 8, 2, 8, 2
+    pool = PagedKvPool(p, hkv, d, num_layers=layers, device=_device())
+    per = (pool.k_pool[0, 0].numel() * pool.k_pool.element_size()
+           + pool.v_pool[0, 0].numel() * pool.v_pool.element_size()) * layers
+    ssd = str(tmp_path / "cold.bin")
+    cold = HostKvPages(budget_bytes=per, ssd_path=ssd)  # one page host budget
+    pool.attach_cold(cold)
+
+    blocks = [pool.alloc_block() for _ in range(p)]
+    for i, b in enumerate(blocks):
+        pool.k_pool[:, b].fill_(i)
+        pool.v_pool[:, b].fill_(-i)
+        pool.demote_page(b, key=i)
+    # every page beyond the first is on the private SSD
+    assert cold.ssd_bytes >= per * (p - 1)
+    ram_before = cold.bytes_held
+
+    bound = torch.zeros(2, dtype=torch.float16)
+    n = cold.share_hold_kv(p - 1, 777, extra={"bounds": bound})
+    assert n > 0
+    # host RAM did not grow to hold the lifted blob
+    assert cold.bytes_held <= ram_before + per
+    # the shared page resolves (read-through) carrying its bound and K/V
+    blob = cold.share_take(777)
+    assert blob is not None and "bounds" in blob
+    assert torch.all(blob["k"] == (p - 1)) and torch.all(blob["v"] == -(p - 1))
+    # the private copy is gone
+    assert cold.take(p - 1) is None
+    cold.close()
