@@ -544,7 +544,10 @@ class ColdSsdFile:
         slot = self._alloc_slot()
         off = self.HEADER + slot * self.stride
         for k, _shape, _dt, n in self._spec:
-            self._map[off: off + n] = blob[k].contiguous().view(torch.uint8).numpy().tobytes()
+            t = blob[k].detach()
+            if t.is_cuda:
+                t = t.cpu()  # numpy/mmap needs a host tensor; bounds may arrive on device
+            self._map[off: off + n] = t.contiguous().view(torch.uint8).numpy().tobytes()
             off += n
         self._slot_of[key] = slot
         # No per-page flush: the page cache writes this back; the serving spill
@@ -567,6 +570,23 @@ class ColdSsdFile:
             blob[k] = t
             off += n
         return blob
+
+    def read_field(self, key, field: str, pin: bool = False):
+        """Read ONE tensor of a slot by its spec name (partial read: adopting a
+        prefix needs the small bounds plane without pulling the slot's K/V)."""
+        slot = self._slot_of[key]
+        off = self.HEADER + slot * self.stride
+        for k, shape, dt, n in self._spec:
+            if k == field:
+                t = torch.empty(shape, dtype=getattr(torch, dt), device="cpu",
+                                pin_memory=pin)
+                src = torch.from_numpy(
+                    self._np.frombuffer(self._map, dtype=self._np.uint8,
+                                        count=n, offset=off))
+                t.view(torch.uint8).reshape(-1).copy_(src)
+                return t
+            off += n
+        raise KeyError(field)
 
     def forget(self, key) -> None:
         slot = self._slot_of.pop(key, None)
@@ -626,16 +646,29 @@ class HostKvPages:
         self._ssd_capacity_bytes = ssd_capacity_bytes
         self._staging: dict | None = None  # one reused pinned promote buffer
         #: SHARED prefix pages, content-addressed by the page-token rolling hash,
-        #: held on behalf of a PrefixStore entry (sparse path). key -> [blob, n, refs].
-        #: A private block-id blob is per-request and freed when the page is freed; a
-        #: shared blob survives the publishing request and is refcounted by every store
-        #: entry whose prefix covers that page. Bounds ride alongside as blob["bounds"].
-        self._shared: dict[int, list] = {}
+        #: held on behalf of a SparsePrefixCache entry. key -> [n, refs, blob|None].
+        #: Every store entry covering the page adds a ref; the blob lives under the
+        #: SAME pinned budget as private pages and LRU-spills to a prefix spill
+        #: file (a page is TRANSFERRED from private to shared, never cloned — the
+        #: uncapped clone was the 256k host OOM: a second full KV copy). None blob
+        #: = spilled; share_take reads it back.
+        self._shared: OrderedDict[int, list] = OrderedDict()
+        self._shared_ssd: ColdSsdFile | None = None
+        self._shared_ssd_bytes = 0
+        #: one RAM LRU across private and shared pages: ("p",key)/("s",key) -> n.
+        self._ram_order: OrderedDict[tuple[str, Any], int] = OrderedDict()
 
     @property
     def bytes_held(self) -> int:
-        """Bytes in host RAM (the pinned budget this tier caps). SSD is separate."""
-        return self._used
+        """Pinned host RAM held right now, private blobs + shared prefix blobs.
+        Both share the one budget; SSD is separate and not counted here."""
+        return self._used + self._shared_ram_bytes()
+
+    def _shared_ram_bytes(self) -> int:
+        return sum(rec[0] for rec in self._shared.values() if rec[2] is not None)
+
+    def _ram_over(self) -> bool:
+        return self._used + self._shared_ram_bytes() > self.budget_bytes
 
     @property
     def ssd_bytes(self) -> int:
@@ -691,16 +724,41 @@ class HostKvPages:
         self._blobs[key] = blob
         self._held[key] = nbytes
         self._used += nbytes
+        self._ram_order[("p", key)] = nbytes
         self.demotions += 1
-        while self._used > self.budget_bytes:
-            victim, dropped = self._held.popitem(last=False)
-            vblob = self._blobs.pop(victim)
-            self._used -= dropped
-            if self._ssd_path:
-                self._write_ssd(victim, vblob, dropped)
-            else:
-                self.drops += 1
+        self._enforce_budget()
         return True
+
+    def _enforce_budget(self) -> None:
+        """Evict oldest RAM-resident pages (private AND shared prefix, one LRU)
+        until pinned bytes fit the budget. A private page spills to the private
+        file or is dropped; a shared (refcounted) page spills to the prefix file.
+        A shared page with no spill file stays — a store entry references it."""
+        while self._used + self._shared_ram_bytes() > self.budget_bytes:
+            for (ns, k), n in list(self._ram_order.items()):
+                if ns == "p":
+                    blob = self._blobs.pop(k, None)
+                    if blob is None or self._held.get(k) != n:
+                        continue  # promoted/forgotten between enqueue and sweep
+                    self._held.pop(k)
+                    self._ram_order.pop(("p", k), None)
+                    self._used -= n
+                    if self._ssd_path:
+                        self._write_ssd(k, blob, n)
+                    else:
+                        self.drops += 1
+                    break
+                rec = self._shared.get(k)
+                if rec is None or rec[2] is None or rec[0] != n:
+                    self._ram_order.pop(("s", k), None)
+                    continue
+                # [n, refs, blob]: evict below
+                if not self._ssd_path:
+                    continue  # cannot drop a refcounted shared page
+                self._shared_evict_ram(k)
+                break
+            else:
+                return  # nothing evict-able remains in the LRU
 
     def _write_ssd(self, key, blob: dict, nbytes: int) -> None:
         """Move a page already removed from host accounting onto the spill file."""
@@ -715,6 +773,7 @@ class HostKvPages:
         the SSD spill path — or None if neither tier has it."""
         n = self._held.pop(key, None)
         blob = self._blobs.pop(key, None)
+        self._ram_order.pop(("p", key), None)
         if blob is not None:
             self._used -= n
             self.promotions += 1
@@ -736,6 +795,7 @@ class HostKvPages:
     def forget(self, key) -> None:
         n = self._held.pop(key, None)
         self._blobs.pop(key, None)
+        self._ram_order.pop(("p", key), None)
         if n is not None:
             self._used -= n
         elif self._ssd is not None and key in self._ssd:
@@ -748,51 +808,155 @@ class HostKvPages:
             "kv_cold_bytes": self._used,
             "kv_cold_ssd_pages": 0 if self._ssd is None else len(self._ssd),
             "kv_cold_ssd_bytes": self._ssd_bytes,
+            "kv_cold_shared_pages": len(self._shared),
+            "kv_cold_shared_bytes": self._shared_ram_bytes(),
+            "kv_cold_shared_ssd_bytes": self._shared_ssd_bytes,
             "kv_cold_demotions": self.demotions,
             "kv_cold_promotions": self.promotions,
             "kv_cold_drops": self.drops,
         }
 
     def close(self) -> None:
-        """Release the spill file's mmap and handle (host RAM is GC'd with the blobs)."""
+        """Release the spill files' mmap and handles (host RAM is GC'd with the blobs)."""
         if self._ssd is not None:
             self._ssd.close()
             self._ssd = None
+        if self._shared_ssd is not None:
+            self._shared_ssd.close()
+            self._shared_ssd = None
 
     # ----- shared, content-addressed prefix pages (sparse PrefixStore seam) -----
     def share_hold(self, key: int, blob: dict, nbytes: int) -> None:
         """Hold (or refcount) one published prefix page's blob under ``key``. The
-        store retains the blob, not a device block: sparse frees the device frame on
-        demote, so a prefix entry cannot name a physical id the way the dense store
-        does. Bounds ride in ``blob['bounds']`` when present. Idempotent on key."""
+        blob is TRANSFERRED from private storage (same allocation, no second
+        copy): the caller has already popped it from ``_blobs``. It enters the
+        one pinned budget and LRU-spills to the prefix file when the budget
+        binds; bounds ride in ``blob['bounds']`` and spill with it.
+        Idempotent on key — just adds a reference."""
         rec = self._shared.get(key)
         if rec is not None:
-            rec[2] += 1
+            rec[1] += 1
             return
-        self._shared[key] = [blob, nbytes, 1]
+        self._shared[key] = [nbytes, 1, blob]
+        self._ram_order[("s", key)] = nbytes
+        self._enforce_budget()
+
+    def share_hold_kv(self, private_key, shared_key: int,
+                      extra: dict | None = None) -> int:
+        """Transfer one private blob to a shared content key (no clone): pop it
+        from the private namespace (RAM or private spill file), fold in ``extra``
+        (the small host bounds), and hand it to the shared namespace. The blob
+        starts spilled (written straight to the prefix file) when it was already
+        past the host budget - no copy is pulled into RAM. Returns bytes held."""
+        n = self._held.pop(private_key, None)
+        blob = self._blobs.pop(private_key, None)
+        self._ram_order.pop(("p", private_key), None)
+        if n is not None:
+            self._used -= n
+        if blob is None:
+            # already past the host budget: lift the blob off the private spill
+            # file once (disk, not RSS), fold in bounds, and place it straight in
+            # the shared spill namespace - nothing added to host RAM.
+            if self._ssd is None or private_key not in self._ssd:
+                return 0
+            n = self._ssd_page_bytes.pop(private_key, self._ssd.stride)
+            blob = self._ssd.read(private_key, False)
+            self._ssd.forget(private_key)
+            self._ssd_bytes -= n
+            if extra:
+                blob.update(extra)
+                n += sum(t.numel() * t.element_size()
+                         for t in extra.values() if torch.is_tensor(t))
+            self._shared[shared_key] = [n, 1, None]
+            self._ram_order.pop(("s", shared_key), None)  # starts spilled
+            self._write_shared_ssd(shared_key, blob, n)
+            return n
+        if extra:
+            blob.update(extra)
+            n += sum(t.numel() * t.element_size()
+                     for t in extra.values() if torch.is_tensor(t))
+        self.share_hold(shared_key, blob, n)
+        return n
+
+
+    def _shared_evict_ram(self, key: int) -> None:
+        """Spill one RAM-resident shared page to the prefix file, keep its record."""
+        n, refs, blob = self._shared[key]
+        self._write_shared_ssd(key, blob, n)
+        self._shared[key] = [n, refs, None]
+        self._ram_order.pop(("s", key), None)
+
+    def _shared_ssd_path(self) -> str:
+        return (self._ssd_path[:-4] if self._ssd_path.endswith(".bin")
+                else self._ssd_path) + ".prefix.bin"
+
+    def _write_shared_ssd(self, key: int, blob: dict, nbytes: int) -> None:
+        if self._shared_ssd is None:
+            self._shared_ssd = ColdSsdFile(self._shared_ssd_path(), _blob_spec(blob))
+        self._shared_ssd.write(("s", key), blob)
+        self._shared_ssd_bytes += nbytes
 
     def share_take(self, key: int) -> dict | None:
-        """A read-only REFERENCE to a shared page blob (promotion copies it into a
-        private fresh block; the shared blob is never mutated). None when absent."""
+        """A read-only REFERENCE to a shared page blob. Read-through: a spilled
+        page is loaded from the prefix file (without removing it — the store
+        entry still owns it; promotion copies it into a private fresh block).
+        None when the key is not a shared page."""
         rec = self._shared.get(key)
-        return None if rec is None else rec[0]
+        if rec is None:
+            return None
+        blob = rec[2]
+        if blob is None and self._shared_ssd is not None and ("s", key) in self._shared_ssd:
+            blob = self._shared_ssd.read(("s", key), torch.cuda.is_available())
+            rec[2] = blob
+            self._shared_ssd.forget(("s", key))
+            self._shared_ssd_bytes -= rec[0]
+            self._ram_order[("s", key)] = rec[0]
+            self._shared.move_to_end(key)
+            self._enforce_budget()
+        return blob
+
+    def share_take_field(self, key: int, field: str):
+        """One named tensor of a shared page blob (``bounds``), read-through from
+        the prefix spill file when the blob is spilled, without loading its K/V."""
+        rec = self._shared.get(key)
+        if rec is None:
+            return None
+        blob = rec[2]
+        if blob is not None:
+            return blob.get(field)
+        if self._shared_ssd is not None and ("s", key) in self._shared_ssd:
+            return self._shared_ssd.read_field(("s", key), field)
+        return None
 
     def share_release(self, key: int) -> None:
-        """Drop one store reference; the blob is deleted at the last reference."""
+        """Drop one store reference; the blob is deleted/spilled-slot freed at
+        the last reference."""
         rec = self._shared.get(key)
         if rec is None:
             return
-        rec[2] -= 1
-        if rec[2] <= 0:
-            self._shared.pop(key, None)
+        rec[1] -= 1
+        if rec[1] > 0:
+            return
+        n, _refs, blob = self._shared.pop(key)
+        self._ram_order.pop(("s", key), None)
+        if blob is None and self._shared_ssd is not None and ("s", key) in self._shared_ssd:
+            self._shared_ssd.forget(("s", key))
+            self._shared_ssd_bytes -= n
 
     def share_ref(self, key: int) -> None:
         """Add one store reference to an already-shared key (a frozen prefix
-        copy shares the blob of the entry it was snapshotted from)."""
-        self._shared[key][2] += 1
+        copy shares the blob of the entry it was snapshotted from). No-op when
+        the key has already been released (evicted between freeze and ref)."""
+        rec = self._shared.get(key)
+        if rec is not None:
+            rec[1] += 1
 
     def share_keys(self) -> frozenset[int]:
         return frozenset(self._shared)
+
+    def shared_bytes(self) -> int:
+        """Pinned RAM held for shared prefix blobs (test/ledger diagnostic)."""
+        return self._shared_ram_bytes()
 
 
 class LinearStatePool:

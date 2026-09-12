@@ -974,10 +974,15 @@ class Engine:
             if entry is not None:
                 matched = len(entry["tokens"])
                 req.seq_len = req.prefill_from = matched
-                self._sparse.shared[req.req_id] = dict(enumerate(entry["keys"]))
+                keys = list(entry["keys"])
+                self._sparse.shared[req.req_id] = dict(enumerate(keys))
                 if self._sparse.scorer == "bounds":
-                    for p, b in entry["bounds"].items():
-                        self._sparse.set_bounds(req.req_id, p, b)
+                    # bounds are read by field out of each (possibly spilled)
+                    # shared blob, not pinned in the entry
+                    for p, key in enumerate(keys):
+                        b = self._sparse.prefix.bound_of_key(key)
+                        if b is not None:
+                            self._sparse.set_bounds(req.req_id, p, b)
                 snap_states, snap_windows = entry["state"]
                 self._states.states[slot].copy_(snap_states)
                 if snap_windows is not None:
@@ -1530,7 +1535,9 @@ class Engine:
             if blob is None:
                 raise RuntimeError(f"sparse prefix page {page} missing its shared blob")
             new = self._kv.shared_promote(blob)
-            shared_keys.pop(page)  # now private; the store keeps the original blob
+            shared_keys.pop(page)  # the store keeps its ref; this page is now private
+            if page in r.cold_pages:
+                r.cold_pages.remove(page)  # transfer moved the blob to the content key
         else:
             new = self._kv.alloc_block()
         live[page] = new
@@ -1538,35 +1545,37 @@ class Engine:
         tr.map_resident(r.req_id, page, new)
         return new
 
-    @staticmethod
-    def _sparse_clone_cold(pool, key) -> dict | None:
-        """A tensor-clone of a demoted page's PRIVATE host blob, without removing
-        it from private storage (the page stays the request's; the clone feeds the
-        shared prefix index). Call only inside/after the tick's demotions scope
-        once the blob is held — under batched demotion (#538) peeking before the
-        batch sync returns None."""
-        src = pool.cold.peek(key)
-        if src is None:
-            return None
-        return {k: v.clone() for k, v in src.items() if torch.is_tensor(v)}
-
     def _sparse_offer_drop(self, r: _Req, page: int) -> None:
-        """Page ``page`` just LEFT the resident union and its blob is held: offer
-        a shared clone to the prefix index. Drop-only — a stable pin never reaches
-        here. The index buffers out-of-order drops behind the contiguous frontier
+        """Page ``page`` just LEFT the resident union: offer it to the prefix index.
+        Drop-only — a stable pin never reaches here. No blob is copied or moved
+        yet: the index buffers out-of-order drops behind the contiguous frontier
         and skips a page with no bound, so an entry never names a page it cannot
-        serve. Newly published content keys become the publisher's private-blob
-        fallback if its own blob is byte-LRU evicted."""
+        serve. When the frontier closes, :meth:`SparsePrefixCache.publish_dropped`
+        hands back the content keys and :meth:`_sparse_transfer_to_shared`
+        REHOMES each private blob to its content key (one copy, not two)."""
         tr = self._sparse
         if tr.prefix is None or not tr.has_bounds(r.req_id, page):
             return
-        clone = self._sparse_clone_cold(self._kv, (r.req_id, page))
-        if clone is None:
-            return
         keys = tr.prefix.publish_dropped(
-            r.req_id, r.tokens, tr.bounds_view(r.req_id), page, clone)
-        if keys:
-            tr.shared.setdefault(r.req_id, {}).update(keys)
+            r.req_id, r.tokens, tr.bounds_view(r.req_id), page, (r.req_id, page))
+        for p, content_key in keys.items():
+            self._sparse_transfer_to_shared(r, p, content_key)
+        for content_key in tr.prefix.take_freeze_refs():
+            self._kv.cold.share_ref(content_key)
+
+    def _sparse_transfer_to_shared(self, r: _Req, page: int, content_key: int) -> None:
+        """Rehome one page's PRIVATE blob to the shared content key (transfer, not
+        clone) and attach its bounds. The publisher keeps the page addressable
+        (cold_pages -> shared key map); if the page is already spilled the
+        private blob is gone, so the shared key just starts at ref 0-byte and gets
+        promoted from the private SSD on its own next read."""
+        tr = self._sparse
+        # Host clone: the bound rides in the shared blob, which can spill through
+        # ColdSsdFile.write (numpy), so it must not be a device tensor.
+        bound = tr.bounds_view(r.req_id)[page].cpu()
+        self._kv.cold.share_hold_kv(
+            (r.req_id, page), content_key, extra={"bounds": bound})
+        tr.shared.setdefault(r.req_id, {})[page] = content_key
 
     def _sparse_finalize(self, sf, rows: list[_Req]) -> None:
         """After the forward: store Quest bounds of every now-complete page, then
