@@ -1325,6 +1325,127 @@ def test_prefix_publish_consumes_boundary_snapshots_no_second_copy():
     assert snap == {}, f"consumed boundary snapshots retained: {sorted(snap)}"
     hit = cache.lookup(tokens)
     assert hit is not None and len(hit["keys"]) == P
+
+
+def test_published_content_keys_are_bit_identical_to_page_key():
+    """The incremental rolling hash must produce the SAME integer content keys as
+    the from-zero page_key at every page — published blobs are addressed by
+    them, so a recurrence change silently corrupts the shared index."""
+    import torch as _torch
+
+    from tilerl.kv_cache import HostKvPages
+    from tilerl.sparse_engine import SparsePrefixCache, page_key
+
+    rng = np.random.default_rng(0)
+    for P in (1, 7, 13):
+        tokens = tuple(int(x) for x in rng.integers(0, 100_000, P * BLOCK_TOKENS))
+        cold = HostKvPages(budget_bytes=1 << 30)
+        cache = SparsePrefixCache(cold, states=None)
+        rid = 0
+        cache.set_request(rid, P)
+        bounds = {p: _torch.zeros(1) for p in range(P)}
+        for m in range(1, P + 1):
+            cache.note_boundary(rid, m, (_torch.zeros(2), None))
+        for p in range(P):
+            t = _torch.full((2,), float(p))
+            out = cache.publish_dropped(rid, tokens, bounds, p, {"k": t, "v": t})
+            for page, key in out.items():
+                assert key == page_key(tokens, page)
+        entry = cache.lookup(tokens)
+        assert entry is not None
+        assert entry["keys"] == [page_key(tokens, p) for p in range(P)]
+        # the entry sits on the chain keyed by the from-zero page-(m-1) hash
+        assert entry["hash"] == page_key(tokens, P - 1)
+        assert entry in cache._entries[page_key(tokens, P - 1)]
+
+
+def test_publish_hash_steps_stay_linear_not_quadratic_in_context():
+    """256k top profile frame: page_key rehashed the whole prefix per dropped page
+    (O(M^2)). With the rolling hash, extending by one page hashes only its 16
+    tokens, so over P one-at-a-time drops _page_hash is called exactly 16*P
+    times — not sum_p 16*(p+1)."""
+    import torch as _torch
+
+    from tilerl import sparse_engine as se
+    from tilerl.kv_cache import HostKvPages
+    from tilerl.sparse_engine import SparsePrefixCache
+
+    P = 128
+    cold = HostKvPages(budget_bytes=1 << 30)
+    cache = SparsePrefixCache(cold, states=None)
+    rid = 0
+    cache.set_request(rid, P)
+    bounds = {p: _torch.zeros(1) for p in range(P)}
+    for m in range(1, P + 1):
+        cache.note_boundary(rid, m, (_torch.zeros(2), None))
+
+    calls = 0
+    orig = se._page_hash
+
+    def counted(prev, token):
+        nonlocal calls
+        calls += 1
+        return orig(prev, token)
+
+    se._page_hash = counted
+    try:
+        # the engine passes the prefix as it exists at the moment each page drops,
+        # growing by exactly one page between calls
+        for p in range(P):
+            t = _torch.full((2,), float(p))
+            cache.publish_dropped(rid, tuple(range((p + 1) * BLOCK_TOKENS)),
+                                 bounds, p, {"k": t, "v": t})
+    finally:
+        se._page_hash = orig
+    assert calls == 16 * P, calls
+
+
+def test_drop_reads_the_host_bounds_mask_without_touching_the_device_tensor():
+    """has_bounds per dropped page did bool(device_mask[page]), a device sync per
+    page. It must read the host mirror: after bounds are written, swapping the
+    device twin for an object that explodes on indexing must leave the per-drop
+    has_bounds path untouched."""
+    from tilerl.sparse_engine import SparseTracker
+
+    tr = SparseTracker(tiny(), k_pages=4, scorer="bounds",
+                       device=torch.device("cpu"))
+    tr.attach(0)
+    b = torch.zeros((tr.n_full, tr.hkv, 2, tr.dim), dtype=torch.float16)
+    tr.set_bounds(0, 0, b)
+    tr.set_bounds(0, 2, b)
+
+    class _Explodes:
+        def __getitem__(self, idx):
+            raise AssertionError("has_bounds touched the device bounds mask")
+
+    tr.bounds_valid[0] = _Explodes()
+    assert tr.has_bounds(0, 0)
+    assert not tr.has_bounds(0, 1)
+    assert tr.has_bounds(0, 2)
+    assert not tr.has_bounds(0, 999)
+    tr.drop(0)
+
+
+def test_sparse_build_disables_fused_attn_prep_guard():
+    """sm90 fused attn_prep corrupts K/V for >1 ragged sparse row in one packed
+    prefill tick (B=8 dense-vs-sparse g0 max_abs 8-11, mean ~1.1, argmax flips);
+    the unfused write_tokens path is bit-exact. build_engine must force the
+    unfused fallback for sparse (prefill and decode) until the fused twin is
+    fixed. Dense keeps it."""
+    dense = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore())
+    assert getattr(dense._backend, "no_fused_attn_prep", False) is False
+    dense.shutdown()
+
+    sparse = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+        sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
+    assert sparse._backend.no_fused_attn_prep is True
+    sparse.shutdown()
 def test_sparse_draft_follower_adopts_a_published_prefix_and_matches_cold():
     """Warm path: under sparse+spec a follower ADOPTS a published prefix — the
     published page blobs carry the draft head's per-page KV, the follower copies
