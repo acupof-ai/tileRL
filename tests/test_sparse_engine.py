@@ -163,8 +163,6 @@ def test_quest_scores_chunked_over_pages_matches_all_at_once():
     [Tq,Cp,Hkv,D] is 4.2 GiB at Cp=2048 and OOMs a V100). max-over-query and
     sum-over-head/dim commute with the page split, so the chunked score must be
     bit-identical; Cp is a non-multiple of the chunk to cover the tail."""
-    import torch
-
     from tilerl.sparse_engine import quest_scores
 
     tq, hq, hkv, d, cp = 37, 8, 4, 256, 201
@@ -524,6 +522,384 @@ def test_cold_tier_spills_past_the_host_budget_and_the_ledger_splits_tiers(tmp_p
     _drain(e, rid, 6)  # finish releases the request's cold pages (both tiers)
     e.shutdown()
 
+def _draft(cfg, trunk):
+    """A one-layer DraftHead over the tiny trunk (same builder as test_decode_graph)."""
+    from dataclasses import replace
+
+    from tilerl.model import build_random
+    from tilerl.spec import DraftHead
+
+    dcfg = replace(cfg, num_layers=1, full_attn_layers=(0,), fp4=False)
+    params = {k: v for k, v in build_random(dcfg, seed=3).params.items()
+              if k.startswith("layers.")}
+    gen = torch.Generator().manual_seed(3)
+    h = cfg.hidden_size
+    params["fc"] = (torch.randn(h, 2 * h, generator=gen) * 0.02).to(torch.bfloat16)
+    params["norm"] = torch.ones(h, dtype=torch.bfloat16)
+    params["pre_fc_norm_hidden"] = torch.ones(h, dtype=torch.bfloat16)
+    return DraftHead(trunk, params, num_layers=1)
+
+
+def _sparse_engine(sparse_k, draft=False, cfg=None):
+    from tilerl_kernels.backend import get_backend
+
+    cfg = cfg or tiny()
+    model = build_random(cfg, seed=11)
+    # Both arms of an exact-token gate must use one backend: a real draft goes
+    # through _serve_draft -> has_kernel, which RefBackend does not declare.
+    # The CPU cell backend is the spec harness test_e2e uses.
+    backend = get_backend()
+    kw = dict(num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+              max_num_batched_tokens=512, sparse_k=sparse_k, scorer="bounds",
+              kv_cold_bytes=1 << 30)
+    if draft:
+        kw["draft"] = _draft(cfg, model)
+        kw["spec_depth"] = 1
+    return build_engine(cfg=cfg, model=model, backend=backend, **kw)
+
+
+def test_sparse_with_draft_matches_sparse_without_draft_greedy():
+    """Exact-acceptance: greedy speculative decode emits the SAME tokens as greedy
+    non-spec decode under the same sparse selection (sparse_k=2). The W verify
+    queries are scored jointly (max across queries), so every draft position
+    attends the same selected pages plus its own causal block."""
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+    plain = _sparse_engine(2, draft=False)
+    t_plain = _drain(plain, plain.submit(prompt, params), 8)
+    plain.shutdown()
+    spec = _sparse_engine(2, draft=True)
+    t_spec = _drain(spec, spec.submit(prompt, params), 8)
+    spec.shutdown()
+    assert t_spec == t_plain, f"spec {t_spec} != plain {t_plain}"
+
+
+def test_sparse_draft_admission_reject_does_not_leak_a_state_slot():
+    """Sparse+spec reject path: when the dense draft pool is full (a running row
+    owns its blocks), _admit frees the just-allocated state slot and returns
+    False, and the bookkeeping counter _slots_used must come back with it.
+    Otherwise every rejected tick permanently consumes a slot and the engine
+    fills up on a row it never admitted.
+
+    Two rows are required: the submit capacity guard is STATIC (num_blocks), so
+    one row sized to the pool passes submit; it is the admit-time free-blocks
+    guard (dynamic) that rejects a second row once the first owns the blocks."""
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    from tilerl_kernels.backend import get_backend
+
+    e = build_engine(
+        cfg=cfg, model=model, backend=get_backend(),
+        num_blocks=64, num_slots=4, max_batch=2, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+        kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+    # The 5-page prompt needs 6 dense draft blocks (plus one verify position);
+    # size the shared draft pool so one row fits but two cannot.
+    from tilerl.kv_cache import PagedKvPool
+
+    d = e._draft
+    d.kv = PagedKvPool(6, cfg.num_kv_heads, cfg.head_dim,
+                       num_layers=d.cfg.num_layers,
+                       layer_map=tuple(range(d.cfg.num_layers)),
+                       device=d.backend.device, dtype=d.kv.dtype)
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)  # 6 pages
+    params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=0)
+    e.submit(prompt, params)
+    try:
+        for _ in range(6):                       # admit r1, grow its draft blocks
+            e.step()
+            if e._running and e._running[0].draft_blocks:
+                break
+        assert e._draft.kv.free_blocks < 6, "fixture: row 1 did not fill the draft pool"
+        e.submit(prompt, params)                 # static guard passes, admit rejects
+        slots_before = e.stats()["slots_used"]
+        for _ in range(6):
+            e.step()                             # r2 retries admit every tick
+        st = e.stats()
+        assert st["slots_used"] == slots_before == 1, (
+            f"rejected admits leaked slots: {st['slots_used']} vs {slots_before}")
+    finally:
+        e.shutdown()
+
+
+def test_sparse_draft_pool_is_reserved_at_admit_across_rows():
+    """The dense draft pool is a SHARED device resource, but sparse admit used to
+    check it only against the row's own PROMPT pages and grew draft blocks lazily
+    in the forward loop. Two rows each statically within capacity, admitted in one
+    _build_plan, both passed and the second row's alloc_block raised
+    PagedKvPool exhausted mid-forward. The full draft span (prompt + max_new +
+    verify width-1, submit's static bound) is RESERVED at admit so cross-row
+    accounting lives in the pool's free list: row 2 waits until row 1 releases,
+    and no forward ever exhausts."""
+    from tilerl_kernels.backend import get_backend
+
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    e = build_engine(
+        cfg=cfg, model=model, backend=get_backend(),
+        num_blocks=64, num_slots=4, max_batch=2, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+        kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+    # One full draft span: 48 prompt + 2 new + 1 verify position = 51 -> 4 blocks.
+    from tilerl.kv_cache import PagedKvPool
+
+    d = e._draft
+    d.kv = PagedKvPool(4, cfg.num_kv_heads, cfg.head_dim,
+                       num_layers=d.cfg.num_layers,
+                       layer_map=tuple(range(d.cfg.num_layers)),
+                       device=d.backend.device, dtype=d.kv.dtype)
+    prompt = np.arange(7, 7 + 3 * BLOCK_TOKENS, dtype=np.int64)  # exactly 3 pages
+    params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=0)
+    e.submit(prompt, params)
+    r2 = e.submit(prompt, params)
+    t2 = None
+    try:
+        for _ in range(256):
+            e.step()   # raised "PagedKvPool exhausted" inside the forward pre-fix
+            running = [x for x in e._running]
+            # two sparse draft rows must never be admitted against a one-row pool
+            assert len(running) <= 1, (
+                f"{len(running)} draft rows share a one-row draft pool")
+            t2 = e.poll().get(r2, t2)
+            if t2 is not None and len(t2) >= 2:
+                break
+        assert t2 is not None and len(t2) == 2, (
+            "row 2 must admit and finish after row 1 releases the shared pool")
+    finally:
+        e.shutdown()
+
+
+def test_sparse_verify_tick_populates_and_reads_the_plus_one_own_page_across_a_boundary():
+    """The +1 own-page column exists only for a verify tick (tq>1); a depth-1 run
+    on a short prompt never has a draft chain that STRADDLES a 16-token boundary,
+    so reserving the next own page was unexercised. A block-aligned prefill plus
+    an always-accepted (oracle) draft puts the first verify chain at committed
+    position L-1 (offset 15) and a draft on page L/16+1: the own span names the
+    +1 page, the write populates it, attention reads it, and committed tokens
+    equal a dense engine. An oracle head is essential — a random draft's crossing
+    proposals are rejected at position 0 and never change output."""
+    from dataclasses import replace as _replace
+
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl.spec import DraftHead
+
+    class _OracleDraft(DraftHead):
+        def __init__(self, cfg, expected):
+            self.cfg = _replace(cfg, num_layers=1, full_attn_layers=(0,))
+            self.params, self.expected = {}, expected
+            self.width = 2
+            self.has_confidence = False
+            self.trunk = None
+
+        def forward(self, hidden, ids, positions, kv, backend, hidden_out=None,
+                    last_only=False):
+            pos = np.atleast_2d(np.asarray(positions))
+            logits = torch.zeros(*pos.shape, self.cfg.vocab_size, device=backend.device)
+            for i in range(pos.shape[0]):
+                for j in range(pos.shape[1]):
+                    logits[i, j, self.expected.get(int(pos[i, j]) + 1, 0)] = 10.0
+            if hidden_out is not None:
+                hidden_out.append(torch.as_tensor(hidden))
+            return logits
+
+        def confidence(self, hidden, probs, backend):
+            return probs
+
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    backend = get_backend()
+    common = dict(num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+                  max_num_batched_tokens=512)
+    # 4 full pages + 15 tokens: after prefill the first verify's committed
+    # position lands on offset 15, so its tq=2 chain writes 79 (page 4) and 80
+    # (page 5) — the +1 column is page 5, beyond the page the committed token is on.
+    prompt = np.arange(7, 7 + 4 * BLOCK_TOKENS + 15, dtype=np.int64)
+    n_new = 8
+    params = SamplingParams(temperature=0.0, max_new_tokens=n_new, seed=0)
+
+    dense = build_engine(cfg=cfg, model=model, backend=backend, sparse_k=0, **common)
+    base = _drain(dense, dense.submit(prompt, params), n_new)
+    dense.shutdown()
+    expected = {i: t for i, t in enumerate(list(prompt) + base)}
+
+    crossed = {"n": 0}
+    e = build_engine(
+        cfg=cfg, model=model, backend=backend, sparse_k=2, scorer="bounds",
+        kv_cold_bytes=1 << 30, draft=_OracleDraft(cfg, expected), spec_depth=1, **common)
+    import tilerl.sparse_engine as se
+
+    orig = se.SparseForward.__init__
+
+    def watch(self, *a, **kw):
+        orig(self, *a, **kw)
+        for r in self.rows:
+            if r["decoding"] and r["tq"] > 1:
+                # chain queries are [q_hi-tq .. q_hi): a boundary straddle has
+                # first and last query on different pages, so own must name +1.
+                first_page = (r["q_hi"] - r["tq"]) // BLOCK_TOKENS
+                last_page = (r["q_hi"] - 1) // BLOCK_TOKENS
+                if last_page > first_page and last_page in r["own"]:
+                    crossed["n"] += 1
+
+    se.SparseForward.__init__ = watch
+    try:
+        got = _drain(e, e.submit(prompt, params), n_new)
+    finally:
+        se.SparseForward.__init__ = orig
+        e.shutdown()
+    assert crossed["n"] >= 1, "no verify chain straddled a page boundary into +1 own"
+    assert got == base, f"sparse+oracle crossing {got} != dense greedy {base}"
+
+
+def test_sparse_draft_follower_returns_miss_on_a_published_prefix():
+    """Under sparse+spec a follower must NOT adopt a published trunk prefix: the
+    draft head conditions every position on trunk hidden and builds its own dense
+    KV only while forwarding, so an adopted (non-forwarded) prefix leaves the
+    draft attending over an unbuilt pool. The correct behaviour is return-miss —
+    prefill from zero, which builds trunk and draft KV correctly. A no-draft
+    follower still adopts the same prefix (the save is preserved)."""
+    from tilerl.sparse_engine import page_key
+
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    n_tokens = 5 * BLOCK_TOKENS
+    prefix = [int(t) for t in np.arange(7, 7 + n_tokens)]
+
+    def build(draft):
+        from tilerl_kernels.backend import get_backend
+
+        return build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=64, num_slots=4, max_batch=2, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30, **({"draft": draft, "spec_depth": 1} if draft else {}))
+
+    def seed_published_prefix(e):
+        # Minimal block-aligned entry: lookup matches on tokens; the draft path
+        # must return-miss before it touches keys/bounds/state.
+        cache = e._sparse.prefix
+        ptokens = tuple(prefix[: n_tokens - (n_tokens % BLOCK_TOKENS)])
+        # Reference the live state tensor (no extra allocation to perturb the
+        # measured-peak memory ledger); the draft path returns-miss before reading it.
+        entry = {"eid": cache._next_id, "tokens": ptokens, "keys": [],
+                 "bounds": {}, "state": (e._states.states[0], None)}
+        cache._next_id += 1
+        cache._entries.setdefault(page_key(ptokens, len(ptokens) // BLOCK_TOKENS - 1),
+                                  []).append(entry)
+        cache._by_id[entry["eid"]] = entry
+        return len(ptokens)
+
+    params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=0)
+
+    # WITH a draft: a published prefix exists but the follower returns-miss and
+    # runs to completion (prefilling from zero builds the draft KV correctly;
+    # sparse+/-draft token equality is covered by
+    # test_sparse_with_draft_matches_sparse_without_draft_greedy).
+    spec = build(_draft(cfg, model))
+    seed_published_prefix(spec)
+    rid = spec.submit(np.asarray(prefix), params)
+    got = None
+    try:
+        for _ in range(60):
+            spec.step()
+            running = [r for r in spec._running if r.req_id == rid]
+            if running:
+                # sparse_matched==0 is the return-miss signal: the published entry
+                # was not adopted, so this follower prefills from zero.
+                assert running[0].sparse_matched == 0, "draft follower adopted a trunk prefix"
+            d = spec.poll()
+            if rid in d and len(d[rid]) >= 4:
+                got = d[rid][:4]
+                break
+        assert spec._prefix_hits == 0
+        assert got is not None, "return-miss draft follower did not finish"
+    finally:
+        spec.shutdown()
+
+    # The return-miss follower must be bit-equal to a cold follower that never saw
+    # the published prefix — same trunk and draft KV, same proposals.
+    cold = build(_draft(cfg, model))
+    cold_got = _drain(cold, cold.submit(np.asarray(prefix), params), 4)
+    cold.shutdown()
+    assert got == cold_got, f"return-miss {got} != cold {cold_got}"
+
+    # WITHOUT a draft the same published prefix IS adopted (save preserved).
+    plain = build(None)
+    matched_len = seed_published_prefix(plain)
+    rid2 = plain.submit(np.asarray(prefix), params)
+    try:
+        for _ in range(20):
+            plain.step()
+            running = [r for r in plain._running if r.req_id == rid2]
+            if running:
+                assert running[0].sparse_matched == matched_len, \
+                    "non-spec follower should adopt the prefix"
+                break
+        assert plain._prefix_hits == 1
+    finally:
+        plain.shutdown()
+
+
+def test_full_k_sparse_with_draft_matches_dense_with_draft():
+    """k>=pages selects everything: sparse + draft equals dense + draft."""
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+    dense = _sparse_engine(6, draft=True)  # k=6 covers every earlier page
+    t_dense = _drain(dense, dense.submit(prompt, params), 8)
+    dense.shutdown()
+    # a genuinely dense engine (sparse off) with a draft, same CPU-cell backend
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    from tilerl_kernels.backend import get_backend
+
+    full = build_engine(cfg=cfg, model=model, backend=get_backend(), num_blocks=64,
+                        num_slots=4, max_batch=1, max_total_tokens=4096,
+                        draft=_draft(cfg, model), spec_depth=1)
+    t_full = _drain(full, full.submit(prompt, params), 8)
+    full.shutdown()
+    assert t_dense == t_full, f"sparse+draft {t_dense} != dense+draft {t_full}"
+
+
+def test_verify_tick_packed_table_shape_is_fixed():
+    """Graph-capture structural gate: a CUDA graph bakes the block-table shape in.
+    The packed [selected;own] width must depend ONLY on the tick query width, not
+    on context length: every decode/verify row is k_pages + the 8-page window,
+    plus at most 1 if the W-1 draft chain crosses a page boundary (W-1 <= 15).
+    Run the same engine over prompts of different lengths and assert the observed
+    decode widths are one context-independent constant per query width. Capture
+    itself stays eager-only in the first cut."""
+    from tilerl import sparse_engine as se
+    from tilerl.sparse_index import WINDOW_PAGES
+
+    K = 2
+    engine = _sparse_engine(K, draft=True)  # verify ticks carry up to W+1=2 q
+    orig = se.SparseForward.attention_args
+    seen: dict[int, set[int]] = {}
+
+    def wrap(self, plane, q, h=None):
+        table, sl = orig(self, plane, q, h)
+        for r in self.rows:
+            if int(r["force_window"]) == 0:  # decode/verify tick (no forced window), never prefill
+                seen.setdefault(int(r["tq"]), set()).add(int(table.shape[1]))
+        return table, sl
+
+    # two contexts of different page counts (10 and 16); widths must not diverge
+    for n_pages in (10, 16):
+        prompt = np.arange(3, 3 + n_pages * BLOCK_TOKENS, dtype=np.int64)
+        rid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=6, seed=0))
+        se.SparseForward.attention_args = wrap
+        try:
+            _drain(engine, rid, 6)
+        finally:
+            se.SparseForward.attention_args = orig
+    engine.shutdown()
+
+    assert seen, "no decode/verify tick observed"
+    bound = K + WINDOW_PAGES
+    for tq, widths in seen.items():
+        assert widths <= {bound, bound + 1}, (tq, widths)
+
 
 if __name__ == "__main__":
     import sys
@@ -559,7 +935,8 @@ def test_select_tensor_op_count_is_constant_in_candidate_count():
             tr.set_bounds(0, p, b)
         cand = list(range(n_cand))
         row = dict(req_id=0, own=[n_cand], own_len=BLOCK_TOKENS, cand=cand,
-                   force_window=0, resolve=lambda p: p, reserved=set())
+                   force_window=0, resolve=lambda p: p, reserved=set(),
+                   decoding=True, tq=1)
         sf = SparseForward(tr, [row], torch.device("cpu"))
         q = torch.randn(1, cfg.num_attention_heads, cfg.head_dim)
         with _Count() as c:
@@ -637,8 +1014,6 @@ def _resident_forward(B, device_select, n_pages=20, k=4):
     """A SparseForward over B rows where every page is RESIDENT (the cross-tick
     pin steady state a captured decode tick requires): k selection from
     n_pages-2 candidate pages plus a trailing 2-page own window."""
-    import torch
-
     from tilerl.sparse_engine import SparseForward, SparseTracker
 
     cfg = tiny()
@@ -698,8 +1073,6 @@ def test_device_select_packed_table_matches_eager_at_b1_and_b8():
     """Token-equality to eager sparse at the SparseForward level: the device
     path's leading compact physical columns and seq_len must equal the eager
     path's packed table at B=1 and B=8 (same selection, same own pages)."""
-    import torch
-
     for B in (1, 8):
         cfg, eager = _resident_forward(B, False, k=4)
         _, device = _resident_forward(B, True, k=4)
@@ -741,8 +1114,6 @@ def test_quest_scores_batched_matches_single_row_bit_for_bit():
     """The captured tick scores all B rows with quest_scores_batched; it must be
     bit-identical to applying the single-row quest_scores per row (the page chunk
     split commutes over rows exactly as it does over pages)."""
-    import torch
-
     from tilerl.sparse_engine import quest_scores, quest_scores_batched
 
     B, tq, hq, hkv, d, cp = 4, 3, 8, 4, 16, 33
@@ -760,8 +1131,6 @@ def _forward_one_cold(B, device_select, cold_pages):
     """Like _resident_forward but ``cold_pages`` are NON-resident (l2p=-1):
     bounds exist for them (a demoted page keeps its bounds) but the K is cold or
     SSD-resident. Returns (SparseForward, cfg, cold_pages)."""
-    import torch
-
     from tilerl.sparse_engine import SparseForward, SparseTracker
 
     cfg = tiny()
@@ -802,8 +1171,6 @@ def test_device_select_excludes_a_cold_candidate_and_eager_promotes_it():
       and leave the cold page out, never map it to a phantom block 0;
     - the eager refresh path scores ALL candidates and resolves (promotes) it.
     """
-    import torch
-
     cold = {0}  # candidate page 0 has the highest score but is non-resident
     dev, cfg = _forward_one_cold(1, True, cold)
     q = torch.randn(1, 1, cfg.num_attention_heads, cfg.head_dim)
