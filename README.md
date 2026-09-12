@@ -79,32 +79,33 @@ context lines are derived from the same ledger, not measured on a card yet:
 **256K B=1 fits in bf16; 8×128K fits only with fp8 KV; 8×256K misses one card**
 ([entry](docs/experience/wins/2026-09-11-p6-long-context-budget-on-one-h20.md)).
 
-**Sparse KV is the long-context lever, and it ships.**
-[`tilerl serve`](docs/design-sparse-kv.md) defaults to sparse Quest selection —
-top-128 16-token pages plus an 8-page causal window, one softmax over both —
-with speculative decode running under it; `--sparse-k 0` restores the dense
-engine. Pages not selected this tick demote through the pinned-host path and
-promote back through one batched H2D/D2H pair per tick, so long contexts hold
-in a small device hot pool. No attention kernel changed: the sparse tick is a
-packed block table.
+**Sparse KV is the long-context lever; it is opt-in, under investigation, not
+the default.** `--sparse-k 128` enables sparse Quest selection — top-128
+16-token pages plus an 8-page causal window, one softmax over both — with pages
+not selected this tick demoting through the pinned-host path and promoting back
+through one batched H2D/D2H pair per tick, so long contexts hold in a small
+device hot pool. No attention kernel changed: the sparse tick is a packed block
+table. `tilerl serve` defaults to dense (`DEFAULT_SPARSE_K = 0`).
 
-The ship gate is output fidelity vs dense on the V100 production path, not
-page-mass recall. After the #546 own-table `page_base` fix (pre-fix sparse
-output numbers are void — own K/V scattered into padding frames on sm70 and
-sm90), k=all is token-identical, and at k=128 prefill KL is 0.0023 / top-1
-0.981 at 8k and 0.019 / 0.949 at 32k. On the 32k continuation the mean
-per-token NLL gap to dense is +0.013 nats/token at k=128 and +0.018 at k=256
-(top-5 agreement 1.0) — k=128 is no worse than k=256 on generated tokens. That
-verdict is interim: n=3 windows of one held stream (per-window gaps −0.068 to
-+0.096), with windows to n=8 running on the V100. On it k=128 is the default
-and the cross-group union hot pool (needed only past ~128) stays parked
+Sparse shipped briefly as the default (#530) and was reverted the same day by
+[#558](https://github.com/acupof-ai/tileRL/pull/558) after end-to-end MMLU on
+the 27B H20 exposed a generation defect the short-context V100 continuity probe
+did not: on the same 400 thinking questions, greedy spec-off sparse k=128
+scored **0.3475 accuracy vs dense 0.9150**; the spec-on run was worse (paired
+n=1282 acc 0.202 vs dense 0.859, McNemar delta −0.624 ±0.045), with sparse
+generations ballooning to ~600–865 tokens and often emitting no answer letter.
+At MMLU lengths k=128 selects the full page set, so this is not expected
+near-tie divergence from a smaller attention set — it is a defect on the
+sm90 B=8 sparse generation path under localization. The earlier V100 rows that
+motivated the default still hold for what they measured: after the #546
+own-table `page_base` fix, k=all is token-identical on sm70, and 8k/32k
+prefill KL/top-1 (0.0023/0.981, 0.019/0.949) plus a 64-token teacher-forced
+NLL gap (~+0.013 nats/token, n=3) are short, forced-teacher, B=1 sm70 numbers;
+they do not predict long free-running B=8 sm90 generation
 ([entry](docs/experience/wins/2026-09-12-dense-vs-sparse-long-ctx.md),
-[#531 output table](https://github.com/acupof-ai/tileRL/pull/531)). Open
-defect: under sparse + spec a follower cannot adopt a published trunk prefix
-(the draft builds its dense KV only while forwarding), so the prefix cache
-publishes but does not serve in the production default; the follower
-return-misses and prefills from zero (open defect,
-[#530](https://github.com/acupof-ai/tileRL/pull/530)).
+[#531](https://github.com/acupof-ai/tileRL/pull/531),
+[#558](https://github.com/acupof-ai/tileRL/pull/558)). Do not re-enable sparse
+by default until an sm90 B=8 long-generation continuity gate passes.
 
 **The self-judge retry recipe (P1) is rejected**: across two matched seeds the
 held-out GSM8K gain has opposite signs (458 → 448 and 456 → 482), so it does not
