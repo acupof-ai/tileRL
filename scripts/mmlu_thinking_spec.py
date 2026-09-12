@@ -111,11 +111,15 @@ def run_arm(source: str, prompts: list[str], k: int, draft_path: str | None,
         from tilerl.spec import load_draft
 
         draft = load_draft(model, draft_path)
-    engine = build_engine(
-        cfg, model, backend, num_blocks=0, num_slots=CONCURRENCY + 2,
-        max_batch=CONCURRENCY, max_total_tokens=max_ctx,
-        max_num_batched_tokens=512, sparse_k=k, scorer="bounds",
-        draft=draft, spec_depth=1)
+    # Sparse drops pages to a host cold tier, so a sparse build needs a cold
+    # budget (guarded in build_engine). 16 GiB; dense passes 0.
+    engine_kw = dict(num_blocks=0, num_slots=CONCURRENCY + 2,
+                     max_batch=CONCURRENCY, max_total_tokens=max_ctx,
+                     max_num_batched_tokens=512, sparse_k=k, scorer="bounds",
+                     draft=draft, spec_depth=1)
+    if k:
+        engine_kw["kv_cold_bytes"] = 1 << 34
+    engine = build_engine(cfg, model, backend, **engine_kw)
     sp = SamplingParams(
         temperature=0.0, seed=0, max_new_tokens=MAX_NEW,
         **({"max_think_tokens": MAX_THINK,
