@@ -544,7 +544,10 @@ class ColdSsdFile:
         slot = self._alloc_slot()
         off = self.HEADER + slot * self.stride
         for k, _shape, _dt, n in self._spec:
-            self._map[off: off + n] = blob[k].contiguous().view(torch.uint8).numpy().tobytes()
+            t = blob[k].detach()
+            if t.is_cuda:
+                t = t.cpu()  # numpy/mmap needs a host tensor; bounds may arrive on device
+            self._map[off: off + n] = t.contiguous().view(torch.uint8).numpy().tobytes()
             off += n
         self._slot_of[key] = slot
         # No per-page flush: the page cache writes this back; the serving spill
