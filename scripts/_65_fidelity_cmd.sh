@@ -43,11 +43,16 @@ SPAN=${FIDELITY_SPAN:-0}
 KS=${FIDELITY_KS:-128}
 CTX=${FIDELITY_CTX:-32768}
 
-echo "fidelity V100 start $(date -u +%FT%TZ) root=$PWD src=$TILERL_QWEN38_SOURCE gpu=$GPU ctx=$CTX ks=$KS out=$OUT"
+echo "fidelity V100 start $(date -u +%FT%TZ) root=$PWD src=$TILERL_QWEN38_SOURCE gpu=$GPU ctx=$CTX ks=$KS nll=${FIDELITY_NLL:-0} out=$OUT"
 
-# dense + each sparse arm; dense ~10 min at 32k (~3 min at 8k). 5400s hard cap.
-CUDA_VISIBLE_DEVICES=$GPU timeout 5400 "$PY" scripts/fidelity_engine.py \
-  "$CORPUS" --span "$SPAN" --ctx "$CTX" --ks "$KS" --out "$OUT"
+# FIDELITY_NLL=1 switches to the continuation-quality SLO: sparse generates 64
+# greedy tokens per span and the dense engine teacher-forces/scores them.
+NLL_FLAG=""
+[ "${FIDELITY_NLL:-0}" = "1" ] && NLL_FLAG="--nll"
+# dense + each sparse arm; dense ~10 min at 32k (~3 min at 8k). NLL uses fresh
+# engines per arm, so allow more wall time. 10800s hard cap.
+CUDA_VISIBLE_DEVICES=$GPU timeout 10800 "$PY" scripts/fidelity_engine.py \
+  "$CORPUS" --span "$SPAN" --ctx "$CTX" --ks "$KS" $NLL_FLAG --out "$OUT"
 rc=$?
 echo "fidelity V100 EXIT_$rc end $(date -u +%FT%TZ) out=$OUT"
 exit $rc

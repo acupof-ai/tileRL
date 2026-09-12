@@ -213,6 +213,148 @@ def tiny(out):
     print("TINY GATE PASS", m, flush=True)
 
 
+def generate_greedy(eng, model, prompt_ids, n):
+    """Native greedy n-token continuation of prompt_ids."""
+    rid = eng.submit(prompt_ids, SamplingParams(temperature=0.0, max_new_tokens=n, seed=0))
+    return drain_tokens(eng, rid, n)
+
+
+def drain_prefill_len(eng, rid, target_len):
+    """Step until rid has prefilled target_len tokens (or it has vanished from
+    both the running and waiting sets). A fresh submit can spend its first tick
+    WAITING (absent from _running); a 1-token continuation can finish in the same
+    tick as the last prefill chunk."""
+
+    def present():
+        return any(r.req_id == rid for r in eng._running) or any(
+            r.req_id == rid for r in getattr(eng, "_waiting", ())
+        )
+
+    for _ in range(1_000_000):
+        r = next((r for r in eng._running if r.req_id == rid), None)
+        if r is not None and r.seq_len >= target_len:
+            return
+        if not present():
+            return
+        eng.step()
+    raise TimeoutError("prefill never reached target length")
+
+
+def teacher_forced_logits(model, backend, cfg, eng, full_ids, wanted):
+    """Run full_ids as one prefill and capture full-vocab logits at absolute
+    wanted positions (no sampling). Forces the forward to return EVERY chunk
+    position (last_only=False), caches the wanted ones, and hands the engine the
+    last-row logit it expects for its own sampling so the final partial
+    continuation chunk is captured too (hidden_out only fires for full chunks)."""
+    cap: dict[int, torch.Tensor] = {}
+    orig = model.forward
+
+    def wrapped(ids, positions, kv, be, **kw):
+        want = kw.pop("last_only", None)
+        out = orig(ids, positions, kv, be, last_only=False, **kw)
+        pb = torch.as_tensor(positions)
+        if out.dim() == 3:
+            for b in range(out.shape[0]):
+                for jj in range(out.shape[1]):
+                    ap = int(pb[b, jj]) if pb.ndim == 2 else int(pb[jj])
+                    if ap in wanted and ap not in cap:
+                        cap[ap] = out[b, jj].detach().float().cpu()
+        # return the row the engine would have sampled: its last valid position
+        if want is None or want is False:
+            return out
+        if want is True:
+            return out[:, -1:]
+        idx = torch.as_tensor([n - 1 for n in want], device=out.device)
+        return out[torch.arange(out.shape[0], device=out.device), idx].unsqueeze(1)
+
+    model.forward = wrapped
+    rid = eng.submit(full_ids, SamplingParams(temperature=0.0, max_new_tokens=1, seed=0))
+    drain_prefill_len(eng, rid, len(full_ids))
+    r = next((r for r in eng._running if r.req_id == rid), None)
+    if r is not None:
+        for _ in range(8):
+            if rid in eng.poll() or not any(x.req_id == rid for x in eng._running):
+                break
+            eng.step()
+    model.forward = orig
+    return {p: cap[int(p)] for p in wanted}
+
+
+def nll_under(eng, model, backend, cfg, prompt, forced, n):
+    """Mean NLL of `forced[0:n]` and fraction in dense top-5, scored by running
+    prompt+forced through `eng`. Logit at prompt_len-1+i predicts forced[i]."""
+    t = len(prompt)
+    wanted = list(range(t - 1, t - 1 + n))
+    full = np.concatenate([np.asarray(prompt), np.asarray(forced[:n])])
+    lg = teacher_forced_logits(model, backend, cfg, eng, full, wanted)
+    nll, in5 = 0.0, 0
+    for i in range(n):
+        z = lg[t - 1 + i]
+        lp = torch.log_softmax(z, -1)
+        tok = int(forced[i])
+        nll += float(-lp[tok])
+        in5 += int(tok in set(torch.topk(z, 5).indices.tolist()))
+    return nll / n, in5 / n
+
+
+def nll_sweep(model, backend, cfg, spans, ks, n, num_blocks, out, cold_format):
+    """For each span: dense greedy D; per k sparse greedy S; teacher-force both
+    continuations through a FRESH dense engine and score them. Returns mean
+    NLL(S|dense), NLL(D|dense), and S-token-in-dense-top5.
+
+    Each generate/score is its own engine: a second submit on an engine that has
+    already finished a request does not repopulate hidden capture (the request
+    leaves prefill in the same tick), so engine reuse under-counts logits."""
+    t0 = spans[0].shape[0]
+    agg = {k: {"nll_sparse": 0.0, "nll_dense": 0.0, "sparse_in_top5": 0.0} for k in ks}
+    nll_d = 0.0
+    for si, prompt in enumerate(spans):
+        # dense greedy D
+        e = make_engine(model, backend, t0 + n + 64, 0, num_blocks, cold_format)
+        dseq = generate_greedy(e, model, prompt, n)
+        e.shutdown()
+        if backend.device.type == "cuda":
+            torch.cuda.empty_cache()
+        # score D under a fresh dense engine
+        e = make_engine(model, backend, t0 + n + 64, 0, num_blocks, cold_format)
+        nll_d, _ = nll_under(e, model, backend, cfg, prompt, dseq, n)
+        e.shutdown()
+        if backend.device.type == "cuda":
+            torch.cuda.empty_cache()
+        for k in ks:
+            sp = make_engine(model, backend, t0 + n + 64, k, num_blocks, cold_format)
+            sseq = generate_greedy(sp, model, prompt, n)
+            sp.shutdown()
+            if backend.device.type == "cuda":
+                torch.cuda.empty_cache()
+            de = make_engine(model, backend, t0 + n + 64, 0, num_blocks, cold_format)
+            nll_s, in5 = nll_under(de, model, backend, cfg, prompt, sseq, n)
+            de.shutdown()
+            if backend.device.type == "cuda":
+                torch.cuda.empty_cache()
+            agg[k]["nll_sparse"] += nll_s
+            agg[k]["nll_dense"] += nll_d
+            agg[k]["sparse_in_top5"] += in5
+            print(
+                f"span {si} k={k} nll_sparse={nll_s:.4f} nll_dense={nll_d:.4f} top5={in5:.3f}",
+                flush=True,
+            )
+    ns = len(spans)
+    result = {
+        f"sparse_k={k}": {key: round(v / ns, 5) for key, v in row.items()} for k, row in agg.items()
+    }
+    for k in ks:
+        result[f"sparse_k={k}"]["nll_gap_sparse_minus_dense"] = round(
+            result[f"sparse_k={k}"]["nll_sparse"] - result[f"sparse_k={k}"]["nll_dense"], 5
+        )
+    result["_n_spans"] = ns
+    result["_n_greedy"] = n
+    with open(out, "w") as fh:
+        json.dump(result, fh, indent=2)
+    print("RESULT_NLL", json.dumps(result), flush=True)
+    return result
+
+
 def main27b(args):
     from pathlib import Path
 
@@ -228,6 +370,24 @@ def main27b(args):
     t = len(ids)
     qpos = sample_positions(t, args.span)
     ks = [int(x) for x in args.ks.split(",")]
+    if args.nll:
+        # continuation-quality SLO: teacher-force sparse greedy tokens through dense.
+        fname = args.nll_spans or f"held_{args.ctx}_nspan.jsonl"
+        with open(Path(args.corpus) / fname) as fh:
+            rows = [json.loads(l) for l in fh.read().splitlines() if l.strip()]
+        spans = [np.asarray(r["ids"], dtype=np.int64)[: args.ctx] for r in rows]
+        nll_sweep(
+            model,
+            backend,
+            model.cfg,
+            spans,
+            ks,
+            64,
+            num_blocks=0,
+            out=args.out,
+            cold_format=args.cold_format,
+        )
+        return
     # num_blocks=0: dense fits the pool by _fit_blocks; sparse forces its own
     # n_groups*k+window+chunk pool regardless of this.
     compare(
@@ -254,6 +414,9 @@ if __name__ == "__main__":
     ap.add_argument("--ks", default="128")
     # ""=engine default (f16 cold on an f32 sm70 pool), "native"=pool dtype.
     ap.add_argument("--cold-format", default="", choices=["", "f16", "native"])
+    # continuation NLL: teacher-force sparse greedy tokens through the dense engine
+    ap.add_argument("--nll", action="store_true")
+    ap.add_argument("--nll-spans", default="")
     ap.add_argument("--out", default="/tmp/fidelity-engine.json")
     ap.add_argument("--tiny", action="store_true")
     a = ap.parse_args()
