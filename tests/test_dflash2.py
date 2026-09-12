@@ -404,7 +404,7 @@ def _engine_run(head, spec, n):
     engine = build_engine(
         tiny(), head.trunk, get_backend(), num_blocks=64, num_slots=4, max_batch=4,
         max_total_tokens=256, draft=head if spec else None,
-        decode_graph=False, prefix_store=NoPrefixStore(),
+        decode_graph=False, prefix_store=NoPrefixStore(), sparse_k=0,
     )
     rid = engine.submit(_PROMPT, SamplingParams(temperature=0.0, max_new_tokens=n, seed=0))
     out: dict = {}
@@ -512,7 +512,7 @@ def test_engine_block_equals_the_full_context_block(tmp_path):
     engine = build_engine(
         tiny(), model, backend, num_blocks=64, num_slots=4, max_batch=4,
         max_total_tokens=256, max_num_batched_tokens=4, draft=head, decode_graph=False,
-        prefix_store=NoPrefixStore(),  # 4: the prompt spans two prefill chunks
+        prefix_store=NoPrefixStore(), sparse_k=0,  # 4: the prompt spans two prefill chunks
     )
     seen: list[tuple[list[int], list[int]]] = []
     inner = engine._draft.step
@@ -556,11 +556,13 @@ def test_spec_draft_rejected_behind_a_real_prefix_store(tmp_path):
         build_engine(
             tiny(), head.trunk, get_backend(), num_blocks=64, num_slots=4, max_batch=4,
             max_total_tokens=256, draft=head, decode_graph=False, prefix_store=None,
+            sparse_k=0,  # dense: must keep the REAL PrefixStore this guard refuses
         )
 
     # Positive control: the same draft builds behind NoPrefixStore.
     engine = build_engine(
         tiny(), head.trunk, get_backend(), num_blocks=64, num_slots=4, max_batch=4,
         max_total_tokens=256, draft=head, decode_graph=False, prefix_store=NoPrefixStore(),
+        sparse_k=0,
     )
     assert engine is not None

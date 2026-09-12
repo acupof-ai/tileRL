@@ -238,8 +238,8 @@ def test_on_policy_guard_refuses_cached_engines():
     cfg, model = _build_model("tiny", seed=0, keep_master=True)
     run = lambda e: list(grpo_loop(e, model, [[1, 2, 3]], lambda p, c: 0.0, 1, RefBackend()))
 
-    # prefix cache on, graph off
-    cached = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=4)
+    # prefix cache on, graph off (dense: sparse turns both off and makes the guard vacuous)
+    cached = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=4, sparse_k=0)
     with pytest.raises(ValueError, match="on-policy"):
         run(cached)
 
@@ -251,6 +251,7 @@ def test_on_policy_guard_refuses_cached_engines():
         RefBackend(),
         num_blocks=32,
         num_slots=4,
+        sparse_k=0,  # dense: sparse forces decode_graph off
         decode_graph=True,
         prefix_store=NoPrefixStore(),
     )
@@ -281,7 +282,7 @@ def test_opd_refuses_a_cached_engine_with_no_adapters_too():
 
     cfg, model = _build_model("tiny", seed=0, keep_master=True)
     # Prefix store on: the same cached-engine condition the adapter arm is refused for.
-    cached = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=4)
+    cached = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=4, sparse_k=0)
     with pytest.raises(ValueError, match="on-policy"):
         opd_loop(cached, model, [[1, 2, 3]], 1, RefBackend(), trainable=None)
 

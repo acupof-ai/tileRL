@@ -29,7 +29,8 @@ from tilerl.testing import RefBackend
 def _engine(num_slots=4, num_blocks=8):
     cfg, model = _build_model("tiny", seed=0)
     eng = build_engine(cfg, model, RefBackend(), num_blocks=num_blocks, num_slots=num_slots,
-                       max_batch=num_slots, max_total_tokens=2048, max_num_batched_tokens=512)
+                       max_batch=num_slots, max_total_tokens=2048, max_num_batched_tokens=512,
+                       sparse_k=0)  # this file prices the DENSE ledger
     return cfg, model, eng
 
 
@@ -217,7 +218,7 @@ def test_serve_dry_run_checkpoint_is_header_only_and_needs_dry_run(tmp_path, cap
             ["serve", "--model", "tiny", "--checkpoint", str(tmp_path)]))
     cli.cmd_serve(cli._build_parser().parse_args(
         ["serve", "--model", "tiny", "--dry-run", "--checkpoint", str(tmp_path),
-         "--json", "--device-free", "1000000", "--slots", "4"]))
+         "--json", "--device-free", "1000000", "--slots", "4", "--sparse-k", "0"]))
     rows = json.loads(capsys.readouterr().out)
     by = {r["owner"]: r for r in rows}
     cfg, _, _ = _engine()
@@ -297,10 +298,10 @@ def test_serve_dry_run_needs_device_free_off_cuda_and_prints_rows(capsys):
     with pytest.raises(SystemExit, match="--device-free"):
         cli.cmd_serve(cli._build_parser().parse_args(
             ["serve", "--model", "tiny", "--dry-run", "--json",
-             "--blocks", "8", "--slots", "4", "--max-batch", "4"]))
+             "--blocks", "8", "--slots", "4", "--max-batch", "4", "--sparse-k", "0"]))
     cli.cmd_serve(cli._build_parser().parse_args(
         ["serve", "--model", "tiny", "--dry-run", "--json", "--device-free", "1000000",
-         "--blocks", "8", "--slots", "4", "--max-batch", "4"]))
+         "--blocks", "8", "--slots", "4", "--max-batch", "4", "--sparse-k", "0"]))
     rows = json.loads(capsys.readouterr().out)
     owners = {r["owner"] for r in rows}
     assert {"weights", "kv_pool", "state_slots", "kv_pool_budget",
