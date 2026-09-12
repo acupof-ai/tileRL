@@ -888,6 +888,13 @@ class Engine:
         else:
             self._prefix_misses += 1
         slot = self._states.alloc_slot()
+        # Sparse + spec: the draft stays dense, so its own pool must hold this
+        # row's whole context (grown lazily below); the hot pool cannot back it.
+        # Check before any admitted state is committed: returning False below
+        # after _slots_used was incremented leaked one slot per retry tick.
+        if sparse and self._draft is not None and self._draft.kv.free_blocks < total_blocks:
+            self._states.free_slot(slot)
+            return False
         # Sparse: blocks grow lazily per own span, never pre-allocate the whole
         # context; prefix-block reuse is likewise skipped (cold pages live in this
         # request's own host tier, not in the shared store).
@@ -925,11 +932,6 @@ class Engine:
             req.own_blocks = total_blocks if boot_loaded else total_blocks - matched // BLOCK_TOKENS
         self._blocks_used += req.own_blocks
         self._slots_used += 1
-        # Sparse + spec: the draft stays dense, so its own pool must hold this
-        # row's whole context (grown lazily below); the hot pool cannot back it.
-        if sparse and self._draft is not None and self._draft.kv.free_blocks < total_blocks:
-            self._states.free_slot(slot)
-            return False
         if sparse:
             self._sparse.attach(req.req_id)
             if self._sparse.prefix is not None:
