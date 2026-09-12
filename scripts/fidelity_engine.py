@@ -307,6 +307,7 @@ def nll_sweep(model, backend, cfg, spans, ks, n, num_blocks, out, cold_format):
     leaves prefill in the same tick), so engine reuse under-counts logits."""
     t0 = spans[0].shape[0]
     agg = {k: {"nll_sparse": 0.0, "nll_dense": 0.0, "sparse_in_top5": 0.0} for k in ks}
+    per_span_gap: dict[int, list[float]] = {k: [] for k in ks}
     nll_d = 0.0
     for si, prompt in enumerate(spans):
         # dense greedy D
@@ -335,8 +336,10 @@ def nll_sweep(model, backend, cfg, spans, ks, n, num_blocks, out, cold_format):
             agg[k]["nll_sparse"] += nll_s
             agg[k]["nll_dense"] += nll_d
             agg[k]["sparse_in_top5"] += in5
+            per_span_gap[k].append(nll_s - nll_d)
             print(
-                f"span {si} k={k} nll_sparse={nll_s:.4f} nll_dense={nll_d:.4f} top5={in5:.3f}",
+                f"span {si} k={k} nll_sparse={nll_s:.4f} nll_dense={nll_d:.4f} "
+                f"top5={in5:.3f} gap={nll_s - nll_d:.4f}",
                 flush=True,
             )
     ns = len(spans)
@@ -344,10 +347,14 @@ def nll_sweep(model, backend, cfg, spans, ks, n, num_blocks, out, cold_format):
         f"sparse_k={k}": {key: round(v / ns, 5) for key, v in row.items()} for k, row in agg.items()
     }
     for k in ks:
+        gaps = per_span_gap[k]
         result[f"sparse_k={k}"]["nll_gap_sparse_minus_dense"] = round(
             result[f"sparse_k={k}"]["nll_sparse"] - result[f"sparse_k={k}"]["nll_dense"], 5
         )
+        result[f"sparse_k={k}"]["gap_min"] = round(min(gaps), 5)
+        result[f"sparse_k={k}"]["gap_max"] = round(max(gaps), 5)
     result["_n_spans"] = ns
+    result["_span_note"] = f"{ns} prefix-aligned disjoint windows of one held stream"
     result["_n_greedy"] = n
     with open(out, "w") as fh:
         json.dump(result, fh, indent=2)
