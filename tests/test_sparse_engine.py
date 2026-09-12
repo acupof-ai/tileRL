@@ -608,7 +608,7 @@ def test_sparse_draft_admission_reject_does_not_leak_a_state_slot():
                        device=d.backend.device, dtype=d.kv.dtype)
     prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)  # 6 pages
     params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=0)
-    r1 = e.submit(prompt, params)
+    e.submit(prompt, params)
     try:
         for _ in range(6):                       # admit r1, grow its draft blocks
             e.step()
@@ -622,6 +622,53 @@ def test_sparse_draft_admission_reject_does_not_leak_a_state_slot():
         st = e.stats()
         assert st["slots_used"] == slots_before == 1, (
             f"rejected admits leaked slots: {st['slots_used']} vs {slots_before}")
+    finally:
+        e.shutdown()
+
+
+def test_sparse_draft_pool_is_reserved_at_admit_across_rows():
+    """The dense draft pool is a SHARED device resource, but sparse admit used to
+    check it only against the row's own PROMPT pages and grew draft blocks lazily
+    in the forward loop. Two rows each statically within capacity, admitted in one
+    _build_plan, both passed and the second row's alloc_block raised
+    PagedKvPool exhausted mid-forward. The full draft span (prompt + max_new +
+    verify width-1, submit's static bound) is RESERVED at admit so cross-row
+    accounting lives in the pool's free list: row 2 waits until row 1 releases,
+    and no forward ever exhausts."""
+    from tilerl_kernels.backend import get_backend
+
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    e = build_engine(
+        cfg=cfg, model=model, backend=get_backend(),
+        num_blocks=64, num_slots=4, max_batch=2, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+        kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+    # One full draft span: 48 prompt + 2 new + 1 verify position = 51 -> 4 blocks.
+    from tilerl.kv_cache import PagedKvPool
+
+    d = e._draft
+    d.kv = PagedKvPool(4, cfg.num_kv_heads, cfg.head_dim,
+                       num_layers=d.cfg.num_layers,
+                       layer_map=tuple(range(d.cfg.num_layers)),
+                       device=d.backend.device, dtype=d.kv.dtype)
+    prompt = np.arange(7, 7 + 3 * BLOCK_TOKENS, dtype=np.int64)  # exactly 3 pages
+    params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=0)
+    e.submit(prompt, params)
+    r2 = e.submit(prompt, params)
+    t2 = None
+    try:
+        for _ in range(256):
+            e.step()   # raised "PagedKvPool exhausted" inside the forward pre-fix
+            running = [x for x in e._running]
+            # two sparse draft rows must never be admitted against a one-row pool
+            assert len(running) <= 1, (
+                f"{len(running)} draft rows share a one-row draft pool")
+            t2 = e.poll().get(r2, t2)
+            if t2 is not None and len(t2) >= 2:
+                break
+        assert t2 is not None and len(t2) == 2, (
+            "row 2 must admit and finish after row 1 releases the shared pool")
     finally:
         e.shutdown()
 

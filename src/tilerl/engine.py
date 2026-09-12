@@ -889,12 +889,20 @@ class Engine:
             self._prefix_misses += 1
         slot = self._states.alloc_slot()
         # Sparse + spec: the draft stays dense, so its own pool must hold this
-        # row's whole context (grown lazily below); the hot pool cannot back it.
-        # Check before any admitted state is committed: returning False below
-        # after _slots_used was incremented leaked one slot per retry tick.
-        if sparse and self._draft is not None and self._draft.kv.free_blocks < total_blocks:
-            self._states.free_slot(slot)
-            return False
+        # row's whole context. Two checks happen before any admitted state is
+        # committed (returning False after the counters were bumped leaked one
+        # slot per retry tick). Reserve the FULL draft span (prompt + max_new +
+        # verify width-1, the same bound submit's static guard uses) at admit so
+        # the shared draft pool accounts across rows: a prompt-only guard lets two
+        # rows both pass and then alloc_block raises inside the forward.
+        if sparse and self._draft is not None:
+            draft_need = self._kv.blocks_for_tokens(
+                len(req.tokens) + req.params.max_new_tokens + self._width - 1)
+            if self._draft.kv.free_blocks < draft_need:
+                self._states.free_slot(slot)
+                return False
+            req.draft_blocks = [
+                self._draft.kv.alloc_block() for _ in range(draft_need)]
         # Sparse: blocks grow lazily per own span, never pre-allocate the whole
         # context; prefix-block reuse is likewise skipped (cold pages live in this
         # request's own host tier, not in the shared store).
@@ -910,6 +918,10 @@ class Engine:
         except Exception:
             for b in blocks:
                 self._kv.free_block(b)
+            if sparse and self._draft is not None:
+                for b in req.draft_blocks:
+                    self._draft.kv.free_block(b)
+                req.draft_blocks = []
             self._states.free_slot(slot)
             raise
         req.blocks = blocks
@@ -1808,13 +1820,14 @@ class Engine:
             # measured, the engine then drafted token 79 where full context drafts 61.
             for r in rows:
                 if self._sparse is not None:
-                    # Dense draft KV grows in the DRAFT pool's own id space; the
-                    # trunk's r.blocks was just emptied by _sparse_finalize. Cover
-                    # the committed tail plus the width-1 draft proposals step() writes.
-                    dpool = self._draft.kv
+                    # The dense draft KV span is fully RESERVED at admit (prompt +
+                    # max_new + verify width bound), so the blocks already exist.
+                    # This is a bound check, not a grow: allocating here would race
+                    # another row for the shared draft pool.
                     end = r.seq_len - 1 + self._width - 1
-                    while len(r.draft_blocks) * BLOCK_TOKENS <= end:
-                        r.draft_blocks.append(dpool.alloc_block())
+                    assert len(r.draft_blocks) * BLOCK_TOKENS > end, (
+                        f"draft needs position {end} but admit reserved "
+                        f"{len(r.draft_blocks)} blocks")
                     continue
                 while r.blocks and len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 1:
                     r.blocks.append(self._kv.alloc_block())
