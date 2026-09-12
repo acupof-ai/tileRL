@@ -236,6 +236,10 @@ class SparseTracker:
         #: [cap, n_full, Hkv, 2, D] fp16 per request + per-row-valid mask/count
         self.bounds_t: dict[int, Tensor] = {}
         self.bounds_valid: dict[int, Tensor] = {}
+        #: host mirror of bounds_valid: has_bounds is called per dropped page, and
+        #: bool(device_tensor[i]) forces a device sync every call. The mask's only
+        #: writers are set_bounds/_grow, so a bytearray kept alongside costs nothing.
+        self.bounds_valid_host: dict[int, bytearray] = {}
         self.bounds_count: dict[int, int] = {}
         #: device twin of ``resident``: logical page -> physical block, -1 if not
         #: resident. The captured decode tick gathers selected blocks with one
@@ -290,6 +294,7 @@ class SparseTracker:
             (self.n_full, self.INIT_CAP, self.hkv, 2, self.dim),
             dtype=torch.float16, device=dev)
         self.bounds_valid[req_id] = torch.zeros(self.INIT_CAP, dtype=torch.bool, device=dev)
+        self.bounds_valid_host[req_id] = bytearray(self.INIT_CAP)
         self.l2p_t[req_id] = torch.full(
             (self.INIT_CAP,), -1, dtype=torch.long, device=dev)
         self.bounds_count[req_id] = 0
@@ -301,6 +306,7 @@ class SparseTracker:
     def drop(self, req_id: int) -> None:
         self.bounds_t.pop(req_id, None)
         self.bounds_valid.pop(req_id, None)
+        self.bounds_valid_host.pop(req_id, None)
         self.l2p_t.pop(req_id, None)
         self.bounds_count.pop(req_id, None)
         if self.scorer == "index":
@@ -320,10 +326,13 @@ class SparseTracker:
         nt[:, :cap] = t
         nv = torch.zeros(new_cap, dtype=torch.bool, device=t.device)
         nv[:cap] = self.bounds_valid[rid]
+        hv = bytearray(new_cap)
+        hv[:cap] = self.bounds_valid_host[rid]
         nl = torch.full((new_cap,), -1, dtype=torch.long, device=t.device)
         nl[:cap] = self.l2p_t[rid]
         self.bounds_t[rid] = nt
         self.bounds_valid[rid] = nv
+        self.bounds_valid_host[rid] = hv
         self.l2p_t[rid] = nl
 
     def map_resident(self, rid: int, page: int, phys: int) -> None:
@@ -342,6 +351,7 @@ class SparseTracker:
             self._grow(req_id, page + 1)
         self.bounds_t[req_id][:, page] = b
         self.bounds_valid[req_id][page] = True
+        self.bounds_valid_host[req_id][page] = 1
         if page >= self.bounds_count[req_id]:
             self.bounds_count[req_id] = page + 1
         if not self.bytes_per_page:
@@ -352,8 +362,8 @@ class SparseTracker:
         return _BoundsView(self, req_id)
 
     def has_bounds(self, req_id: int, page: int) -> bool:
-        v = self.bounds_valid.get(req_id)
-        return v is not None and page < v.shape[0] and bool(v[page])
+        v = self.bounds_valid_host.get(req_id)
+        return v is not None and page < len(v) and bool(v[page])
 
     def bounds_rows(self, req_id: int, plane: int, pages: list[int]) -> Tensor:
         """One plane's bounds over ``pages`` in pages order:
@@ -740,6 +750,12 @@ class SparsePrefixCache:
         self._snap: dict[int, dict[int, tuple]] = {}
         self._pending: dict[int, dict[int, dict]] = {}
         self._grow: dict[int, dict] = {}
+        # Per-publisher prefix-hash state. page_key(tokens, p) rehashes the whole
+        # prefix from zero, so recomputing it per dropped page is O(M^2) (the
+        # 256k prefill's top profile frame). The hash is prefix-rolling: extend it
+        # 16 tokens per new page once, and cache the token tuple.
+        self._tok_tuple: dict[int, tuple] = {}
+        self._content_keys: dict[int, list[int]] = {}
         self._prompt_pages: dict[int, int] = {}
         self._frozen: dict[int, set[int]] = {}  # req -> boundaries frozen
         #: (rid, frozen-entry eid) waiting for the engine to add their share refs
@@ -775,6 +791,25 @@ class SparsePrefixCache:
         window = None if window is None else window.cpu()
         self._snap.setdefault(req_id, {})[complete] = (states.cpu(), window)
 
+    def _ensure_prefix(self, req_id: int, tokens):
+        """Cached (token tuple, per-page content keys) for a publisher. Each new
+        page EXTENDS the rolling hash over its 16 tokens once instead of rehashing
+        the whole prefix; a longer token vector (decode appends pages) extends it.
+        The keys are bit-identical to :func:`page_key` — same rolling recurrence."""
+        tup = self._tok_tuple.get(req_id)
+        new = tuple(int(t) for t in tokens)
+        if tup is None or len(new) > len(tup):
+            self._tok_tuple[req_id] = new
+            ckeys = self._content_keys.setdefault(req_id, [])
+            h = ckeys[-1] if ckeys else 0
+            start = len(ckeys) * BLOCK_TOKENS
+            for i in range(start, (len(new) // BLOCK_TOKENS) * BLOCK_TOKENS):
+                h = _page_hash(h, new[i])
+                if (i + 1) % BLOCK_TOKENS == 0:
+                    ckeys.append(h)
+            return new, ckeys
+        return tup, self._content_keys[req_id]
+
     def publish_dropped(self, req_id: int, tokens, bounds, page: int,
                         offered) -> dict[int, int]:
         """Offer one page the moment it LEFT the resident union (finalize demote).
@@ -789,7 +824,7 @@ class SparsePrefixCache:
         A duplicate prefix at m stays off the lookup chains (its blobs still
         rehome for the publisher's own fallback)."""
         self._pending.setdefault(req_id, {})[page] = offered
-        tokens = tuple(int(t) for t in tokens)
+        tokens, ckeys = self._ensure_prefix(req_id, tokens)
         pend = self._pending[req_id]
         snaps = self._snap.get(req_id, {})
         e = self._grow.get(req_id)
@@ -801,7 +836,7 @@ class SparsePrefixCache:
             m -= 1
         if m == old_len:
             return {}
-        out = {p: page_key(tokens, p) for p in range(old_len, m)}
+        out = {p: ckeys[p] for p in range(old_len, m)}
         for p in range(old_len, m):
             item = pend.pop(p)
             if isinstance(item, dict):
@@ -815,26 +850,33 @@ class SparsePrefixCache:
                                           for t in item.values()
                                           if torch.is_tensor(t)))
         ptokens = tokens[: m * BLOCK_TOKENS]
+        chain_hash = ckeys[m - 1]
         if e is None:
             e = {"eid": self._next_id, "tokens": (), "keys": [],
-                 "state": None}
+                 "state": None, "hash": 0}
             self._next_id += 1
             self._grow[req_id] = e
             self._by_id[e["eid"]] = e
-        self._detach(e)
+        # detach from the chain at the OLD length using its stored hash, BEFORE
+        # overwriting it; a first extension has no chain yet (tokens empty).
+        if e["tokens"]:
+            old_chain = self._entries.get(e["hash"])
+            if old_chain is not None and e in old_chain:
+                old_chain.remove(e)
         e["tokens"] = ptokens
         e["keys"].extend(out[p] for p in range(old_len, m))
+        e["hash"] = chain_hash
         e["state"] = snaps[m]
         snaps.pop(m, None)  # consumed: one snapshot, not a retained second copy
         dup = any(
             x is not e and x["tokens"] == ptokens
-            for x in self._entries.get(page_key(ptokens, m - 1), ()))
+            for x in self._entries.get(chain_hash, ()))
         if not dup:
-            self._entries.setdefault(page_key(ptokens, m - 1), []).append(e)
+            self._entries.setdefault(chain_hash, []).append(e)
         at_first = old_len == 0
         at_prompt_end = m == self._prompt_pages.get(req_id)
         if at_first or at_prompt_end:
-            self._freeze(req_id, m, e)
+            self._freeze(req_id, m, e, chain_hash)
         self.published += 1
         while len(self._by_id) > self.capacity and self._evict_one():
             pass
@@ -860,7 +902,7 @@ class SparsePrefixCache:
         return self._cold.share_take_field(content_key, "bounds")
 
 
-    def _freeze(self, req_id: int, m: int, e: dict) -> None:
+    def _freeze(self, req_id: int, m: int, e: dict, chain_hash: int) -> None:
         """Retain an immutable copy of the grow entry at length m on the lookup
         chains, with its own share refs so it ages independently of the growing
         entry. The first closure and the prompt end may be the same boundary."""
@@ -868,12 +910,13 @@ class SparsePrefixCache:
         if m in done:
             return
         snap = {"eid": self._next_id, "tokens": e["tokens"],
-                "keys": list(e["keys"]), "state": e["state"]}
+                "keys": list(e["keys"]), "state": e["state"],
+                "hash": chain_hash}
         self._next_id += 1
         # Refs are NOT bumped here: the engine transfers the blobs to these keys
         # after publish_dropped returns, then calls add_freeze_refs.
         self._freeze_pending.append((req_id, snap["eid"]))
-        self._entries.setdefault(page_key(snap["tokens"], m - 1), []).append(snap)
+        self._entries.setdefault(chain_hash, []).append(snap)
         self._by_id[snap["eid"]] = snap
         done.add(m)
 
@@ -888,11 +931,10 @@ class SparsePrefixCache:
                 keys.extend(entry["keys"])
         return keys
 
-    def _detach(self, entry: dict) -> None:
-        if entry["tokens"]:
-            chain = self._entries.get(self._entry_hash(entry["tokens"]))
-            if chain is not None and entry in chain:
-                chain.remove(entry)
+    @staticmethod
+    def _chain_hash(entry: dict) -> int:
+        return entry.get("hash",
+                         page_key(entry["tokens"], len(entry["tokens"]) // BLOCK_TOKENS - 1))
 
     def _evict_one(self) -> bool:
         """Evict the oldest entry not still growing with a live publisher. False
@@ -912,15 +954,11 @@ class SparsePrefixCache:
         """Remove one entry and release every shared page blob it references. A
         page shared with a surviving entry keeps its blob (share refcount)."""
         self._by_id.pop(entry["eid"], None)
-        chain = self._entries.get(self._entry_hash(entry["tokens"]))
+        chain = self._entries.get(self._chain_hash(entry))
         if chain is not None:
             chain.remove(entry)
         for key in entry["keys"]:
             self._cold.share_release(key)
-
-    @staticmethod
-    def _entry_hash(tokens) -> int:
-        return page_key(tokens, len(tokens) // BLOCK_TOKENS - 1)
 
     def lookup(self, tokens):
         """Longest block-aligned published prefix of ``tokens`` -> entry dict or None."""
@@ -945,6 +983,8 @@ class SparsePrefixCache:
         self._snap.pop(req_id, None)
         self._pending.pop(req_id, None)
         self._grow.pop(req_id, None)
+        self._tok_tuple.pop(req_id, None)
+        self._content_keys.pop(req_id, None)
         self._prompt_pages.pop(req_id, None)
         self._frozen.pop(req_id, None)
 
@@ -954,6 +994,8 @@ class SparsePrefixCache:
         self._snap.clear()
         self._pending.clear()
         self._grow.clear()
+        self._tok_tuple.clear()
+        self._content_keys.clear()
         self._prompt_pages.clear()
         self._frozen.clear()
         self.evictions = 0
