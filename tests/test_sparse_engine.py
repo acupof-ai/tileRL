@@ -1290,3 +1290,24 @@ def test_sparse_is_off_by_default_after_the_sm90_hotfix():
         sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
     assert sparse._sparse is not None and sparse._sparse.k_pages == 2
     sparse.shutdown()
+
+
+def test_sparse_build_disables_fused_attn_prep_guard():
+    """sm90 fused attn_prep corrupts K/V for >1 ragged sparse row in one packed
+    prefill tick (B=8 dense-vs-sparse g0 max_abs 8-11, mean ~1.1, argmax flips);
+    the unfused write_tokens path is bit-exact. build_engine must force the
+    unfused fallback for sparse until the fused twin is fixed. Dense keeps it."""
+    dense = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore())
+    assert getattr(dense._backend, "no_fused_attn_prep", False) is False
+    dense.shutdown()
+
+    sparse = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+        sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
+    assert sparse._backend.no_fused_attn_prep is True
+    sparse.shutdown()

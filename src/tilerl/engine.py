@@ -2594,6 +2594,14 @@ def build_engine(
         # memory; a captured decode graph cannot hold that — the sparse tick is
         # eager (the graph-captured sparse verify tick is a later card follow-up).
         decode_graph = False
+        # sm90 fused attn_prep (q/k/v prep off the fused-qkv GEMV) corrupts K/V
+        # when >1 ragged sparse row shares a packed prefill tick — measured
+        # B=8 dense-vs-sparse g0 max_abs 8-11 (mean ~1.1), argmax flips, while
+        # the unfused write_tokens path is bit-exact (max_abs 0) on the same
+        # inputs. Force the unfused fallback (model.py slices the fused qkv when
+        # backend.attn_prep returns None) until the fused twin is fixed. Cost is
+        # one extra prefill-prep launch, prefill only.
+        backend.no_fused_attn_prep = True
         sparse_tracker = SparseTracker(cfg, sparse_k, scorer, device=backend.device)
         # An explicitly-passed NoPrefixStore means "sharing off" (training/old
         # tests); otherwise the sparse prefix index attaches once the cold tier
