@@ -562,6 +562,10 @@ class Engine:
         self._slots_used = 0
         self._prefix_hits = 0
         self._prefix_misses = 0
+        #: spec followers that adopted a WARM entry (draft K/V + boundary hidden),
+        #: distinct from _prefix_hits so "0 warm adoptions" is observable, not
+        #: indistinguishable from the path never running.
+        self._prefix_warm_adoptions = 0
         #: cold-start KV boot store: contexts loaded from --kv-store, and load calls.
         self._boot_hits = 0
         # Matched tokens, not just hit count: a hit that matches 512 of 30826 is a miss wearing a
@@ -1106,6 +1110,7 @@ class Engine:
                 "slots_total": self.usable_slots,
                 "prefix_hits": self._prefix_hits,
                 "prefix_misses": self._prefix_misses,
+                "prefix_warm_adoptions": self._prefix_warm_adoptions,
                 "prefix_hit_tokens": self._prefix_hit_tokens,
                 # both operands of the fetch-vs-recompute decision, for a live server
                 "prefill_rate": round(self.prefill_rate, 1),
@@ -1556,6 +1561,7 @@ class Engine:
         r.hidden_prev = None
         r.hidden_from = matched - 1
         r.draft_pos = matched - 1
+        self._prefix_warm_adoptions += 1
 
     def _sparse_offer_drop(self, r: _Req, page: int, draft_pages: dict | None = None) -> None:
         """Page ``page`` just LEFT the resident union: offer it to the prefix index.

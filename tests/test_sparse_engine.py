@@ -1490,6 +1490,8 @@ def test_sparse_draft_follower_adopts_a_published_prefix_and_matches_cold():
     warm.step()
     req = next(x for x in warm._running if x.req_id == rid)
     assert req.sparse_matched == 24 * BLOCK_TOKENS, req.sparse_matched
+    # the warm path (not a trunk-only miss) is observable in stats
+    assert warm.stats()["prefix_warm_adoptions"] == 1
     got = _drain(warm, rid, 8)
     warm.shutdown()
     assert got == cold_got, f"warm draft follower {got} != cold spec {cold_got}"
