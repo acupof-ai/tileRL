@@ -29,7 +29,6 @@ from tilerl.config import qwen38_27b
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.kv_cache import NoPrefixStore
 from tilerl.model import load_hf
-from tilerl.tokenizer import get_tokenizer
 
 PROMPT_PAGES = 24
 PAGE = 16
@@ -72,7 +71,6 @@ def main() -> None:
     from tilerl.spec import load_draft
 
     cfg = qwen38_27b()
-    tok = get_tokenizer(args.source)
     model = load_hf(cfg, args.source)
     backend = get_backend()
     draft = load_draft(model, args.draft)
