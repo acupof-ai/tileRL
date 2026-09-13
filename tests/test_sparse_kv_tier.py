@@ -709,3 +709,57 @@ def test_two_spilled_publishers_of_one_content_key_share_one_slot(tmp_path):
     cold.share_release(777)
     assert 777 not in cold.share_keys()
     cold.close()
+
+
+def test_an_unwritable_spill_path_refuses_to_construct(tmp_path):
+    """Fail fast: an unwritable --cold-ssd-path (and its .prefix.bin sibling)
+    must be rejected when HostKvPages is built, not after the host budget binds
+    mid-decode. Red on main: the constructor never probed the path."""
+    import pytest
+
+    from tilerl.kv_cache import SpillWriteError
+
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)  # r-x, no write
+    try:
+        with pytest.raises(SpillWriteError):
+            HostKvPages(budget_bytes=1 << 20, ssd_path=str(ro / "cold.bin"))
+    finally:
+        ro.chmod(0o700)
+
+
+def test_a_shared_spill_failure_stays_in_ram_and_disables_spill(tmp_path):
+    """Shared prefix spill is a cache. If the sibling write raises, the page
+    stays in RAM, shared SSD spill turns off for the process, and the caller
+    never sees — private spill is untouched. Red on main: the OSError escaped."""
+    from tilerl.kv_cache import ColdSsdFile
+
+    per = 2 * 2 * BLOCK_TOKENS
+    cold = HostKvPages(budget_bytes=per * 2, ssd_path=str(tmp_path / "c.bin"))
+
+    def boom(*_a, **_k):
+        raise OSError(13, "Permission denied")
+
+    orig = ColdSsdFile.write
+    ColdSsdFile.write = boom  # fire on BOTH files; private failure must still raise
+    try:
+        blob = {"k": torch.zeros(1), "v": torch.zeros(1)}
+        n = 2
+        cold.share_hold(11, blob, n)
+        # Force a shared eviction: it must not raise and the page is retained.
+        ok = cold._shared_evict_ram(11)
+        assert ok is False
+        assert cold.shared_spill_disabled is True
+        assert cold.share_take(11) is not None  # still served from RAM
+
+        # a PRIVATE page past the tiny budget still fails loudly (live row needs it)
+        import pytest
+
+        from tilerl.kv_cache import SpillWriteError
+        big = {f"k{i}": torch.zeros(per) for i in range(4)}
+        with pytest.raises(SpillWriteError):
+            cold.hold(("r", 9), big, per * 3)
+    finally:
+        ColdSsdFile.write = orig
+        cold.close()

@@ -2439,3 +2439,107 @@ def test_served_sparse_default_auto_enables_device_select_and_sparse_graph():
         e.shutdown()
     finally:
         em._graph_on = orig
+
+
+def test_a_shared_spill_failure_lets_requests_finish_token_exact(tmp_path):
+    """The V100 hang: a shared-prefix spill that raises used to escape step,
+    wedging the request with a leaked slot. Shared spill is a cache, so on
+    failure it disables for the process and the page stays in RAM; both
+    requests must finish token-identically to a spill-succeeding run."""
+    import tilerl.kv_cache as kvmod
+
+    cfg = tiny()
+    per = __import__("tilerl.memory", fromlist=["per_kv_block_bytes"]).per_kv_block_bytes(
+        cfg, __import__("torch").bfloat16)
+    ssd = str(tmp_path / "spill.bin")
+
+    def _eng():
+        return build_engine(
+            cfg, build_random(cfg, seed=11), RefBackend(), num_blocks=64, num_slots=4,
+            max_batch=1, max_total_tokens=4096, max_num_batched_tokens=512,
+            sparse_k=2, scorer="bounds", kv_cold_bytes=per, cold_ssd_path=ssd)
+
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+
+    good = _eng()
+    want = _drain(good, good.submit(prompt, SamplingParams(
+        temperature=0.0, max_new_tokens=4, seed=0)), 4)
+    good.shutdown()
+
+    e = _eng()
+    orig = kvmod.ColdSsdFile.write
+    calls = {"n": 0}
+
+    def shared_only_fail(self, key, blob):
+        # the shared/prefix spill file keys are ("s", int); private keys are tuples
+        if isinstance(key, tuple) and len(key) == 2 and key[0] == "s":
+            calls["n"] += 1
+            raise OSError(13, "Permission denied")
+        return orig(self, key, blob)
+
+    kvmod.ColdSsdFile.write = shared_only_fail
+    try:
+        rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+        out = _drain(e, rid, 4)
+        # a second request still completes on the same engine
+        rid2 = e.submit(((prompt.astype(np.int64)+100) % 300) + 7, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+        out2 = _drain(e, rid2, 4)
+    finally:
+        kvmod.ColdSsdFile.write = orig
+    e.shutdown()
+    assert calls["n"] >= 1
+    assert out == want, (out, want)
+    assert len(out2) == 4
+
+
+def test_a_private_spill_failure_fails_the_request_and_frees_its_slot(tmp_path):
+    """A private cold spill OSError (a page a live row needs) must finish that
+    request with a client-visible error, free its slot/blocks, and leave a second
+    request able to run. Red on main: the error escaped step and the loop retried
+    forever with a leaked slot."""
+    import tilerl.kv_cache as kvmod
+
+    cfg = tiny()
+    per = __import__("tilerl.memory", fromlist=["per_kv_block_bytes"]).per_kv_block_bytes(
+        cfg, __import__("torch").bfloat16)
+    ssd = str(tmp_path / "spill.bin")
+    e = build_engine(
+        cfg, build_random(cfg, seed=11), RefBackend(), num_blocks=64, num_slots=4,
+        max_batch=1, max_total_tokens=4096, max_num_batched_tokens=512,
+        sparse_k=2, scorer="bounds", kv_cold_bytes=per, cold_ssd_path=ssd)
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=6, seed=0))
+
+    orig = kvmod.ColdSsdFile.write
+
+    def private_only_fail(self, key, blob):
+        is_shared = isinstance(key, tuple) and len(key) == 2 and key[0] == "s"
+        if not is_shared:
+            raise OSError(28, "No space left on device")
+        return orig(self, key, blob)
+
+    kvmod.ColdSsdFile.write = private_only_fail
+    try:
+        failed = None
+        for _ in range(200):
+            e.step()
+            failed = e._failed.get(rid)
+            if failed is not None:
+                break
+    finally:
+        kvmod.ColdSsdFile.write = orig
+    assert failed is not None and failed[0] == "cold_spill_failed", failed
+    # the client-visible failure is consumed here; until taken, poll() reports it
+    import pytest as _pytest
+
+    from tilerl.engine import RequestFailed
+    with _pytest.raises(RequestFailed):
+        e.take(rid)
+    # slot and blocks returned
+    assert rid not in e._running
+    assert all(x.req_id != rid for x in e._running)
+    # a later request still completes on the freed capacity
+    rid2 = e.submit(((prompt.astype(np.int64)+50) % 300) + 7, SamplingParams(temperature=0.0, max_new_tokens=3, seed=0))
+    out2 = _drain(e, rid2, 3)
+    e.shutdown()
+    assert len(out2) == 3

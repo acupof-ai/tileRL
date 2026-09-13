@@ -278,11 +278,28 @@ class PagedKvPool:
                 # Wait once for every in-flight non-blocking D2H; only now are the
                 # pinned blobs valid and the frames safe to reuse.
                 self._sync_cold()
-                for block, store_key, blob, n in batch:
-                    if not self.cold.hold(store_key, blob, n):
-                        raise RuntimeError(
-                            f"demotions: host tier dropped block {block}")
-                    self.free_block(block)
+                # On a hold failure the frames were already pulled from the caller's
+                # block tables (demote_page runs before this exit). Return EVERY
+                # batch frame to the pool before the error propagates, so the row
+                # the engine then finishes does not leak or double-free the blocks:
+                # _release frees only what is still in req.blocks.
+                i = 0
+                try:
+                    for block, store_key, blob, n in batch:
+                        if not self.cold.hold(store_key, blob, n):
+                            raise RuntimeError(
+                                f"demotions: host tier dropped block {block}")
+                        self.free_block(block)
+                        i += 1
+                except BaseException:
+                    # Frames [0,i) already held+freed above. Free only the rest:
+                    # their callers pulled them from req.blocks before this exit,
+                    # so _release does not see them; freeing them again here keeps
+                    # the pool balanced (no double free, no leak).
+                    for block, _k, _blob, _n in batch[i:]:
+                        if self.refcount[block] > 0:
+                            self.free_block(block)
+                    raise
             del pending[held_before:]
 
     def promote_keyed(self, key) -> int:
@@ -463,6 +480,35 @@ class PagedKvPool:
         return (tokens + BLOCK_TOKENS - 1) // BLOCK_TOKENS
 
 
+class SpillWriteError(OSError):
+    """A cold page the caller must persist could not be written to the spill
+    file (an unwritable directory, ENOSPC, an I/O error). Distinct from the
+    shared-prefix case, which is a cache the engine may simply forget."""
+
+
+def _shared_ssd_path(ssd_path: str) -> str:
+    """The shared-prefix spill file is a sibling of the private spill path."""
+    return (ssd_path[:-4] if ssd_path.endswith(".bin") else ssd_path) + ".prefix.bin"
+
+
+def assert_spill_writable(path: str) -> None:
+    """Open/creates ``path`` for writing at build time, so a serve pointed at an
+    unwritable spill location refuses to START instead of wedging the first tick
+    whose demotion exceeds the host budget. Leaves the file behind: the spill
+    constructor creates it lazily on first spill and treats an existing file as
+    normal. Names the path and errno in the error."""
+    if not path:
+        return
+    try:
+        with open(path, "ab"):
+            pass
+    except OSError as e:
+        raise SpillWriteError(
+            f"cold spill path {path!r} is not writable "
+            f"(errno {e.errno}: {e.strerror}); pass a writable --cold-ssd-path"
+        ) from e
+
+
 class ColdSsdFile:
     """One mmap'd spill file for cold pages past the host-RAM budget.
 
@@ -618,6 +664,12 @@ class HostKvPages:
 
     def __init__(self, budget_bytes: int = 4 << 30, ssd_path: str = "",
                  ssd_capacity_bytes: int = 0) -> None:
+        # Fail fast: both the private spill and its shared-prefix sibling must be
+        # writable now, because the failure used to surface only after the host
+        # budget bound mid-decode (V100 /data00 root-owned, 2026-09-14).
+        assert_spill_writable(ssd_path)
+        if ssd_path:  # "" means no spill; the derived sibling would be ".prefix.bin"
+            assert_spill_writable(_shared_ssd_path(ssd_path))
         self.budget_bytes = budget_bytes
         #: opaque cold key -> held bytes / blob (int block on #500, (req,page) tuple on sparse)
         self._held: OrderedDict[Any, int] = OrderedDict()
@@ -651,6 +703,12 @@ class HostKvPages:
         self._shared_ram = 0
         self._shared_ssd: ColdSsdFile | None = None
         self._shared_ssd_bytes = 0
+        #: Once a shared-prefix spill raises, shared SSD spill is OFF for the
+        #: process: a shared entry is a cache the engine can forget, so a write
+        #: failure must not wedge the tick (the 2026-09-14 V100 hang). Private
+        #: spill failure is different — a live row needs that page — and raises.
+        self.shared_spill_disabled = False
+        self.shared_spill_error = ""
         #: one RAM LRU across private and shared pages: ("p",key)/("s",key) -> n.
         self._ram_order: OrderedDict[tuple[str, Any], int] = OrderedDict()
 
@@ -745,16 +803,26 @@ class HostKvPages:
                 # [n, refs, blob]: evict below
                 if not self._ssd_path:
                     continue  # cannot drop a refcounted shared page
-                self._shared_evict_ram(k)
-                break
+                if self._shared_evict_ram(k):
+                    break
+                # shared spill is disabled: the page stayed in RAM, keep scanning
+                # the LRU for a private page that can spill or drop.
+                continue
             else:
                 return  # nothing evict-able remains in the LRU
 
     def _write_ssd(self, key, blob: dict, nbytes: int) -> None:
-        """Move a page already removed from host accounting onto the spill file."""
-        if self._ssd is None:
-            self._ssd = ColdSsdFile(self._ssd_path, _blob_spec(blob))
-        self._ssd.write(key, blob)
+        """Move a page already removed from host accounting onto the spill file.
+        A live row can still name a private cold page, so a write failure is a
+        SpillWriteError the engine turns into a request failure (not a wedge)."""
+        try:
+            if self._ssd is None:
+                self._ssd = ColdSsdFile(self._ssd_path, _blob_spec(blob))
+            self._ssd.write(key, blob)
+        except OSError as e:
+            raise SpillWriteError(
+                f"private cold spill write to {self._ssd_path!r} failed for key "
+                f"{key!r} (errno {e.errno}: {e.strerror})") from e
         self._ssd_bytes += nbytes
         self._ssd_page_bytes[key] = nbytes
 
@@ -874,7 +942,12 @@ class HostKvPages:
                          for t in extra.values() if torch.is_tensor(t))
             self._shared[shared_key] = [n, 1, None]
             self._ram_order.pop(("s", shared_key), None)  # starts spilled
-            self._write_shared_ssd(shared_key, blob, n)
+            if not self._write_shared_ssd(shared_key, blob, n):
+                # Sibling spill unwritable: the blob is in hand, keep it in RAM
+                # instead of a record that says "spilled" but is unreadable.
+                self._shared[shared_key] = [n, 1, blob]
+                self._shared_ram += n
+                self._ram_order[("s", shared_key)] = n
             return n
         if extra:
             blob.update(extra)
@@ -884,23 +957,40 @@ class HostKvPages:
         return n
 
 
-    def _shared_evict_ram(self, key: int) -> None:
-        """Spill one RAM-resident shared page to the prefix file, keep its record."""
+    def _shared_evict_ram(self, key: int) -> bool:
+        """Try to spill one RAM-resident shared page to the prefix file.
+
+        Returns True when RAM was freed. On an OSError the page STAYS in RAM and
+        shared SSD spill is disabled for the process: the shared blob is a cache
+        a prefix entry references, so dropping it would make a later follower
+        raise, while keeping it is just the no-spill configuration — memory
+        bounded, tokens unchanged. The budget loop moves on to a private page."""
         n, refs, blob = self._shared[key]
-        self._write_shared_ssd(key, blob, n)
+        if not self._write_shared_ssd(key, blob, n):
+            return False
         self._shared[key] = [n, refs, None]
         self._shared_ram -= n
         self._ram_order.pop(("s", key), None)
+        return True
 
-    def _shared_ssd_path(self) -> str:
-        return (self._ssd_path[:-4] if self._ssd_path.endswith(".bin")
-                else self._ssd_path) + ".prefix.bin"
-
-    def _write_shared_ssd(self, key: int, blob: dict, nbytes: int) -> None:
-        if self._shared_ssd is None:
-            self._shared_ssd = ColdSsdFile(self._shared_ssd_path(), _blob_spec(blob))
-        self._shared_ssd.write(("s", key), blob)
+    def _write_shared_ssd(self, key: int, blob: dict, nbytes: int) -> bool:
+        """Spill one shared page; True when written. OSError disables shared spill
+        for the process and leaves the page in RAM (log once). Never raises."""
+        if not self._ssd_path or self.shared_spill_disabled:
+            return False
+        try:
+            if self._shared_ssd is None:
+                self._shared_ssd = ColdSsdFile(_shared_ssd_path(self._ssd_path), _blob_spec(blob))
+            self._shared_ssd.write(("s", key), blob)
+        except OSError as e:
+            self.shared_spill_disabled = True
+            self.shared_spill_error = f"errno {e.errno}: {e.strerror}"
+            print(f"[cold] shared-prefix spill to {_shared_ssd_path(self._ssd_path)!r} "
+                  f"failed once ({self.shared_spill_error}); shared SSD spill disabled "
+                  f"for this process, shared pages stay in RAM", flush=True)
+            return False
         self._shared_ssd_bytes += nbytes
+        return True
 
     def share_take(self, key: int) -> dict | None:
         """A read-only REFERENCE to a shared page blob. Read-through: a spilled
