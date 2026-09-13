@@ -2,7 +2,10 @@
 
 > Status: **tiny CPU green; sm90 card B=1 exact (8/8 followers, first-token
 > logits max_abs 0.0). The B=8 wave diverges, and so does a COLD-vs-COLD B=8
-> wave — that is the open sm90 B>1 packed-prefill defect (#563/#567), not this
+> wave — that is a separate open defect: an sm90 B=8 spec wave is not
+> reproducible across identical cold waves
+> ([errors/2026-09-13-sm90-b8-spec-wave-not-reproducible.md](../errors/2026-09-13-sm90-b8-spec-wave-not-reproducible.md)),
+> not this
 > path.** A spec follower now ADOPTS a published sparse prefix instead of
 > prefilling from zero; its tokens are bit-equal to a cold spec follower
 > (`sparse_k=2` + spec, 24-page published prompt, CPU) and at B=1 on the 27B
@@ -91,7 +94,9 @@ zero-tail follower (each verified red without its fix). Full suite 774 green.
 - B=8 wave: 1/8 token-equal — but a cold-vs-cold B=8 control (the same
   followers, two fresh cold waves) is also only 3/8 equal, with mismatches at
   the same decode positions (5..31). The B=8 divergence exists without any
-  warm adoption; it is the sm90 B>1 packed-prefill defect (#563/#567).
+  warm adoption; it is a separate defect — an sm90 B=8 spec wave is not
+  reproducible across identical cold waves, under the active unfused guard
+  ([errors/2026-09-13-sm90-b8-spec-wave-not-reproducible.md](../errors/2026-09-13-sm90-b8-spec-wave-not-reproducible.md)).
 - 8/8 adoptions, matched=384; 27.0 MiB `kv_prefix`, delta 0; the warm wave
   ran in ~half the cold wave's wall time (101.0 s vs 201.7 s).
 
