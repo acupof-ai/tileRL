@@ -158,6 +158,10 @@ def main() -> None:
         rv = orig_fwd(decodes, prefills, chunks)
         torch.cuda.synchronize()
         ticks[-1]["ms"] = (time.perf_counter() - t0) * 1000
+        # what did THIS tick's dense rows actually do?
+        ticks[-1]["d_dec"] = len(decodes)
+        ticks[-1]["d_pf"] = len(prefills)
+        ticks[-1]["d_nout"] = sum(len(r.output) for r in decodes)
         return rv
 
     e._build_plan = plan_wrap
@@ -171,6 +175,8 @@ def main() -> None:
     first_dense_ts: dict[int, float] = {}
     tick_idx = 0
     submitted = 0
+    failed: dict[int, tuple[str, str]] = {}
+    phase_seen: dict[int, set] = {}
 
     for _ in range(20000):
         # stagger a short request mid-prefill on its schedule tick, if free slot
@@ -194,6 +200,11 @@ def main() -> None:
                 admit_ts[r.req_id] = now
             if not r.sparse_on and r.req_id not in first_dense_ts:
                 first_dense_ts[r.req_id] = now
+            phase_seen.setdefault(r.req_id, set()).add(r.phase)
+        # A per-request failure removes it from running (run_d -> 0) and peek
+        # never returns it; surface it instead of reporting a silent UNFINISHED.
+        for fr, (reason, msg) in list(e._failed.items()):
+            failed.setdefault(fr, (reason, msg))
         for rid in rids:
             cur = e.peek(rid)
             if cur is None:
@@ -203,6 +214,8 @@ def main() -> None:
             out_tokens[rid] = list(cur)
             if len(cur) >= target[rid]:
                 finish_ts.setdefault(rid, now)
+        if failed:
+            break
         if submitted >= args.n_shorts and long_rid in finish_ts and all(
                 r in finish_ts for r in short_rids):
             break
@@ -215,8 +228,14 @@ def main() -> None:
           f"{'decode_ms':>10s} {'toks':>4s} {'dec_tok/s':>9s}")
     rates = []
     for r in short_rids:
+        if r in failed:
+            reason, msg = failed[r]
+            print(f"{r:4d} FAILED [{reason}] {msg[:80]}")
+            continue
         if r not in finish_ts:
-            print(f"{r:4d} UNFINISHED")
+            ph = sorted(phase_seen.get(r, ()))
+            in_wait = any(w.req_id == r for w in e._waiting)
+            print(f"{r:4d} UNFINISHED phases_seen={ph} still_waiting={in_wait}")
             continue
         q = (admit_ts.get(r, submit_ts[r]) - submit_ts[r]) * 1000
         wd = (first_dense_ts.get(r, submit_ts[r]) - submit_ts[r]) * 1000
@@ -251,11 +270,16 @@ def main() -> None:
         ms = sorted(t["ms"] for t in fill_dense)
         print(f"dense ticks during fill with dense runnable (n={len(ms)}): "
               f"min {ms[0]:.1f} med {ms[len(ms)//2]:.1f} max {ms[-1]:.1f} ms")
+        # of those, how many actually carried a decode row vs only a prefill?
+        dec = [t for t in fill_dense if t["d_dec"] > 0]
+        pf = [t for t in fill_dense if t["d_pf"] > 0 and t["d_dec"] == 0]
+        print(f"  carried decode rows: {len(dec)}; prefill-only: {len(pf)}; "
+              f"sum nout seen on decode ticks: {sum(t['d_nout'] for t in dec)}")
         slow = [t for t in fill_dense if t["ms"] > 500]
         print(f"  dense ticks >500 ms (steady-state stall, not JIT): {len(slow)}")
         for t in slow[:10]:
-            print(f"    tick {t['tick']}: {t['ms']:.0f} ms runD/runS "
-                  f"{t['run_d']}/{t['run_s']} waitD {t['wait_d']}")
+            print(f"    tick {t['tick']}: {t['ms']:.0f} ms dec/pf {t['d_dec']}/{t['d_pf']} "
+                  f"runD/runS {t['run_d']}/{t['run_s']} waitD {t['wait_d']}")
 
     gaps, cur, started = [], 0, False
     for t in ticks:
