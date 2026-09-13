@@ -36,12 +36,16 @@ its slot; the next request admits.
 
 ## Operations
 
-The server runs under `scripts/_serve_v100_dense.sh` on the host: flock-guarded
-single instance, restart loop (max 10), log byte-capped at 32 MiB
-(`~/serve70_dense.log`). The process python is `~/venv70/bin/python`
+The server runs under [`scripts/serve_v100_dense.sh`](../scripts/serve_v100_dense.sh)
+on the host: flock-guarded single instance, restart loop (max 10), log
+byte-capped at 32 MiB (`~/serve70_dense.log`). The first log line records the
+synced tree sha. The process python is `~/venv70/bin/python`
 (torch 2.5.1+cu121); deploy code with `scripts/v100.sh`.
 
-Stop: `pkill -f _serve_v100_dense.sh` (the supervisor trap releases the GPU).
+Stop: `pkill -f serve_v100_dense.sh` (the supervisor trap releases the GPU).
+
+`scripts/serve_v100.sh` is a different, older launcher (single session,
+spec-on, 32k context); do not use it for this serve.
 
 ## Measured 2026-09-13 (stable config)
 
