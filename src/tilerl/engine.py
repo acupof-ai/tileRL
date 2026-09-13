@@ -55,6 +55,7 @@ from .kv_cache import (
     NoPrefixStore,
     PagedKvPool,
     PrefixStore,
+    SpillWriteError,
 )
 from .sparse_index import DEFAULT_SPARSE_K
 from .spec import _PREFILL_BUCKET, LADDER_WIDTHS
@@ -266,6 +267,9 @@ class _Req:
     #: exact snapshot at the deepest aligned prefill chunk end inside the ragged tail
     #: window; inserted at completion. See `_finish_prefills`.
     pending_prefix: tuple[int, Any] | None = None
+    #: A request failed mid-flight (e.g. cold spill): release its frames without
+    #: trying to publish a prefix snapshot whose cold blobs may already be gone.
+    failed: bool = False
     output: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     thought_closed: bool = False  # the reasoning block ended (model's or forced)
@@ -2343,8 +2347,21 @@ class Engine:
         )
         if sparse:
             promote_ctx.__exit__(None, None, None)
-            sparse_offers = self._sparse_finalize(
-                sf, rows, None if hid is None else hid[-1])
+            try:
+                sparse_offers = self._sparse_finalize(
+                    sf, rows, None if hid is None else hid[-1])
+            except SpillWriteError as e:
+                # A private cold page this tick demoted could not be spilled; the
+                # batched demotions() exit cannot say which row owns it, so fail
+                # the whole sparse tick set with a client-visible error and free
+                # their slots/blocks. Returning leaves waiting requests and the
+                # server serving. The wedge this replaces: the error escaped
+                # step, the loop retried forever with no commit and a leaked slot
+                # (V100 unwritable /data00 spill, 2026-09-14).
+                for r in rows:
+                    if r in self._running:
+                        self._finish(r, error=str(e), reason="cold_spill_failed")
+                return
             # retain the last tick's served candidates+selection so a recall probe
             # reads it after the SparseForward is discarded:
             # req -> {group: (candidate_pages, chosen_candidate_pages)}.
@@ -2852,7 +2869,7 @@ class Engine:
             # frontier closure while device frames and draft blocks are still
             # live: pages a hot pool never dropped get snapshotted from the live
             # frame here, so a same-prompt follower can still adopt the prefix.
-            if self._sparse.prefix is not None and req.sparse_matched == 0:
+            if self._sparse.prefix is not None and req.sparse_matched == 0 and not req.failed:
                 keys = self._sparse.prefix.close_request(
                     req.req_id, req.tokens, self._sparse.bounds_view(req.req_id))
                 written_page = ((req.draft_pos + 1) // BLOCK_TOKENS
@@ -2888,6 +2905,8 @@ class Engine:
         self._slots_used -= 1
 
     def _finish(self, req: _Req, error: str | None = None, reason: str | None = None) -> None:
+        if error is not None:
+            req.failed = True
         self._release(req)
         if error is None:
             self._finished[req.req_id] = req.output
