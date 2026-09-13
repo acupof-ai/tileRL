@@ -37,9 +37,8 @@ PREFIX_TOKENS = PROMPT_PAGES * PAGE  # 384
 TAIL_TOKENS = 20
 
 
-def _ids(tok, n: int, seed: int) -> np.ndarray:
+def _ids(n: int, seed: int, vocab: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
-    vocab = tok.vocab_size
     return rng.integers(100, min(vocab, 32000), n, dtype=np.int64)
 
 
@@ -87,7 +86,7 @@ def main() -> None:
             kv_cold_bytes=1 << 30, draft=draft, spec_depth=1,
             prefix_store=NoPrefixStore() if not prefix else None)
 
-    prompt = _ids(tok, PREFIX_TOKENS, 7).tolist()
+    prompt = _ids(PREFIX_TOKENS, 7, cfg.vocab_size).tolist()
 
     # publish: one request generates enough that the full prefix drops/publishes
     warm = make_engine(prefix=True)
@@ -98,7 +97,7 @@ def main() -> None:
         "publisher did not publish the full prefix"
     assert warm.stats()["prefix_warm_adoptions"] == 0
 
-    followers = [prompt + _ids(tok, TAIL_TOKENS, 100 + i).tolist()
+    followers = [prompt + _ids(TAIL_TOKENS, 100 + i, cfg.vocab_size).tolist()
                  for i in range(args.batch)]
 
     # WARM wave (two+ real followers share ticks; here all B adopt the one prefix)
