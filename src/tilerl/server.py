@@ -268,7 +268,9 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
         try:
-            request_id, prompt_tokens, max_new, opened, tools = _submit(req)
+            # to_thread: engine.submit takes step()'s lock; on the loop a request arriving
+            # during a long prefill freezes every route, /health included.
+            request_id, prompt_tokens, max_new, opened, tools = await asyncio.to_thread(_submit, req)
         except ValueError as exc:
             return JSONResponse(
                 status_code=400,
@@ -308,7 +310,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         reasoning, text = split_think(tokenizer.decode(output_ids), opened)
         # The engine keeps the token that completed the match, so `text` still
         # carries the sequence and all three APIs exclude it.
-        stopped = engine.stop_text(request_id)
+        stopped = await asyncio.to_thread(engine.stop_text, request_id)
         text = cut_at_stop(text, stopped)
         # The template answers a tool request in <tool_call> XML; parse it with the
         # SAME function /v1/messages uses, so one call cannot mean two things
@@ -328,7 +330,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         # message.content above is the stripped display text: the two are
         # deliberately different lengths. Truncating this list to match the
         # text would break the RL join, which scores what was sampled.
-        scores = engine.logprobs(request_id) if req.logprobs else None
+        scores = (await asyncio.to_thread(engine.logprobs, request_id)) if req.logprobs else None
         content = None if scores is None else [
             {"token": tokenizer.decode([tid]), "logprob": None if lp != lp else lp}
             for tid, lp in zip(output_ids, scores)
@@ -517,7 +519,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         try:
             # A picked constructor hides every other field from extra="allow".
             req = ChatCompletionRequest.model_validate(_ws_body(ask))
-            request_id, prompt_tokens, max_new, opened, _ = _submit(req)
+            request_id, prompt_tokens, max_new, opened, _ = await asyncio.to_thread(_submit, req)
         except Exception as exc:
             await ws.send_json({"t": "error", "message": f"{type(exc).__name__}: {exc}"})
             await ws.close()
