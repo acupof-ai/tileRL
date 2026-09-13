@@ -14,6 +14,11 @@
     "date": "2026-08-29",
     "tok_s": 71.85266081308166
   },
+  "decode-kv/d2048-b1/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 87.33086560928957
+  },
   "decode-kv/d2048-b2/sm90": {
     "commit": "6e260b8",
     "date": "2026-08-29",
@@ -34,6 +39,11 @@
     "date": "2026-08-28",
     "tok_s": 48.1
   },
+  "decode-kv/d32768-b1/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 80.06812199220505
+  },
   "decode-kv/d32768-b2/sm90": {
     "commit": "6e260b8",
     "date": "2026-08-29",
@@ -43,6 +53,11 @@
     "commit": "6e260b8",
     "date": "2026-08-29",
     "tok_s": 138.72857183414737
+  },
+  "decode-kv/d512-b1/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 92.38771599788666
   },
   "decode-kv/d512-b16/sm90": {
     "commit": "5049f07",
@@ -69,6 +84,11 @@
     "date": "2026-08-29",
     "tok_s": 328.39408934193426
   },
+  "decode-kv/d8192-b1/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 88.87364923310717
+  },
   "decode-kv/d8192-b2/sm90": {
     "commit": "6e260b8",
     "date": "2026-08-29",
@@ -78,6 +98,11 @@
     "commit": "6e260b8",
     "date": "2026-08-29",
     "tok_s": 157.48552710735785
+  },
+  "decode-kv/d8192-b8/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 280.16624656766214
   },
   "kv-reuse/prefix-hits/cpu": {
     "commit": "655e941",
@@ -153,6 +178,11 @@
     "commit": "3fb9c55",
     "date": "2026-08-29",
     "tok_s": 194.73286026185278
+  },
+  "train/27B-lora-b4t256/sm90": {
+    "commit": "132085997bbd3336cc0f204583c614fc52db527d",
+    "date": "2026-09-09",
+    "tok_s": 455.4180499685555
   },
   "train/tiny-b2t128/cpu": {
     "commit": "717172d",
