@@ -21,6 +21,42 @@ B=1 decode is the rollout shape — the training target — but not the serving
 bottleneck. Weights are fp4 against **bf16** activations at B=1; the fp8 path
 is the M > 1 kernel and carries prefill and batched decode.
 
+## Status (2026-09-13)
+
+**Development stops here in favour of ecosystem engines (ckl, 2026-09-13); the V100 serve endpoint stays up** (host:port to follow in a one-line edit). This is the state at wrap-up.
+
+What runs today (H20 unless noted; every number links its entry):
+- **Dense serve**: the table above — 92.4 d512 decode / 2689.8 prefill tok/s, 74.6% MMLU
+  ([wins/2026-09-07](docs/experience/wins/2026-09-07-a-claude-code-turn-is-314-seconds-of-prefill.md)).
+- **Sparse KV is accuracy-equivalent but slower**: on the same matched 400 thinking MMLU
+  questions, `--sparse-k 128` scores **0.863 vs dense 0.858** at **37.4 vs 187 tok/s**,
+  so it stays opt-in on perf grounds
+  ([errors/2026-09-12-sm90-fused-attn-prep-sparse-packed-prefill.md](docs/experience/errors/2026-09-12-sm90-fused-attn-prep-sparse-packed-prefill.md)).
+  Sparse decode is graph-captured and serves by default once opted in
+  ([#557](https://github.com/acupof-ai/tileRL/pull/557)); sparse B=1 eager at 32k is
+  **88.23 ms/tick vs ~13 ms dense graph**, 256k pending
+  ([#571](https://github.com/acupof-ai/tileRL/pull/571)).
+- **Speculative decode is a B=1 lever only**: B=8 free-running spec is not reproducible
+  across identical cold waves (3/8 rows agree) and is **not** verified — sparse+spec
+  warm prefix adoption is exact at B=1
+  ([errors/2026-09-13-sm90-b8-spec-wave-not-reproducible.md](docs/experience/errors/2026-09-13-sm90-b8-spec-wave-not-reproducible.md),
+  [wins/2026-09-13-warm-spec-prefix-adoption.md](docs/experience/wins/2026-09-13-warm-spec-prefix-adoption.md)).
+- **V100 sm70 serves sparse 64k** (3.44 tok/s decode, 343.2 s prefill, RSS 27.92/31 GiB) but the
+  **256k prefill is SIGKILLed (OOM)** before its spill file is ever written
+  ([errors/2026-09-13-v100-256k-sparse-prefill-host-oom](docs/experience/errors/2026-09-13-v100-256k-sparse-prefill-host-oom.md)). P6 fp8 long-ctx fits are ledger-derived,
+  not card-measured ([wins/2026-09-11-p6-long-context-budget-on-one-h20.md](docs/experience/wins/2026-09-11-p6-long-context-budget-on-one-h20.md)).
+- **RL**: GRPO 100-step tiny gains reproduced on GSM8K (89.6→94.8%) but not MATH-5; the
+  full-27B training rollout tick is measured **2.64x the serving tick** and never closed
+  ([errors/2026-09-08-the-training-rollout-tick-is-2.6x-serving.md](docs/experience/errors/2026-09-08-the-training-rollout-tick-is-2.6x-serving.md)).
+
+Unfinished (owners in [OPEN.md](docs/experience/OPEN.md), **14 open defects**): the sparse 256k
+decode number still waits on a named card lend — its 32k row shipped in
+[#571](https://github.com/acupof-ai/tileRL/pull/571) (88.23 ms/tick vs ~13 ms dense graph); 32k
+teacher-forced sparse NLL closed partial at **5 of 8 windows** (k128 gap −0.1402 nats/token,
+[entry](docs/experience/errors/2026-09-13-sparse-nll-32k-partial-5of8.md)).
+All eight H20 cards were recorded as transferred to aupai on 2026-09-13, so pending device
+numbers wait on a named card lend.
+
 Accuracy is not in that table: these weights score **74.6% MMLU 0-shot**
 (746/1000, `fuse_projections=True` via `scripts/mmlu.py`, 2026-09-03; the
 unfused arm scores 74.2% — [why](docs/experience/errors/2026-09-03-mmlu-score-depends-on-concurrency.md)).
