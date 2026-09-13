@@ -909,6 +909,27 @@ class SparsePrefixCache:
                     self._cold.share_ref(k)
         return out
 
+    def close_request(self, req_id: int, tokens, bounds) -> dict[int, int]:
+        """Force the prompt-end frontier closure when a publisher finishes.
+
+        Drop-only publishing reaches the prompt end only if the last prompt page
+        leaves the resident union; a hot pool (large k) can keep every prompt
+        page resident for the whole run, so without this the frozen prompt entry
+        never forms and a same-prompt follower misses. Pages still resident are
+        offered under their private key tuple, which the engine resolves from
+        the live device frame."""
+        pp = self._prompt_pages.get(req_id)
+        if pp is None:
+            return {}
+        e = self._grow.get(req_id)
+        old_len = 0 if e is None else len(e["keys"])
+        if old_len >= pp:
+            return {}  # already closed through the prompt end via natural drops
+        pend = self._pending.setdefault(req_id, {})
+        for p in range(old_len, pp):
+            pend.setdefault(p, (req_id, p))
+        return self.publish_dropped(req_id, tokens, bounds, pp - 1, pend[pp - 1])
+
     def bound_of_key(self, content_key: int):
         """A page's stored Quest bound from its (possibly spilled) shared blob,
         or None. Adopt reads bounds by field so the bounds plane is not pinned
@@ -969,7 +990,7 @@ class SparsePrefixCache:
         page shared with a surviving entry keeps its blob (share refcount)."""
         self._by_id.pop(entry["eid"], None)
         chain = self._entries.get(self._chain_hash(entry))
-        if chain is not None:
+        if chain is not None and entry in chain:
             chain.remove(entry)
         for key in entry["keys"]:
             self._cold.share_release(key)
@@ -995,6 +1016,7 @@ class SparsePrefixCache:
         the lookup chains and age out under the normal LRU. Gapped buffers,
         unconsumed snapshots and the grow link are dropped."""
         self._snap.pop(req_id, None)
+        self._snap_hidden.pop(req_id, None)
         self._pending.pop(req_id, None)
         self._grow.pop(req_id, None)
         self._tok_tuple.pop(req_id, None)
@@ -1006,6 +1028,7 @@ class SparsePrefixCache:
         for entry in list(self._by_id.values()):
             self._drop(entry)
         self._snap.clear()
+        self._snap_hidden.clear()
         self._pending.clear()
         self._grow.clear()
         self._tok_tuple.clear()

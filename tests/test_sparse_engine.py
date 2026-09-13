@@ -344,12 +344,21 @@ def test_sparse_prefix_publishes_only_when_pages_leave_the_hot_union():
     miss.shutdown()
 
     sparse = _sparse()
-    # A 5-page prompt fits entirely inside k+window: nothing leaves the union, so
-    # the pin publishes no prefix at all.
+    # A 5-page prompt fits entirely inside k+window: nothing leaves the union,
+    # so no DROP publishes while it runs. Finishing it closes the prompt-end
+    # frontier from the live device frames instead.
     short = sparse.submit(np.arange(7, 7 + 5 * BLOCK_TOKENS, dtype=np.int64),
                           SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
-    _drain(sparse, short, 4)
+    for _ in range(30):
+        sparse.step()
+        sr = next((x for x in sparse._running if x.req_id == short), None)
+        if sr is not None and sr.decoding:
+            break
     assert sparse._sparse.prefix.published == 0, sparse._sparse.prefix.published
+    _drain(sparse, short, 4)
+    short_entry = sparse._sparse.prefix.lookup(
+        np.arange(7, 7 + 5 * BLOCK_TOKENS, dtype=np.int64))
+    assert short_entry is not None and len(short_entry["keys"]) == 5
 
     r1 = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
     _drain(sparse, r1, 200)
@@ -1495,3 +1504,65 @@ def test_sparse_draft_follower_adopts_a_published_prefix_and_matches_cold():
     got = _drain(warm, rid, 8)
     warm.shutdown()
     assert got == cold_got, f"warm draft follower {got} != cold spec {cold_got}"
+
+
+def test_sparse_publisher_publishes_full_prompt_at_finish_without_any_drop():
+    """A hot pool (k >= prompt pages) never drops a prompt page during the run;
+    the prompt-end entry must still form when the publisher finishes, from live
+    device frames with draft K/V attached (the card gate's publisher shape:
+    k=128, a 24-page prompt — drop-only publishing alone never closes)."""
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    prompt = (np.arange(8 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+
+    from tilerl_kernels.backend import get_backend
+
+    eng = build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=64, scorer="bounds",
+        kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+    try:
+        rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
+        _drain(eng, rid, 8)
+        entry = eng._sparse.prefix.lookup(prompt)
+        assert entry is not None and len(entry["keys"]) == 8, \
+            "publisher finished without closing the prompt-end frontier"
+        assert all("dk" in eng._kv.cold.share_take(k) for k in entry["keys"]), \
+            "finish-published blobs carry no draft KV"
+    finally:
+        eng.shutdown()
+
+
+def test_sparse_warm_follower_with_an_exact_page_aligned_prompt_matches_cold():
+    """A warm follower whose prompt equals the published prefix in WHOLE (zero
+    residual tokens) used to stick in PREFILL forever: nothing schedules a chunk
+    and no first-token logits appear. It must finish and stay bit-equal to a
+    cold follower."""
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    prompt = (np.arange(8 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    def eng():
+        from tilerl_kernels.backend import get_backend
+
+        return build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=64, scorer="bounds",
+            kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+
+    cold = eng()
+    cold_got = _drain(cold, cold.submit(prompt, params), 8)
+    cold.shutdown()
+    warm = eng()
+    pid = warm.submit(prompt, params)
+    _drain(warm, pid, 8)
+    rid = warm.submit(prompt, params)
+    warm.step()
+    assert next(x for x in warm._running if x.req_id == rid).sparse_matched \
+        == 8 * BLOCK_TOKENS
+    got = _drain(warm, rid, 8)
+    warm.shutdown()
+    assert got == cold_got, f"zero-tail warm {got} != cold {cold_got}"

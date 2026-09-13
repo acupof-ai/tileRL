@@ -954,7 +954,18 @@ class Engine:
                 entry = None
             if entry is not None:
                 matched = len(entry["tokens"])
-                req.seq_len = req.prefill_from = matched
+                req.seq_len = matched
+                if (self._draft is not None and matched == len(req.tokens)
+                        and matched % BLOCK_TOKENS == 0):
+                    # A warm spec follower whose prompt matches a page-aligned
+                    # prefix in WHOLE has zero residual tokens, so no chunk would
+                    # forward and the row stuck in PREFILL with no first-token
+                    # logits. Re-forward the last adopted page (its promote is a
+                    # fresh private copy): the boundary hidden conditions the
+                    # first draft and logits at matched-1 appear.
+                    req.prefill_from = matched - BLOCK_TOKENS
+                else:
+                    req.prefill_from = matched
                 keys = list(entry["keys"])
                 self._sparse.shared[req.req_id] = dict(enumerate(keys))
                 if self._sparse.scorer == "bounds":
@@ -2343,12 +2354,28 @@ class Engine:
         if req.state_slot is None:
             return  # never admitted; blocks and slot are taken together in `_admit`
         if self._sparse is not None:
+            # A finishing publisher (never a prefix-adopting follower: its prompt
+            # pages belong to another publisher's blobs) forces its prompt-end
+            # frontier closure while device frames and draft blocks are still
+            # live: pages a hot pool never dropped get snapshotted from the live
+            # frame here, so a same-prompt follower can still adopt the prefix.
+            if self._sparse.prefix is not None and req.sparse_matched == 0:
+                keys = self._sparse.prefix.close_request(
+                    req.req_id, req.tokens, self._sparse.bounds_view(req.req_id))
+                written_page = ((req.draft_pos + 1) // BLOCK_TOKENS
+                                if self._draft is not None and req.draft_blocks
+                                else -1)
+                for p, content_key in keys.items():
+                    draft_block = req.draft_blocks[p] if p <= written_page else None
+                    self._sparse_transfer_to_shared(req, p, content_key, draft_block)
+                for content_key in self._sparse.prefix.take_freeze_refs():
+                    self._kv.cold.share_ref(content_key)
             # Sparse: drop this request's host-held cold blobs, keyed (req, logical
             # page) and never present in req.blocks, plus its bounds store.
             cold = self._kv.cold
             if cold is not None:
                 for p in req.cold_pages:
-                    cold.forget((req.req_id, p))
+                    cold.forget((req.req_id, p) if isinstance(p, int) else p)
             self._sparse.drop(req.req_id)
         elif self._kv.cold is not None and req.cold_pages:
             # #500 manual sparse_retier seam: _sparse is None, cold_pages are (idx, phys).
