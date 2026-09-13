@@ -27,7 +27,7 @@ import re
 import time
 
 from tilerl.engine import SamplingParams
-from tilerl.eval import letter, mmlu_questions
+from tilerl.eval import letter, mmlu_indices, mmlu_questions
 
 CONCURRENCY = 8
 MAX_NEW = 2048
@@ -45,14 +45,9 @@ def question_set_hash(indices: list[int]) -> str:
 
 
 def question_indices(n: int, seed: int) -> list[int]:
-    """Dataset row ids of the mmlu_questions(n, seed) slice. Must match the
-    sampling in tilerl.eval.mmlu_questions."""
-    import random
-
-    from datasets import load_dataset
-
-    size = len(load_dataset("cais/mmlu", "all", split="test"))
-    return sorted(random.Random(seed).sample(range(size), n) if n < size else range(size))
+    """Dataset row ids of the arm's slice; the single shared sampler in
+    tilerl.eval.mmlu_indices (identical to what mmlu_questions renders)."""
+    return mmlu_indices(n, seed)
 
 
 def answer_letter(text: str) -> str:

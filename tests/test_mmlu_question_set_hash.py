@@ -1,6 +1,5 @@
 """mmlu_thinking_spec question-set hash: ordered-question fingerprint and
---pair refusal across mismatched sets (the --n 400 vs --first-n-of-2000
-confound: --n changes which rows are sampled, even at the same seed)."""
+--pair refusal across mismatched sets."""
 
 import importlib.util
 import json
@@ -8,12 +7,41 @@ import os
 
 import pytest
 
+from tilerl.eval import mmlu_indices
+
+# CPU gate has no HF dataset; exercise the shared sampler at the real MMLU test
+# size (cais/mmlu "all"), so the historical-overlap figure is computed, not typed.
+MMLU_TEST_SIZE = 14042
+
 _spec = importlib.util.spec_from_file_location(
     "mmlu_thinking_spec",
     os.path.join(os.path.dirname(__file__), "..", "scripts", "mmlu_thinking_spec.py"),
 )
 mts = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mts)
+
+
+def test_indices_use_the_single_sampler(monkeypatch):
+    # Harness delegates to tilerl.eval.mmlu_indices rather than reimplementing
+    # the sample (drift guard); monkeypatch avoids the HF dataset in CPU CI.
+    sentinel = [5, 9, 27]
+    monkeypatch.setattr(mts, "mmlu_indices", lambda n, seed: sentinel)
+    assert mts.question_indices(27, 4) is sentinel
+
+
+def test_n_changes_the_sample_historical_split():
+    # The exact confound the hash guards: the guard arm ran --n 400 while the
+    # dense comparison took the first 400 of a --n 2000 slice. Sorted samples
+    # of different n are NOT nested prefixes — most rows differ. Computed from
+    # the sampler, not a typed constant, so it tracks the real dataset size.
+    i400 = mmlu_indices(400, 0, MMLU_TEST_SIZE)
+    first400_of_2000 = mmlu_indices(2000, 0, MMLU_TEST_SIZE)[:400]
+    assert mts.question_set_hash(i400) != mts.question_set_hash(first400_of_2000)
+    overlap = len(set(i400) & set(first400_of_2000))
+    assert overlap < 400 / 2  # majority differ; 80/400 at the current 14042 rows
+    # A true prefix (same n, first-N) keeps full overlap and an ordered hash.
+    assert mts.question_set_hash(i400[:128]) != mts.question_set_hash(i400)
+    assert set(i400[:128]) <= set(i400)
 
 
 def _arm(n_done, preds, gold):
