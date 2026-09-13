@@ -26,13 +26,6 @@ BLOCK_TOKENS = 16
 _MASK64 = (1 << 64) - 1
 
 
-def _blob_bytes(st: dict) -> int:
-    """Bytes of a spilled blob, for the fetch-rate accounting: state snapshot or KV+scale."""
-    return sum(t.numel() * t.element_size()
-               for t in (st.get("states"), st.get("windows"), st.get("k"), st.get("v"),
-                         st.get("ks"), st.get("vs")) if t is not None)
-
-
 def _rolling_hash(prev: int, token: int) -> int:
     # +1 so token 0 still perturbs the state; collisions are verified by PrefixStore.
     return ((prev * 1000003) ^ (token + 1)) & _MASK64
@@ -665,10 +658,7 @@ class HostKvPages:
     def bytes_held(self) -> int:
         """Pinned host RAM held right now, private blobs + shared prefix blobs.
         Both share the one budget; SSD is separate and not counted here."""
-        return self._used + self._shared_ram_bytes()
-
-    def _shared_ram_bytes(self) -> int:
-        return self._shared_ram
+        return self._used + self._shared_ram
 
     @property
     def ssd_bytes(self) -> int:
@@ -734,7 +724,7 @@ class HostKvPages:
         until pinned bytes fit the budget. A private page spills to the private
         file or is dropped; a shared (refcounted) page spills to the prefix file.
         A shared page with no spill file stays — a store entry references it."""
-        while self._used + self._shared_ram_bytes() > self.budget_bytes:
+        while self._used + self._shared_ram > self.budget_bytes:
             for (ns, k), n in list(self._ram_order.items()):
                 if ns == "p":
                     blob = self._blobs.pop(k, None)
@@ -809,7 +799,7 @@ class HostKvPages:
             "kv_cold_ssd_pages": 0 if self._ssd is None else len(self._ssd),
             "kv_cold_ssd_bytes": self._ssd_bytes,
             "kv_cold_shared_pages": len(self._shared),
-            "kv_cold_shared_bytes": self._shared_ram_bytes(),
+            "kv_cold_shared_bytes": self._shared_ram,
             "kv_cold_shared_ssd_bytes": self._shared_ssd_bytes,
             "kv_cold_demotions": self.demotions,
             "kv_cold_promotions": self.promotions,
@@ -975,7 +965,7 @@ class HostKvPages:
 
     def shared_bytes(self) -> int:
         """Pinned RAM held for shared prefix blobs (test/ledger diagnostic)."""
-        return self._shared_ram_bytes()
+        return self._shared_ram
 
 
 class LinearStatePool:
@@ -1499,8 +1489,7 @@ class NoPrefixStore:
     def lookup(self, tokens: Sequence[int]) -> PrefixHit | None:
         return None
 
-    def insert(self, tokens: Sequence[int], blocks: Sequence[int], state: Any = None,
-               spill: bool = True) -> bool:
+    def insert(self, tokens: Sequence[int], blocks: Sequence[int], state: Any = None) -> bool:
         return False
 
     def retire(self, tokens: Sequence[int]) -> bool:
@@ -1562,7 +1551,7 @@ class PrefixStore:
         # it is the absence of pressure, not pressure.
         self.superseded = 0
         self.blocks_freed = 0
-        # S: constant at every prefix length, and what puts the break-even above zero
+        #: byte size of one GDN snapshot, learned from the first insert
         self._snapshot_bytes = 0
 
     def _hash_all(self, tokens: Sequence[int]) -> int:
@@ -1571,13 +1560,9 @@ class PrefixStore:
             h = self._roll(h, int(t))
         return h
 
-    def insert(self, tokens: Sequence[int], blocks: Sequence[int], state: Any = None,
-               spill: bool = True) -> bool:
+    def insert(self, tokens: Sequence[int], blocks: Sequence[int], state: Any = None) -> bool:
         """Cache ``tokens`` (covered by ``blocks``) with its ``state`` snapshot and retain
         the blocks; True when a new entry was retained, False for a duplicate.
-
-        ``spill`` is accepted for call-site compatibility but ignored (the dense
-        SSD tier was removed 2026-09-14).
         """
         tokens = tuple(int(t) for t in tokens)
         blocks = tuple(blocks)
