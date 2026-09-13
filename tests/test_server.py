@@ -185,6 +185,30 @@ def test_render_chat_is_chatml():
     )
 
 
+def test_top_level_enable_thinking_reaches_the_rendered_prompt():
+    """OpenAI/sglang clients send enable_thinking top-level. The HTTP route's
+    pydantic model has extra=allow, so without a normalization step the field
+    is swallowed into model_extra and thinking stays on (27B V100 smoke:
+    50/50 empty content, finish=length, all tokens in reasoning_content).
+    Both placements must render the template's closed-think marker."""
+    from tilerl.server import ChatCompletionRequest, _normalize_thinking, _render_chat
+
+    def rendered(body):
+        req = ChatCompletionRequest.model_validate(_normalize_thinking(dict(body)))
+        thinking = (req.chat_template_kwargs or {}).get("enable_thinking")
+        return _render_chat(req.messages, thinking)
+
+    msgs = [{"role": "user", "content": "hi"}]
+    think = "<" + "think>"
+    closed = rendered({"messages": msgs, "enable_thinking": False})
+    via_kwargs = rendered({"messages": msgs,
+                           "chat_template_kwargs": {"enable_thinking": False}})
+    on = rendered({"messages": msgs, "enable_thinking": True})
+    assert closed.endswith(f"<|im_start|>assistant\n{think}\n\n</think>\n\n")
+    assert closed == via_kwargs
+    assert on.endswith(f"<|im_start|>assistant\n{think}\n")
+
+
 def test_completion_nonstream(client, model_id):
     resp = client.post(
         "/v1/chat/completions",

@@ -94,8 +94,13 @@ _MAX_THINK = {"none": 0, "minimal": 128, "low": 512, "medium": 2048, "high": 819
 
 
 def _ws_body(ask: dict) -> dict:
-    """Top-level enable_thinking moves into chat_template_kwargs; the rest passes as sent."""
-    body = dict(ask)
+    return _normalize_thinking(dict(ask))
+
+
+def _normalize_thinking(body: dict) -> dict:
+    """A top-level enable_thinking moves into chat_template_kwargs so the one
+    renderer sees it. OpenAI/sglang clients send it top-level; without the move
+    pydantic (extra=allow) swallows it on the HTTP route and thinking stays on."""
     if "enable_thinking" in body:
         body["chat_template_kwargs"] = {**(body.get("chat_template_kwargs") or {}),
                                         "enable_thinking": body.pop("enable_thinking")}
@@ -267,6 +272,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
+        req = ChatCompletionRequest.model_validate(_normalize_thinking(req.model_dump()))
         try:
             # to_thread: engine.submit takes step()'s lock; on the loop a request arriving
             # during a long prefill freezes every route, /health included.
