@@ -41,32 +41,39 @@ and the ON arm is indistinguishable from OFF per turn (0.988x). Interleaved
 conversations actually adopt published prefixes (24 hits) — the new tier has a
 credit side, unlike the dense `KvTier`'s 0.
 
-## Limitation — the mmap spill file is not exercised at this size
+## Limitation — the multi-session run exercised the shared-prefix spill only
 
 `cold_ssd_bytes` was **0.0** in the 6 GiB run: the ~8.4k-token prompts built
 only ~1.15 GiB of shared prefix, under the 6 GiB host budget, so nothing spilled
 to disk. That row proves the host cold tier is leak-free and free at 12
-sessions, but not the spill file under churn. A second arm pinned the host
-budget to **256 MiB**, forcing most of the shared set to spill:
+sessions, but not a spill file under churn. A second arm pinned the host
+budget to **256 MiB**, forcing the shared set to spill:
 
-| host budget | on/off ratio | RSS first→max | spilled (private + prefix) | hits |
-|---:|---:|---:|---:|---:|
-| 6 GiB | 0.988 | 1.99 → 6.88 GiB | 0 B | 24 |
-| 256 MiB | 0.993 | 1.95 → **5.99 GiB** | **195 MiB + 1.069 GiB** | 24 |
+| host budget | on/off ratio | RSS first→max | private spill | prefix spill | hits |
+|---:|---:|---:|---:|---:|---:|
+| 6 GiB | 0.988 | 1.99 → 6.88 GiB | 0 B | 0 B | 24 |
+| 256 MiB | 0.993 | 1.95 → **5.99 GiB** | **0 B** | **1.069 GiB** | 24 |
 
-With the file actually written (1.069 GiB prefix spill on disk), RSS stays
-flat ~0.9 GiB lower and the spill arm is still 0.993x per turn — spilling is
-free on the wall clock and memory stays bounded. The 256 MiB off baseline was
-4.146/3.633 s (its own same-run off server); both arms compiles 0. The 256k
-single-stream run separately stressed the file alone (11 GiB spilled, RSS
-pinned at the 6.0 GiB budget, cumulative write 1.1% of prefill).
+`cold_ssd_bytes` (HostKvPages' PRIVATE spill) and `cold_host_bytes` were 0 in
+every measured row: at 256 MiB the host budget held nothing private and only
+the shared prefix spilled (the sole file on disk was
+`coldsmall_spill.prefix.bin`, 1.069 GiB). With it written, RSS stays flat
+~0.9 GiB lower and the spill arm is still 0.993x per turn — shared-prefix
+spilling is free on the wall clock and memory stays bounded. What this arm
+does NOT cover is PRIVATE-page churn under the mmap file: the 12 conversations
+share their prefixes, so the workload contains almost no unshared cold pages.
+The 256k single-stream run also spilled to the SHARED prefix file (11.0 GiB
+shared-SSD, RSS pinned at the 6.0 GiB budget, cumulative write 1.1% of
+prefill); private-file behavior is covered by CPU gates only (a page already
+spilled to the private SSD lifts into the prefix file byte-equal), not by a
+card run. The 256 MiB off baseline was 4.146/3.633 s (its own
+same-run off server); both arms compiles 0.
 
 ## Relationship to the 1.65x entry
 
-That error stays **open and stands as written**: it concerns the dense
-`KvTier` (`--ssd-path`), which is unchanged and still publish-but-never-serve
-in the dense default. The two are different classes behind different flags;
-this win does not flip that reject.
+It concerns the dense `KvTier` (`--ssd-path`), a different class behind a
+different flag; this win does not flip that reject (the dense tier was removed
+on 2026-09-14 with the reject standing).
 
 ## Rule
 
