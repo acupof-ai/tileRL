@@ -287,6 +287,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--cold-format',
         '--cold-ssd-bytes',
         '--cold-ssd-path',
+        '--decode-graph',
         '--depth',
         '--device-free',
         '--draft',

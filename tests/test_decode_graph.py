@@ -601,3 +601,34 @@ def test_graph_auto_off_on_sm70_before_capture_can_poison_the_allocator():
         assert engine_mod._graph_on(cpu, None) is False
     finally:
         engine_mod._sm70_graph_warned = False
+
+
+def test_serve_decode_graph_flag_plumbs_to_engine_on_sm70(monkeypatch):
+    import inspect
+    """serve --decode-graph must reach build_engine as decode_graph=True and
+    flip _graph_on on a cuda-shaped sm70 backend; omitted stays None (auto,
+    which the sm70 exclusion disables). Red without the cmd_serve plumb:
+    argparse rejects the flag / build_engine never sees the kwarg."""
+    from types import SimpleNamespace
+
+    import tilerl.engine as engine_mod
+    from tilerl import cli
+
+    seen = {}
+
+    def _stub_build_engine(cfg, model, backend, **kw):
+        seen.update(kw)
+        return SimpleNamespace(_decode_graph_on=engine_mod._graph_on(backend, kw.get("decode_graph")))
+
+    monkeypatch.setattr(engine_mod, "build_engine", _stub_build_engine)
+    sm70 = SimpleNamespace(device=torch.device("cuda"), arch="sm70")
+    parser = cli._build_parser()
+
+    args_on = parser.parse_args(["serve", "--model", "tiny", "--decode-graph"])
+    cfg = SimpleNamespace(max_position_embeddings=512)
+    cli._build_engine(cfg, None, sm70, decode_graph=getattr(args_on, "decode_graph", None))
+    assert seen["decode_graph"] is True
+
+    args_off = parser.parse_args(["serve", "--model", "tiny"])
+    assert getattr(args_off, "decode_graph", None) is None
+    assert "decode_graph=getattr(args" in inspect.getsource(cli.cmd_serve)

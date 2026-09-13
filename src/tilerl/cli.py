@@ -152,7 +152,8 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
                   dram_bytes=0, state_bytes=0, kv_fp8="", decode=None,
                   max_batched_tokens=0, kv_cold_bytes=0, cold_format="",
                   cold_ssd_path="", cold_ssd_bytes=0,
-                  sparse_k=DEFAULT_SPARSE_K, scorer="bounds", kv_store=""):
+                  sparse_k=DEFAULT_SPARSE_K, scorer="bounds", kv_store="",
+                  decode_graph=None):
     """Serving-size engine on one card. Multi-card serving is one process per card
     under CUDA_VISIBLE_DEVICES (see generate.py for the process-per-device pattern);
     the in-process DataParallelEngine wrapper was deleted 2026-09-09 — its hand-written
@@ -205,6 +206,7 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
     # build_engine to override its sparse default.
     kw["sparse_k"] = sparse_k
     kw["scorer"] = scorer
+    kw["decode_graph"] = decode_graph
     if sparse_k:
         import torch
 
@@ -350,7 +352,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            max_batched_tokens=args.max_batched_tokens,
                            sparse_k=getattr(args, "sparse_k", 0),
                            scorer=getattr(args, "scorer", "bounds"),
-                           kv_cold_bytes=getattr(args, "kv_cold_bytes", 0))
+                           kv_cold_bytes=getattr(args, "kv_cold_bytes", 0),
+                           decode_graph=getattr(args, "decode_graph", None))
     app = create_app(engine, tokenizer, model_name=cfg.name)
     # --dry-run: build (which materializes and fits) then print the memory ledger and stop,
     # never bind the HTTP port. --json prints the rows for the cost-model tooling. The budget
@@ -2516,6 +2519,11 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.add_argument("--max-batched-tokens", type=int, default=0,
                          help="token budget for one tick's chunked prefill; raise for "
                               "faster prefill at decode's expense (default: engine's 512)")
+    p_serve.add_argument("--decode-graph", action="store_const", const=True, default=None,
+                         help="force the captured decode tick on an arch whose AUTO path "
+                              "disables it (sm70: dense capture fails there and poisons the "
+                              "allocator; with --sparse-k the sparse graph is captured "
+                              "instead). Informed opt-in for capture measurement.")
     p_serve.add_argument("--no-warmup", dest="warmup", action="store_false",
                          help="skip precapturing the decode graphs; the first real messages "
                               "then pay for them (1088 ms/token falling to 26 over six "
