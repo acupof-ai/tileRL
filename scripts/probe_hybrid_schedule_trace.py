@@ -1,28 +1,21 @@
 """Hybrid scheduler trace: is the 6:1 the scheduler or the measurement?
 
-The wall-time scheduler SHOULD give ~28 dense ticks per sparse tick
-(1023 ms / 37 ms). The V100 run showed 5.95:1 and ~9.7 tok/s for short
-requests. A longer sparse tick earns MORE dense ticks under wall-time
-accounting, so tick-duration spread cannot explain it. This wraps the real
-step() and records, per tick, whether a dense row was even runnable when the
-tick went to sparse:
+Two phases, to separate JIT from steady state and capacity from fairness:
 
-  mode, synced wall ms,
-  rows this tick ran (dense/sparse),
-  admitted running rows by mode (dense/sparse),
-  waiting rows by mode (dense/sparse)
+1. WARMUP: one short dense and one short sparse request are drained first so
+   both graph/JIT paths are hot; timed measurements start after.
+2. TIMED FILL: one long sparse prefill starts; <= (slots-1) short dense
+   requests are submitted STAGGERED mid-prefill, each guaranteed a free slot,
+   so there is no capacity queue by construction. The question is then exactly:
+   does a short request with a free slot, arriving during a long fill, get a
+   normal TTFT and decode speed?
 
-Diagnosis:
-- sparse tick with running_dense > 0  -> the scheduler starved dense.
-- sparse tick with running_dense == 0 -> no dense row existed; a short-request
-  mean that includes that wait is measuring queue/TTFT, not decode speed.
+Per tick it records mode, synced wall ms (with tick index, so a first-tick JIT
+outlier is distinguishable from a steady-state stall), planned/running/waiting
+rows by mode, free slots/blocks, and why the waiting head did not admit.
+Per short: submit tick, queue_ms (submit->admit), wait2dense, TTFT, decode.
 
-It splits every short request's wall time into queue (submit -> admit),
-TTFT (submit -> first token), and decode (first -> last token) tok/s, and
-prints dense-ticks-per-sparse-gap counted only while a dense row was runnable.
-
---dump-out saves the long request's greedy token ids for 96-vs-192 exactness;
-run twice (--cap 192 and --cap 96) and diff the two files.
+--dump-out saves the long greedy tokens for a 96-vs-192 exactness check.
 
 Run (V100):
   TILERL_TARGET=cuda /usr/bin/python3 scripts/probe_hybrid_schedule_trace.py \
@@ -46,11 +39,21 @@ def main() -> None:
     ap.add_argument("--slots", type=int, default=4)
     ap.add_argument("--ctx", type=int, default=131072)
     ap.add_argument("--long-tokens", type=int, default=32768)
-    ap.add_argument("--n-shorts", type=int, default=19)
+    # Shorts arrive STAGGERED MID-PREFILL, never more than the free slots (one
+    # slot is held by the long request). This isolates "does a short request with
+    # a free slot get normal latency during a long fill" from capacity queueing.
+    ap.add_argument("--n-shorts", type=int, default=3,
+                    help="must be <= slots-1 so every short has a free slot")
+    ap.add_argument("--short-stagger-ticks", type=int, default=12,
+                    help="ticks between mid-prefill short submissions")
+    ap.add_argument("--warmup-new-tokens", type=int, default=2048)
     ap.add_argument("--short-new-tokens", type=int, default=64)
     ap.add_argument("--short-max-new", type=int, default=40)
     ap.add_argument("--dump-out", default="")
     args = ap.parse_args()
+    assert args.n_shorts <= args.slots - 1, (
+        f"n-shorts {args.n_shorts} exceeds free slots {args.slots - 1}; the "
+        "point is no capacity queueing")
 
     import torch
     from tilerl_kernels.backend import get_backend
@@ -71,22 +74,41 @@ def main() -> None:
         sparse_prefill_tokens=args.cap,
         decode_graph=True, draft=load_draft(model, args.draft), spec_depth=1)
 
+    def drain(e, rids, limit=4000):
+        for _ in range(limit):
+            e.step()
+            p = e.poll()
+            if all(r in p for r in rids):
+                return
+        raise RuntimeError("warmup drain timed out")
+
+    print("warmup: one short dense and one short sparse request to pay JIT/capture "
+          "in BOTH modes before timing...", flush=True)
     rng = np.random.default_rng(3)
+    warm_ids = rng.integers(3, 300, args.warmup_new_tokens).astype(np.int64)
+    # dense warmup (under N) and sparse warmup (over N) drain sequentially
+    wd = e.submit(warm_ids[:64], SamplingParams(temperature=0.0, max_new_tokens=8, seed=900))
+    drain(e, [wd])
+    ws = e.submit(warm_ids, SamplingParams(temperature=0.0, max_new_tokens=4, seed=901))
+    drain(e, [ws])
+    print("warmup done; starting the timed long sparse fill", flush=True)
+
     long_rid = e.submit(
         rng.integers(3, 300, args.long_tokens).astype(np.int64),
         SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
-    short_rids = [
-        e.submit(rng.integers(3, 300, args.short_new_tokens).astype(np.int64),
-                 SamplingParams(temperature=0.0, max_new_tokens=args.short_max_new,
-                                seed=i))
-        for i in range(args.n_shorts)]
 
-    rids = [long_rid, *short_rids]
-    submit_ts = {r: time.perf_counter() for r in rids}
+    # Stagger the short requests mid-prefill, one every --short-stagger-ticks;
+    # n_shorts <= slots-1 so each always has a free slot (no capacity queue).
+    short_rids = []
+    next_submit_at_tick = 4  # let the long fill be clearly underway
+    submit_tick = {}
+
+    rids = [long_rid]
+    submit_ts = {long_rid: time.perf_counter()}
     admit_ts: dict[int, float] = {}
     first_ts: dict[int, float] = {}
     finish_ts: dict[int, float] = {}
-    out_tokens: dict[int, list] = {r: [] for r in rids}
+    out_tokens: dict[int, list] = {long_rid: []}
     ticks = []
 
     # Wrap the two seams the real step calls; keep step itself in charge of
@@ -115,6 +137,7 @@ def main() -> None:
                     else:
                         admit_fail["blocks"] += 1
         meta = {
+            "tick": len(ticks),
             "mode": ("sparse" if rows and rows[0].sparse_on else
                      "dense" if rows else "idle"),
             "plan_d": sum(1 for r in rows if not r.sparse_on),
@@ -144,11 +167,27 @@ def main() -> None:
     # consuming it, so first-token time is the first tick the list is non-empty and
     # finish time is when it reaches max_new -- poll-once collapsed all 40 tokens
     # to the finish tick and made decode_ms 0.
-    target = {**{long_rid: 2}, **{r: args.short_max_new for r in short_rids}}
+    target = {long_rid: 2}
     first_dense_ts: dict[int, float] = {}
+    tick_idx = 0
+    submitted = 0
 
     for _ in range(20000):
+        # stagger a short request mid-prefill on its schedule tick, if free slot
+        if (submitted < args.n_shorts
+                and tick_idx == next_submit_at_tick + submitted * args.short_stagger_ticks):
+            ids = rng.integers(3, 300, args.short_new_tokens).astype(np.int64)
+            rid = e.submit(ids, SamplingParams(
+                temperature=0.0, max_new_tokens=args.short_max_new, seed=100 + submitted))
+            short_rids.append(rid)
+            rids.append(rid)
+            submit_ts[rid] = time.perf_counter()
+            submit_tick[rid] = tick_idx
+            out_tokens[rid] = []
+            target[rid] = args.short_max_new
+            submitted += 1
         e.step()
+        tick_idx += 1
         now = time.perf_counter()
         for r in e._running:
             if r.req_id not in admit_ts and r.state_slot is not None:
@@ -164,7 +203,8 @@ def main() -> None:
             out_tokens[rid] = list(cur)
             if len(cur) >= target[rid]:
                 finish_ts.setdefault(rid, now)
-        if all(r in finish_ts for r in rids):
+        if submitted >= args.n_shorts and long_rid in finish_ts and all(
+                r in finish_ts for r in short_rids):
             break
     e.poll()
 
@@ -203,6 +243,19 @@ def main() -> None:
           f"dense {len(de)} ({sum(t['ms'] for t in de):.0f} ms)")
     print(f"sparse ticks WITH runnable dense row (scheduler starvation): {starved}")
     print(f"sparse ticks with NO runnable dense row (queue/arrival gap):  {no_dense}")
+
+    # Steady-state dense tick cost DURING the long fill, with a dense row runnable:
+    # the JIT/capture question. Print index+ms so first-tick outliers are visible.
+    fill_dense = [t for t in ticks if t["mode"] == "dense" and t["run_d"] > 0]
+    if fill_dense:
+        ms = sorted(t["ms"] for t in fill_dense)
+        print(f"dense ticks during fill with dense runnable (n={len(ms)}): "
+              f"min {ms[0]:.1f} med {ms[len(ms)//2]:.1f} max {ms[-1]:.1f} ms")
+        slow = [t for t in fill_dense if t["ms"] > 500]
+        print(f"  dense ticks >500 ms (steady-state stall, not JIT): {len(slow)}")
+        for t in slow[:10]:
+            print(f"    tick {t['tick']}: {t['ms']:.0f} ms runD/runS "
+                  f"{t['run_d']}/{t['run_s']} waitD {t['wait_d']}")
 
     gaps, cur, started = [], 0, False
     for t in ticks:
