@@ -2,6 +2,8 @@
 
 ## 2026-09-14
 
+- **reject (V100/sm70, k=128, B=1)** — **sparse 256k is SIGKILL in prefill on a 31 GiB V100 with a 10 GiB pinned host tier; 64k serves.** 64k: prefill 343.2 s, decode 3.44 tok/s, peak RSS 27.92 GiB, cold_ssd 0. 256k: OOM-killed in prefill with cold_ssd still 0 and no spill file created — the SSD spill path was never reached, so this is not a verdict against it. Kill mechanism untested (no cold-pool byte reading at the kill); the recorded hypothesis is own-span pages pinning faster than prefill demotes. Options open: bigger host budget/RAM, prefill-time eager demotion, or a 64k V100 cap. [errors/2026-09-13-v100-256k-sparse-prefill-host-oom.md](docs/experience/errors/2026-09-13-v100-256k-sparse-prefill-host-oom.md)
+
 - **reject — the dense SSD prefix tier is removed (`KvTier`, `--ssd-path`, `--ssd-min-tokens`).** It measured 1.65x worse wall clock per turn with 0 hits at 12 sessions, the only session count the serve-path criterion could be evaluated at ([errors/2026-09-06](docs/experience/errors/2026-09-06-the-ssd-tier-is-165x-worse-at-12-sessions.md)); its read/write/prefetch machinery, 17 e2e tests, the `ssd_restart_speedup` collector and ten dense-only probe scripts go with it. The sparse cold tier's mmap spill (`--cold-ssd-path`, `ColdSsdFile`) and the boot store (`--kv-store`, `KvBootStore`) are separate paths and are unchanged. Dev-only tooling removed — no bench entry.
 
 ## 2026-09-13
