@@ -305,6 +305,25 @@ class _Req:
         return self.phase == _PHASE_DONE
 
 
+def _check_warmup_pad(pad_slot, pad_block, n_slots, n_blocks):
+    """The scratch frame a graph's warmup/capture forwards scribble must exist:
+    those forwards run on zeroed static buffers (block table 0, slot 0), and on
+    a graph captured lazily mid-traffic block 0 / slot 0 are live frames."""
+    if pad_slot is not None and not 0 <= pad_slot < n_slots:
+        raise ValueError(f"warmup pad slot {pad_slot} outside 0..{n_slots - 1}")
+    if pad_block is not None and not 0 <= pad_block < n_blocks:
+        raise ValueError(f"warmup pad block {pad_block} outside 0..{n_blocks - 1}")
+
+
+def _point_warmup_tables(bt, ss, pad_block, pad_slot) -> None:
+    """Steer the zeroed warmup/capture writes at the reserved pad frame. run()
+    repoints both buffers per real tick; sf.fill() zeroes/refills its own table
+    before the first replay, so this only has to survive construction. None keeps
+    the old block 0 / slot 0 scratch (unreserved graphs)."""
+    bt.fill_(0 if pad_block is None else pad_block)
+    ss.fill_(0 if pad_slot is None else pad_slot)
+
+
 class _DecodeGraph:
     """Captured ``model.forward`` for one (batch, width) bucket: per tick, small
     H2D copies of the inputs plus one replay. Replay mutates the engine's own
@@ -324,7 +343,10 @@ class _DecodeGraph:
         last_only=False,
         keep=0,
         aux_layers=(),
+        pad_slot=None,
+        pad_block=None,
     ):
+        _check_warmup_pad(pad_slot, pad_block, state_pool.states.shape[0], kv_pool.num_blocks)
         device = backend.device
         B, W = batch_size, width
         # int32 end to end: a long buffer costs a cast launch per use inside the graph.
@@ -353,10 +375,12 @@ class _DecodeGraph:
             keep_steps=keep,  # verify ticks only; a W>1 prefill chunk has no step buffers
         )
         # Warmup on a side stream: tilelang JIT (host work) must finish before capture.
+        # Zeroed buffers write physical block 0 / slot 0; with a reserved pad
+        # frame warmup AND capture scribble that instead (run() repoints per tick).
         self._ids.fill_(0)
         self._pos.fill_(0)
         self._sl.fill_(W)
-        self._ss.fill_(0)
+        _point_warmup_tables(self._bt, self._ss, pad_block, pad_slot)
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -449,7 +473,10 @@ class _SparseDecodeGraph:
         width,
         pool=None,
         aux_layers=(),
+        pad_slot=None,
+        pad_block=None,
     ):
+        _check_warmup_pad(pad_slot, pad_block, state_pool.states.shape[0], kv_pool.num_blocks)
         device = backend.device
         B, W = batch_size, width
         self._b, self._w = B, W
@@ -472,6 +499,10 @@ class _SparseDecodeGraph:
             page_base=sf.page_base,
             sparse=sf,
         )
+        # The sparse graph is captured lazily mid-traffic, so its warmup/capture
+        # would hit live frame block 0 / slot 0; steer both at the pad frame.
+        # fill() zeroes and refills own_table before the first replay.
+        _point_warmup_tables(sf.own_table, self._slots, pad_block, pad_slot)
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -2184,6 +2215,8 @@ class Engine:
                 W,
                 pool=self._graph_pool,
                 aux_layers=self._aux_layers,
+                pad_slot=self._pad_slot,
+                pad_block=self._pad_block,
             )
         return _CpuSparseGraph(self._model, self._backend, self._kv, self._states, sf, B, W)
 
@@ -2473,6 +2506,8 @@ class Engine:
                 pool=self._graph_pool,
                 keep=W if keep else 0,
                 aux_layers=self._aux_layers,
+                pad_slot=self._pad_slot,
+                pad_block=self._pad_block,
             )
         except Exception as exc:
             warnings.warn(f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback")

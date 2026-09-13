@@ -632,3 +632,25 @@ def test_serve_decode_graph_flag_plumbs_to_engine_on_sm70(monkeypatch):
     args_off = parser.parse_args(["serve", "--model", "tiny"])
     assert getattr(args_off, "decode_graph", None) is None
     assert "decode_graph=getattr(args" in inspect.getsource(cli.cmd_serve)
+
+
+def test_graph_warmup_steers_at_the_reserved_pad_frame():
+    """The cuda warmup/capture forwards run on zeroed static tables and would
+    scribble physical block 0 / slot 0 — live frames when a sparse graph is
+    captured lazily mid-traffic (V100 sparse+spec garbage, 2026-09-14).
+    The constructor must validate the pad ids and point both tables at them;
+    None keeps the old block-0 scratch (unreserved graphs)."""
+    import torch as _t
+
+    import tilerl.engine as engine_mod
+
+    check, point = engine_mod._check_warmup_pad, engine_mod._point_warmup_tables
+    check(3, 5, 4, 6)  # in-range returns None
+    for bad_slot, bad_block in ((4, 0), (0, 6)):
+        with pytest.raises(ValueError):
+            check(bad_slot, bad_block, 4, 6)
+    bt, ss = _t.zeros(2, 4), _t.zeros(2)
+    point(bt, ss, 5, 3)
+    assert bt.unique().tolist() == [5] and ss.unique().tolist() == [3]
+    point(bt, ss, None, None)
+    assert bt.unique().tolist() == [0] and ss.unique().tolist() == [0]
