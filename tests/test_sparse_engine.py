@@ -584,6 +584,54 @@ def test_sparse_with_draft_matches_sparse_without_draft_greedy():
     assert t_spec == t_plain, f"spec {t_spec} != plain {t_plain}"
 
 
+def test_b8_spec_wave_reproduces_a_b8_plain_wave_row_for_row():
+    """CPU gate for the open sm90 B=8 cold-wave defect
+    (errors/2026-09-13-sm90-b8-spec-wave-not-reproducible): 8 sparse rows
+    sharing ticks through a W=1 verify tick emit, per row, the same tokens as
+    the same 8 rows with spec off, each arm a fresh engine. The CPU cell is
+    8/8 — verify scoring/reselection is batch-shape-exact — so a served-shape
+    divergence (scripts/probe_wave_cut.py, pending-remote, H20) names a device
+    kernel, not the acceptance math."""
+    from tilerl_kernels.backend import get_backend
+
+    rows, steps, pages = 8, 8, 5
+    rng = np.random.default_rng(0)
+    prompts = [
+        np.asarray([7] + rng.integers(10, tiny().vocab_size - 100,
+                                      size=pages * BLOCK_TOKENS + 3).tolist(),
+                   dtype=np.int64)
+        for _ in range(rows)
+    ]
+
+    def wave(draft_on: bool):
+        cfg = tiny()
+        model = build_random(cfg, seed=11)
+        kw = dict(num_blocks=128, num_slots=rows + 2, max_batch=rows,
+                  max_total_tokens=8192, max_num_batched_tokens=512,
+                  sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
+        if draft_on:
+            kw.update(draft=_draft(cfg, model), spec_depth=1)
+        e = build_engine(cfg=cfg, model=model, backend=get_backend(), **kw)
+        params = SamplingParams(temperature=0.0, max_new_tokens=steps, seed=0)
+        rids = [e.submit(p, params) for p in prompts]
+        out = {r: [] for r in rids}
+        try:
+            for _ in range(512):
+                e.step()
+                for r, tt in e.poll().items():
+                    if r in out:
+                        out[r].extend(tt)
+                if all(len(out[r]) >= steps for r in rids):
+                    break
+            else:
+                raise TimeoutError({r: len(out[r]) for r in rids})
+        finally:
+            e.shutdown()
+        return [out[r][:steps] for r in rids]
+
+    assert wave(True) == wave(False)
+
+
 def test_sparse_draft_admission_reject_does_not_leak_a_state_slot():
     """Sparse+spec reject path: when the dense draft pool is full (a running row
     owns its blocks), _admit frees the just-allocated state slot and returns
