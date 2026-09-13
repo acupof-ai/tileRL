@@ -1279,6 +1279,11 @@ class Engine:
         # owns a tick only when dense has spent at least as much wall time since
         # the last sparse tick as that sparse tick cost; otherwise dense owns the
         # tick. Every tick stays one mode (one BatchKv geometry).
+        # ponytail: this shares the device QUEUE, not just the scheduler — a dense
+        # decode tick during a long sparse prefill still syncs behind the in-flight
+        # prefill kernel, so a concurrent short request measures ~9.9 tok/s vs
+        # 52.6 solo (wins/2026-09-14-hybrid-*). Decoupling needs a separate fill
+        # queue/stream or finer chunk interleaving; fairness ticks alone don't fix it.
         mode_sparse = self._sparse is not None
         if self._sparse is not None:
             dense_rows = [r for r in self._running if not r.sparse_on]
