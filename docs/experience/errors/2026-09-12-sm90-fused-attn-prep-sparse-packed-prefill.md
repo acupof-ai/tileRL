@@ -1,12 +1,15 @@
 # sm90 fused attn_prep corrupts sparse K/V when >1 ragged row shares a packed prefill tick
 
 > Status: **open.** #563 lands the guard (sparse forces the unfused writer);
-> the fused twin is not fixed. The guard is necessary but NOT sufficient: under
-> it sparse k=128 spec-off still reads acc 0.7986 at 139/400 vs 0.915 dense on
-> the same set (`/work/65-guard563-s400.log`, card 0, head 2193eafc) — at k=128
-> every ≤1k-token prompt is fully covered, so that residual gap is a further
-> bug, not a fidelity trade. Sparse stays opt-in (DEFAULT_SPARSE_K=0). The fused
-> twin PR removes this status and the OPEN.md row.
+> the fused twin is not fixed. Under the guard sparse k=128 matches dense on a
+> matched question set: spec-off B=8 MMLU, `--n 400 --first-n 400 --seed 0`,
+> sparse 0.865 (389 tok/q, 32.6 tok/s) vs dense-fused 0.858 (397 tok/q,
+> 187.0 tok/s), `/work/65-guard563-s400.json` vs `/work/cc-dense400.json`,
+> card 0. The earlier "0.7986 vs 0.915" reading compared two different question
+> sets (`--n 400` vs `--n 2000 --first-n 400`; the harness samples per n). What
+> the guard costs is speed, 94 → 33 tok/s, so sparse stays opt-in
+> (DEFAULT_SPARSE_K=0) until the fused twin is fixed. The fused twin PR removes
+> this status and the OPEN.md row.
 
 ## Context
 
@@ -63,9 +66,10 @@ sparse packing until it has a B>1 ragged-row parity gate; the unfused writer is
 the safe fallback. A near-tied argmax flip is not evidence — compare matched
 full logits.
 
-The guard is necessary, not sufficient: with it active (head 2193eafc), sparse
-k=128 spec-off B=8 MMLU reads acc 0.7986 at 139/400 vs dense 0.915 on the same
-prompts (`/work/65-guard563-s400.log`, card 0). k=128 + the 8-page window covers
-every ≤1k-token prompt in full, so the gap cannot be selection dropping a page;
-a further sm90 sparse defect remains (decode path or another prefill cell). The
-serving default stays sparse-OFF until a device gate reaches dense accuracy.
+The guard trades speed, not accuracy: on the same 400 questions sparse k=128
+spec-off reads 0.865 vs dense-fused 0.858 (card 0, `--n 400 --first-n 400
+--seed 0`), at 32.6 vs 187.0 tok/s. K/V pages written by the fused and unfused
+twins are byte-identical against an f64 reference (kvtwin/kvpre probes, decode
+and prefill ticks); only Q differs by one bf16 ulp from f32 reduction order.
+Two MMLU jsons are comparable only if their `gold`/`subjects` lists agree:
+`--n` changes the sample, not just `--first-n`.
