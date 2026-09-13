@@ -2864,3 +2864,38 @@ def test_hybrid_dense_ledger_is_memoized_but_pure_sparse_stays_live():
         memory_mod.plan = orig
     p.shutdown()
     assert calls["n"] == 2, "pure sparse ledger must stay live per stats call"
+
+
+def test_hybrid_dense_spec_row_finishes_with_exactly_n_during_sparse_fill():
+    """Device regression (#586 trace): dense rows kept decoding (1,449 observed
+    output tokens against a 40-token cap) and never finished during a concurrent
+    long sparse fill. A dense spec (draft d1) short row must stop at EXACTLY
+    max_new_tokens even while the sparse prefill owns alternating ticks."""
+    from tilerl_kernels.backend import get_backend
+
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    e = build_engine(
+        cfg=cfg, model=model, backend=get_backend(),
+        num_blocks=0, num_slots=4, max_batch=4, max_total_tokens=300000,
+        max_num_batched_tokens=512, sparse_k=128, scorer="bounds",
+        kv_cold_bytes=1 << 30, sparse_min_tokens=8192,
+        draft=_draft(cfg, model), spec_depth=1)
+    try:
+        rng = np.random.default_rng(3)
+        e.submit(rng.integers(3, 300, 200 * 192).astype(np.int64),
+                 SamplingParams(max_new_tokens=2, seed=0))
+        N = 10
+        rid = e.submit(rng.integers(3, 300, 64).astype(np.int64),
+                       SamplingParams(temperature=0.0, max_new_tokens=N, seed=100))
+        out = []
+        for _ in range(6000):
+            e.step()
+            out += e.poll().get(rid, [])
+            if len(out) >= N:
+                break
+        assert len(out) == N, f"dense spec row produced {len(out)} tokens, cap {N}"
+        # it must be DONE and gone from running, not still decoding
+        assert not any(r.req_id == rid for r in e._running), "row still running at cap"
+    finally:
+        e.shutdown()

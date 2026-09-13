@@ -155,13 +155,16 @@ def main() -> None:
     def fwd_wrap(decodes, prefills, chunks):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+        before = {r.req_id: len(r.output) for r in decodes}
         rv = orig_fwd(decodes, prefills, chunks)
         torch.cuda.synchronize()
         ticks[-1]["ms"] = (time.perf_counter() - t0) * 1000
-        # what did THIS tick's dense rows actually do?
+        # INCREMENTAL tokens this tick produced (len(output) is cumulative).
         ticks[-1]["d_dec"] = len(decodes)
         ticks[-1]["d_pf"] = len(prefills)
-        ticks[-1]["d_nout"] = sum(len(r.output) for r in decodes)
+        ticks[-1]["d_nout"] = sum(
+            len(r.output) - before.get(r.req_id, 0) for r in decodes)
+        ticks[-1]["d_out_len"] = {r.req_id: len(r.output) for r in decodes}
         return rv
 
     e._build_plan = plan_wrap
@@ -274,7 +277,14 @@ def main() -> None:
         dec = [t for t in fill_dense if t["d_dec"] > 0]
         pf = [t for t in fill_dense if t["d_pf"] > 0 and t["d_dec"] == 0]
         print(f"  carried decode rows: {len(dec)}; prefill-only: {len(pf)}; "
-              f"sum nout seen on decode ticks: {sum(t['d_nout'] for t in dec)}")
+              f"INCREMENTAL tokens on decode ticks: {sum(t['d_nout'] for t in dec)}")
+        # final length of every short vs its max_new_tokens (overrun => finish gate
+        # not firing; stuck below max => decode not advancing)
+        for r in short_rids:
+            outlen = len(out_tokens.get(r, []))
+            mark = "FINISHED" if r in finish_ts else (
+                "FAILED" if r in failed else "alive/unfinished")
+            print(f"  short {r}: output_len={outlen} max_new={args.short_max_new} {mark}")
         slow = [t for t in fill_dense if t["ms"] > 500]
         print(f"  dense ticks >500 ms (steady-state stall, not JIT): {len(slow)}")
         for t in slow[:10]:
