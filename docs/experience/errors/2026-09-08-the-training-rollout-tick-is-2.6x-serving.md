@@ -1,7 +1,52 @@
 # A wrong reason kept a 2.6x decode gap unexamined — 27B, 2026-09-08
 
-**Status:** open — pending-remote. The gap is measured and reproducible; 93% of it is unattributed. The localizing arm is GPU-only (one process, one card, two engines; CPU cannot price 27B decode). Command at the next card window:
-`scripts/pod_run.sh rollgap <card> -- python3 scripts/prof_rollout_gap.py`.
+**Status:** open — localizing arm ran on V100 (sm70) 2026-09-14 and DID NOT REPRODUCE the gap. The defect stays open: this arm names neither a mechanism nor the config bundle as the cause. See "2026-09-14 arm" below.
+
+## 2026-09-14 arm (V100 sm70, main d1b56684)
+
+One process, one card, one set of weights, `scripts/prof_rollout_gap.py
+--source /data00/home/chenkailun.c/models/Qwen3.8-27B-NVFP4 --tokens 128`
+(B=8, prompt 256, train blocks 232 vs serve 2048, both tok/fwd 7.79):
+
+| arm | blocks | ms/tok | fwd/tok | dev ms/fwd | resid/tok | tok/fwd | dev/wall |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| train | 232 | 10.26 | 0.128 | 79.83 | 0.01 | 7.79 | 0.999 |
+| serve | 2048 | 19.44 | 0.128 | 151.33 | 0.01 | 7.79 | 0.999 |
+
+`gap 0.528x, term1 1.000x, term2 0.527x, term3 0.988x`; residual 0.011 ms/tok
+on both (0.1% of the tick).
+
+**No gap.** Training is *faster* here (10.26 vs 19.44 ms/tok); the recorded
+defect was 2.643x with training *slower*. The forwards/token term is identical
+(1.000x — the recorded 1.159x tok/fwd confound is gone), and the residual the
+pre-recorded prediction expected to carry the gap is ~0 on both. The device
+term moves monotonically with the KV pool size (79.83 at 232 blocks vs 151.33
+at 2048), the opposite direction from a training slowdown. Closure holds
+(dev/wall ≈ 1.0), so the identity is measured, not miscalculated.
+
+What this rules in/out:
+
+- the CONFIG BUNDLE as built by this probe is not sufficient to produce the
+  gap — under matched conditions on the same card the ordering inverts;
+- the residual/host term is not hiding it at this shape;
+- pool GEOMETRY alone changes device ms/fwd but in the wrong direction.
+
+What differs from the recorded measurements and is still untested (the arm
+does not reproduce the recorded conditions):
+
+- **architecture**: this is sm70 (V100), decode graph capture auto-disabled;
+  the recorded 55/61 vs 23 pair were both graph-on on H20 (sm90). Graph
+  replay vs eager across the two configs is the strongest remaining candidate
+  and needs an sm90 window, not this box.
+- **LoRA / weight state**: held out of both arms here; the real rollout has
+  adapters attached.
+- **context**: prompt 256 here vs the recorded shorter-context/training
+  numbers; cross-context attention cost was previously ruled out by direction
+  but not on this matched setup.
+
+Next arm is sm90 graph-on vs -off across the two configs (the
+`probe_557_*`/graph machinery), keeping one-process/one-weights; LoRA as its
+own follow-up. Log: `~/tilerl-logs/rollgap.log` on n37-002-027.
 
 ## Context
 
