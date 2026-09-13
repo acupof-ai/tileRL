@@ -2673,47 +2673,70 @@ def test_hybrid_a_dense_prompt_over_the_device_pool_routes_sparse_at_submit():
 
 
 def test_hybrid_wall_time_fairness_gives_dense_dozens_of_ticks_per_sparse_tick():
-    """Tick-count alternation handed each mode half the TICKS, but one sm70
-    sparse prefill tick costs ~1 s against ~35 ms for a dense decode tick, so
-    dense got ~1% of wall time. Wall-time fairness: after a 100-cost sparse
-    tick, dense must run >=90 cost-1 ticks before the next sparse tick.
-    Fake clock: sparse ticks cost 100, dense ticks 1; red on tick-count
-    round-robin (which interleaves 1:1)."""
-    e = _hybrid_engine()
-    e._hybrid_fake_dt = (100.0, 1.0)  # (sparse_dt, dense_dt) per tick
-    rng = np.random.default_rng(5)
-    # one dense row and one sparse row, enough tokens to keep both runnable
-    short = rng.integers(3, 300, 64).astype(np.int64)
-    long = rng.integers(3, 300, 20 * BLOCK_TOKENS).astype(np.int64)
-    e.submit(short, SamplingParams(temperature=0.0, max_new_tokens=400, seed=0))
-    e.submit(long, SamplingParams(temperature=0.0, max_new_tokens=1, seed=0))
+    """Measured V100 ratio: a sparse prefill tick is ~1023 ms, a dense decode
+    tick ~37 ms, so while both modes are runnable wall-time fairness must give
+    ~28 dense ticks per sparse tick (1000/37). A fake clock pins sparse tick at
+    1000 and dense at 37; a long-lived dense decode row coexists with the sparse
+    prefill, and the steady-state mode sequence averages >=25 dense ticks
+    between consecutive sparse ticks, and a dense row arriving after sparse ticks
+    ran solo is served on the next tick (it owes no solo-history debt, and a tie
+    at a freshly opened window goes to dense).
 
-    # Run until the SECOND sparse tick is planned; count dense ticks between the
-    # first and second sparse tick by re-planning without forwarding: instead
-    # drive real steps and observe the mode sequence from stats/counters.
+    Note: this gate CANNOT be red on the prior global-debt scheduler under a
+    deterministic fake clock -- that scheduler also yields ~27:1 here. The V100
+    regression (5.95:1, 9.7 tok/s) comes from real tick-duration spread and
+    request-arrival timing, which a uniform fake clock does not model; it is
+    caught by the device A-B, not this gate. The change here pins the intended
+    rolling-window/tie semantics so a future edit cannot silently regress them."""
+    e = _fair_engine()
+    e._hybrid_fake_dt = (1000.0, 37.0)
+    rng = np.random.default_rng(5)
+    long = rng.integers(3, 300, 120 * 192).astype(np.int64)
+    e.submit(long, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+    # three solo sparse ticks before any dense row exists
+    for _ in range(3):
+        e.step()
+    e.submit(rng.integers(3, 300, 64).astype(np.int64),
+             SamplingParams(temperature=0.0, max_new_tokens=2000, seed=1))
     seq = []
     orig = e._run_forward
 
     def watch(decodes, prefills, chunks):
         rows = decodes + prefills
         seq.append(rows[0].sparse_on if rows else None)
-        # let the long sparse prefill advance so it stays runnable
         return orig(decodes, prefills, chunks)
 
     e._run_forward = watch
-    for _ in range(400):
+    # drive until >=6 sparse ticks have run WITH the dense row present
+    n_with_dense = 0
+    for _ in range(4000):
         e.step()
-        if sum(1 for m in seq if m is True) >= 2:
-            break
         e.poll()
+        if any(not r.sparse_on for r in e._running):
+            n_with_dense = sum(1 for m in seq if m is True)
+        if n_with_dense >= 6:
+            break
     e.shutdown()
     s = [m for m in seq if m is not None]
-    first_sparse = s.index(True)
-    second_sparse = s.index(True, first_sparse + 1)
-    dense_between = s[first_sparse + 1: second_sparse].count(False)
-    assert dense_between >= 90, (
-        f"after a 100-cost sparse tick only {dense_between} dense ticks ran "
-        "before the next sparse tick; wall-time fairness requires >= 90")
+    # the arriving dense row is served immediately (first tick after arrival is
+    # dense; the solo sparse history is not a debt it inherits)
+    assert s[0] is False, f"newly arrived dense row first tick was {s[0]}"
+    idx = [i for i, m in enumerate(s) if m is True]
+    assert len(idx) >= 2, f"need a steady window, got sparse ticks {len(idx)}"
+    gaps = [idx[i + 1] - idx[i] - 1 for i in range(len(idx) - 1)]
+    dense_per_sparse = sum(gaps) / len(gaps)
+    assert dense_per_sparse >= 25, (
+        f"{dense_per_sparse:.1f} dense ticks per sparse tick in steady state; "
+        "1000/37 wall-time fairness requires >= 25")
+
+
+def _fair_engine():
+    cfg = tiny()
+    return build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+        num_blocks=512, num_slots=8, max_batch=8, max_total_tokens=65536,
+        max_num_batched_tokens=512, sparse_k=64, scorer="bounds",
+        kv_cold_bytes=1 << 30, sparse_min_tokens=8192)
 
 
 def test_hybrid_dense_admit_reserves_live_sparse_rows_hot_headroom():

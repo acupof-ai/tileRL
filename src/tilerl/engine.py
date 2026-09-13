@@ -633,15 +633,16 @@ class Engine:
         # shorter ones run dense on the captured graph and pin their whole context.
         # 0 = every request is sparse, the pre-hybrid behavior.
         self._sparse_min_tokens = sparse_min_tokens if sparse_tracker is not None else 0
-        # Hybrid tick scheduler. TICK-COUNT alternation gave each mode half the
-        # TICKS, but one sparse prefill tick costs ~1 s on sm70 against ~35 ms for
-        # a dense decode tick -- so dense got ~1% of wall time (0.5 tok/s while a
-        # long prefill ran). Wall-time fairness instead: after a sparse tick the
-        # dense side owns every tick until it has accumulated an EQUAL wall
-        # duration (or it has no runnable row), then one sparse tick runs. A
-        # sparse tick is capped (~1 s chunk) so the dense wait is bounded.
-        self._hybrid_dense_budget = 0.0   # dense wall time owed after last sparse tick
-        self._hybrid_dense_used = 0.0     # dense wall time accumulated since it
+        # Hybrid wall-time fairness. A ROLLING window: since the last sparse
+        # tick, track wall time each mode actually received while BOTH had a
+        # runnable row. Sparse owns the next tick only when dense has already
+        # received at least as much wall time as sparse in that window. This
+        # serves a newly-arrived dense row immediately (it arrives with dense
+        # behind in the window) instead of making it pay for sparse ticks that
+        # ran while no dense row existed -- that global-debt design gave ~0.08
+        # dense/sparse tick ratio on the V100 (short min 1.5 tok/s, 29 s TTFT).
+        self._hybrid_sparse_wall = 0.0  # sparse wall time in the current window
+        self._hybrid_dense_wall = 0.0   # dense wall time in the current window
         #: test seam: (sparse_dt, dense_dt) replaces the perf_counter measurement
         self._hybrid_fake_dt: tuple[float, float] | None = None
         self._hybrid_t0 = 0.0
@@ -1283,7 +1284,10 @@ class Engine:
             dense_rows = [r for r in self._running if not r.sparse_on]
             sparse_rows = [r for r in self._running if r.sparse_on]
             if dense_rows and sparse_rows:
-                mode_sparse = self._hybrid_dense_used >= self._hybrid_dense_budget
+                # dense owns the tick while it is behind OR TIED: a tie at a
+                # freshly-opened window (dense just arrived, both at 0) must serve
+                # the dense row, not make it wait one ~1 s sparse tick.
+                mode_sparse = self._hybrid_dense_wall > self._hybrid_sparse_wall
             elif dense_rows:
                 mode_sparse = False
             decodes = [r for r in decodes if r.sparse_on == mode_sparse]
@@ -2581,23 +2585,30 @@ class Engine:
             if r.sparse_on and r.phase != _PHASE_DONE)
 
     def _hybrid_charge(self, sparse: bool) -> None:
-        """Per-mode tick counters and wall-time fairness accounting.
+        """Per-mode counters and rolling-window wall-time accounting.
 
-        After a SPARSE tick, dense is owed the tick's duration: dense keeps
-        owning following ticks while both modes run, until it has accumulated
-        equal wall time. A DENSE tick adds to that accumulation. Measured from
-        the fake-clock seam in tests ((sparse_dt, dense_dt) per tick)."""
+        Only ticks that run while the OTHER mode also has a runnable row enter
+        the window -- time spent solo is not a debt either side owes. A sparse
+        tick opens a window carrying its cost; dense ticks accrue against it and
+        sparse may run again only once dense has caught up. This serves a dense
+        row the instant it arrives (dense is then behind) rather than charging
+        it for sparse ticks that ran while no dense row existed."""
         if self._sparse_min_tokens == 0:
             return
+        other_present = any(r.sparse_on != sparse for r in self._running)
         dt = (self._hybrid_fake_dt[1 if not sparse else 0]
               if self._hybrid_fake_dt is not None
               else time.perf_counter() - self._hybrid_t0)
         if sparse:
             self._sparse_mode_ticks += 1
-            self._hybrid_dense_budget += dt
+            if other_present:
+                # New window: this sparse tick's cost is what dense must match.
+                self._hybrid_sparse_wall = dt
+                self._hybrid_dense_wall = 0.0
         else:
             self._dense_mode_ticks += 1
-            self._hybrid_dense_used += dt
+            if other_present:
+                self._hybrid_dense_wall += dt
 
     def _finish_prefills(self, prefills: list[_Req], chunks: list[int], logits, base: int) -> None:
         done = []
