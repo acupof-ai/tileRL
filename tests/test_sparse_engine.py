@@ -1871,7 +1871,6 @@ def test_publish_hash_steps_stay_linear_not_quadratic_in_context():
     times — not sum_p 16*(p+1)."""
     import torch as _torch
 
-    from tilerl import sparse_engine as se
     from tilerl.kv_cache import HostKvPages
     from tilerl.sparse_engine import SparsePrefixCache
 
@@ -1885,14 +1884,15 @@ def test_publish_hash_steps_stay_linear_not_quadratic_in_context():
         cache.note_boundary(rid, m, (_torch.zeros(2), None))
 
     calls = 0
-    orig = se._page_hash
+    from tilerl import kv_cache as kvc
+    orig = kvc._rolling_hash
 
     def counted(prev, token):
         nonlocal calls
         calls += 1
         return orig(prev, token)
 
-    se._page_hash = counted
+    kvc._rolling_hash = counted
     try:
         # the engine passes the prefix as it exists at the moment each page drops,
         # growing by exactly one page between calls
@@ -1901,7 +1901,7 @@ def test_publish_hash_steps_stay_linear_not_quadratic_in_context():
             cache.publish_dropped(rid, tuple(range((p + 1) * BLOCK_TOKENS)),
                                  bounds, p, {"k": t, "v": t})
     finally:
-        se._page_hash = orig
+        kvc._rolling_hash = orig
     assert calls == 16 * P, calls
 
 
