@@ -121,20 +121,29 @@ def main() -> None:
     e._build_plan = plan_wrap
     e._run_forward = fwd_wrap
 
+    # peek() (not poll) after each tick: it returns the growing token list without
+    # consuming it, so first-token time is the first tick the list is non-empty and
+    # finish time is when it reaches max_new -- poll-once collapsed all 40 tokens
+    # to the finish tick and made decode_ms 0.
+    target = {**{long_rid: 2}, **{r: args.short_max_new for r in short_rids}}
     for _ in range(20000):
         e.step()
         now = time.perf_counter()
         for r in e._running:
             if r.req_id not in admit_ts and r.state_slot is not None:
                 admit_ts[r.req_id] = now
-        polled = e.poll()
-        for rid, toks in polled.items():
-            if rid not in first_ts:
+        for rid in rids:
+            cur = e.peek(rid)
+            if cur is None:
+                continue
+            if rid not in first_ts and cur:
                 first_ts[rid] = now
-            out_tokens[rid].extend(toks)
-            finish_ts[rid] = now
+            out_tokens[rid] = list(cur)
+            if len(cur) >= target[rid]:
+                finish_ts.setdefault(rid, now)
         if all(r in finish_ts for r in rids):
             break
+    e.poll()
 
     e.shutdown()
 
