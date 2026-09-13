@@ -616,3 +616,36 @@ def test_sparse_kv_cold_excluded_from_device_peak_but_in_host_total():
     assert by["host_total"]["derived"] == cold
     # device total reconciles to the measured peak exactly (cold absent)
     assert by["device_total"]["derived"] == peak
+
+
+def test_dense_memory_rows_computed_once_and_stable(monkeypatch):
+    """_build_stats runs twice a step; #460 made each call re-walk every param
+    tensor via plan. The static dense ledger must be built once and then served
+    from the memo (a 27B sm70 decode regression attributed to #460)."""
+    import tilerl.memory as memory_mod
+
+    _, _, eng = _engine()
+    calls = 0
+    orig_plan = memory_mod.plan
+
+    def counting_plan(*a, **k):
+        nonlocal calls
+        calls += 1
+        return orig_plan(*a, **k)
+
+    monkeypatch.setattr(memory_mod, "plan", counting_plan)
+    first = eng._memory_rows()
+    for _ in range(4):
+        eng._build_stats()
+    again = eng._memory_rows()
+    assert calls == 1, calls
+    assert again is first
+    eng._mem_rows = None
+    assert eng._memory_rows() == first
+    # add_lora attaches adapter tensors post-build (the train manifest reads
+    # engine.config after that): the params-length key must force a rebuild.
+    import torch
+    eng._model.params["lora_probe.weight"] = torch.zeros(3)
+    assert eng._memory_rows() != first
+    assert calls == 3
+    assert eng._memory_rows() == eng._memory_rows()

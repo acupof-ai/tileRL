@@ -730,6 +730,11 @@ class Engine:
         self._thread: threading.Thread | None = None
         #: Published by the loop so `stats()` never takes the lock a forward holds.
         self._stats_snapshot: dict[str, Any] | None = None
+        #: Memoized dense ledger: weights/pools/slots are static after build, and
+        #: _build_stats (twice a step) used to re-walk every param tensor per tick.
+        #: Keyed on len(params): add_lora attaches adapter tensors post-build, so
+        #: the train manifest's ledger must recompute after an attach.
+        self._mem_rows: tuple[int, list] | None = None
 
         self._next_id = 1
         self._waiting: deque[_Req] = deque()
@@ -1443,6 +1448,9 @@ class Engine:
         the transient residual, so ``measured peak = Σ static + transient`` is printed."""
         from .memory import memory_table, plan
 
+        n_params = len(self._model.params)
+        if self._mem_rows is not None and self._mem_rows[0] == n_params:
+            return self._mem_rows[1]
         kv, sp = self._kv, self._states
         # Only the MTP DraftHead attaches a separate PagedKvPool; DFlash2 has no .kv pool.
         draft_pool = getattr(self._draft, "kv", None)
@@ -1597,6 +1605,11 @@ class Engine:
                         "delta": 0,
                     }
                 )
+        # A dense engine with neither the manual cold seam nor a boot store has a
+        # fully static ledger; memoize so the twice-a-step stats call does not
+        # re-walk the param tensors.
+        if self._sparse is None and self._boot is None and getattr(kv, "cold", None) is None:
+            self._mem_rows = (n_params, rows)
         return rows
 
     def sparse_retier(self, keep: frozenset[int]) -> tuple[int, int]:
