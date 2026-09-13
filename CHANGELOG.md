@@ -12,6 +12,8 @@
 
 - **perf (H20 card-3 256k verified)** — **the sparse 256k prefill lost ~40% to per-drop prefix hashing, not the spill disk.** py-spy put `_page_hash`/`page_key` at ~32% self time: `publish_dropped` rehashed each content key from token zero on every drop (O(M²)); `has_bounds` also forced a CUDA sync per drop via `bool(device_mask[i])`. Fix: extend one rolling hash per new page, cache per-page keys + the chain hash, and mirror the bounds mask to a host bytearray. Keys stay bit-identical (gated). H20 256k prefill **996.3 → 359.5 s (64%)**; spill write unchanged at ~2%. — [wins/2026-09-13-sparse-publish-prefix-hash-quadratic.md](docs/experience/wins/2026-09-13-sparse-publish-prefix-hash-quadratic.md)
 
+- **accept-or-reject verdict (H20 card-3, 12 interleaved sessions)** — **the sparse host cold prefix tier is flat and free under multi-session churn.** 12 conversations × 3 growing turns: on/off per-turn **0.988** (6 GiB host budget, no spill) and **0.993** with a 256 MiB budget that actually wrote **1.07 GiB** to the mmap prefix file; server RSS flat 6.88 / 5.99 GiB across 36 turns (the #556 leak does not recur), 24 interleaved prefix hits. Distinct from the still-open dense `KvTier` 1.65x/0-hit reject (`--ssd-path`), which no fix touched. Sparse path is fidelity-flagged (#563). — [wins/2026-09-13-sparse-cold-tier-flat-at-12-sessions.md](docs/experience/wins/2026-09-13-sparse-cold-tier-flat-at-12-sessions.md)
+
 One line per event — phase exit, default flip, accept-or-reject verdict — with
 its `docs/experience/` entry. Newest first.
 
