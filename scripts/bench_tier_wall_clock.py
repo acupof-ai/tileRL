@@ -29,6 +29,7 @@ teardown failure costs the derivation and not the measurement.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -92,12 +93,36 @@ def _turn(port: int, model: str, convs: list, c: int, req_s: float) -> dict:
     return {"wall_s": time.monotonic() - t0, "out": out}
 
 
+def _rss_kib(pid: int) -> int | None:
+    """VmRSS (KiB) of the server pid from /proc — the #556 leak under
+    multi-session churn shows as RSS climbing while cold_host stays pinned."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return None
+
+
 def run_arm(args, arm: str, spill: str, log: str) -> list[dict]:
     """One server, every session count. Returns one row per (sessions, turn) cell."""
     cmd = [args.python, "-u", "-m", "tilerl.cli", "serve", "--model", args.model,
            "--host", "127.0.0.1", "--port", str(PORT), "--max-batch", "1",
            "--max-ctx", str(args.max_ctx), "--slots", str(args.slots)]
-    if spill:
+    # Both sparse-cold arms run --sparse-k; ONLY the on arm pins a host budget and
+    # adds the mmap spill file. The off arm leaves kv-cold-bytes unset (auto-sized
+    # to the whole context, no SSD), so it is sparse-without-spill — the control
+    # for the cold SSD tier, not the dense engine. Dense --ssd-path is the else.
+    if args.cold_spill:
+        cmd += ["--sparse-k", str(args.sparse_k)]
+        if spill:
+            cmd += ["--kv-cold-bytes", str(args.kv_cold_bytes),
+                    "--cold-ssd-path", spill]
+            if args.cold_ssd_bytes:
+                cmd += ["--cold-ssd-bytes", str(args.cold_ssd_bytes)]
+    elif spill:
         cmd += ["--ssd-path", spill]
     # setdefault, not override: a hardcoded /work made the child recompile on any other box.
     env = dict(os.environ)
@@ -108,11 +133,17 @@ def run_arm(args, arm: str, spill: str, log: str) -> list[dict]:
                                 cwd=args.repo)
     try:
         st0 = _wait_up(PORT, proc, args.boot_s)
-        # The tier being off must be visible in the data, not inferred from the flag:
-        # a tier-off /health emits no ssd_* keys at all.
-        has_tier = any(k.startswith("ssd_") for k in st0)
+        # The sparse engine reports kv_cold_* even with the SPILL off (it
+        # auto-sizes a host budget), so key presence is not tier-on. The cold
+        # arms are distinguished by the explicit spill flag; the summary later
+        # asserts the on arm actually writes spill bytes. Dense KvTier is
+        # distinguishable from data (ssd_* keys).
+        if args.cold_spill:
+            has_tier = bool(spill)
+        else:
+            has_tier = any(k.startswith("ssd_") for k in st0)
         assert has_tier == bool(spill), (
-            f"arm {arm}: spill={spill!r} but ssd_* keys present={has_tier}")
+            f"arm {arm}: spill={spill!r} but tier keys present={has_tier}")
         blocks_total = int(st0["blocks_total"])
         print(f"# arm {arm} up: blocks_total={blocks_total} "
               f"tier={'on' if has_tier else 'off'}", flush=True)
@@ -151,6 +182,14 @@ def run_arm(args, arm: str, spill: str, log: str) -> list[dict]:
                         "ssd_refusals": after.get("ssd_refusals", 0),
                         "ssd_hits": after.get("ssd_hits", 0),
                         "ssd_bytes": after.get("ssd_bytes", 0),
+                        # sparse HostKvPages cold tier (present with --cold-spill)
+                        "cold_host_bytes": after.get("kv_cold_bytes"),
+                        "cold_ssd_bytes": after.get("kv_cold_ssd_bytes"),
+                        "cold_shared_bytes": after.get("kv_cold_shared_bytes"),
+                        "cold_shared_ssd_bytes": after.get("kv_cold_shared_ssd_bytes"),
+                        "cold_demotions": after.get("kv_cold_demotions", 0),
+                        "cold_promotions": after.get("kv_cold_promotions", 0),
+                        "rss_kib": _rss_kib(proc.pid),
                         "compiles": _compiles(log),
                     }
                     rows.append(row)
@@ -198,28 +237,52 @@ def main() -> int:
     ap.add_argument("--boot-s", type=float, default=900.0)
     ap.add_argument("--req-s", type=float, default=1800.0)
     ap.add_argument("--spill", default=SPILL)
+    ap.add_argument("--cold-spill", action="store_true",
+                    help="bench the sparse HostKvPages cold mmap tier (--sparse-k + "
+                         "--kv-cold-bytes + --cold-ssd-path) instead of dense --ssd-path")
+    ap.add_argument("--sparse-k", type=int, default=128)
+    ap.add_argument("--kv-cold-bytes", type=int, default=6 * 1024**3,
+                    help="pinned host budget for the sparse cold tier (default 6 GiB)")
+    ap.add_argument("--cold-ssd-bytes", type=int, default=12 * 1024**3,
+                    help="cold spill SSD capacity (default 12 GiB)")
     ap.add_argument("--skip-warmup", action="store_true")
     ap.add_argument("--out", default="/work/tier_wall.json")
     benchrec.add_record_args(ap)
     a = ap.parse_args()
     a.sessions = [int(x) for x in a.sessions.split(",") if x.strip()]
 
-    # A warm-up arm so the measured arms meet a populated TileLang cache. Without it the
-    # FIRST arm pays every compile and reads slower for a reason that is not the tier.
+    # A warm-up arm at the FULL measured shape (max sessions, all turns) so every
+    # sparse growing-context / chunk shape compiles before a wall is recorded. The
+    # old 2-session/1-turn warmup left the 12-session x3-turn sparse arms compiling
+    # 24 shapes during measurement, contaminating the off-arm walls. JIT cache
+    # persists across server restarts (TILELANG_CACHE_DIR), so one full run covers
+    # both measured arms.
     if not a.skip_warmup:
         warm = a.spill + "_warmup"
         shutil.rmtree(warm, ignore_errors=True)
-        os.makedirs(warm, exist_ok=True)
-        w = argparse.Namespace(**{**vars(a), "sessions": [2], "turns": 1})
+        if a.cold_spill:
+            os.makedirs(os.path.dirname(warm) or ".", exist_ok=True)
+        else:
+            os.makedirs(warm, exist_ok=True)
+        w = argparse.Namespace(**{**vars(a), "sessions": [max(a.sessions)],
+                                  "turns": a.turns})
         run_arm(w, "jitwarm", warm, "/work/tier_wall_jitwarm.log")
         shutil.rmtree(warm, ignore_errors=True)
 
     rows: list[dict] = []
-    # Tier off first, then on, into a wiped spill dir: a tier that adopts a previous run's
-    # files starts with hits it did not earn (measured: ssd_recovered=39 once).
+    # Wipe prior spill so a tier cannot adopt a previous run's files (measured:
+    # ssd_recovered=39 once). Dense KvTier wants a DIRECTORY; the sparse cold
+    # mmap spill wants a FILE base (it opens <base> and <base>.prefix.bin), so
+    # mkdir-ing the base makes the first spill raise IsADirectoryError.
     shutil.rmtree(a.spill, ignore_errors=True)
+    for f in (a.spill, a.spill + ".prefix.bin"):
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(f)
     rows += run_arm(a, "off", "", "/work/tier_wall_off.log")
-    os.makedirs(a.spill, exist_ok=True)
+    if not a.cold_spill:
+        os.makedirs(a.spill, exist_ok=True)
+    else:
+        os.makedirs(os.path.dirname(a.spill) or ".", exist_ok=True)
     rows += run_arm(a, "on", a.spill, "/work/tier_wall_on.log")
 
     print("\n=== summary (derived from the rows above, which are already in the log)",
@@ -249,6 +312,26 @@ def main() -> int:
                 cell["ssd_evictions"] = max(r["ssd_evictions"] for r in rs)
                 cell["ssd_offered"] = max(r["ssd_offered"] for r in rs)
                 cell["ssd_hits"] = max(r["ssd_hits"] for r in rs)
+                if a.cold_spill:
+                    # sparse HostKvPages cold tier: host RSS must stay pinned while
+                    # spill bytes grow; demotions/promotions are its churn counters.
+                    rss = [r["rss_kib"] for r in rs if r.get("rss_kib")]
+                    ch = [r.get("cold_host_bytes") for r in rs
+                          if r.get("cold_host_bytes") is not None]
+                    cs = [r.get("cold_ssd_bytes") for r in rs
+                          if r.get("cold_ssd_bytes") is not None]
+                    css = [r.get("cold_shared_ssd_bytes") for r in rs
+                           if r.get("cold_shared_ssd_bytes") is not None]
+                    if rss:
+                        cell["cold_on_rss_first_gib"] = round(rss[0] / 1048576, 3)
+                        cell["cold_on_rss_max_gib"] = round(max(rss) / 1048576, 3)
+                    if ch:
+                        cell["cold_host_max_gib"] = round(max(ch) / 1024**3, 3)
+                    if cs or css:
+                        cell["cold_ssd_max_gib"] = round(
+                            (max(cs or [0]) + max(css or [0])) / 1024**3, 3)
+                    cell["cold_demotions"] = max(r.get("cold_demotions", 0) for r in rs)
+                    cell["cold_promotions"] = max(r.get("cold_promotions", 0) for r in rs)
         summary[n] = cell
     bad = [(r["arm"], r["sessions"], r["compiles"]) for r in rows if r["compiles"] > 0]
     print(json.dumps({"per_sessions": summary,
