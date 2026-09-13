@@ -1,11 +1,12 @@
 # A spec follower adopts a warm sparse prefix, bit-equal to cold — 2026-09-13
 
-> Status: **tiny CPU green; sm90 card parity pending-remote.** A spec follower
-> now ADOPTS a published sparse prefix instead of prefilling from zero, and its
-> tokens are bit-equal to a cold spec follower (`sparse_k=2` + spec, 24-page
-> published prompt, 8 generated tokens). The sm90 continuity gate must pass
-> before sparse is re-defaulted; this gate runs on CPU and does not exercise
-> the card kernel.
+> Status: **tiny CPU green; sm90 card B=1 exact (8/8 followers, first-token
+> logits max_abs 0.0). The B=8 wave diverges, and so does a COLD-vs-COLD B=8
+> wave — that is the open sm90 B>1 packed-prefill defect (#563/#567), not this
+> path.** A spec follower now ADOPTS a published sparse prefix instead of
+> prefilling from zero; its tokens are bit-equal to a cold spec follower
+> (`sparse_k=2` + spec, 24-page published prompt, CPU) and at B=1 on the 27B
+> card (k=128, 64 generated tokens).
 
 ## Context
 
@@ -62,6 +63,16 @@ the state a cold build of the same prefix produces.
 - a transferred page whose private blob was already past the host budget is
   re-keyed to its content key for future demotes, so a re-demotion refreshes
   the shared blob instead of dropping it.
+- **a hot pool never drops a prompt page**: with k >= the prompt page count the
+  drop-only frontier never closes and no follower could match (the 27B card
+  gate, k=128, a 24-page prompt). On request release the publisher forces the
+  prompt-end closure, offering still-resident pages under their private key so
+  they snapshot from the live frame; followers (`sparse_matched>0`) are excluded
+  because their prompt pages belong to another publisher's blobs.
+- a follower whose prompt equals a page-aligned prefix in WHOLE has zero
+  residual tokens and would sit in PREFILL forever; its last adopted page is
+  re-forwarded once (the dense boot path's same trick) to produce first-token
+  logits.
 
 ## Gate
 
@@ -70,7 +81,19 @@ warm follower tokens == an isolated cold spec follower bit-for-bit; every
 published blob carries `dk`; the follower adopts the full 24-page prefix
 (`sparse_matched == 384`). The held prefix bytes (trunk + bounds + draft)
 show as a measured==derived `kv_prefix` host ledger row, split out of
-`kv_cold`. 768 CPU tests green.
+`kv_cold`. Two more CPU red tests cover the no-drop finish publish and the
+zero-tail follower (each verified red without its fix). Full suite 774 green.
+
+27B card-4 gate (k=128, 64 tokens), `scripts/probe_warm_prefix.py` +
+`probe_warm_control.py`: one warm publisher, 8 followers.
+- B=1, sequential: warm == cold for all 8 followers, first-token logits
+  max_abs **0.0**.
+- B=8 wave: 1/8 token-equal — but a cold-vs-cold B=8 control (the same
+  followers, two fresh cold waves) is also only 3/8 equal, with mismatches at
+  the same decode positions (5..31). The B=8 divergence exists without any
+  warm adoption; it is the sm90 B>1 packed-prefill defect (#563/#567).
+- 8/8 adoptions, matched=384; 27.0 MiB `kv_prefix`, delta 0; the warm wave
+  ran in ~half the cold wave's wall time (101.0 s vs 201.7 s).
 
 ## Rule
 
