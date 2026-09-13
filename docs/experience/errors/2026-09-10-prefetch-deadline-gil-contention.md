@@ -131,3 +131,11 @@ so N=1 catches a window only ~once per 14 ticks; N=20 catches one within
 ~1 tick. The sweep could not price a fixed N (2 runs per cell, and the tail
 decides the flake), so the shipped fix spins until the fetch parks with a
 50 ms wall-clock bound — N=∞ with an early exit, no tuned parameter.
+
+## Code removed 2026-09-14
+
+The whole `KvTier` prefetch path (deadline, background reader, `any_fetching()`)
+was removed with the dense SSD tier in #568 (b6b20bb3, consolidated #574):
+`grep -rn "KvTier\|any_fetching\|ssd_prefetch" src/` is empty and the engine
+step has no sleep/yield. The surviving cold tier (`ColdSsdFile`) is a synchronous
+mmap with no prefetch. OPEN.md row deleted; nothing left to exercise.

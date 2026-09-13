@@ -117,3 +117,27 @@ stopped at the paragraph that refuted it. **Evidence that matches the expectatio
 search**, which is the same failure whether the evidence is prose, a number, or a grep hit.
 The stopping rule cannot be "I found something consistent". For a claim about code it is: read
 the whole section, and name the mechanism by which the claim could be false.
+
+## Pending-remote arm (2026-09-14) — the surviving sizing defect
+
+The tier demotes snapshots and keeps blocks, taking peak pool occupancy 45.6% → 99.1%;
+the block axis then evicts demoted entries and `_drop` forgets the host copy (H20 cell:
+103 demotions, 0 promotions, 5.9 GiB of the 6 GiB tier budget unused). The probe self-serves
+with the tier on and prints every `/health` key per turn:
+
+```
+scripts/pod_run.sh drampress <card> -- /work/tl013/bin/python -u \
+    scripts/probe_dram_pressure.py --max-ctx 49152 --sessions 12 --turns 3
+```
+
+The probe hardcodes `--dram-bytes 4 GiB`; dense serve defaults the tier to 0, so this row
+is inert unless the tier is opted in. Verdict statistics from the per-turn output:
+`dram_demotions` vs `dram_promotions` (original: 103 vs 0), peak
+`pool_used_blocks/blocks_total` with the tier on against a tier-off cell, and evictions
+that fired while demoted entries existed (the orphan path). **Arch-independence:** the
+store mechanics are arch-independent and CPU-drivable in isolation, but the numbers that
+choose the fix (occupancy, promotion rate at 27B prompt lengths) are card-specific — a V100
+run decides whether V100 serve should ever opt into `--dram-bytes`; the H20 103/0 record
+stands for H20 until overwritten. The fix is whichever the data supports: retain fewer
+blocks on demote (needs partial-entry hits), or size the block pool against the tier's
+retention at build time.

@@ -4,8 +4,13 @@
 **Machine:** local CPU target, tiny model (`tests/test_kv.py::test_last_prefill_boundary_is_a_real_chunk_end`).
 No card was available — the V100 held an 8.5-hour serve process — so this is chunk arithmetic found and
 fixed without one; the invariant is exact, not statistical.
-**Status:** **open** — the shipped fix (c14511b) closes the case at `budget == 512` and the bug returns as soon
-as a decode row shares the tick. The real defect is `_last_prefill_boundary`'s signature; see the last section.
+**Status:** **closed 2026-09-14.** The schedule-dependent half landed without any of the
+rejected designs: the engine holds the exact snapshot at the deepest aligned chunk end the
+real walk reached and inserts it at completion. The n-only predictor stays, scoping the
+hold to a ≤32-token tail window. The `spill_held`/disk half this entry priced was the
+dense SSD tier (`KvTier`), removed in #568 — the in-memory boundary entry is what serves
+turns, and that is what now always lands. Wins:
+[2026-09-14-ragged-prompt-publishes-its-real-deepest-boundary.md](../wins/2026-09-14-ragged-prompt-publishes-its-real-deepest-boundary.md)
 
 ## Context
 

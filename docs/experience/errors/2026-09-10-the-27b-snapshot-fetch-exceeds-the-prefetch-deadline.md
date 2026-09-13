@@ -73,3 +73,9 @@ cache — not the requester that left — is the result's owner.
 | 2026-09-10 | H20 card 0 | sm90 | 27B-NVFP4 | 157.6 MiB | 117 | 75.0 | 3 | 3/3 | 11.39 ms |
 
 Raw artifacts: `/work/spin27b.log` on the pod.
+
+## Code removed 2026-09-14
+
+The prefetch/fetch machinery this entry describes went away with the dense SSD
+tier in #568 (b6b20bb3, consolidated #574); the surviving `ColdSsdFile` is a
+synchronous mmap. OPEN.md row deleted.

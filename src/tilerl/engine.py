@@ -61,10 +61,13 @@ from .spec import _PREFILL_BUCKET, LADDER_WIDTHS
 
 
 def _last_prefill_boundary(n: int) -> int:
-    """Where `_pick` ends the final prefill chunk of an `n`-token prompt, 0 if aligned."""
+    """Where an UNINTERRUPTED walk ends the final aligned chunk of an `n`-token
+    ragged prompt; 0 if aligned. The true walk is schedule-dependent -- decode
+    rows sharing a tick shrink the budget -- so this predicts the common case,
+    and `_finish_prefills` holds a snapshot for walks that walk past it."""
     tail = n % BLOCK_TOKENS
     if not tail:
-        return 0  # the prompt-complete branch handles it
+        return 0
     end = (n // BLOCK_TOKENS) * BLOCK_TOKENS
     return end - BLOCK_TOKENS if tail == 1 else end
 
@@ -260,6 +263,9 @@ class _Req:
     #: interior prefill boundaries this row has already published. Only the first and the last
     #: land, so a row's publishes stay at 2 whatever the prompt length -- see `_finish_prefills`.
     interior_published: int = 0
+    #: exact snapshot at the deepest aligned prefill chunk end inside the ragged tail
+    #: window; inserted at completion. See `_finish_prefills`.
+    pending_prefix: tuple[int, Any] | None = None
     output: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     thought_closed: bool = False  # the reasoning block ended (model's or forced)
@@ -1233,12 +1239,10 @@ class Engine:
             # 64-alignment above lands exactly on 64, so the tail is a chunk of its own:
             # `end == n` holds with `short = 64 - 64 = 0`, `short > 0` is False, and the
             # 1-token chunk ships. 14 lengths under 4000 hit this (65, 129, ... 2561, one per
-            # `budget × k + 1` and per `_PREFILL_BUCKET × k + 1`), and on every one of them
-            # `_last_prefill_boundary` names a position no chunk ends at, so `last` never
-            # fires and that prompt's prefix is never published. Costs no extra
+            # `budget × k + 1` and per `_PREFILL_BUCKET × k + 1`). Costs no extra
             # forward: measured over n=2..4000 at budget 512, 21606 chunks before and after.
-            # Covers this budget only -- `budget` is `max_num_batched_tokens - len(decodes)`
-            # and the boundary helper takes `n` alone, so a shared tick still loses the boundary.
+            # Schedules below BLOCK_TOKENS still ship the 1-token tail -- their deepest
+            # aligned boundary is held and published at completion instead.
             # errors/2026-09-08-a-one-token-chunk-made-last-unreachable.md
             if len(r.tokens) - (r.prefill_from + chunk) == 1 and chunk > BLOCK_TOKENS:
                 chunk -= BLOCK_TOKENS
@@ -2416,22 +2420,34 @@ class Engine:
                 done.append((pf, logits[base + k, min(c, logits.shape[1]) - 1], 0))
             elif pf.prefill_from % BLOCK_TOKENS == 0:
                 # A chunk end is a state-pool boundary, so the snapshot is exact here.
-                # Only the last boundary is published at a chunk end; ask `_pick`
-                # where it is, since a remaining-length test misreads the
-                # backed-off 17-token tail.
-                last = pf.prefill_from == _last_prefill_boundary(len(pf.tokens))
-                # The FIRST interior boundary and the last, never the ones between: a row's
-                # publishes stay at 2 whatever the prompt length, where per-boundary publishing
-                # emitted 62 at a 31k prompt and outran any budget a pressured card has. Costs a
-                # PARTIAL sharer the intermediate prefixes it would have matched, and that cost
-                # GROWS with prompt length: this boundary is one chunk in, wherever the prompt
-                # ends, so a long prompt's sharer matches an absolute cap. 83.3% of ideal reuse at
-                # 2048 tokens, 12.5% at 16384. K evenly spaced publishes fixes the axis and gives
-                # back the whole cross-session gain (grid 81408, pure LRU's baseline).
+                # The FIRST interior boundary always lands; a later one may be the
+                # last, but which is last is schedule-dependent -- decode rows sharing
+                # the tick shrink the budget and shift the whole walk -- so hold the
+                # newest boundary's exact snapshot and insert it at completion instead
+                # of predicting the walk from n alone.
+                # errors/2026-09-08-a-one-token-chunk-made-last-unreachable.md
+                # The first boundary plus the last, never the ones between: a row's
+                # publishes stay at 2 whatever the prompt length, where per-boundary
+                # publishing emitted 62 at a 31k prompt and outran any budget a
+                # pressured card has. Costs a PARTIAL sharer the intermediate prefixes
+                # it would match, and that cost GROWS with prompt length. 83.3% of
+                # ideal reuse at 2048 tokens, 12.5% at 16384.
                 # errors/2026-09-08-the-eviction-policy-was-the-wrong-layer.md
                 pf.interior_published += 1
-                if pf.interior_published == 1 or last:
+                predicted = _last_prefill_boundary(len(pf.tokens))
+                if pf.interior_published == 1:
                     self._publish_prefix(pf, pf.prefill_from)
+                elif len(pf.tokens) % BLOCK_TOKENS and pf.prefill_from >= predicted:
+                    # Tail window [predicted, n): at most two aligned chunk ends, so
+                    # this holds <=2 snapshots per ragged prompt and keeps only the
+                    # deepest the actual schedule reached. Not predicted: a decode
+                    # row sharing the tick shifts the walk past the n-only value.
+                    # Published at completion -- at most 32 tokens later, one tick.
+                    pf.pending_prefix = (
+                        pf.prefill_from,
+                        (self._states.states[pf.state_slot].clone(),
+                         self._states.window_snapshot(pf.state_slot)),
+                    )
         if not done:
             return
         self._sample_commit(done)
@@ -2440,6 +2456,13 @@ class Engine:
             prompt_len = len(pf.tokens) - len(pf.output)
             if pf.phase != _PHASE_DONE and prompt_len % BLOCK_TOKENS == 0:
                 self._publish_prefix(pf, prompt_len)
+            elif pf.phase != _PHASE_DONE and pf.pending_prefix is not None:
+                # Ragged prompt: the held boundary snapshot is exact and its
+                # blocks are still live; insert it at completion.
+                pos, snap = pf.pending_prefix
+                self._prefix_published += self._prefix.insert(
+                    pf.tokens[:pos], pf.blocks[: pos // BLOCK_TOKENS], snap)
+            pf.pending_prefix = None
             if pf.phase != _PHASE_DONE:
                 if len(pf.output) >= pf.params.max_new_tokens:
                     self._finish(pf)
@@ -2860,6 +2883,7 @@ class Engine:
         for b in req.blocks:
             self._kv.free_block(b)
         self._blocks_used -= req.own_blocks
+        req.pending_prefix = None  # a prefill that never completed still held a snapshot
         self._states.free_slot(req.state_slot)
         self._slots_used -= 1
 

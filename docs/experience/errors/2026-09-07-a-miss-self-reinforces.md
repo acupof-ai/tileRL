@@ -126,3 +126,20 @@ Raw artifacts: `/work/tbalt.log` on the H20 (36 rows, per-session totals,
   transfer directly: a prefill chunk's entry is what a *later* request matches
   against, so retiring the previous chunk would cost the intermediate prefixes that
   make a partial hit possible. Sizing that trade needs its own measurement.
+
+## Pending-remote arm (2026-09-14)
+
+V100-only by definition — the alternation never reproduced on H20 or CPU; the
+statistic is not arch-independent. Serve (the observed V100 box, 4-slot
+endpoint) then:
+
+```
+scripts/pod_run.sh alt <card> -- /work/tl013/bin/python -u scripts/bench_chat_interleaved.py \
+    --url http://127.0.0.1:8000 --sessions 12 --turns 3 --grow 84 --ttft
+```
+
+Verdict statistic: turn-0 `prefix_hits` per session, grouped by submission-index
+parity. The defect reads as one parity group ~all miss and the other ~all hit
+(original: 3364-token prompts hit, 3344 miss, alternating); a healthy box has
+both groups equal and high (H20: 11/12). Grow is chosen to land prompts near
+3.3k tokens; verify length from the run's own rows before reading parity.

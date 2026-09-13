@@ -567,6 +567,40 @@ Closed by the depth run: whether the mechanism is hit depth (yes — TTFT linear
 R² 0.998, and it predicts the unfitted miss row to −6.8%), and whether `compiles` can now go red
 (yes — 164 bytes, flushed).
 
+## Pending-remote arms (2026-09-14)
+
+The two pending statistics are the fixed term (row "1.2-2.5 s") and the K-ladder budget
+arm. Start one server, run both arms against it (one process, one card, config the only
+variable — the bench already reads `prefix_hits`/`prefix_hit_tokens`/per-row TTFT):
+
+```
+scripts/pod_run.sh cell <card> -- bash -c '
+/work/tl013/bin/python -u -m tilerl.cli serve --model qwen38-27b \
+    --host 127.0.0.1 --port 8000 --max-batch 8 --slots 16 --max-ctx 49152 \
+    --state-bytes 1073741824 --dram-bytes 4294967296 &
+for i in $(seq 1 600); do curl -sf 127.0.0.1:8000/health >/dev/null && break; sleep 1; done
+/work/tl013/bin/python -u scripts/bench_chat_interleaved.py \
+    --url http://127.0.0.1:8000 --sessions 24 --turns 1 --sys-tokens 30000 --ttft \
+    --server-log /work/fixed_serve.log'
+```
+
+- **Fixed term:** regress the 24 turn-1 rows' TTFT on unmatched fraction
+  `1 − prefix_hit_tokens/prompt_len`; the intercept is the fixed per-hit cost. Turns
+  held at 1 removes the depth covariate. Verdict statistic: intercept in seconds with
+  its standard error — the row closes when the 0.437-unmatched extrapolation is replaced
+  by an intercept with ≥1 point below u=0.1. **Arch-dependence:** the mechanism is
+  arch-independent (extra forwards, snapshot restore) but the number is card-specific —
+  a V100 (sm70, eager) intercept is the V100 serve deployment's number; the recorded
+  1.2–2.5 s range is H20 and only an H20 run overwrites it.
+- **K ≥ 2 ladder arm:** rerun the same command with `--state-bytes 4294967296` (12+
+  snapshots at 155 MiB, so K ≥ 2 fits every one of the ≤11 rung depths) and compare
+  per-turn wall clock and `prefix_hit_tokens` depth against the 1 GiB arm. Verdict
+  statistic: TTFT ratio on the same parent-child pair at a budget where K ≥ 2 fits.
+  Same arch qualification: V100 gives V100's ratio.
+
+Run row 3's fit **before** the ladder arm — the entry says the ladder cannot be priced
+until the fixed term is pinned.
+
 
 ## Rule
 
