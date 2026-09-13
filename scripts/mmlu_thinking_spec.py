@@ -35,6 +35,26 @@ MAX_THINK = 512
 ANS_RE = re.compile(r"\b([ABCD])\b")
 
 
+def question_set_hash(indices: list[int]) -> str:
+    """Stable fingerprint of the ORDERED question (dataset row id) list. A pair
+    of arms is only comparable on identical sets: --n 400 vs the first 400 of
+    --n 2000 sample different rows even with the same seed."""
+    import hashlib
+
+    return hashlib.sha256(",".join(map(str, indices)).encode()).hexdigest()[:16]
+
+
+def question_indices(n: int, seed: int) -> list[int]:
+    """Dataset row ids of the mmlu_questions(n, seed) slice. Must match the
+    sampling in tilerl.eval.mmlu_questions."""
+    import random
+
+    from datasets import load_dataset
+
+    size = len(load_dataset("cais/mmlu", "all", split="test"))
+    return sorted(random.Random(seed).sample(range(size), n) if n < size else range(size))
+
+
 def answer_letter(text: str) -> str:
     """Letter from the post-</think> continuation; last standalone letter as a
     fallback when the close marker is missing (a truncated thinker)."""
@@ -256,10 +276,13 @@ def main():
         return
 
     raw, golds, subjects = mmlu_questions(args.n, args.seed)
-    # --first-n takes the leading questions of the SAME seeded --n slice, so a
-    # 400-run is a true subset of a 2000-run and pairs on identical absolute ids.
+    indices = question_indices(args.n, args.seed)
     if args.first_n:
-        raw, golds, subjects = raw[:args.first_n], golds[:args.first_n], subjects[:args.first_n]
+        raw, golds, subjects, indices = (raw[:args.first_n], golds[:args.first_n],
+                                         subjects[:args.first_n], indices[:args.first_n])
+    qset_hash = question_set_hash(indices)
+    print(f"qset_hash={qset_hash} n={args.n} seed={args.seed} first_n={args.first_n or args.n}",
+          flush=True)
     prompts = thinking_prompts(raw)
     tok = get_tokenizer(args.source)
     backend = get_backend()
@@ -269,6 +292,7 @@ def main():
     result = {"n": args.n, "seed": args.seed, "k": args.k,
               "draft": bool(draft_path), "max_think": MAX_THINK,
               "max_new": MAX_NEW, "concurrency": CONCURRENCY,
+              "qset_hash": qset_hash, "question_ids": indices,
               "gold": golds, "subjects": subjects, "arms": {}}
     wanted = {"both": ["dense", "sparse"], "dense": ["dense"],
               "sparse": ["sparse"]}[args.arm]
@@ -291,6 +315,7 @@ def main():
                 ntok = sum(len(tok.encode(texts[i])) for i in done)
                 with open(args.out, "w") as fh:
                     json.dump({"n": args.n, "seed": args.seed, "k": args.k,
+                               "qset_hash": qset_hash, "question_ids": indices,
                                "arms": {label: {"n_done": len(done), "done_idx": done,
                                                 "predictions": [preds[i] for i in done],
                                                 "correct": correct,
@@ -364,7 +389,17 @@ def pair_arms(dense_json, sparse_json, out):
     with open(sparse_json) as fh:
         s_doc = json.load(fh)
     d, s = d_doc["arms"]["dense"], s_doc["arms"]["sparse"]
-    assert d_doc["seed"] == s_doc["seed"] and d_doc["n"] == s_doc["n"], "slice mismatch"
+    hd, hs = d_doc.get("qset_hash"), s_doc.get("qset_hash")
+    if hd is None or hs is None:
+        raise SystemExit("question-set hash missing; rerun both arms on a harness with qset_hash")
+    if hd != hs:
+        raise SystemExit(
+            f"question-set mismatch: dense {hd} (n={d_doc['n']} seed={d_doc['seed']}) "
+            f"vs sparse {hs} (n={s_doc['n']} seed={s_doc['seed']}); "
+            "--pair needs the same ordered questions (--n changes the sample)")
+    # Hash equality already pins seed/n/slice (done_idx positions align); the
+    # old n==n assert rejected a --first-n 400 arm paired with a same-ids full run.
+    assert d_doc["seed"] == s_doc["seed"], "seed mismatch despite equal qset_hash"
     result = dict(d_doc)
     result["arms"] = {"dense": d, "sparse": s}
     result["paired_two_cards"] = {
