@@ -228,19 +228,6 @@
       "weight": 0.06,
       "why": "decode-family; a guard row after the verdict flipped three times"
     },
-    "ssd_restart_speedup": {
-      "collector": {
-        "required": [],
-        "script": "scripts/bench_ssd_restart.py"
-      },
-      "direction": "+",
-      "shape": [
-        "prompt_tokens"
-      ],
-      "unit": "ratio",
-      "weight": 0.94,
-      "why": "a restart re-pays the prefill 94%; the tier is what avoids it"
-    },
     "train_step_tok_s": {
       "direction": "+",
       "shape": [

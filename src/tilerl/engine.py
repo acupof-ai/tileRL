@@ -29,7 +29,6 @@ sequences: ``decode=`` is the one place ids become text, for ``stop_texts``.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import re
@@ -52,7 +51,6 @@ from .kv_cache import (
     DramSnapshots,
     HostKvPages,
     KvBootStore,
-    KvTier,
     LinearStatePool,
     NoPrefixStore,
     PagedKvPool,
@@ -257,8 +255,6 @@ class _Req:
     phase: int  # _PHASE_PREFILL | _PHASE_DECODE | _PHASE_DONE
     prefill_from: int  # prefix-reuse offset for the prefill forward
     own_blocks: int  # blocks the engine allocated (vs adopted from a hit)
-    #: perf_counter deadline for an in-flight SSD prefetch; 0 = none outstanding
-    fetch_deadline: float = 0.0
     #: this row's live decode-boundary entry length, retired when the next lands; 0 = none.
     decode_entry: int = 0
     #: interior prefill boundaries this row has already published. Only the first and the last
@@ -715,11 +711,6 @@ class Engine:
                 own_blocks=0,
             )
             self._waiting.append(req)
-        # outside the lock: the enqueue must not sit on step()'s critical path
-        with contextlib.suppress(Exception):  # a tier fault must never fail a submit
-            rate = self.prefill_rate
-            if self._prefix.prefetch_if_worth_it(tokens, rate):
-                req.fetch_deadline = time.perf_counter() + len(tokens) / rate
         return rid
 
     @property
@@ -811,33 +802,6 @@ class Engine:
                     # `_loop` stops calling `step` once nothing runs, so this carries the last
                     # tick's state -- including a failed forward's, hence `finally`.
                     self._stats_snapshot = self._build_stats()
-        # Yield the GIL once per tick so the SSD reader/writer threads can run without
-        # contending with the step loop (71.7ms → 0.5ms for torch.load, H20, 2026-09-10).
-        # Outside the lock: a reader that ever takes _lock during a load would block on it.
-        if self._prefix.has_ssd:
-            time.sleep(0)
-            # Spin only for a row still WAITING on its OWN fetch. The old gate was the
-            # tier-global any_fetching(), so an unrelated fetch -- or one whose requester
-            # had already recomputed past its deadline -- made every tick burn the whole
-            # bound. Key sets replace fetch_in_flight()'s O(tokens) scan in this loop.
-            # Bound: the shortest remaining live deadline, capped at 50 ms -- a stuck
-            # reader's safety valve, never more than the caller still owes it.
-            now = time.perf_counter()
-            waiting = [(r, self._prefix.boundary_keys(r.tokens))
-                       for r in self._waiting if r.fetch_deadline > now]
-            if waiting:
-                spin_end = now + min(0.050, min(r.fetch_deadline - now for r, _ in waiting))
-                while True:
-                    now = time.perf_counter()
-                    if now >= spin_end:
-                        break
-                    keys = self._prefix.fetching_keys()
-                    if not any(
-                        r.fetch_deadline > now and bkeys & keys
-                        for r, bkeys in waiting
-                    ):
-                        break
-                    time.sleep(0)
         if idle:
             return
 
@@ -1013,25 +977,12 @@ class Engine:
         """Admit the whole waiting queue up to ``max_batch``, then all running
         decodes plus as many prefill rows as the token budget and one width
         bucket allow; a longer prompt stays in PREFILL and chunks across ticks."""
-        held: list[_Req] = []
         while self._waiting and len(self._running) < self.limits.max_batch:
             head = self._waiting[0]
-            # Deadline expired: stop WAITING and admit with a full prefill. The fetch is
-            # not abandoned -- it keeps reading and parks, so the next same-prefix request
-            # faults it in from memory (27B: 157 MiB/117 ms per read, never discarded).
-            if head.fetch_deadline and time.perf_counter() > head.fetch_deadline:
-                head.fetch_deadline = 0.0
-            # Hold the row while its own prefetch reads: `lookup` declines an in-flight
-            # prefix, so admitting now prefills what the fetch is already fetching. Set
-            # aside rather than `break`, which would stall the rows behind it.
-            elif head.fetch_deadline and self._prefix.fetch_in_flight(head.tokens):
-                held.append(self._waiting.popleft())
-                continue
             # break, not continue: head-of-line FIFO, else a blocked large request starves.
             if not self._admit(head):
                 break
             self._running.append(self._waiting.popleft())
-        self._waiting.extendleft(reversed(held))  # back at the front, order preserved
         decodes = [r for r in self._running if r.phase == _PHASE_DECODE]
         prefills: list[_Req] = []
         chunks: list[int] = []
@@ -1149,7 +1100,6 @@ class Engine:
                 "prefix_hit_tokens": self._prefix_hit_tokens,
                 # both operands of the fetch-vs-recompute decision, for a live server
                 "prefill_rate": round(self.prefill_rate, 1),
-                "prefix_break_even_tokens": self._prefix.break_even_tokens(self.prefill_rate),
                 "prefix_published": self._prefix_published,
                 # Whether the store is under pressure at all: a DRAM/SSD tier below it can
                 # only recover entries that were actually evicted, and at 144 MiB a 27B
@@ -2400,11 +2350,11 @@ def _weight_fingerprint(cfg, kv_fp8: torch.dtype | None = None) -> str:
     `num_attention_heads` -- so the list was already wrong when it was written.
 
     `kv_fp8` is not a config field but IS the store's byte format, so it is appended: a
-    flag flip against the same --ssd-path otherwise adopts blobs of the other format, which
+    flag flip against the same --kv-store otherwise adopts blobs of the other format, which
     is a RuntimeError in one direction and untrustworthy numerics in the other.
 
     It does NOT distinguish two checkpoints of the same architecture. Pass
-    `ssd_fingerprint` explicitly when one spill directory serves both.
+    `ssd_fingerprint` explicitly when one boot store directory serves both.
     """
     import dataclasses
 
@@ -2547,23 +2497,14 @@ def build_engine(
     #: matches exactly, skipping its prefill. Keyed by the same rolling prefix hash,
     #: gated by the weight fingerprint and a per-page checksum.
     kv_store: str = "",
-    #: directory for the SSD prefix tier; "" is off. Unlike the DRAM tier this one does
-    #: not need concurrent sessions to pay: after a restart HBM is empty, so the first
-    #: lookup of every returning conversation reaches back and the disk is what answers.
-    #: ``ssd_fingerprint`` must change whenever the weights do -- a tier serving KV
-    #: computed under other weights is silently wrong, and the fingerprint is the only
-    #: thing that stops it. Defaults to the model's shape, which does NOT cover a
-    #: different checkpoint at the same shape.
+    #: weight/config fingerprint for the --kv-store cold-start boot store. Must
+    #: change whenever the weights do — a boot context computed under other weights
+    #: is silently wrong, and the fingerprint is the only thing that stops it.
+    #: Defaults to the model's shape, which does NOT cover a different checkpoint
+    #: at the same shape.
     #: # ponytail: shape-derived fingerprint; hash the weights when two checkpoints of
-    #: #   one architecture are served from one spill dir
-    ssd_path: str = "",
+    #: #   one architecture are served from one boot dir
     ssd_fingerprint: str = "",
-    #: spill floor in tokens; 0 takes KvTier's own default (one chunk). Measured on H20
-    #: card 6: write-through costs 0.925 s of a 2.041 s prefill, and the reason is that a
-    #: GDN snapshot is a CONSTANT ~157 MB at every prefix length, so the 6 publishes of one
-    #: 2729-token prompt copy 941 MB of state to serve a single 157 MB entry. Raising this
-    #: drops the short publishes, which are the ones a longer prefix supersedes anyway.
-    ssd_min_tokens: int = 0,
     #: HBM budget for resident GDN snapshots; 0 keeps the quarter-of-free rule below.
     state_bytes: int = 0,
     #: fp8 dtype for the KV planes; None is off, the default. 65536 -> 33280 bytes per token
@@ -2770,11 +2711,6 @@ def build_engine(
         kv_pool.attach_cold(
             HostKvPages(budget_bytes=kv_cold_bytes, ssd_path=cold_ssd_path,
                         ssd_capacity_bytes=cold_ssd_bytes))
-    if ssd_path:
-        # Not gated on cuda: the tier is target-independent, and the CPU target is where
-        # its parity is checked.
-        kw["ssd"] = KvTier(ssd_path, ssd_fingerprint or _weight_fingerprint(cfg, kv_fp8),
-                           **({"min_tokens": ssd_min_tokens} if ssd_min_tokens else {}))
     if sparse_k and kv_store:
         raise NotImplementedError(
             "dense bulk boot (--kv-store) with sparse_k>0 is not supported: a boot "

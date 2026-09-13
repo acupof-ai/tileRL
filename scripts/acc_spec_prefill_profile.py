@@ -180,7 +180,7 @@ def main() -> None:
 
     store_t = 0.0
     store = engine._prefix
-    for name in ("lookup", "prefetch_if_worth_it", "evict_until_free", "reclaimable_blocks"):
+    for name in ("lookup", "evict_until_free", "reclaimable_blocks"):
         fn = getattr(store, name)
 
         def _wrap_store(*a, _fn=fn, **kw):

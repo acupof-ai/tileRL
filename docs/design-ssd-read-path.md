@@ -4,6 +4,11 @@
 > implemented as designed. The read path that shipped runs the `torch.load` off-tick
 > in a daemon reader thread (`kv_cache.py`), not inside `step()` under the lock.
 > See [errors/2026-09-09-ssd-read-path-proposed-vs-landed.md](experience/errors/2026-09-09-ssd-read-path-proposed-vs-landed.md).
+>
+> **REMOVED 2026-09-14.** The dense tier this doc designs (`KvTier`, `--ssd-path`)
+> was deleted after the serve-path REJECT in
+> [errors/2026-09-06](experience/errors/2026-09-06-the-ssd-tier-is-165x-worse-at-12-sessions.md).
+> The sparse cold tier (`--cold-ssd-path`) is a different path.
 
 From `origin/main` at `d4fc973`. No code. Numbers marked **measured** are read off
 an entry; the rest are derived and named as such.

@@ -186,9 +186,10 @@ is silently off-policy. Worth **3.87 s off a 133.65 s step (2.9%)** at group 8 /
 gen 1024 / LoRA-16 / micro 1 on H20, four recaptures removed per step, see
 [wins/2026-09-07-an-update-keeps-the-decode-graphs.md](docs/experience/wins/2026-09-07-an-update-keeps-the-decode-graphs.md).
 
-**`--ssd-path` stays off on the serve path**: 1.65x worse per turn at 12 sessions and 0
-hits, see
+**The dense SSD prefix tier (`--ssd-path`, `KvTier`) was removed on 2026-09-14** —
+1.65x worse per turn at 12 sessions and 0 hits, see
 [errors/2026-09-06-the-ssd-tier-is-165x-worse-at-12-sessions.md](docs/experience/errors/2026-09-06-the-ssd-tier-is-165x-worse-at-12-sessions.md).
+(The sparse cold tier's mmap spill lives behind `--cold-ssd-path`, a different path.)
 
 **Git.** Commitizen `<type>(<scope>): <subject>`, scopes `kv` `engine` `ops`
 `autograd` `train` `server` `docs`. Work on a named branch from a scratchpad
