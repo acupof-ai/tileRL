@@ -2233,3 +2233,74 @@ def test_sparse_mixed_length_rows_prefilling_one_tick_match_their_solo_g0():
                 f"row {i} g0 logits differ from solo: max|d|="
                 f"{float((got[i] - want[i]).abs().max()):.3e}, argmax flip="
                 f"{int(_torch.argmax(got[i])) != int(_torch.argmax(want[i]))}")
+
+
+def test_sparse_decode_never_enters_the_dense_graph_when_graphs_are_on():
+    """Dispatch regression (card-2, #557 CHANGE-REQ): with _decode_graph_on=True
+    (the CUDA auto state) the dense _run_decode_graph used to win EVERY sparse
+    decode tick, capturing a sparse=None BatchKv over the own blocks, so the
+    sparse graph was never built. A sparse row must route through the sparse
+    graph and never touch the dense graph; a dense row still uses it."""
+    prompt = np.arange(7, 7 + 12 * BLOCK_TOKENS, dtype=np.int64)
+    params = lambda: SamplingParams(temperature=0.0, max_new_tokens=12, seed=0)
+
+    # sparse engine forced into the CUDA state: BOTH graph flags on
+    e = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=8192,
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+        sparse_k=64, scorer="bounds", kv_cold_bytes=1 << 30,
+        sparse_device_select=True)
+    calls = {"dense": 0, "sparse": 0}
+
+    def dense_stub(reqs, chains=None):
+        calls["dense"] += 1
+        return True  # the bug: claiming a sparse tick for the dense graph
+
+    e._run_decode_graph = dense_stub
+    _orig_sparse = e._run_sparse_decode_graph
+
+    def sparse_wrap(reqs, chains):
+        ok = _orig_sparse(reqs, chains)
+        calls["sparse"] += int(ok)
+        return ok
+
+    e._run_sparse_decode_graph = sparse_wrap
+    e._decode_graph_on = True  # CUDA auto-enables this; CPU normally leaves it off
+    rid = e.submit(prompt, params())
+    try:
+        for _ in range(400):
+            e.step()
+            if len(e.poll().get(rid, ())) >= 12:
+                break
+    finally:
+        e.shutdown()
+    assert calls["sparse"] >= 1, "the sparse graph never replayed"
+    assert calls["dense"] == 0, (
+        f"a sparse decode tick entered the dense graph {calls['dense']} times")
+
+    # dense engine: the same flag routes to the dense graph as before
+    d = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=8192,
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore())
+    dense_calls = {"n": 0}
+
+    def dense_only(reqs, chains=None):
+        dense_calls["n"] += 1
+        return True
+
+    d._run_decode_graph = dense_only
+    d._decode_graph_on = True
+    # max_new_tokens>1: token 1 emits at prefill, token 2 onwards is a decode tick
+    drid = d.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+    for _ in range(400):
+        d.step()
+        if len(d.poll().get(drid, ())) >= 1:
+            break
+    for _ in range(3):
+        d.step()
+        if dense_calls["n"]:
+            break
+    d.shutdown()
+    assert dense_calls["n"] >= 1, "a dense decode tick did not use the dense graph"

@@ -2274,6 +2274,7 @@ class Engine:
         if (
             not prefills
             and decodes
+            and self._sparse is None
             and self._decode_graph_on
             and self._run_decode_graph(decodes, chains)
         ):
