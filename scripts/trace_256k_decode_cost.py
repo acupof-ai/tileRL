@@ -3,10 +3,11 @@
 
 The sparse cold-tier win entries are prefill-only. This measures the DECODE
 cost on top of a k=128 hot set whose pages mostly live in the host tier / mmap
-spill: every SPARSE_REFRESH_TICKS (=8) decode ticks the tracker re-selects 128
-pages and the engine promotes them, so 64 decode steps cross 8 refresh
-boundaries. Reports per-tick ms (CUDA-synced), split refresh vs ordinary,
-plus host RSS during decode.
+spill. On the measured head the serve path never enabled device selection, so
+every pure-decode tick ran the eager full-candidate re-selection (the cost
+this prices); per-tick refresh tagging is recorded for the post-#557 graph
+path, where 7 captured ticks alternate with one eager refresh every
+SPARSE_REFRESH_TICKS. Reports per-tick ms (CUDA-synced) plus host RSS.
 
 H20 card 3, one ctx per process:
   scripts/pod_run.sh dec256k 3 -- python3 scripts/trace_256k_decode_cost.py \
