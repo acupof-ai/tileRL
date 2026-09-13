@@ -198,11 +198,11 @@ Two levers past 32K, cheaper first:
    ms/token). It needs an f16 `paged_attention_split`, its own parity run, and a
    check that f16 K/V does not degrade long-range attention. Not done.
 2. **Spilling cold blocks to disk** — trades prefix hit rate for capacity, so it
-   suits long documents that get re-read rather than one long generation. `KvTier`
-   and a `--kv-tier <dir>` flag were written and reviewed on the sm70 branch
-   (`e9d5852`, `29b58a3`) but **never reached `main`** — `e4aaf8c` ported the
-   server work and left the code behind. Not a lever until it is ported. Its
-   baseline is **32768**, not the 4096 that shipped before: 8x of the headroom is
+   suits long documents that get re-read rather than one long generation. The dense
+   `KvTier` prefix tier that aimed at this was rejected on the serve path
+   (1.65x worse per turn at 12 sessions, 0 hits) and deleted on 2026-09-14; the
+   sparse cold tier spills fixed-stride pages behind `--cold-ssd-path`, a different
+   path. Its baseline is **32768**, not the 4096 that shipped before: 8x of the headroom is
    a flag, and folding it into offload's credit would overstate offload.
 
 Every row in the table is arithmetic from the block size, not a measured sweep. The

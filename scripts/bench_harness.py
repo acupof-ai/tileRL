@@ -448,10 +448,6 @@ def _view_readme() -> None:
             v1, v2 = turns[0]["value"], turns[1]["value"]
             print(f"| Cross-turn prefix reuse, turn 2 vs turn 1 | {v1 / v2:.1f}x "
                   f"| {turns[1]['device']['name']}, {turns[1]['build']}, record {turns[1]['id']} |")
-    for r in cur.values():
-        if r["metric"] == "ssd_restart_speedup":
-            print(f"| SSD tier restart, warm vs cold | {r['value']:.3f}x "
-                  f"| {r['device']['name']}, record {r['id']} |")
 
 
 def _view_regress() -> None:

@@ -171,7 +171,6 @@ uv run tilerl ledger
 [`docs/design-rl-stack.md`](docs/design-rl-stack.md) — ISO, the draft head, the ledger ·
 [`docs/design-engine.md`](docs/design-engine.md) ·
 [`docs/design-kernels.md`](docs/design-kernels.md) ·
-[`docs/design-ssd-read-path.md`](docs/design-ssd-read-path.md) — the prefix tier's break-even and async fetch ·
 [`docs/support-matrix.md`](docs/support-matrix.md) — per-op status per target ·
 [`docs/experience/PENDING-REMOTE-CARDS.md`](docs/experience/PENDING-REMOTE-CARDS.md) — the gated card work that remains ·
 [`docs/experience/`](docs/experience/) — every measurement, win and dead end, dated ·

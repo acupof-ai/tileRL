@@ -1,6 +1,8 @@
 # The SSD tier is 1.65x worse per turn at 12 sessions, and it serves nothing to pay for it
 
-**Status:** closed
+**Status:** closed (removed) — the dense tier (`KvTier`, `--ssd-path`,
+`--ssd-min-tokens`) was deleted on 2026-09-14. The sparse cold tier's mmap spill
+(`--cold-ssd-path`) is a different path and inherits nothing from this verdict.
 **Date:** 2026-09-06
 **Commit:** a5b63cb
 **Card:** H20 card 6

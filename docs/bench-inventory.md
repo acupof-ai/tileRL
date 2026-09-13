@@ -17,12 +17,14 @@ non-metric scripts must not be deleted.
 | `baseline.py` | Merges the pod's baseline JSON into the repo's (`pull`/`show`/`selfcheck`) |
 | `_pod_bench.sh` | generic pod runner |
 
-## SSD/tier support measurements (keep while the tier is shipped)
+## Tier support measurements
+
+The dense `KvTier` scripts (`bench_ssd_bandwidth.py`, `bench_write_through.py`
+plus the `bench_ssd_*`/`probe_prefetch_*` family) were deleted with the tier on
+2026-09-14; see [errors/2026-09-06](experience/errors/2026-09-06-the-ssd-tier-is-165x-worse-at-12-sessions.md).
 
 | File | Quantity |
 |---|---|
-| `bench_ssd_bandwidth.py` | spill read bandwidth — settles the 198.9 MiB/s vs 548.9 MiB/s contradiction |
-| `bench_write_through.py` | write-through cost inside the publishing prefill (the 45.3% → 8.96% fix) |
 | `bench_pin_cost.py` | where a DRAM demotion's time goes: pin vs copy |
 | `bench_prefix_state.py` | prefix-boundary snapshot cost and survival count, both store kinds |
 

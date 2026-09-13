@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import contextlib
 import os
-import threading
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -1190,534 +1189,6 @@ def _to_device(state: Any, device: torch.device) -> Any:
     return tuple(None if s is None else _to_device(s, device) for s in state)
 
 
-class KvTier:
-    """SSD byte-store below the HBM pool: spilled prefix KV + GDN snapshots.
-
-    A prefix evicted from the pool spills here instead of being dropped; a later
-    lookup reloads it into fresh blocks, skipping the prefill recompute. On a
-    32 GB V100 with a full host there is no DRAM residency tier, so it is
-    HBM→SSD.
-
-    # ponytail: raw bf16 spill, fp8 tier-quant is 2x capacity if SSD fills
-    """
-
-    def __init__(self, path: str, fingerprint: str, min_tokens: int = 4 * BLOCK_TOKENS,
-                 max_pending: int = 32, max_bytes: int = 20 * 2**30) -> None:
-        import queue
-
-        # One chunk (4 blocks = 64 tokens), not the 2048 the eviction-driven version used:
-        # write-through spills at chunk boundaries, so a 2048 floor refuses every publish.
-        self.min_tokens = min_tokens
-        # Bounds in-flight writes; measured not to bind (peak `_pending` 4 against 32, 0
-        # refusals) and never set to a non-default anywhere in the tree, so `max_bytes` is
-        # what protects the host: errors/2026-09-06-the-max-pending-cap-is-not-the-queue-that-binds.md.
-        self._max_pending = max_pending
-        self.offered = 0
-        self.refusals = 0
-        # Stage timers: three guesses at the per-publish cost were wrong in a row, so the
-        # spill reports where its time goes instead of being guessed at a fourth time.
-        self.copy_ms = 0.0
-        self.gather_ms = 0.0
-        # The save was the one stage the timers above skipped, and it is the one the
-        # "~100 ms" in five comments described. This timer wraps `torch.save` with no
-        # fsync, so it is PAGE-CACHE time: 273 ms for a 320.6 MiB entry on the pod's
-        # /work, where the durable cost of the same entry is 1337 (5.75x). Do not size a
-        # cap on it (errors/2026-09-06-ssd-save-ms-is-page-cache-time.md). Under a real
-        # 12-session workload it reads 164 ms per save on a 292.5 MiB half-entry, and
-        # summed it is 30% of wall clock -- on the writer thread, so not 30% of any tick.
-        self.save_ms = 0.0
-        self.saves = 0
-        self.over_budget = 0  # byte-budget evictions
-        self._healthy = True  # daemon failure (disk full/perm) flips this to refuse
-        # Size-based LRU: total on-disk bytes capped at max_bytes; the daemon
-        # evicts the least-recently-accessed entry's files after each write.
-        # resident()/load_kv()/load_state() touch an entry to MRU.
-        self._max_bytes = max_bytes
-        self._lru: OrderedDict[int, int] = OrderedDict()
-        self._total = 0
-        # Never rmtree the caller's path -- it may be a shared dir. Own a fixed subdir
-        # marked by a sentinel that carries the fingerprint.
-        self._dir = os.path.join(os.fspath(path), "tilerl_kvtier")
-        marker = os.path.join(self._dir, ".kvtier")
-        self._marker, self._fingerprint, self._generation = marker, fingerprint, 0
-        if os.path.exists(self._dir) and not os.path.exists(marker):
-            raise RuntimeError(f"{self._dir} exists but is not a KvTier dir (no .kvtier marker)")
-        os.makedirs(self._dir, exist_ok=True)
-        # Cold start KEEPS what is on disk when the fingerprint matches: a runtime tier
-        # needs lookups to reach past the newest entry, but after a restart HBM is empty so
-        # EVERY lookup reaches back. Wiping here made a cold hit impossible by construction.
-        self.recovered = self._recover(marker, fingerprint)
-        # Deferred write: spill_kv runs inside a decode tick, so it does only the
-        # GPU->CPU copy + enqueue; a daemon flushes the save off-tick. On the pod's /work
-        # one 320.6 MiB entry is 273 ms as `ssd_save_ms` counts it and **1337 ms durable**
-        # (240 MiB/s) -- the timer has no fsync, so it stops before the device has the
-        # bytes. The 641.8 this comment used to quote was measured on a Mac whose volume
-        # writes 26x faster (errors/2026-09-06-ssd-save-ms-is-page-cache-time.md).
-        # The durable figure is the DEVICE's rate, not this queue's: the daemon pops an
-        # entry once `torch.save` returns, which is a page-cache accept, so `_pending`
-        # empties at ~1784 MiB/s and a 585.0 MiB-per-offer workload never fills it
-        # (errors/2026-09-06-the-max-pending-cap-is-not-the-queue-that-binds.md).
-        # _pending/_pending_st serve blobs not yet on disk, so resident()/load see them.
-        self._pending: dict[int, dict] = {}
-        self._pending_st: dict[int, dict] = {}
-        self._lock = threading.Lock()
-        self._q: queue.Queue = queue.Queue()
-        # A daemon thread here is starved by Engine.step()'s GIL hold unless step()
-        # yields; see errors/2026-09-10-prefetch-deadline-gil-contention.md
-        self._writer = threading.Thread(target=self._flush_loop, daemon=True)
-        # read side: the torch.load runs off-tick, not inside step() under the lock
-        self._fetches: dict[int, dict] = {}   # key -> {"blob", "st", "tokens"}, collected by take()
-        self._fetching: set[int] = set()      # queued or mid-read
-        # A fetched read ALWAYS parks: a fetch that lost the deadline race still serves
-        # the next same-prefix request, and the read it did is already paid for. The cap
-        # bounds parked buffers that nothing follows (27B: ~157 MiB each): without it a
-        # flood of prefetch-and-recompute rows pins host RAM forever.
-        self._park_keys: deque[int] = deque()
-        self._max_parked = 2
-        self.prefetches = 0
-        self.fetches_ready = 0
-        # Loads that failed (unreadable / truncated / raced-eviction spill). A fetch that
-        # finishes is never dropped: it parks even if its deadline expired, and eviction
-        # from the parked-fetch FIFO below only sheds the warm memory copy -- the entry is
-        # still on disk, so a later lookup faults it in like any resident entry.
-        self.fetch_drops = 0
-        self.fetch_ms = 0.0
-        self.fetch_bytes = 0
-        self.snapshot_bytes = 0
-        self.tick_loads = 0
-        self._rq: queue.Queue = queue.Queue()
-        # Test seam for the fetch-hold gate: ``_fetch_started`` fires once a dequeued read
-        # has registered its key in ``_fetching`` (fetch_in_flight is provably true), and
-        # the reader blocks on ``_fetch_gate`` until the test clears it. Both are
-        # always-set/no-op in production -- a sleep cannot make the in-flight precondition
-        # deterministic.
-        self._fetch_started = threading.Event()
-        self._fetch_gate = threading.Event()
-        self._fetch_gate.set()
-        # Same starvation as _writer above; the GIL yield in step() is what lets
-        # torch.load finish inside the prefetch deadline
-        self._reader = threading.Thread(target=self._fetch_loop, daemon=True)
-        self._reader.start()
-        self._writer.start()
-
-    def hold_fetches_for_test(self) -> tuple[threading.Event, threading.Event]:
-        """Park the reader mid-fetch and return (started, gate). A dequeued read signals
-        ``started`` with the key already in ``_fetching`` and waits on ``gate``; ``set()``
-        releases it. Test-only: makes the hold's in-flight precondition a controlled state
-        instead of a race the runner speed decides."""
-        self._fetch_started.clear()
-        self._fetch_gate.clear()
-        return self._fetch_started, self._fetch_gate
-
-    def _recover(self, marker: str, fingerprint: str) -> int:
-        """Adopt the spill files already on disk, or wipe them. Returns entries adopted.
-
-        The marker holds the fingerprint the files were written under. On a match the
-        index is rebuilt from the directory listing and every entry is servable; on a
-        mismatch -- new weights, a different tokenizer, a changed BLOCK_TOKENS -- the
-        files describe a model that no longer exists and are removed. A mismatch is the
-        normal case after training, so `clear()` invalidating the tier is a fingerprint
-        bump and not a directory walk.
-
-        Only sizes are read here, not tensors: a 20 GiB directory would otherwise be
-        loaded to answer a question the filename already answers, and every load path
-        re-verifies the stored tokens anyway.
-        """
-        prev = None
-        with contextlib.suppress(OSError), open(marker) as f:
-            prev = f.read().strip()
-        if prev is not None and prev != fingerprint:
-            for name in os.listdir(self._dir):
-                if name.endswith((".kv", ".st")):
-                    with contextlib.suppress(OSError):
-                        os.remove(os.path.join(self._dir, name))
-            prev = None
-        with open(marker, "w") as f:
-            f.write(fingerprint)
-        if prev is None:
-            return 0
-        # A key is servable only with BOTH halves present -- a fault-in loads the state
-        # first and drops the key when it is missing -- and a half-written pair should not
-        # occupy the byte budget meanwhile.
-        sizes: dict[int, list[int]] = {}
-        for name in os.listdir(self._dir):
-            stem, _, ext = name.rpartition(".")
-            if ext not in ("kv", "st"):
-                continue
-            try:
-                key = int(stem, 16)
-                sz = os.path.getsize(os.path.join(self._dir, name))
-            except (ValueError, OSError):
-                continue
-            sizes.setdefault(key, [0, 0])[0 if ext == "kv" else 1] = sz
-        for key, (kv, st) in sizes.items():
-            if kv and st:
-                self._lru[key] = kv + st
-                self._total += kv + st
-                # constant at every length, so any recovered entry's .st size is S
-                self.snapshot_bytes = st
-            else:
-                for ext in (".kv", ".st"):
-                    with contextlib.suppress(OSError):
-                        os.remove(os.path.join(self._dir, f"{key & _MASK64:016x}{ext}"))
-        return len(self._lru)
-
-    def _flush_loop(self) -> None:
-        while True:
-            tag, blob, dst, events = self._q.get()
-            # The copies were launched non_blocking, so the host buffers are not valid
-            # until their events fire. Waiting HERE is the point: the prefill path pays a
-            # launch and this thread pays the transfer.
-            for ev in events:
-                if ev is not None:
-                    ev.synchronize()
-            # Write only while the entry is still pending: a drop() that raced us
-            # already removed it, and writing now would resurrect an evicted
-            # prefix on disk (write-back invalidation → wrong tokens).
-            k = tag[1] if isinstance(tag, tuple) else tag
-            table = self._pending_st if isinstance(tag, tuple) else self._pending
-            with self._lock:
-                if table.get(k) is not blob:
-                    continue
-            try:
-                ts = time.perf_counter()
-                torch.save(blob, dst)
-                self.save_ms += (time.perf_counter() - ts) * 1000
-                self.saves += 1
-            except Exception:  # noqa: BLE001 - disk full / perm: stop trusting the tier
-                self._healthy = False
-                continue
-            with self._lock:
-                still_pending = table.get(k) is blob
-                if still_pending:
-                    table.pop(k, None)
-            if still_pending:
-                self._track_written(k, dst)
-                continue
-            # a drop() landed mid-save: undo the write so the evicted prefix stays gone
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(dst)
-
-    def _track_written(self, key: int, path: str) -> None:
-        """Register a spilled file's size and evict LRU entries while over
-        ``max_bytes``. Called by the flush daemon after a successful save."""
-        try:
-            sz = os.path.getsize(path)
-        except OSError:
-            return
-        with self._lock:
-            self._lru[key] = self._lru.get(key, 0) + sz
-            self._lru.move_to_end(key)
-            self._total += sz
-            # Enforced, not just counted: a budget that only reports is unbounded disk
-            # growth, and this repo has filled a disk once. An entry still being written is
-            # never the victim -- dropping it mid-save would resurrect it when the daemon
-            # finishes, and `_flush_loop` reads the pending table to decide that.
-            while self._total > self._max_bytes and len(self._lru) > 1:
-                victim = next(
-                    (k for k in self._lru
-                     if k not in self._pending and k not in self._pending_st),
-                    None,
-                )
-                if victim is None:
-                    break  # every entry is still in flight
-                self._total -= self._lru.pop(victim)
-                self.over_budget += 1
-                for path in (self._kv(victim), self._st(victim)):
-                    with contextlib.suppress(FileNotFoundError):
-                        os.remove(path)
-
-    def _touch_lru(self, key: int) -> None:
-        with self._lock:
-            if key in self._lru:
-                self._lru.move_to_end(key)
-
-    def _kv(self, key: int) -> str:
-        return os.path.join(self._dir, f"{key & _MASK64:016x}.kv")
-
-    def _st(self, key: int) -> str:
-        return os.path.join(self._dir, f"{key & _MASK64:016x}.st")
-
-    def spill_kv(self, key: int, tokens: tuple[int, ...], blocks: Sequence[int],
-                 pool: PagedKvPool) -> bool:
-        # True = accepted. The tier owns the length floor and the capacity refusal, so a
-        # composite tier can vary them per level. A refusal is counted, not just returned:
-        # refusals/offered is what says whether the device keeps up with write-through.
-        if len(blocks) * BLOCK_TOKENS < self.min_tokens:
-            return False
-        self.offered += 1
-        with self._lock:
-            if not self._healthy or len(self._pending) >= self._max_pending:
-                self.refusals += 1
-                return False
-        # The gather is timed separately: `torch.stack` over N block slices is N slice
-        # kernels plus a device-to-device copy of the whole entry, all on the prefill
-        # stream, and it is a candidate for the residual cost.
-        tg = time.perf_counter()
-        kk = torch.stack([pool.k_pool[:, b] for b in blocks])
-        vv = torch.stack([pool.v_pool[:, b] for b in blocks])
-        self.gather_ms += (time.perf_counter() - tg) * 1000
-        k, ev_k = self._to_host(kk)
-        v, ev_v = self._to_host(vv)
-        # Store tokens too: files are keyed by a 64-bit hash, so a collision would
-        # otherwise load a different prefix's KV. load_kv verifies before copying.
-        blob = {"k": k, "v": v, "tokens": tuple(tokens)}
-        if pool.k_scale is not None:
-            # fp8 bytes without their scale reload as a different tensor, silently
-            blob["ks"] = pool.k_scale[:, blocks].cpu()
-            blob["vs"] = pool.v_scale[:, blocks].cpu()
-        with self._lock:
-            self._pending[key] = blob
-        self._q.put((key, blob, self._kv(key), [ev_k, ev_v]))
-        return True
-
-    def _to_host(self, t: torch.Tensor):
-        """``(host tensor, event)`` -- a pinned async D2H, or a plain copy off CUDA.
-
-        `.cpu()` on a pageable destination is SYNCHRONOUS and lands mid-prefill: measured
-        on H20 card 6, write-through cost 0.925 s of a 2.041 s request, and stage timers put
-        660 ms of it in this copy against 4 ms in the block gather. So the destination is
-        pinned and the copy is `non_blocking`; the event is what the daemon waits on.
-
-        `torch.empty(pin_memory=True)` per spill, deliberately -- torch's
-        CachingHostAllocator already reuses pinned blocks, and two hand-written pools on top
-        of it both measured WORSE: keyed per (numel, dtype), 0.421 s against 0.383 s; as a
-        two-slot arena, 1.640 s, because a request's 6 publishes outrun a depth the flush
-        daemon only frees after `torch.save` and 16 of 18 spills fell back to pageable.
-        """
-        if t.device.type != "cuda":
-            return t.contiguous().cpu(), None
-        tg = time.perf_counter()
-        t = t.contiguous()
-        host = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
-        host.copy_(t, non_blocking=True)
-        ev = torch.cuda.Event()
-        ev.record()
-        self.copy_ms += (time.perf_counter() - tg) * 1000
-        return host, ev
-
-    def prefetch(self, key: int, tokens: tuple[int, ...]) -> bool:
-        """True = queued or already in flight. Holds no blocks, so a dropped one costs
-        a host buffer and unwinds nothing."""
-        with self._lock:
-            if key in self._fetches or key in self._fetching:
-                return True
-            if not (key in self._lru or (key in self._pending and key in self._pending_st)):
-                return False
-            self._fetching.add(key)
-        self.prefetches += 1
-        self._rq.put((key, tokens))
-        return True
-
-    def fetch_pending(self, key: int) -> bool:
-        with self._lock:
-            return key in self._fetching
-
-    def fetching_keys(self) -> frozenset[int]:
-        """Snapshot of every fetch mid-read; cheap to intersect inside a spin."""
-        with self._lock:
-            return frozenset(self._fetching)
-
-    def any_fetching(self) -> bool:
-        with self._lock:
-            return bool(self._fetching)
-
-    def take(self, key: int):
-        """The prefetched pair, or None. `st` may be absent on an older parked entry."""
-        with self._lock:
-            done = self._fetches.pop(key, None)
-            self._park_keys = deque(k for k in self._park_keys if k != key)
-        if done is None or "blob" not in done:
-            return None
-        return done
-
-    def _fetch_loop(self) -> None:
-        while True:
-            key, tokens = self._rq.get()
-            # The key is already in _fetching (prefetch registered it before enqueue); the
-            # gate lets a test hold the read here so the in-flight window is deterministic.
-            self._fetch_started.set()
-            self._fetch_gate.wait()
-            with self._lock:
-                blob = self._pending.get(key)
-                st = self._pending_st.get(key)
-            if blob is None or st is None:
-                try:
-                    ts = time.perf_counter()
-                    if blob is None:
-                        blob = torch.load(self._kv(key), map_location="cpu")
-                        self.fetch_bytes += _blob_bytes(blob)
-                    # the .st too: reading it in `load_state` put 157 MiB on the tick
-                    if st is None:
-                        st = torch.load(self._st(key), map_location="cpu")
-                        self.fetch_bytes += _blob_bytes(st)
-                    self.fetch_ms += (time.perf_counter() - ts) * 1000
-                except Exception:  # noqa: BLE001 - truncated / corrupt / raced eviction
-                    self.drop(key)
-                    self.fetch_drops += 1
-                    with self._lock:
-                        self._fetching.discard(key)
-                    continue
-            with self._lock:
-                self._fetching.discard(key)
-                # Always park: the deadline gates whether a row WAITS, not whether a
-                # finished read is kept -- the load is paid for either way, and the next
-                # request with this prefix faults it in from memory instead of disk.
-                self._fetches[key] = {"blob": blob, "st": st, "tokens": tokens}
-                if key not in self._park_keys:
-                    self._park_keys.append(key)
-                while len(self._park_keys) > self._max_parked:
-                    victim = self._park_keys.popleft()
-                    self._fetches.pop(victim, None)
-            self.fetches_ready += 1
-
-    def load_kv(self, key: int, tokens: tuple[int, ...], blocks: Sequence[int],
-                pool: PagedKvPool, blob: dict | None = None) -> bool:
-        # False = data gone (a raced eviction dropped it) OR a hash collision
-        # stored a different prefix — caller treats either as a miss. Serves a
-        # still-pending blob from memory, closing the resident()/load TOCTOU.
-        if blob is None:
-            with self._lock:
-                blob = self._pending.get(key)
-        if blob is None:
-            if not os.path.exists(self._kv(key)):
-                return False
-            # A truncated file is the crash case, not a theoretical one: the daemon writes
-            # off-tick, so a kill between `torch.save` starting and finishing leaves a
-            # partial blob that `_recover` then adopts by size. Treat an unreadable file as
-            # a miss and drop it, rather than raising inside a lookup.
-            try:
-                # counted: this is the number that can refute "the fetch became async"
-                self.tick_loads += 1
-                blob = torch.load(self._kv(key), map_location="cpu")
-            except Exception:  # noqa: BLE001 - truncated / corrupt spill
-                self.drop(key)
-                return False
-        if blob.get("tokens") != tuple(tokens):
-            return False  # hash collision: these bytes belong to a different prefix
-        self._touch_lru(key)
-        # one index_copy_ per plane: the per-block loop was 3,750 launches at 30k tokens
-        idx = torch.as_tensor(list(blocks), device=pool.device)
-        k = self._planes_on_device(blob["k"], pool)
-        v = self._planes_on_device(blob["v"], pool)
-        if (pool.k_scale is None) != ("ks" not in blob):
-            # Belt to _weight_fingerprint's brace: it now carries kv_fp8, so a flag flip
-            # against the same --ssd-path yields a different fingerprint -- but an explicit
-            # ssd_fingerprint routes around that. Dropping the entry costs a re-prefill; the
-            # dtype-mismatched index_copy_ below raises out of _admit, failing every request.
-            return False
-        if pool.k_scale is None:
-            pool.k_pool.index_copy_(1, idx, k)
-            pool.v_pool.index_copy_(1, idx, v)
-            return True
-        # index assignment, not index_copy_: torch has no index_copy_ for fp8 on CPU
-        pool.k_pool[:, idx], pool.v_pool[:, idx] = k, v
-        pool.k_scale.index_copy_(1, idx, blob["ks"].to(pool.device))
-        pool.v_scale.index_copy_(1, idx, blob["vs"].to(pool.device))
-        return True
-
-    def _planes_on_device(self, t: torch.Tensor, pool: PagedKvPool) -> torch.Tensor:
-        """Permute AFTER the transfer: `.to(cuda)` on a non-contiguous view materialises
-        a host temp of the whole blob first. Same-device is a no-op, so `"c"` cannot see
-        this."""
-        return t.to(pool.device, non_blocking=t.is_pinned()).permute(1, 0, 2, 3, 4)
-
-    def spill_state(self, key: int, tokens: tuple[int, ...], states, windows) -> None:
-        st, ev_s = self._to_host(states)
-        win, ev_w = (None, None) if windows is None else self._to_host(windows)
-        blob = {"states": st, "windows": win, "tokens": tuple(tokens)}
-        with self._lock:
-            self._pending_st[key] = blob
-        self._q.put((("st", key), blob, self._st(key), [ev_s, ev_w]))
-
-    def load_state(self, key: int, tokens: tuple[int, ...], blob: dict | None = None):
-        # None = gone or a hash-collision mismatch — caller degrades to a miss.
-        if blob is None:
-            with self._lock:
-                blob = self._pending_st.get(key)
-        if blob is None:
-            if not os.path.exists(self._st(key)):
-                return None
-            try:
-                # reached only with no prefetch: below the break-even, or no reader
-                blob = torch.load(self._st(key), map_location="cpu")
-            except Exception:  # noqa: BLE001 - truncated / corrupt spill, same as load_kv
-                self.drop(key)
-                return None
-        if blob.get("tokens") != tuple(tokens):
-            return None
-        self._touch_lru(key)
-        return blob["states"], blob["windows"]
-
-    def read_bytes_per_s(self) -> float:
-        """B in the break-even, over both planes a hit reads. 0 before the first read."""
-        return 0.0 if self.fetch_ms <= 0 else self.fetch_bytes / (self.fetch_ms / 1000.0)
-
-    def resident(self, key: int) -> bool:
-        """Whether this key is in the in-memory index, without touching the disk.
-
-        The candidate filter for a lookup: a query walks every prefix length, and
-        a `torch.load` on each would be one or two file reads per length. This is a dict
-        probe, so the disk is read only for the one candidate that survives.
-        """
-        with self._lock:
-            return key in self._lru or (key in self._pending and key in self._pending_st)
-
-    def drop(self, key: int) -> None:
-        with self._lock:
-            self._pending.pop(key, None)
-            self._pending_st.pop(key, None)
-            self._total -= self._lru.pop(key, 0)
-        for p in (self._kv(key), self._st(key)):
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(p)
-
-    def invalidate(self) -> None:
-        """Make every file on disk unreadable without walking the directory.
-
-        An optimizer step calls this. Rewriting the marker means the next `_recover`
-        fingerprint-mismatches and removes the files then; until that restart the
-        in-memory index is what gates reads, and it is cleared here. One write instead of
-        a 20 GiB unlink walk inside a training step on a 229 MB/s device.
-        """
-        self._generation += 1
-        with contextlib.suppress(OSError), open(self._marker, "w") as f:
-            f.write(f"{self._fingerprint}#{self._generation}")
-        with self._lock:
-            self._pending.clear()
-            self._pending_st.clear()
-            self._lru.clear()
-            self._total = 0
-
-    def stats(self) -> dict[str, int]:
-        with self._lock:
-            pending = len(self._pending) + len(self._pending_st)
-            entries, total = len(self._lru), self._total
-        return {
-            "ssd_entries": entries,
-            "ssd_bytes": total,
-            "ssd_recovered": self.recovered,
-            "ssd_offered": self.offered,
-            "ssd_refusals": self.refusals,
-            "ssd_gather_ms": int(self.gather_ms),
-            "ssd_copy_ms": int(self.copy_ms),
-            "ssd_save_ms": int(self.save_ms),
-            "ssd_saves": self.saves,
-            "ssd_evictions": self.over_budget,
-            "ssd_pending": pending,
-            "ssd_healthy": int(self._healthy),
-            "ssd_prefetches": self.prefetches,
-            "ssd_fetches_ready": self.fetches_ready,
-            "ssd_fetch_drops": self.fetch_drops,
-            "ssd_tick_loads": self.tick_loads,
-            "ssd_fetch_ms": int(self.fetch_ms),
-            # with fetch_ms this gives B for the run
-            "ssd_fetch_bytes": self.fetch_bytes,
-            # retained at 0 for readers: the lookup path no longer reads the .st
-            "ssd_state_load_ms": 0,
-            "ssd_state_loads": 0,
-        }
-
 
 def _crc32(data: bytes) -> int:
     import zlib
@@ -1731,8 +1202,9 @@ class KvBootStore:
     request prefix matches, skipping the (2.25 h at 256k on a V100) prefill.
 
     It is the third source a promoted page can come from — host RAM
-    (:class:`HostKvPages`) and SSD (:class:`KvTier` prefix spill) are the other
-    two — but unlike the prefix spill a boot entry's pages are written for the
+    (:class:`HostKvPages`) and the sparse cold tier's SSD spill
+    (:class:`ColdSsdFile`) are the other two — but unlike the cold spill a boot
+    entry's pages are written for the
     WHOLE context deliberately, in one fixed-stride file per tensor so a page is
     one ``pread``. Layout under ``<dir>/<hash>/`` (≤5 files):
 
@@ -1760,7 +1232,7 @@ class KvBootStore:
 
         self._json = json
         self._fingerprint = fingerprint
-        # Own a subdir, like KvTier: never write directly into a caller's directory.
+        # Own a subdir: never write directly into a caller's directory.
         self._root = os.path.join(os.fspath(path), "tilerl_kvboot")
         self._marker = os.path.join(self._root, ".kvboot")
         if os.path.exists(self._root) and not os.path.exists(self._marker):
@@ -1831,8 +1303,7 @@ class KvBootStore:
         d = self._entry_dir(h)
         os.makedirs(d, exist_ok=True)
         cold = pool.cold_dtype
-        # Boot save is a deliberate one-time offline write, never on a decode tick:
-        # plain .cpu() is fine (the KvTier pinned path exists for write-through).
+        # Boot save is a deliberate one-time offline write, never on a decode tick.
         k = torch.stack([pool.k_pool[:, b] for b in blocks]).cpu()
         v = torch.stack([pool.v_pool[:, b] for b in blocks]).cpu()
         if cold is not None:
@@ -2041,28 +1512,6 @@ class NoPrefixStore:
     def reclaimable_blocks(self) -> int:
         return 0
 
-    def prefetch_if_worth_it(self, tokens: Sequence[int], prefill_rate: float) -> bool:
-        return False
-
-    def break_even_tokens(self, prefill_rate: float) -> int:
-        return 1 << 31
-
-    def fetch_in_flight(self, tokens: Sequence[int]) -> bool:
-        return False
-
-    def fetching_keys(self) -> frozenset[int]:
-        return frozenset()
-
-    def boundary_keys(self, tokens: Sequence[int]) -> frozenset[int]:
-        return frozenset()
-
-    @property
-    def has_ssd(self) -> bool:
-        return False
-
-    def any_fetching(self) -> bool:
-        return False
-
     def clear(self) -> None:
         return None
 
@@ -2093,13 +1542,11 @@ class PrefixStore:
         capacity: int = 4096,
         state_bytes: int = 8 << 30,
         dram: DramSnapshots | None = None,
-        ssd: KvTier | None = None,
     ) -> None:
         self._pool = pool
         self.capacity = capacity
         self.state_bytes = state_bytes
         self._dram = dram
-        self._ssd = ssd
         self._state_used = 0
         self._roll = _rolling_hash
         self._entries: dict[int, list[_Entry]] = {}
@@ -2115,34 +1562,8 @@ class PrefixStore:
         # it is the absence of pressure, not pressure.
         self.superseded = 0
         self.blocks_freed = 0
-        self.ssd_hits = 0
-        self.ssd_faults = 0
         # S: constant at every prefix length, and what puts the break-even above zero
         self._snapshot_bytes = 0
-        self.fetch_waits = 0
-
-    @property
-    def has_ssd(self) -> bool:
-        return self._ssd is not None
-
-    def any_fetching(self) -> bool:
-        return self._ssd is not None and self._ssd.any_fetching()
-
-    def fetching_keys(self) -> frozenset[int]:
-        """Snapshot of tier keys mid-read, for a spin loop's cheap membership test."""
-        return frozenset() if self._ssd is None else self._ssd.fetching_keys()
-
-    def boundary_keys(self, tokens: Sequence[int]) -> frozenset[int]:
-        """The hashes at every whole-block boundary of ``tokens`` -- the keys the
-        prefetch ladder can have queued for this prompt."""
-        if self._ssd is None:
-            return frozenset()
-        h, keys = 0, set()
-        for i, t in enumerate(tokens, 1):
-            h = self._roll(h, int(t))
-            if i % BLOCK_TOKENS == 0:
-                keys.add(h)
-        return frozenset(keys)
 
     def _hash_all(self, tokens: Sequence[int]) -> int:
         h = 0
@@ -2150,73 +1571,13 @@ class PrefixStore:
             h = self._roll(h, int(t))
         return h
 
-    def fetch_in_flight(self, tokens: Sequence[int]) -> bool:
-        """True while a prefetch for some prefix of ``tokens`` is still reading.
-
-        Same length ladder `prefetch_if_worth_it` queues on, so the engine asks about
-        exactly the fetches it started.
-        """
-        if self._ssd is None:
-            return False
-        h = 0
-        for i, t in enumerate(tokens, 1):
-            h = self._roll(h, int(t))
-            if i % BLOCK_TOKENS == 0 and self._ssd.fetch_pending(h):
-                return True
-        return False
-
-    def break_even_tokens(self, prefill_rate: float) -> int:
-        """Prefix length above which fetching beats recomputing, at this prefill rate.
-
-        `(S + n*k)/B < n/R`, so `n* = (S/B) / (1/R - k/B)`: S the recurrent snapshot
-        (constant at any length), k the KV bytes per token, B the tier's read rate, R
-        tokens/s of prefill. Every operand is read here rather than fixed --
-        `k` is 64 KiB on a bf16 pool, 128 on sm70's f32 one and 32 KiB + scale on fp8,
-        and the two archs' `R` differ by more than an order of magnitude, so a constant
-        would be wrong on one of them (docs/design-ssd-read-path.md).
-
-        Returns 2**31 when `k/B >= 1/R`: the device cannot stream KV as fast as the card
-        recomputes it, and no length pays.
-        """
-        if self._ssd is None or prefill_rate <= 0:
-            return 1 << 31
-        k = self._pool.bytes_per_token
-        b = self._ssd.read_bytes_per_s()
-        s = self._snapshot_bytes or self._ssd.snapshot_bytes
-        if b <= 0:
-            # unmeasured tier fetches once and calibrates; a restart is the case it exists for
-            return 0
-        if s <= 0:
-            return 1 << 31
-        denom = 1.0 / prefill_rate - k / b
-        return (1 << 31) if denom <= 0 else int(s / b / denom)
-
-    def prefetch_if_worth_it(self, tokens: Sequence[int], prefill_rate: float) -> bool:
-        """Start reading the longest resident prefix, if fetching beats recomputing.
-        Allocation-free, which is why it can live where the prefix MATCH cannot."""
-        if self._ssd is None:
-            return False
-        if len(tokens) < self.break_even_tokens(prefill_rate):
-            return False
-        h, hashes = 0, []
-        for t in tokens:
-            h = self._roll(h, int(t))
-            hashes.append(h)
-        for i in range(len(tokens) - len(tokens) % BLOCK_TOKENS, 0, -BLOCK_TOKENS):
-            if self._ssd.prefetch(hashes[i - 1], tuple(tokens[:i])):
-                return True
-        return False
-
     def insert(self, tokens: Sequence[int], blocks: Sequence[int], state: Any = None,
                spill: bool = True) -> bool:
         """Cache ``tokens`` (covered by ``blocks``) with its ``state`` snapshot and retain
         the blocks; True when a new entry was retained, False for a duplicate.
 
-        ``spill=False`` keeps the entry in HBM but does not offer it to the disk tier. The
-        caller uses it for a publish a later one supersedes: measured on H20 card 6, one
-        2729-token prompt publishes 6 times and spills 1624 MB, of which only the longest
-        entry (325 MB) is ever read -- 5.0x the bytes for nothing, because a GDN snapshot
-        is a CONSTANT ~157 MB at every prefix length.
+        ``spill`` is accepted for call-site compatibility but ignored (the dense
+        SSD tier was removed 2026-09-14).
         """
         tokens = tuple(int(t) for t in tokens)
         blocks = tuple(blocks)
@@ -2244,18 +1605,9 @@ class PrefixStore:
         self._by_id[entry.eid] = entry
         for b in blocks:
             self._pool.retain(b)
-        # Write-through: a GPU->CPU copy plus an enqueue here, with the save off-tick on
-        # a daemon (1337 ms durable for a 320.6 MiB entry on the pod's /work; `ssd_save_ms`
-        # reports 273 because it has no fsync), so a full queue refuses rather than
-        # blocking prefill. Both
-        # halves go or neither -- a fault-in needs the pair. `resident` skips what is already
-        # on disk, without which every fault-in writes back the bytes it just read.
         if state is not None and self._snapshot_bytes == 0:
             self._snapshot_bytes = sum(t.numel() * t.element_size()
                                        for t in state if t is not None)
-        if (spill and self._ssd is not None and state is not None and not self._ssd.resident(h)
-                and self._ssd.spill_kv(h, tokens, blocks, self._pool)):
-            self._ssd.spill_state(h, tokens, state[0], state[1])
         while len(self._by_id) > self.capacity or self._state_used > self.state_bytes:
             # State-byte pressure with a tier is not a reason to lose a prefix: demote the
             # LRU snapshot instead and keep the entry matchable. Only when nothing is left
@@ -2301,69 +1653,8 @@ class PrefixStore:
                     self.lookups_matched += 1  # per LOOKUP; /health's prefix_hits is per admission
                     self._by_id.move_to_end(e.eid)  # this is the whole of "recently used"
                     return PrefixHit(i, e.blocks, e.state)
-            # Nothing resident at this length. Before trying a shorter prefix, ask the disk:
-            # after a restart HBM is empty, so the LONGEST prefix on disk is what this loop
-            # would otherwise walk straight past on its way to a miss.
-            if self._ssd is not None and self._ssd.resident(prefix_hashes[i - 1]):
-                key = prefix_hashes[i - 1]
-                if self._ssd.fetch_pending(key):
-                    # a miss for now: reading it here too puts the 1.7 s back on the tick
-                    self.fetch_waits += 1
-                    break
-                hit = self._fault_in(key, tokens[:i], fetched=self._ssd.take(key))
-                if hit is not None:
-                    return hit
         self.lookups_missed += 1
         return None
-
-    def _fault_in(self, h: int, tokens: tuple[int, ...],
-                  fetched: dict | None = None) -> PrefixHit | None:
-        """Reload one prefix from the SSD tier into fresh blocks, or None.
-
-        The reload allocates from the pool and hands the entry to `insert`, so the faulted
-        prefix is an ordinary resident entry afterwards -- one code path owns retain,
-        eviction and the byte accounting. `resident` gated the call, so at most one
-        candidate length pays a `torch.load`.
-
-        `fetched` is the reader thread's `{"blob", "st"}`; without it both `torch.load`s
-        happen here, on the tick.
-        """
-        blob = None if fetched is None else fetched.get("blob")
-        st = None if fetched is None else fetched.get("st")
-        need = PagedKvPool.blocks_for_tokens(len(tokens))
-        # Only a whole-block prefix can be adopted: `insert` refuses a partial block,
-        # because publishing one shares a page a slot is still appending to. Every publish
-        # point is block-aligned, so this is a guard, not a path.
-        if len(tokens) % BLOCK_TOKENS:
-            return None
-        # Both halves or neither: adopting KV without the snapshot would run the GDN
-        # layers from a zero state over KV that is not zero -- wrong, and silent.
-        loaded = self._ssd.load_state(h, tokens, blob=st)
-        if loaded is None:
-            self._ssd.drop(h)
-            return None
-        self.evict_until_free(need)
-        if self._pool.free_blocks < need:
-            return None
-        blocks = [self._pool.alloc_block() for _ in range(need)]
-        try:
-            if not self._ssd.load_kv(h, tokens, blocks, self._pool, blob=blob):
-                self.ssd_faults += 1
-                self._ssd.drop(h)
-                return None
-            state = (loaded[0].to(self._pool.device),
-                     None if loaded[1] is None else loaded[1].to(self._pool.device))
-            # insert() takes its own retain on every block, so the alloc refcount dropped
-            # below is not the last one. Freeing before the insert would put a block on the
-            # free list while this hit is still handing it out.
-            if not self.insert(tokens, blocks, state):
-                return None
-        finally:
-            for b in blocks:
-                self._pool.free_block(b)
-        self.ssd_hits += 1
-        self.lookups_matched += 1
-        return PrefixHit(len(tokens), tuple(blocks), state)
 
     def evict_until_free(self, blocks: int) -> None:
         while self._pool.free_blocks < blocks and self._by_id:
@@ -2454,17 +1745,9 @@ class PrefixStore:
         snapshot goes with its entry, because ``_drop`` calls the tier's ``forget``: a
         stale snapshot surviving in DRAM is exactly the off-policy state this exists to
         refuse.
-
-        The SSD tier is invalidated by bumping its fingerprint, not by deleting files.
-        Deleting is a 20 GiB directory walk on a 229 MB/s device inside an optimizer
-        step; a fingerprint bump makes every file unreadable at the next `_recover` and
-        costs one write. `_drop` deliberately does NOT touch the SSD -- an entry evicted
-        from HBM is exactly what a cold hit should still find on disk.
         """
         while self._by_id:
             self._evict_one()
-        if self._ssd is not None:
-            self._ssd.invalidate()
 
     def _entries_capacity(self) -> int:
         """How many entries can be resident at once, from whichever budget binds.
@@ -2498,12 +1781,6 @@ class PrefixStore:
         }
         if self._dram is not None:
             st.update(self._dram.stats())
-        if self._ssd is not None:
-            st.update(self._ssd.stats())
-            st["ssd_hits"] = self.ssd_hits
-            st["ssd_faults"] = self.ssd_faults
-            # 0 on an engine that holds the row; nonzero means a lookup bypassed the hold.
-            st["ssd_fetch_waits"] = self.fetch_waits
         return st
 
 

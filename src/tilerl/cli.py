@@ -148,7 +148,7 @@ def _shard(cfg, model, tp: int, backend, model_mod):
 
 
 def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
-                  blocks=0, max_ctx=0, max_batch=8, ssd_path="", ssd_min_tokens=0,
+                  blocks=0, max_ctx=0, max_batch=8,
                   dram_bytes=0, state_bytes=0, kv_fp8="", decode=None,
                   max_batched_tokens=0, kv_cold_bytes=0, cold_format="",
                   cold_ssd_path="", cold_ssd_bytes=0,
@@ -179,10 +179,6 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
               max_total_tokens=ctx, max_blocks=(ctx * max_batch) // BLOCK_TOKENS)
     if draft is not None:
         kw["draft"], kw["spec_depth"] = draft, depth
-    if ssd_path:
-        kw["ssd_path"] = ssd_path
-        if ssd_min_tokens:
-            kw["ssd_min_tokens"] = ssd_min_tokens
     if dram_bytes:
         kw["dram_bytes"] = dram_bytes
     if state_bytes:
@@ -344,8 +340,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     engine = _build_engine(cfg, model, backend,
                            draft=draft, depth=args.depth, slots=args.slots,
                            blocks=args.blocks, max_ctx=args.max_ctx,
-                           max_batch=args.max_batch, ssd_path=args.ssd_path,
-                           ssd_min_tokens=args.ssd_min_tokens, dram_bytes=args.dram_bytes,
+                           max_batch=args.max_batch, dram_bytes=args.dram_bytes,
                            state_bytes=args.state_bytes, kv_fp8=args.kv_fp8,
                            cold_format=getattr(args, "cold_format", ""),
                            kv_store=getattr(args, "kv_store", ""),
@@ -2450,18 +2445,6 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.add_argument("--max-ctx", type=int, default=0,
                          help="cap served context (0 = the model's own limit); pairs with "
                               "--blocks so a request cannot outgrow the pool")
-    p_serve.add_argument("--ssd-path", default="",
-                         help="directory for the SSD prefix tier (empty = off). Unlike the "
-                              "host snapshot tier this one pays without concurrent sessions: "
-                              "after a restart HBM is empty, so the first lookup of every "
-                              "returning conversation reaches back to disk. The tier keys its "
-                              "files on the model's config, so a shape change makes them "
-                              "unreadable rather than serving KV from other weights")
-    p_serve.add_argument("--ssd-min-tokens", type=int, default=0,
-                         help="spill floor in tokens (0 = one chunk). A GDN snapshot is a "
-                              "constant ~157 MB at any prefix length, so every short "
-                              "publish costs as much to spill as a long one; raising this "
-                              "drops the publishes a longer prefix supersedes anyway")
     p_serve.add_argument("--state-bytes", type=int, default=0,
                          help="HBM budget in bytes for resident GDN snapshots (0 = a quarter "
                               "of free memory, the default). Without it the tiers' pressure "
@@ -2509,7 +2492,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="cold KV pages past the --kv-cold-bytes host budget spill to "
                               "this one mmap'd file (block-id keyed, no index); promote "
                               "reads them back through the same path. Serving spill for one "
-                              "process; --ssd-path is the separate prefix-boot store.")
+                              "process (sparse cold tier; the old dense --ssd-path tier was "
+                              "removed 2026-09-14).")
     p_serve.add_argument("--cold-ssd-bytes", type=int, default=0, metavar="BYTES",
                          help="countable SSD spill capacity for admission (0 with "
                               "--cold-ssd-path = free space on the spill filesystem).")
