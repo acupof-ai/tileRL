@@ -146,3 +146,32 @@ Raw artifacts: `src/tilerl/sparse_engine.py`, `src/tilerl/engine.py`,
 `tests/test_sparse_engine.py`. CUDAGraph capture and the sparse-vs-dense
 captured decode ms on sm90 pending the H20 card-2 validation run
 (32k B=1/B=8, bit-equal over 64 steps across a refresh, ms/tick).
+
+## Served default and the dispatch guard (#557 fix)
+
+Two gaps kept the captured tick OUT of a served engine even after capture
+worked:
+
+1. **Dense dispatch shadowed the sparse graph.** `_run_forward` tried the
+   dense `_run_decode_graph` first with no sparse guard; on CUDA (where the
+   decode graph auto-enables) it captured a `sparse=None` `BatchKv` over the
+   row's own blocks, returned True, and won every sparse tick — so the sparse
+   graph was never built (card-2: `dense_graph=63 sparse_graph=0`,
+   buckets=0, cap/eager 1.000). The dense branch is now gated on
+   `self._sparse is None`; a sparse row can only reach the sparse graph.
+2. **The served default never selected.** `serve` passes no
+   `sparse_device_select`, and without this PR it stayed its kwarg default
+   False, so even with correct dispatch every pure-decode tick ran eager
+   full re-selection — there was no 8-tick refresh cadence in production
+   (card-3: 88.23 ms/tick vs ~13 ms dense captured). `build_engine` now
+   resolves the default: sparse device selection + the sparse graph are ON
+   whenever the decode graph auto-enables on the backend (sm90; sm70 and an
+   explicit `decode_graph=False` stay eager, which is the true sparse-eager
+   comparison arm). Opt-in shape is unchanged: sparse itself stays behind
+   `--sparse-k N`.
+
+A served sparse sm90 engine therefore alternates 7 captured resident-only
+decode ticks and one eager full-candidate refresh (R=8), instead of eager
+re-selection on every tick. The card-2 diag's `PATH default` arm builds with
+no explicit select flag and reports the per-tick path counters on that
+default.

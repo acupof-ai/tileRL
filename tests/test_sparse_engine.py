@@ -2304,3 +2304,48 @@ def test_sparse_decode_never_enters_the_dense_graph_when_graphs_are_on():
             break
     d.shutdown()
     assert dense_calls["n"] >= 1, "a dense decode tick did not use the dense graph"
+
+
+def test_served_sparse_default_auto_enables_device_select_and_sparse_graph():
+    """Served default (#557 CHANGE-REQ follow-up): production passes no
+    sparse_device_select and leaves decode_graph at its auto value. The engine
+    must resolve sparse device selection + the sparse graph ON wherever the
+    decode graph auto-enables (the captured steady-state tick, with an 8-tick
+    eager refresh), so a served sparse engine is not silently eager-every-tick.
+    On a backend where graph auto-enables (here simulated), both flags come up;
+    explicit decode_graph=False (and the real CPU cell, where _graph_on=False)
+    keeps both off."""
+    import tilerl.engine as em
+
+    def _eng():
+        return build_engine(
+            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+            sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
+
+    # real CPU cell: graph auto OFF -> sparse device select and graph off (eager)
+    e = _eng()
+    assert e._sparse_device_select is False and e._sparse_graph_on is False
+    e.shutdown()
+
+    # a served cuda-like cell: patch the single _graph_on predicate to True
+    orig = em._graph_on
+    em._graph_on = lambda backend, decode_graph: decode_graph is not False
+    try:
+        e = _eng()
+        assert e._sparse_device_select is True and e._sparse_graph_on is True, (
+            f"served default left sparse ticks eager: device_select="
+            f"{e._sparse_device_select} graph_on={e._sparse_graph_on}")
+        e.shutdown()
+        # explicit decode_graph=False still wins (true sparse-eager arm)
+        e = build_engine(
+            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+            sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30,
+            decode_graph=False)
+        assert e._sparse_graph_on is False
+        e.shutdown()
+    finally:
+        em._graph_on = orig

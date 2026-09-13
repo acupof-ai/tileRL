@@ -42,14 +42,18 @@ def make_prompts(ctx, b, gen):
     return out
 
 
-def run(ctx, b, sparse: bool, captured: bool):
+def run(ctx, b, sparse: bool, captured="default"):
+    """captured: "default" = build the engine exactly like serve (no explicit
+    sparse_device_select, decode_graph auto); True/False force it for the
+    cap/eager comparison arms."""
     cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True,
                               backend=backend)
     kw = dict(num_blocks=0, num_slots=b + 2, max_batch=b,
               max_total_tokens=ctx + STEPS + 64, max_num_batched_tokens=512)
     if sparse:
-        kw.update(sparse_k=K, scorer="bounds", kv_cold_bytes=1 << 34,
-                  sparse_device_select=captured)
+        kw.update(sparse_k=K, scorer="bounds", kv_cold_bytes=1 << 34)
+        if captured != "default":
+            kw["sparse_device_select"] = captured
     e = build_engine(cfg, model, backend, **kw)
     cnt = {"dense_graph": 0, "sparse_graph": 0, "eager_forward": 0, "decode": 0}
     od = e._run_decode_graph
@@ -117,22 +121,37 @@ def run(ctx, b, sparse: bool, captured: bool):
     return out
 
 
-print(f"DIAG ctx={CTX} B={B} sparse-cap then sparse-eager", flush=True)
+print(f"DIAG ctx={CTX} B={B} default(captured-on) then cap then eager", flush=True)
+u = run(CTX, B, True, "default")
 c = run(CTX, B, True, True)
 x = run(CTX, B, True, False)
-print(f"PATH cap   {c['cnt']} gon={c['gon']} dgon={c['dgon']} buckets={c['buckets']}", flush=True)
-print(f"PATH eager {x['cnt']} gon={x['gon']} dgon={x['dgon']} buckets={x['buckets']}", flush=True)
+print(f"PATH default {u['cnt']} gon={u['gon']} dgon={u['dgon']} buckets={u['buckets']}",
+      flush=True)
+print(f"PATH cap     {c['cnt']} gon={c['gon']} dgon={c['dgon']} buckets={c['buckets']}",
+      flush=True)
+print(f"PATH eager   {x['cnt']} gon={x['gon']} dgon={x['dgon']} buckets={x['buckets']}",
+      flush=True)
+for i in range(B):
+    for j, (a, z) in enumerate(zip(u["toks"][i], c["toks"][i])):
+        if a != z:
+            lu = u["lg"][i].get(j)
+            lc = c["lg"][i].get(j)
+            gap = float((lu[1] - lc[1]).abs().max()) if lu and lc else float("nan")
+            print(f"FIRSTDIFF default-vs-cap row{i} step{j} logit_maxabs={gap:.4g}",
+                  flush=True)
+            break
+    else:
+        print(f"FIRSTDIFF default-vs-cap row{i} none (token-equal)", flush=True)
 for i in range(B):
     for j, (a, z) in enumerate(zip(c["toks"][i], x["toks"][i])):
         if a != z:
             lc = c["lg"][i].get(j)
             lx = x["lg"][i].get(j)
             gap = float((lc[1] - lx[1]).abs().max()) if lc and lx else float("nan")
-            print(f"FIRSTDIFF row{i} step{j} cap_tok={a} eager_tok={z} logit_maxabs={gap:.4g} "
-                  f"cap_am={lc[0] if lc else None} eager_am={lx[0] if lx else None}", flush=True)
-            break
-    else:
-        print(f"FIRSTDIFF row{i} none (token-equal)", flush=True)
+            print(f"FIRSTDIFF cap-vs-eager row{i} step{j} cap_tok={a} eager_tok={z} "
+                  f"logit_maxabs={gap:.4g} "
+                  f"cap_am={lc[0] if lc else None} eager_am={lx[0] if lx else None}",
+                  flush=True)
 torch.save({"cap": {k: v for k, v in c.items() if k != "lg"},
             "eager": {k: v for k, v in x.items() if k != "lg"}}, "/work/d557_paths.pt")
 print("DIAG_DONE", flush=True)
