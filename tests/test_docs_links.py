@@ -314,6 +314,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
     'train': frozenset({
         '--allow-short-rollouts',
         '--batch',
+        '--curve-target-pt',
         '--data',
         '--depth',
         '--deterministic',

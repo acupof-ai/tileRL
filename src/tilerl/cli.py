@@ -1127,6 +1127,8 @@ def _emit_eval_records(correct: int, total: int, ntok: int, token_lens: list,
 
 def _train_adapters(args: argparse.Namespace) -> None:
     """GRPO or OPD: LoRA on the frozen base, the engine samples, the ledger gates."""
+    if getattr(args, "eval_every", 0):
+        _refuse_blind_curve(args.eval_curve_n, args.curve_target_pt)
     import torch
     from tilerl_kernels.backend import get_backend
 
@@ -2289,6 +2291,22 @@ def cmd_merge(args: argparse.Namespace) -> None:
         print(f"merged {len(args.specialists)} specialists ({args.method}) -> {args.out}  run {m['id']}")
 
 
+def _refuse_blind_curve(n: int, target_pt: float) -> None:
+    """Refuse a curve whose subset cannot resolve the effect it exists to locate,
+    BEFORE the run spends the time. Worst-case binomial SE (p=0.5), in points:
+    50/sqrt(n). The post-run `_se_note` warns at the point's own rate, but a
+    warning after a 99-minute run cannot un-spend it (errors/2026-09-08). The
+    comparison is strict: SE exactly equal to the target is the documented
+    knife-edge (n=100, 5.0 pt against P1's +5.6 pt effect, "1.1 sigma")."""
+    se = 50.0 / (n ** 0.5)
+    if n > 0 and se > target_pt:
+        raise SystemExit(
+            f"--eval-curve-n {n} carries a worst-case binomial SE of {se:.1f} pt, "
+            f"above the --curve-target-pt {target_pt:g} effect the curve locates: "
+            f"the crossing step would be chosen by which rows fell where. Raise "
+            f"--eval-curve-n to >={(50.0 / target_pt) ** 2:.0f}, or raise the target")
+
+
 def _se_note(r: dict) -> str:
     """The subset's sampling width, when it is wide enough to set the answer.
 
@@ -2624,7 +2642,11 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "immediately on a significant decline; 0 = never stop")
     p_train.add_argument("--eval-curve-n", type=int, default=20,
                          help="rows of --eval-gsm8k in the curve subset; keep the scoring "
-                              "under 5%% of a step")
+                              "under 5%% of a step. The run refuses when the subset's "
+                              "worst-case binomial SE does not resolve --curve-target-pt")
+    p_train.add_argument("--curve-target-pt", type=float, default=5.0,
+                         help="effect in points the --eval-every curve exists to locate; "
+                              "the run refuses when 50/sqrt(--eval-curve-n) >= this")
     p_train.add_argument("--eval-curve-seed", type=int, default=0,
                          help="shuffle seed selecting the curve subset; fixed across runs "
                               "so points stay paired and comparable")

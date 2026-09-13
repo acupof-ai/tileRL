@@ -4,10 +4,18 @@
 **Session:** tilerl-25
 **Task:** MATH run 2, `grpo-math-27b`, run `0f7006c74ea0`, card 0
 
-> Status: REJECTED (the run) / **OPEN** (all three fixes). Killed at step 45 of 100,
-> no after-arm. The policy collapsed onto the rollout cap at step 41 and stopped
-> producing a gradient. The fixes below are listed in `OPEN.md`; the run's verdict
-> being final does not close them, and two are on run 3's path.
+> Status: REJECTED (the run) / **closed (code) 2026-09-14.** Fix 3 (the
+> length term in the reward) landed on CPU
+> ([wins/2026-09-08](2026-09-08-a-length-term-in-the-grpo-reward.md) — λ
+> default 0.1, all-right groups now order by length), #131's pre-flight
+> `_refuse_short_rollouts` covers fix 2's launch reading, and the periodic
+> drift half is the `rollouts_within_cap` gate (`cli.py`, logged every
+> step and listed in the manifest). Fix 1 (padding-width buckets) is a
+> backward-cost optimization, not part of this defect. **Pending-remote
+> half:** that the policy actually stops lengthening is unproven and CPU
+> cannot prove it — it needs one real GRPO run with `_within_group_r`
+> negative and shrinking over training. Fix 4 (steps 41/44 exactly on the
+> cap) still needs a bigger cap; that is a config decision for that run.
 
 ## Context
 

@@ -1,6 +1,7 @@
 # A wrong reason kept a 2.6x decode gap unexamined — 27B, 2026-09-08
 
-**Status:** open — the gap is measured and reproducible; 93% of it is unattributed.
+**Status:** open — pending-remote. The gap is measured and reproducible; 93% of it is unattributed. The localizing arm is GPU-only (one process, one card, two engines; CPU cannot price 27B decode). Command at the next card window:
+`scripts/pod_run.sh rollgap <card> -- python3 scripts/prof_rollout_gap.py`.
 
 ## Context
 
