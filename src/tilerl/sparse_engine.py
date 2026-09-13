@@ -919,22 +919,35 @@ class SparsePrefixCache:
         is never published. Snapshots live on the host: the device copy is
         ~144 MiB at 27B and the lag between a boundary and the contiguous drop of
         its lowest still-pinned page can span many ticks.
-        # ponytail: retained per request without a byte budget (bounded by the pin
-        # lag); add an LRU eviction freezing the prefix at that boundary if a
-        # long-pinned frontier page ever makes this large."""
+
+        At most TWO snapshots are retained per request: the LOWEST unconsumed
+        boundary (the next frontier closure consumes it) and the NEWEST (the
+        prompt-end frozen entry consumes it). Closure m is non-decreasing, so any
+        snapshot strictly between can only land an intermediate grow-entry
+        length; dropping it makes a follower compute more prefix, never different
+        tokens. During a long single-request prefill the frontier stalls at page
+        0, so without this cap one snapshot per 512-token chunk piled for the whole
+        prefill — 128 x ~150 MiB at 64k, 512 x ~150 MiB at 256k, outside
+        HostKvPages' pinned budget, the V100 SIGKILL."""
         if complete <= 0:
             return
         # Only boundaries up to the prompt end can freeze an entry; decode-cross
         # boundaries beyond it are generated-token state nobody adopts.
         if req_id in self._prompt_pages and complete > self._prompt_pages[req_id]:
             return
+        snap = self._snap.setdefault(req_id, {})
+        # Boundaries arrive in ascending order; cap at {lowest, newest}.
+        if len(snap) >= 2:
+            snap.pop(max(snap), None)
         states, window = state
         window = None if window is None else window.cpu()
-        self._snap.setdefault(req_id, {})[complete] = (states.cpu(), window)
+        snap[complete] = (states.cpu(), window)
         if hidden is not None:
+            hid = self._snap_hidden.setdefault(req_id, {})
+            if len(hid) >= 2:
+                hid.pop(max(hid), None)
             # clone: .cpu() aliases on the CPU cell, and this outlives the frame
-            self._snap_hidden.setdefault(req_id, {})[complete] = \
-                hidden.detach().cpu().clone().reshape(-1)
+            hid[complete] = hidden.detach().cpu().clone().reshape(-1)
 
     def _ensure_prefix(self, req_id: int, tokens):
         """Cached (token tuple, per-page content keys) for a publisher. The

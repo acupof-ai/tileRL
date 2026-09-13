@@ -432,7 +432,9 @@ def test_sparse_prefix_out_of_order_drops_never_publish_a_hole():
     rid, P = 0, 4
     tokens = tuple(range(P * BLOCK_TOKENS))
     cache.set_request(rid, P)
-    for m in range(1, P + 1):
+    # Boundaries are noted as prefill chunks complete, BEFORE pages drop: note
+    # the first three now; the prompt-end one arrives after the first closure.
+    for m in range(1, P):
         cache.note_boundary(rid, m, (torch.zeros(2), None))
     bounds = {p: torch.zeros(1) for p in range(P)}
 
@@ -455,10 +457,98 @@ def test_sparse_prefix_out_of_order_drops_never_publish_a_hole():
     for p, key in enumerate(hit3["keys"]):
         held = cold.share_take(key)
         assert held is not None and torch.equal(held["k"], torch.full((2,), float(p)))
-    # The prompt-end page closes the full prefix.
-    cache.publish_dropped(rid, tokens, bounds, 3, blob(3))
+    # The prompt-end boundary (noted only now, as the last chunk completes) and
+    # the last page close the full prefix; the cap must not strand it.
+    cache.note_boundary(rid, P, (torch.zeros(2), None))
+    cache.publish_dropped(rid, tokens, bounds, P - 1, blob(P - 1))
     hit4 = cache.lookup(tuple(tokens) + (9, 9))
     assert hit4 is not None and len(hit4["keys"]) == P
+
+
+def test_sparse_prefill_retains_at_most_two_boundary_snapshots_per_request():
+    """The 256k V100 SIGKILL: a long single-request prefill stalls the dropped
+    frontier at page 0 (k+window keep every early page resident), while every
+    aligned 512-token chunk notes a host GDN snapshot (~155 MiB at 27B). The
+    snapshots accumulated in a bare dict OUTSIDE HostKvPages' pinned budget:
+    one per chunk for the whole prefill. Only the next-closure (lowest) and the
+    prompt-end (newest) boundaries can still be consumed, so cap at two."""
+    from tilerl.kv_cache import HostKvPages
+    from tilerl.sparse_engine import SparsePrefixCache
+
+    cold = HostKvPages(budget_bytes=1 << 30)
+    cache = SparsePrefixCache(cold, states=None)
+    rid, P = 0, 64
+    cache.set_request(rid, P)
+
+    def snap(m):
+        states = (torch.zeros(4, 8), torch.ones(2, 4))
+        return states, torch.zeros(3)
+
+    def _bytes(obj):
+        if torch.is_tensor(obj):
+            return obj.numel() * obj.element_size()
+        if isinstance(obj, (tuple, list)):
+            return sum(_bytes(x) for x in obj)
+        return 0
+
+    one = _bytes(snap(0))
+    for m in range(1, P + 1):
+        states, hidden = snap(m)
+        cache.note_boundary(rid, m, states, hidden)
+        held = cache._snap[rid]
+        assert set(held) == {min(held), max(held)} and len(held) <= 2, (
+            m, sorted(held))
+        assert set(cache._snap_hidden[rid]) == set(held)
+
+    snap_bytes = sum(_bytes(s) for s in cache._snap[rid].values())
+    hid_bytes = sum(_bytes(t) for t in cache._snap_hidden[rid].values())
+    assert snap_bytes + hid_bytes <= 2 * one
+    # newest is the prompt end, lowest still closes the first frontier
+    assert max(cache._snap[rid]) == P
+
+
+def test_sparse_long_prefill_snapshot_cap_keeps_a_follower_hit_exact():
+    """End-to-end half of the snapshot cap: with a one-page chunk every prefill
+    page is an aligned boundary, so a 32-page single-request prefill notes 32
+    snapshots while the dropped frontier stays at page 0 (hot pool 13 pages).
+    Under the cap only two survive, yet the prompt-end entry still freezes and a
+    follower ADOPTS it and must decode token-identically to a prefix-miss sparse
+    engine. Dropping intermediate snapshots changes how much prefix is recomputed,
+    not the tokens."""
+    cfg = tiny()
+
+    def _eng():
+        return build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+            num_slots=1, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=16,
+            sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
+
+    prompt = (np.arange(32 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    follow = np.concatenate([prompt, np.arange(100, 124, dtype=np.int64)])
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    miss = _eng()
+    ts_miss = _drain(miss, miss.submit(follow, params), 8)
+    miss.shutdown()
+
+    pub = _eng()
+    rp = pub.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+    _drain(pub, rp, 2)
+    cache = pub._sparse.prefix
+    # 32 boundaries were noted across the prefill; at most two snapshots remain,
+    # and the prompt-end prefix was still published.
+    assert len(cache._snap) <= 1  # publisher's request finished and dropped its state
+    entry = cache.lookup(follow)
+    assert entry is not None and len(entry["keys"]) == 32
+
+    rf = pub.submit(follow, params)
+    pub.step()
+    req = next(x for x in pub._running if x.req_id == rf)
+    assert req.sparse_matched == 32 * BLOCK_TOKENS, req.sparse_matched
+    ts = _drain(pub, rf, 8)
+    pub.shutdown()
+    assert ts == ts_miss, f"prefix-hit follower {ts} != prefix-miss sparse {ts_miss}"
 
 
 def test_sparse_prefix_republished_after_repin_keeps_the_first_blob():

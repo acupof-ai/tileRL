@@ -1,7 +1,11 @@
 # V100 sparse 256k is SIGKILL in prefill under a 10 GiB host tier; 64k serves — 2026-09-13
 
-> Status: **open — observed, mechanism untested.** Sparse k=128 serves 64k
-> on the V100 but is OOM-killed during a single-request 256k prefill.
+> Status: **closed (code) 2026-09-14 — mechanism found and fixed on CPU;
+> device RSS confirmation pending-remote.** The kill was not K/V pages
+> out-running demotion: the growing bytes were the per-chunk host GDN snapshots
+> in `SparsePrefixCache._snap`, held outside `HostKvPages`' budget. See
+> [wins/2026-09-14-bound-sparse-prefill-gdn-snapshots.md](../wins/2026-09-14-bound-sparse-prefill-gdn-snapshots.md).
+> The original observation and the (wrong) hypothesis are kept below.
 > Owner: 5f. Measured by cc on the V100 box (`n37-002-027`, V100-SXM2-32GB).
 
 ## Context
