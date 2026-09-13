@@ -2670,3 +2670,129 @@ def test_hybrid_a_dense_prompt_over_the_device_pool_routes_sparse_at_submit():
     assert req.sparse_on is True, "an un-pinnable prompt must route sparse, not dense"
     _drain_two(e, (rid,), 16)
     e.shutdown()
+
+
+def test_hybrid_wall_time_fairness_gives_dense_dozens_of_ticks_per_sparse_tick():
+    """Tick-count alternation handed each mode half the TICKS, but one sm70
+    sparse prefill tick costs ~1 s against ~35 ms for a dense decode tick, so
+    dense got ~1% of wall time. Wall-time fairness: after a 100-cost sparse
+    tick, dense must run >=90 cost-1 ticks before the next sparse tick.
+    Fake clock: sparse ticks cost 100, dense ticks 1; red on tick-count
+    round-robin (which interleaves 1:1)."""
+    e = _hybrid_engine()
+    e._hybrid_fake_dt = (100.0, 1.0)  # (sparse_dt, dense_dt) per tick
+    rng = np.random.default_rng(5)
+    # one dense row and one sparse row, enough tokens to keep both runnable
+    short = rng.integers(3, 300, 64).astype(np.int64)
+    long = rng.integers(3, 300, 20 * BLOCK_TOKENS).astype(np.int64)
+    e.submit(short, SamplingParams(temperature=0.0, max_new_tokens=400, seed=0))
+    e.submit(long, SamplingParams(temperature=0.0, max_new_tokens=1, seed=0))
+
+    # Run until the SECOND sparse tick is planned; count dense ticks between the
+    # first and second sparse tick by re-planning without forwarding: instead
+    # drive real steps and observe the mode sequence from stats/counters.
+    seq = []
+    orig = e._run_forward
+
+    def watch(decodes, prefills, chunks):
+        rows = decodes + prefills
+        seq.append(rows[0].sparse_on if rows else None)
+        # let the long sparse prefill advance so it stays runnable
+        return orig(decodes, prefills, chunks)
+
+    e._run_forward = watch
+    for _ in range(400):
+        e.step()
+        if sum(1 for m in seq if m is True) >= 2:
+            break
+        e.poll()
+    e.shutdown()
+    s = [m for m in seq if m is not None]
+    first_sparse = s.index(True)
+    second_sparse = s.index(True, first_sparse + 1)
+    dense_between = s[first_sparse + 1: second_sparse].count(False)
+    assert dense_between >= 90, (
+        f"after a 100-cost sparse tick only {dense_between} dense ticks ran "
+        "before the next sparse tick; wall-time fairness requires >= 90")
+
+
+def test_hybrid_dense_admit_reserves_live_sparse_rows_hot_headroom():
+    """CHANGE-REQ (rev-30, #586): a dense admit pins from the one pool sparse
+    rows grow into lazily. Free blocks alone overstate what dense may take -- a
+    live sparse row is entitled to grow to its per-slot hot ceiling. A dense
+    admit that fits free_blocks but starves that headroom must be refused;
+    otherwise the sparse row raises 'hot pool undersized' inside a live tick and
+    the step handler fails EVERY running row. Red on the head that admitted on
+    free_blocks alone."""
+    from tilerl.memory import sparse_hot_pages_per_slot
+
+    cfg = tiny()
+    ceil_ = sparse_hot_pages_per_slot(cfg, 64, 512)
+    # sparse pool fits num_slots x ceiling + 1. Fabricate one live sparse row
+    # holding ceiling-6 REAL pages: free = pool-held = 322, its headroom = 6.
+    # A dense 320-block pin fits free (old code: 320 <= 322, admits) but must be
+    # refused once the headroom is reserved (320 + 6 > 322).
+    e = build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+        num_blocks=0, num_slots=4, max_batch=4, max_total_tokens=16384,
+        max_num_batched_tokens=512, sparse_k=64, scorer="bounds",
+        kv_cold_bytes=1 << 30, sparse_min_tokens=8192)
+    try:
+        rng = np.random.default_rng(9)
+        long = rng.integers(3, 300, 20 * BLOCK_TOKENS).astype(np.int64)
+        srid = e.submit(long, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+        srow0 = e._waiting[0]
+        srow0.sparse_on = True  # fabricate the live sparse mode for this row
+        assert e._admit(srow0), "sparse row must admit with needed=0"
+        e._running.append(e._waiting.popleft())
+        srow = next(r for r in e._running if r.req_id == srid)
+        held = ceil_ - 6
+        for _ in range(held):
+            srow.blocks.append(e._kv.alloc_block())
+        e._sparse.attach(srid)
+        e._sparse.resident[srid] = {p: srow.blocks[p] for p in range(held)}
+        assert e._sparse_hot_headroom() == 6
+        free = e._kv.free_blocks
+        assert free >= 320, f"test setup: free {free} cannot place the 320-block pin"
+
+        # 320 whole-context blocks: dense under N=8192, fits free but not free+headroom.
+        short = rng.integers(3, 300, 320 * BLOCK_TOKENS).astype(np.int64)
+        e.submit(short, SamplingParams(temperature=0.0, max_new_tokens=8, seed=1))
+        drow = e._waiting[0]
+        assert drow.sparse_on is False
+        admitted = e._admit(drow)
+        assert not admitted, (
+            f"dense admitted with {free} free against a 6-page sparse headroom: "
+            "the sparse row's next own page raises inside a live tick")
+    finally:
+        e.shutdown()
+
+
+def test_hybrid_stats_carries_live_sparse_residency():
+    """rev-30 item 4: hybrid reconciles the DENSE memory ledger, so the sparse
+    live occupancy must still be visible flat in stats() (page_bounds/kv_hot),
+    or the concurrent device run cannot see residency vs cold."""
+    cfg = tiny()
+    e = build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+        num_blocks=0, num_slots=4, max_batch=4, max_total_tokens=16384,
+        sparse_k=64, scorer="bounds", kv_cold_bytes=1 << 30,
+        sparse_min_tokens=8192)
+    try:
+        rng = np.random.default_rng(4)
+        long = rng.integers(3, 300, 20 * BLOCK_TOKENS).astype(np.int64)
+        rid = e.submit(long, SamplingParams(max_new_tokens=4, seed=0))
+        r0 = e._waiting[0]
+        r0.sparse_on = True
+        assert e._admit(r0)
+        e._running.append(e._waiting.popleft())
+        for _ in range(3):
+            e._running[0].blocks.append(e._kv.alloc_block())
+        e._sparse.attach(rid)
+        e._sparse.resident[rid] = {p: e._running[0].blocks[p] for p in range(3)}
+        st = e.stats()
+        assert st["sparse_hot_pages"] == 3, st.get("sparse_hot_pages")
+        assert st["sparse_hot_bytes"] > 0 and st["page_bounds_bytes"] >= 0
+        assert "kv_cold_bytes" in st
+    finally:
+        e.shutdown()

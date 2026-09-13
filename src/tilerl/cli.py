@@ -153,7 +153,8 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
                   max_batched_tokens=0, kv_cold_bytes=0, cold_format="",
                   cold_ssd_path="", cold_ssd_bytes=0,
                   sparse_k=DEFAULT_SPARSE_K, scorer="bounds", kv_store="",
-                  decode_graph=None, sparse_min_tokens=0):
+                  decode_graph=None, sparse_min_tokens=0,
+                  sparse_prefill_tokens=0):
     """Serving-size engine on one card. Multi-card serving is one process per card
     under CUDA_VISIBLE_DEVICES (see generate.py for the process-per-device pattern);
     the in-process DataParallelEngine wrapper was deleted 2026-09-09 — its hand-written
@@ -208,6 +209,7 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
     kw["scorer"] = scorer
     kw["decode_graph"] = decode_graph
     kw["sparse_min_tokens"] = sparse_min_tokens
+    kw["sparse_prefill_tokens"] = sparse_prefill_tokens
     if sparse_k:
         import torch
 
@@ -355,7 +357,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            scorer=getattr(args, "scorer", "bounds"),
                            kv_cold_bytes=getattr(args, "kv_cold_bytes", 0),
                            decode_graph=getattr(args, "decode_graph", None),
-                           sparse_min_tokens=getattr(args, "sparse_min_tokens", 0))
+                           sparse_min_tokens=getattr(args, "sparse_min_tokens", 0),
+                           sparse_prefill_tokens=getattr(args, "sparse_prefill_tokens", 0))
     app = create_app(engine, tokenizer, model_name=cfg.name)
     # --dry-run: build (which materializes and fits) then print the memory ledger and stop,
     # never bind the HTTP port. --json prints the rows for the cost-model tooling. The budget
@@ -2534,6 +2537,10 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "the captured graph and pin their whole context (no sparse "
                               "sharing); longer prompts run sparse. 0 = all sparse. A dense "
                               "prompt that does not fit the device KV pool routes sparse.")
+    p_serve.add_argument("--sparse-prefill-tokens", type=int, default=0, metavar="N",
+                         help="hybrid (--sparse-min-tokens): cap one sparse prefill tick "
+                              "to N tokens so it stays ~1 s and dense waits are bounded "
+                              "(default 192 ~= 1 s on the V100 sparse prefill rate)")
     p_serve.add_argument("--scorer", choices=["index", "bounds"], default="bounds",
                          help="sparse-KV page scorer: training-free Quest page bounds "
                               "(default) or the learned V4.1 indexer keys")

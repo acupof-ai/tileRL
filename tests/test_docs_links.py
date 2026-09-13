@@ -310,6 +310,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--slots',
         '--sparse-k',
         '--sparse-min-tokens',
+        '--sparse-prefill-tokens',
         '--state-bytes',
     }),
     'train': frozenset({

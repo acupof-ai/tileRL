@@ -10,9 +10,18 @@ captured graph is fast for them but cannot hold a long context. The hybrid
 engine (`--sparse-min-tokens N`) fixes the mode per request at submit: prompts
 up to N tokens run dense on the precaptured decode graph and pin their whole
 context in the device KV pool (no sparse sharing); longer ones run sparse.
-Ticks never mix the two BatchKv geometries — while both modes have running
-rows, whole ticks alternate per mode (round-robin). The dense graph is
-precaptured before traffic and sparse ticks run **eager** deliberately: eager
+Ticks never mix the two BatchKv geometries. Scheduling is **wall-time
+fairness**, not tick alternation: after a sparse tick the dense side owns
+every tick until it has accumulated an equal wall duration (or has no runnable
+row), then one sparse tick runs. A sparse prefill tick is capped to ~1 s
+(`--sparse-prefill-tokens`, default 192: V100 sparse prefill measured
+191 tok/s, so 192 ≈ 1 s and is a whole 3x64-token bucket above the forced
+8-page window), so the dense wait is bounded. This replaced 1:1 tick
+alternation, which gave dense ~1% of wall time while a long prefill ran
+(measured 0.5 tok/s, 122 s TTFT). A dense admit also reserves every live
+sparse row's headroom to its per-slot hot ceiling, so a dense pin cannot make
+a sparse row raise "hot pool undersized" inside a live tick. The dense graph
+is precaptured before traffic and sparse ticks run **eager** deliberately: eager
 sparse is token-exact on sm70, so hybrid does not depend on the sparse-graph
 capture or its warmup-frame fix (#585).
 
@@ -28,8 +37,11 @@ Boot with `--sparse-k 128 --sparse-min-tokens 8192 --draft <mtp> --depth 1
    `≥ 50 tok/s` decode.
 3. **Concurrent modes:** a 32k sparse request answers correctly while a short
    dense request streams; read `/health` `dense_mode_ticks` and
-   `sparse_mode_ticks` (both must rise; no tick carries both modes — asserted
-   on CPU), and record the short request's tok/s under alternation.
+   `sparse_mode_ticks` (both must rise), plus the flat sparse residency keys
+   (`sparse_hot_pages`, `sparse_hot_bytes`, `page_bounds_bytes`,
+   `kv_cold_bytes`, `kv_prefix_bytes`); record the short request's tok/s and
+   TTFT — wall-time fairness targets ~50% of its solo speed during the long
+   prefill (first round-robin cut measured 0.5 tok/s / 122 s TTFT).
 4. **MMLU smoke:** the served default MMLU smoke stays green with the hybrid
    flags.
 

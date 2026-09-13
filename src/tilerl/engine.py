@@ -616,6 +616,7 @@ class Engine:
         sparse_device_select: bool = False,
         draft_num_blocks: int | None = None,
         sparse_min_tokens: int = 0,
+        sparse_prefill_tokens: int = 0,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -632,14 +633,27 @@ class Engine:
         # shorter ones run dense on the captured graph and pin their whole context.
         # 0 = every request is sparse, the pre-hybrid behavior.
         self._sparse_min_tokens = sparse_min_tokens if sparse_tracker is not None else 0
-        # Hybrid tick scheduler: while both modes have runnable rows, alternate the
-        # whole tick per mode instead of mixing the two BatchKv geometries.
-        # ponytail: each mode then advances only every other tick while both are
-        # active (latency doubles for those ticks); pack both in one tick when it
-        # matters — needs a fused dense+packed table, not two forwards.
-        self._tick_run_sparse = True
+        # Hybrid tick scheduler. TICK-COUNT alternation gave each mode half the
+        # TICKS, but one sparse prefill tick costs ~1 s on sm70 against ~35 ms for
+        # a dense decode tick -- so dense got ~1% of wall time (0.5 tok/s while a
+        # long prefill ran). Wall-time fairness instead: after a sparse tick the
+        # dense side owns every tick until it has accumulated an EQUAL wall
+        # duration (or it has no runnable row), then one sparse tick runs. A
+        # sparse tick is capped (~1 s chunk) so the dense wait is bounded.
+        self._hybrid_dense_budget = 0.0   # dense wall time owed after last sparse tick
+        self._hybrid_dense_used = 0.0     # dense wall time accumulated since it
+        #: test seam: (sparse_dt, dense_dt) replaces the perf_counter measurement
+        self._hybrid_fake_dt: tuple[float, float] | None = None
+        self._hybrid_t0 = 0.0
         self._dense_mode_ticks = 0
         self._sparse_mode_ticks = 0
+        # A sparse prefill tick is capped so its wall time stays ~1 s on the
+        # target card: V100 solo sparse prefill measured 65536 tokens / 343.2 s =
+        # 191 tok/s (errors/2026-09-13-v100-256k), so 192 tokens ~= 1 s and is a
+        # whole 3x64-token bucket above the forced 8-page (128-token) window.
+        # Applied to sparse rows in HYBRID mode only (pure sparse is unchanged).
+        self._sparse_prefill_cap = sparse_prefill_tokens or (
+            192 if sparse_min_tokens else 0)
         #: decode ticks build the packed table with pure device selection (no host
         #: sync) — the capture-ready path; valid only with the pin steady state.
         self._sparse_device_select = sparse_device_select and sparse_tracker is not None
@@ -1034,7 +1048,10 @@ class Engine:
                 # Before the forward too: without this the FIRST forward has no snapshot and
                 # `stats()` falls back to the locking path.
                 self._stats_snapshot = self._build_stats()
+                tick_sparse = bool(
+                    (decodes + prefills) and (decodes + prefills)[0].sparse_on)
                 try:
+                    self._hybrid_t0 = time.perf_counter()
                     self._run_forward(decodes, prefills, chunks)
                 except Exception as exc:
                     for req in list(self._running):
@@ -1044,6 +1061,7 @@ class Engine:
                     # `_loop` stops calling `step` once nothing runs, so this carries the last
                     # tick's state -- including a failed forward's, hence `finally`.
                     self._stats_snapshot = self._build_stats()
+                self._hybrid_charge(tick_sparse)
         if idle:
             return
 
@@ -1075,6 +1093,12 @@ class Engine:
         # By count, not by catching `alloc_slot`'s raise: an exception out of
         # `_admit` reaches `step`'s handler, which fails EVERY running request.
         needed = 0 if sparse else (total_blocks if boot_len else total_blocks - len(hit_blocks))
+        # Hybrid: a dense admit pins its whole context from the ONE pool sparse
+        # rows grow into lazily. Their future own pages are not allocated yet, so
+        # free_blocks overstates what the dense row may take; leave every live
+        # sparse row's headroom to its hot ceiling, or that row later raises
+        # "hot pool undersized" inside a tick and fails every running request.
+        needed += self._sparse_hot_headroom() if not sparse and self._sparse is not None else 0
         if self._kv.free_blocks < needed:
             # Guarded: unguarded, a request waiting on a live retain would drop every entry
             # each tick and free nothing, flushing other clients' prefixes for the whole wait.
@@ -1250,21 +1274,24 @@ class Engine:
                 break
             self._running.append(self._waiting.popleft())
         decodes = [r for r in self._running if r.phase == _PHASE_DECODE]
-        # Hybrid round-robin: when both modes have runnable rows, run one mode's
-        # whole tick and flip for next tick, so every forward stays pure-mode with
-        # one BatchKv geometry. A tick that runs nothing does not flip.
+        # Hybrid wall-time fairness: while both modes have runnable rows, sparse
+        # owns a tick only when dense has spent at least as much wall time since
+        # the last sparse tick as that sparse tick cost; otherwise dense owns the
+        # tick. Every tick stays one mode (one BatchKv geometry).
         mode_sparse = self._sparse is not None
         if self._sparse is not None:
-            d = any(not r.sparse_on for r in self._running)
-            s = any(r.sparse_on for r in self._running)
-            if d and s:
-                mode_sparse = self._tick_run_sparse
-            elif d:
+            dense_rows = [r for r in self._running if not r.sparse_on]
+            sparse_rows = [r for r in self._running if r.sparse_on]
+            if dense_rows and sparse_rows:
+                mode_sparse = self._hybrid_dense_used >= self._hybrid_dense_budget
+            elif dense_rows:
                 mode_sparse = False
             decodes = [r for r in decodes if r.sparse_on == mode_sparse]
         prefills: list[_Req] = []
         chunks: list[int] = []
         budget = self.limits.max_num_batched_tokens - len(decodes)
+        if mode_sparse and self._sparse_prefill_cap:
+            budget = min(budget, self._sparse_prefill_cap)
         bucket = 0
         for r in self._running:
             if r.phase != _PHASE_PREFILL:
@@ -1409,6 +1436,10 @@ class Engine:
                 # hybrid --sparse-min-tokens: ticks each mode ran (0 when off)
                 "dense_mode_ticks": self._dense_mode_ticks,
                 "sparse_mode_ticks": self._sparse_mode_ticks,
+                # hybrid: live sparse residency stays visible even though the
+                # memory ledger reconciles the dense view (rev-30 item 4).
+                **(self._sparse_live_stats()
+                  if self._sparse is not None and self._sparse_min_tokens else {}),
                 "tokens_generated": self._tokens_generated,
                 "spec_drafted": self._spec_drafted,
                 "spec_accepted": self._spec_accepted,
@@ -2364,7 +2395,7 @@ class Engine:
             and self._decode_graph_on
             and self._run_decode_graph(decodes, chains)
         ):
-            self._hybrid_tick(False)
+            self._hybrid_charge(False)
             return
         if (
             not prefills
@@ -2373,7 +2404,7 @@ class Engine:
             and self._sparse_graph_on
             and self._run_sparse_decode_graph(decodes, chains)
         ):
-            self._hybrid_tick(True)
+            self._hybrid_charge(True)
             return
         rows = decodes + prefills
         seq_q = q_dec + chunks
@@ -2495,22 +2526,58 @@ class Engine:
                 self._sparse_process_offers(sparse_offers)
         elif sparse:
             self._sparse_process_offers(sparse_offers)
-        self._hybrid_tick(sparse)
 
-    def _hybrid_tick(self, sparse: bool) -> None:
-        """Per-mode tick accounting and the round-robin flip. Only flips while
-        BOTH modes still have rows: a tick after one mode drained keeps serving
-        the survivor every tick."""
+    def _sparse_live_stats(self) -> dict:
+        """Flat sparse residency counters for a hybrid engine. The memory ledger
+        reconciles the dense pool view, so without these the sparse rows' hot /
+        bounds / cold occupancy during a concurrent run is invisible."""
+        from .memory import per_kv_block_bytes
+
+        block_n = per_kv_block_bytes(self._model.cfg, self._kv.dtype, self._kv.kv_fp8)
+        hot_pages = sum(len(self._sparse.resident.get(r.req_id, ())) for r in self._running)
+        cold = getattr(self._kv, "cold", None)
+        shared_n = cold.shared_bytes() if cold is not None else 0
+        return {
+            "sparse_hot_pages": hot_pages,
+            "sparse_hot_bytes": hot_pages * block_n,
+            "page_bounds_bytes": self._sparse.bounds_bytes(),
+            "kv_cold_bytes": (cold.bytes_held - shared_n) if cold is not None else 0,
+            "kv_prefix_bytes": shared_n,
+        }
+
+    def _sparse_hot_headroom(self) -> int:
+        """Device blocks live sparse rows can still grow toward their per-slot hot
+        ceiling. A dense hybrid admit must leave this much free, or a sparse row
+        raises inside a later tick and fails every running row. Conservative:
+        ceiling minus currently resident, summed over live sparse rows."""
+        from .memory import sparse_hot_pages_per_slot
+
+        ceil = sparse_hot_pages_per_slot(
+            self._model.cfg, self._sparse_k, self.limits.max_num_batched_tokens)
+        resident = self._sparse.resident
+        return sum(
+            max(0, ceil - len(resident.get(r.req_id, ())))
+            for r in self._running
+            if r.sparse_on and r.phase != _PHASE_DONE)
+
+    def _hybrid_charge(self, sparse: bool) -> None:
+        """Per-mode tick counters and wall-time fairness accounting.
+
+        After a SPARSE tick, dense is owed the tick's duration: dense keeps
+        owning following ticks while both modes run, until it has accumulated
+        equal wall time. A DENSE tick adds to that accumulation. Measured from
+        the fake-clock seam in tests ((sparse_dt, dense_dt) per tick)."""
         if self._sparse_min_tokens == 0:
             return
+        dt = (self._hybrid_fake_dt[1 if not sparse else 0]
+              if self._hybrid_fake_dt is not None
+              else time.perf_counter() - self._hybrid_t0)
         if sparse:
             self._sparse_mode_ticks += 1
+            self._hybrid_dense_budget += dt
         else:
             self._dense_mode_ticks += 1
-        d = any(not r.sparse_on for r in self._running)
-        s = any(r.sparse_on for r in self._running)
-        if d and s:
-            self._tick_run_sparse = not sparse
+            self._hybrid_dense_used += dt
 
     def _finish_prefills(self, prefills: list[_Req], chunks: list[int], logits, base: int) -> None:
         done = []
@@ -3271,6 +3338,9 @@ def build_engine(
     #: captured graph and pin their whole context (no sparse sharing); longer ones
     #: run sparse. 0 = all requests sparse, the pre-hybrid behavior.
     sparse_min_tokens: int = 0,
+    #: Hybrid sparse-prefill chunk cap in tokens; 0 uses the 192 default (~1 s on
+    #: the V100 sparse prefill rate). Ignored when sparse_min_tokens is 0.
+    sparse_prefill_tokens: int = 0,
     spec_depth: int | None = None,
     decode: Any = None,
 ) -> Engine:
@@ -3515,4 +3585,5 @@ def build_engine(
         sparse_device_select=sparse_device_select,
         draft_num_blocks=draft_num_blocks,
         sparse_min_tokens=sparse_min_tokens,
+        sparse_prefill_tokens=sparse_prefill_tokens,
     )
