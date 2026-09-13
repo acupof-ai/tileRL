@@ -94,9 +94,26 @@ def main() -> None:
     orig_plan = e._build_plan
     orig_fwd = e._run_forward
 
+    admit_fail = {"slots": 0, "blocks": 0, "reclaim": 0}
+
     def plan_wrap():
         decodes, prefills, chunks = orig_plan()
         rows = decodes + prefills
+        # WHY did the waiting queue head not admit? mirror _admit's gates.
+        if e._waiting:
+            w = e._waiting[0]
+            if e._states.free_slots < 1:
+                admit_fail["slots"] += 1
+            else:
+                total = (len(w.tokens) + 15) // 16
+                need = (0 if w.sparse_on else total)
+                if not w.sparse_on and e._sparse is not None:
+                    need += e._sparse_hot_headroom()
+                if e._kv.free_blocks < need:
+                    if (e._kv.free_blocks + e._prefix.reclaimable_blocks()) < need:
+                        admit_fail["reclaim"] += 1
+                    else:
+                        admit_fail["blocks"] += 1
         meta = {
             "mode": ("sparse" if rows and rows[0].sparse_on else
                      "dense" if rows else "idle"),
@@ -106,6 +123,8 @@ def main() -> None:
             "run_s": sum(1 for r in e._running if r.sparse_on),
             "wait_d": sum(1 for r in e._waiting if not r.sparse_on),
             "wait_s": sum(1 for r in e._waiting if r.sparse_on),
+            "free_slots": e._states.free_slots,
+            "free_blocks": int(e._kv.free_blocks),
         }
         ticks.append(meta)
         return decodes, prefills, chunks
@@ -126,12 +145,16 @@ def main() -> None:
     # finish time is when it reaches max_new -- poll-once collapsed all 40 tokens
     # to the finish tick and made decode_ms 0.
     target = {**{long_rid: 2}, **{r: args.short_max_new for r in short_rids}}
+    first_dense_ts: dict[int, float] = {}
+
     for _ in range(20000):
         e.step()
         now = time.perf_counter()
         for r in e._running:
             if r.req_id not in admit_ts and r.state_slot is not None:
                 admit_ts[r.req_id] = now
+            if not r.sparse_on and r.req_id not in first_dense_ts:
+                first_dense_ts[r.req_id] = now
         for rid in rids:
             cur = e.peek(rid)
             if cur is None:
@@ -148,24 +171,28 @@ def main() -> None:
     e.shutdown()
 
     print(f"\n== short requests (cap={args.cap}, n={len(short_rids)}) ==")
-    print(f"{'rid':>4s} {'queue_ms':>9s} {'ttft_ms':>9s} {'decode_ms':>10s} "
-          f"{'toks':>4s} {'dec_tok/s':>9s}")
+    print(f"{'rid':>4s} {'queue_ms':>9s} {'wait2dense':>10s} {'ttft_ms':>9s} "
+          f"{'decode_ms':>10s} {'toks':>4s} {'dec_tok/s':>9s}")
     rates = []
     for r in short_rids:
         if r not in finish_ts:
             print(f"{r:4d} UNFINISHED")
             continue
         q = (admit_ts.get(r, submit_ts[r]) - submit_ts[r]) * 1000
+        wd = (first_dense_ts.get(r, submit_ts[r]) - submit_ts[r]) * 1000
         ttft = (first_ts[r] - submit_ts[r]) * 1000
         dec_ms = (finish_ts[r] - first_ts[r]) * 1000
         n = len(out_tokens[r])
         rate = (n - 1) / (dec_ms / 1000) if dec_ms > 0 else float("inf")
         rates.append(rate)
-        print(f"{r:4d} {q:9.0f} {ttft:9.0f} {dec_ms:10.0f} {n:4d} {rate:9.1f}")
+        print(f"{r:4d} {q:9.0f} {wd:10.0f} {ttft:9.0f} {dec_ms:10.0f} "
+              f"{n:4d} {rate:9.1f}")
     if rates:
         s = sorted(rates)
         print(f"decode tok/s: min {s[0]:.1f}  median {s[len(s)//2]:.1f}  "
               f"max {s[-1]:.1f}  mean {sum(s)/len(s):.1f}")
+    print(f"\nadmit head-of-line blocked (tick counts): slots_full={admit_fail['slots']} "
+          f"blocks+headroom={admit_fail['blocks']} blocks+reclaim={admit_fail['reclaim']}")
 
     sp = [t for t in ticks if t["mode"] == "sparse"]
     de = [t for t in ticks if t["mode"] == "dense"]
@@ -191,10 +218,12 @@ def main() -> None:
         print(f"dense-runnable ticks per sparse gap (n={len(gaps)}): "
               f"min {min(gaps)} median {sorted(gaps)[len(gaps)//2]} max {max(gaps)}")
 
-    print("\nfirst 20 ticks: mode ms planD/planS runD/runS waitD/waitS")
+    print("\nfirst 20 ticks: mode ms planD/planS runD/runS waitD/waitS "
+          "freeSlots/freeBlocks")
     for t in ticks[:20]:
         print(f"  {t['mode']:6s} {t.get('ms',0):7.0f}  {t['plan_d']}/{t['plan_s']}  "
-              f"{t['run_d']}/{t['run_s']}  {t['wait_d']}/{t['wait_s']}")
+              f"{t['run_d']}/{t['run_s']}  {t['wait_d']}/{t['wait_s']}  "
+              f"{t['free_slots']}/{t['free_blocks']}")
 
     if args.dump_out:
         with open(args.dump_out, "w") as f:
