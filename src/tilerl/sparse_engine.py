@@ -30,6 +30,7 @@ import torch
 from tilerl_kernels.reference import select_pages
 from torch import Tensor
 
+from . import kv_cache
 from .kv_cache import BLOCK_TOKENS
 from .sparse_index import WINDOW_PAGES, index_source_groups
 
@@ -831,20 +832,13 @@ class SparseForward:
 
 
 # --- sparse prefix cache (host-blob backed; replaces the NoPrefixStore stopgap) ---
-_MASK64 = (1 << 64) - 1
-
-
-def _page_hash(prev: int, token: int) -> int:
-    """Same rolling hash as kv_cache._rolling_hash: a page is keyed by the hash of
-    its token span's prefix, so page p's key = hash(tokens[: (p+1)*16])."""
-    return ((prev * 1_000_003) ^ (token + 1)) & _MASK64
 
 
 def page_key(tokens, page: int) -> int:
     """Content key of whole page ``page`` (tokens [page*16, (page+1)*16))."""
     h = 0
     for t in tokens[: (page + 1) * BLOCK_TOKENS]:
-        h = _page_hash(h, int(t))
+        h = kv_cache._rolling_hash(h, int(t))
     return h
 
 
@@ -961,7 +955,7 @@ class SparsePrefixCache:
         h = ckeys[-1] if ckeys else 0
         start = len(ckeys) * BLOCK_TOKENS
         for i in range(start, (len(tail) // BLOCK_TOKENS) * BLOCK_TOKENS):
-            h = _page_hash(h, tail[i])
+            h = kv_cache._rolling_hash(h, tail[i])
             if (i + 1) % BLOCK_TOKENS == 0:
                 ckeys.append(h)
         return tail, ckeys
@@ -1144,7 +1138,7 @@ class SparsePrefixCache:
         h = 0
         hashes = []
         for t in tokens:
-            h = _page_hash(h, int(t))
+            h = kv_cache._rolling_hash(h, int(t))
             hashes.append(h)
         for i in range(len(tokens) // BLOCK_TOKENS, 0, -1):
             for e in self._entries.get(hashes[i * BLOCK_TOKENS - 1], ()):

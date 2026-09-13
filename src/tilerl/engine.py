@@ -756,7 +756,6 @@ class Engine:
         self._prefix_hit_tokens = 0
         self._prefix_published = 0
         self._prefill_forwards = 0
-        # R in the SSD break-even; the arch seed only covers the first decision
         self._prefill_tokens = 0
         self._prefill_secs = 0.0
         self._seed_rate = 2558.6 if getattr(backend, "arch", "") == "sm90" else 75.0
@@ -1231,10 +1230,10 @@ class Engine:
             # 1-token chunk ships. 14 lengths under 4000 hit this (65, 129, ... 2561, one per
             # `budget × k + 1` and per `_PREFILL_BUCKET × k + 1`), and on every one of them
             # `_last_prefill_boundary` names a position no chunk ends at, so `last` never
-            # fires and NOTHING from that prompt is offered to the disk tier. Costs no extra
+            # fires and that prompt's prefix is never published. Costs no extra
             # forward: measured over n=2..4000 at budget 512, 21606 chunks before and after.
             # Covers this budget only -- `budget` is `max_num_batched_tokens - len(decodes)`
-            # and the boundary helper takes `n` alone, so a shared tick still loses the spill.
+            # and the boundary helper takes `n` alone, so a shared tick still loses the boundary.
             # errors/2026-09-08-a-one-token-chunk-made-last-unreachable.md
             if len(r.tokens) - (r.prefill_from + chunk) == 1 and chunk > BLOCK_TOKENS:
                 chunk -= BLOCK_TOKENS
@@ -1308,12 +1307,13 @@ class Engine:
                 "prefix_misses": self._prefix_misses,
                 "prefix_warm_adoptions": self._prefix_warm_adoptions,
                 "prefix_hit_tokens": self._prefix_hit_tokens,
-                # both operands of the fetch-vs-recompute decision, for a live server
+                # measured prefill tokens/s for this engine (arch seed before one)
                 "prefill_rate": round(self.prefill_rate, 1),
                 "prefix_published": self._prefix_published,
-                # Whether the store is under pressure at all: a DRAM/SSD tier below it can
-                # only recover entries that were actually evicted, and at 144 MiB a 27B
-                # snapshot the sm70 budget (free/4 = 1417 MiB) holds 9 of them.
+                # Whether the store is under pressure at all: the DRAM snapshot
+                # tier below it can only recover entries that were actually
+                # evicted, and at 144 MiB a 27B snapshot the sm70 budget
+                # (free/4 = 1417 MiB) holds 9 of them.
                 "prefix_evictions": store["evictions"],
                 "prefix_superseded": store["superseded"],
                 # Indexed, not .get(k, 0): a default turns a store that stopped publishing the
@@ -2403,8 +2403,9 @@ class Engine:
                 done.append((pf, logits[base + k, min(c, logits.shape[1]) - 1], 0))
             elif pf.prefill_from % BLOCK_TOKENS == 0:
                 # A chunk end is a state-pool boundary, so the snapshot is exact here.
-                # Only the last boundary reaches disk; ask `_pick` where it is, since a
-                # remaining-length test misreads the backed-off 17-token tail.
+                # Only the last boundary is published at a chunk end; ask `_pick`
+                # where it is, since a remaining-length test misreads the
+                # backed-off 17-token tail.
                 last = pf.prefill_from == _last_prefill_boundary(len(pf.tokens))
                 # The FIRST interior boundary and the last, never the ones between: a row's
                 # publishes stay at 2 whatever the prompt length, where per-boundary publishing
@@ -2417,7 +2418,7 @@ class Engine:
                 # errors/2026-09-08-the-eviction-policy-was-the-wrong-layer.md
                 pf.interior_published += 1
                 if pf.interior_published == 1 or last:
-                    self._publish_prefix(pf, pf.prefill_from, spill=last)
+                    self._publish_prefix(pf, pf.prefill_from)
         if not done:
             return
         self._sample_commit(done)
@@ -2791,22 +2792,15 @@ class Engine:
         }
         return self._boot.save(req.tokens[:n], self._kv, blocks, state)
 
-    def _publish_prefix(self, req: _Req, length: int, spill: bool = True) -> bool:
+    def _publish_prefix(self, req: _Req, length: int) -> bool:
         """Hand tokens[:length], its blocks and the linear-state snapshot at that
-        boundary to the store; the store owns and evicts all three together.
-
-        ``spill=False`` for a publish a later one supersedes -- the entry stays in HBM but
-        is not written to the disk tier. Every mid-prefill chunk boundary is such a publish:
-        the prompt-complete entry that follows covers it, and on a real second turn the
-        prompt is LONGER, so the longest entry is the one that serves. Skipping them takes
-        one 2729-token prompt from 1624 MB spilled to 325 MB.
-        """
+        boundary to the store; the store owns and evicts all three together."""
         snap = (
             self._states.states[req.state_slot].clone(),
             self._states.window_snapshot(req.state_slot),
         )
         published = self._prefix.insert(
-            req.tokens[:length], req.blocks[: length // BLOCK_TOKENS], snap, spill=spill
+            req.tokens[:length], req.blocks[: length // BLOCK_TOKENS], snap
         )
         self._prefix_published += published
         return published
