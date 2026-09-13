@@ -2543,3 +2543,130 @@ def test_a_private_spill_failure_fails_the_request_and_frees_its_slot(tmp_path):
     out2 = _drain(e, rid2, 3)
     e.shutdown()
     assert len(out2) == 3
+
+
+# ------------------------------------------------- hybrid --sparse-min-tokens
+
+def _hybrid_engine():
+    return build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=128, num_slots=4, max_batch=4, max_total_tokens=8192,
+        max_num_batched_tokens=512, sparse_k=64, scorer="bounds",
+        kv_cold_bytes=1 << 30, sparse_min_tokens=128)
+
+
+def _drain_two(engine, rids, n, ticks=8000):
+    # poll() pops ALL finished rows, so a per-rid drain would discard the other's
+    # output; accumulate each poll dict by rid in one loop.
+    outs = {r: [] for r in rids}
+    for _ in range(ticks):
+        engine.step()
+        if engine._failed:
+            raise AssertionError(engine._failed)
+        for k, v in engine.poll().items():
+            if k in outs:
+                outs[k] += v
+        if all(len(v) >= n for v in outs.values()):
+            return outs
+    raise AssertionError(f"stalled: {[(k, len(v)) for k, v in outs.items()]}")
+
+
+def test_hybrid_short_runs_dense_long_runs_sparse_token_exact_to_pure_modes():
+    """One hybrid engine: the short prompt must equal the pure-dense engine's
+    output, the long prompt the pure-sparse engine's output."""
+    rng = np.random.default_rng(3)
+    short = rng.integers(3, 300, 64).astype(np.int64)
+    long = rng.integers(3, 300, 20 * BLOCK_TOKENS).astype(np.int64)
+    p = lambda: SamplingParams(temperature=0.0, max_new_tokens=6, seed=0)
+
+    e = _hybrid_engine()
+    rs = e.submit(short, p())
+    rl = e.submit(long, p())
+    out = _drain_two(e, (rs, rl), 6)
+    hs, hl = out[rs], out[rl]
+    e.shutdown()
+
+    dense = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=128, num_slots=4, max_batch=4, max_total_tokens=8192,
+        max_num_batched_tokens=512)
+    rd = dense.submit(short, p())
+    want_d = _drain_two(dense, (rd,), 6)[rd]
+    dense.shutdown()
+
+    sp = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=128, num_slots=4, max_batch=4, max_total_tokens=8192,
+        max_num_batched_tokens=512, sparse_k=64, scorer="bounds",
+        kv_cold_bytes=1 << 30)
+    rsp = sp.submit(long, p())
+    want_s = _drain_two(sp, (rsp,), 6)[rsp]
+    sp.shutdown()
+    assert hs == want_d, f"dense-mode short {hs} != pure dense {want_d}"
+    assert hl == want_s, f"sparse-mode long {hl} != pure sparse {want_s}"
+
+
+def test_hybrid_tick_is_never_mixed_and_short_ticks_use_the_dense_graph():
+    """Round-robin: every tick carries one mode; all-short decode ticks run the
+    dense captured graph (forced on the CPU seam), and per-mode counters record
+    the path."""
+    rng = np.random.default_rng(3)
+    short = rng.integers(3, 300, 64).astype(np.int64)
+    long = rng.integers(3, 300, 20 * BLOCK_TOKENS).astype(np.int64)
+    p = lambda: SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    e = _hybrid_engine()
+    # Hybrid never captures the sparse graph: sparse ticks run eager (token-exact),
+    # only the dense graph is used -- and it is precaptured before traffic.
+    assert e._sparse_graph_on is False
+    sparse_graph_calls = {"n": 0}
+    real_sp = e._run_sparse_decode_graph
+    e._run_sparse_decode_graph = (lambda reqs, chains:
+        sparse_graph_calls.__setitem__("n", sparse_graph_calls["n"] + 1)
+        or real_sp(reqs, chains))
+    e._decode_graph_on = True
+    seen = {"dense": [], "sparse": [], "mixed": []}
+    orig_fwd = e._run_forward
+
+    def watch(decodes, prefills, chunks):
+        rows = decodes + prefills
+        if rows:
+            modes = {r.sparse_on for r in rows}
+            assert modes <= {True, False} and len(modes) == 1, "mixed-mode tick"
+            seen["mixed"].append(len(modes) == 2)
+        return orig_fwd(decodes, prefills, chunks)
+
+    e._run_forward = watch
+    dense_graph = {"n": 0}
+    real = e._run_decode_graph
+
+    def counting_dense(reqs, chains=None):
+        dense_graph["n"] += 1
+        return real(reqs, chains)  # CPU: capture fails -> caller runs eager, tokens still commit
+
+    e._run_decode_graph = counting_dense
+    rs = e.submit(short, p())
+    rl = e.submit(long, p())
+    _drain_two(e, (rs, rl), 8)
+    st = e.stats()
+    e.shutdown()
+    assert not any(seen["mixed"]), "a tick carried both modes"
+    assert dense_graph["n"] >= 1, "an all-short decode tick never used the dense graph"
+    assert sparse_graph_calls["n"] == 0, "a hybrid sparse tick entered the sparse graph"
+    assert st["dense_mode_ticks"] >= 1 and st["sparse_mode_ticks"] >= 1, st
+    assert st["dense_mode_ticks"] + st["sparse_mode_ticks"] >= dense_graph["n"]
+
+
+def test_hybrid_a_dense_prompt_over_the_device_pool_routes_sparse_at_submit():
+    """A dense row pins its WHOLE context in the device pool (the sparse cold tier
+    is not available to it); a prompt that cannot fit that pin routes sparse at
+    submit rather than blocking _admit forever."""
+    # 128 blocks x 16 tokens is the whole device pool; a prompt claiming that much
+    # plus decode cannot be dense even with the pool empty.
+    too_long = np.arange(7, 7 + 120 * BLOCK_TOKENS, dtype=np.int64) % 297 + 3
+    e = _hybrid_engine()
+    rid = e.submit(too_long, SamplingParams(temperature=0.0, max_new_tokens=16, seed=0))
+    req = e._waiting[0]
+    assert req.sparse_on is True, "an un-pinnable prompt must route sparse, not dense"
+    _drain_two(e, (rid,), 16)
+    e.shutdown()

@@ -153,7 +153,7 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
                   max_batched_tokens=0, kv_cold_bytes=0, cold_format="",
                   cold_ssd_path="", cold_ssd_bytes=0,
                   sparse_k=DEFAULT_SPARSE_K, scorer="bounds", kv_store="",
-                  decode_graph=None):
+                  decode_graph=None, sparse_min_tokens=0):
     """Serving-size engine on one card. Multi-card serving is one process per card
     under CUDA_VISIBLE_DEVICES (see generate.py for the process-per-device pattern);
     the in-process DataParallelEngine wrapper was deleted 2026-09-09 — its hand-written
@@ -207,6 +207,7 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
     kw["sparse_k"] = sparse_k
     kw["scorer"] = scorer
     kw["decode_graph"] = decode_graph
+    kw["sparse_min_tokens"] = sparse_min_tokens
     if sparse_k:
         import torch
 
@@ -353,7 +354,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            sparse_k=getattr(args, "sparse_k", 0),
                            scorer=getattr(args, "scorer", "bounds"),
                            kv_cold_bytes=getattr(args, "kv_cold_bytes", 0),
-                           decode_graph=getattr(args, "decode_graph", None))
+                           decode_graph=getattr(args, "decode_graph", None),
+                           sparse_min_tokens=getattr(args, "sparse_min_tokens", 0))
     app = create_app(engine, tokenizer, model_name=cfg.name)
     # --dry-run: build (which materializes and fits) then print the memory ledger and stop,
     # never bind the HTTP port. --json prints the rows for the cost-model tooling. The budget
@@ -2527,6 +2529,11 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "Sparse is off by default pending the sm90 continuity gate. "
                               "With --dry-run --checkpoint it instead prices the derived "
                               "ledger. docs/design-sparse-kv.md")
+    p_serve.add_argument("--sparse-min-tokens", type=int, default=0, metavar="N",
+                         help="hybrid with --sparse-k: prompts up to N tokens run DENSE on "
+                              "the captured graph and pin their whole context (no sparse "
+                              "sharing); longer prompts run sparse. 0 = all sparse. A dense "
+                              "prompt that does not fit the device KV pool routes sparse.")
     p_serve.add_argument("--scorer", choices=["index", "bounds"], default="bounds",
                          help="sparse-KV page scorer: training-free Quest page bounds "
                               "(default) or the learned V4.1 indexer keys")

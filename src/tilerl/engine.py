@@ -270,6 +270,9 @@ class _Req:
     #: A request failed mid-flight (e.g. cold spill): release its frames without
     #: trying to publish a prefix snapshot whose cold blobs may already be gone.
     failed: bool = False
+    #: hybrid sparse engine: fixed at submit from prompt length vs --sparse-min-tokens.
+    #: Dense rows pin their whole context and never touch the sparse tracker.
+    sparse_on: bool = False
     output: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     thought_closed: bool = False  # the reasoning block ended (model's or forced)
@@ -612,6 +615,7 @@ class Engine:
         boot_store: Any = None,
         sparse_device_select: bool = False,
         draft_num_blocks: int | None = None,
+        sparse_min_tokens: int = 0,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -624,6 +628,18 @@ class Engine:
         self._states = state_pool
         self._sparse = sparse_tracker
         self._sparse_k = sparse_k
+        # Hybrid mode (sparse engine only): prompts longer than this go sparse;
+        # shorter ones run dense on the captured graph and pin their whole context.
+        # 0 = every request is sparse, the pre-hybrid behavior.
+        self._sparse_min_tokens = sparse_min_tokens if sparse_tracker is not None else 0
+        # Hybrid tick scheduler: while both modes have runnable rows, alternate the
+        # whole tick per mode instead of mixing the two BatchKv geometries.
+        # ponytail: each mode then advances only every other tick while both are
+        # active (latency doubles for those ticks); pack both in one tick when it
+        # matters — needs a fused dense+packed table, not two forwards.
+        self._tick_run_sparse = True
+        self._dense_mode_ticks = 0
+        self._sparse_mode_ticks = 0
         #: decode ticks build the packed table with pure device selection (no host
         #: sync) — the capture-ready path; valid only with the pin steady state.
         self._sparse_device_select = sparse_device_select and sparse_tracker is not None
@@ -643,8 +659,12 @@ class Engine:
         # not the dense table). On when sparse device selection is enabled; on a
         # CUDA backend that also requires the decode graph on (sm70 excluded by
         # _graph_on), on CPU the device-select path runs the eager CPU test seam.
+        # Hybrid mode runs sparse ticks EAGER on purpose: it needs only the dense
+        # precaptured graph, so the sparse capture (and its warmup-frame hazard)
+        # is not required; eager sparse is token-exact on sm70.
         self._sparse_graph_on = (
             sparse_tracker is not None
+            and not self._sparse_min_tokens
             and self._sparse_device_select
             and (self._decode_graph_on or backend.device.type != "cuda")
         )
@@ -903,6 +923,23 @@ class Engine:
 
             # Unallocated: allocating here refuses permanently, since `submit` has no later
             # tick to retry on. The prefix match moves to `_admit` with the allocation.
+            # Hybrid sparse engine: short prompts run dense and pin their whole context
+            # (no sparse sharing); a prompt that could never fit that pin even with the
+            # pool empty routes sparse instead of queueing on an impossible admit.
+            sparse_on = (
+                self._sparse is not None
+                and (self._sparse_min_tokens == 0
+                     or len(tokens) > self._sparse_min_tokens)
+            )
+            if (not sparse_on and self._sparse is not None and params.max_new_tokens > 0
+                    and self._kv.blocks_for_tokens(
+                        total + self._width - 1)
+                    > self._kv.num_blocks - (self._pad_block is not None)):
+                # A dense row cannot use the sparse cold tier: its pin has to fit
+                # the DEVICE pool (usable_blocks counts cold for sparse rows), so a
+                # prompt that would head-of-line block on a permanent _admit False
+                # routes sparse instead.
+                sparse_on = True
             req = _Req(
                 req_id=rid,
                 params=params,
@@ -913,6 +950,7 @@ class Engine:
                 phase=_PHASE_PREFILL,
                 prefill_from=0,
                 own_blocks=0,
+                sparse_on=sparse_on,
             )
             self._waiting.append(req)
         return rid
@@ -1011,13 +1049,18 @@ class Engine:
 
     def _admit(self, req: _Req) -> bool:
         """Take the slot and the blocks for one waiting request. False = it does not fit yet."""
-        sparse = self._sparse is not None
+        # Hybrid: a dense row shares the sparse engine's pools but pins its whole
+        # context in the dense KV pool and never registers with the sparse tracker.
+        sparse = req.sparse_on
         # Slot checked before any block allocation: a bulk boot load allocates all
         # its blocks up front, so admitting with no free slot would have to roll them back.
         if self._states.free_slots < 1:
             return False
         total_blocks = (len(req.tokens) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
-        matched, hit_blocks, snap = self._match_prefix(req.tokens)
+        # Sparse rows share through the tracker's SparsePrefixCache, never the
+        # dense block-retaining store; skip the lookup entirely.
+        matched, hit_blocks, snap = (
+            (0, (), None) if sparse else self._match_prefix(req.tokens))
         boot_len = 0
         # A bulk boot allocates EVERY context block against the device pool up
         # front; the sparse hot pool holds only k+window+chunk per slot and grows
@@ -1207,12 +1250,26 @@ class Engine:
                 break
             self._running.append(self._waiting.popleft())
         decodes = [r for r in self._running if r.phase == _PHASE_DECODE]
+        # Hybrid round-robin: when both modes have runnable rows, run one mode's
+        # whole tick and flip for next tick, so every forward stays pure-mode with
+        # one BatchKv geometry. A tick that runs nothing does not flip.
+        mode_sparse = self._sparse is not None
+        if self._sparse is not None:
+            d = any(not r.sparse_on for r in self._running)
+            s = any(r.sparse_on for r in self._running)
+            if d and s:
+                mode_sparse = self._tick_run_sparse
+            elif d:
+                mode_sparse = False
+            decodes = [r for r in decodes if r.sparse_on == mode_sparse]
         prefills: list[_Req] = []
         chunks: list[int] = []
         budget = self.limits.max_num_batched_tokens - len(decodes)
         bucket = 0
         for r in self._running:
             if r.phase != _PHASE_PREFILL:
+                continue
+            if self._sparse is not None and r.sparse_on != mode_sparse:
                 continue
             if len(decodes) + len(prefills) >= self.limits.max_batch:
                 break
@@ -1349,6 +1406,9 @@ class Engine:
                 "prefill_forwards": self._prefill_forwards,
                 "decode_forwards": self._decode_forwards,
                 "mixed_forwards": self._mixed_forwards,
+                # hybrid --sparse-min-tokens: ticks each mode ran (0 when off)
+                "dense_mode_ticks": self._dense_mode_ticks,
+                "sparse_mode_ticks": self._sparse_mode_ticks,
                 "tokens_generated": self._tokens_generated,
                 "spec_drafted": self._spec_drafted,
                 "spec_accepted": self._spec_accepted,
@@ -1390,7 +1450,11 @@ class Engine:
                 if t is not None
             ),
         }
-        if self._sparse is not None:
+        # ponytail: hybrid mode reconciles the DENSE ledger (the pool is sized for
+        # dense rows pinning their whole context); sparse-only measured owners
+        # (kv_hot/bounds/cold) are omitted. The pool is one container for both
+        # modes, so the sparse per-row breakdown cannot reconcile against it.
+        if self._sparse is not None and self._sparse_min_tokens == 0:
             # Sparse: held owners are the bounds tensors, the cross-tick pinned hot
             # pages still resident after finalize, and the host cold tier. kv_hot
             # counts the live blocks (the tick's selected set), not the pool total.
@@ -1464,7 +1528,7 @@ class Engine:
         draft_pool = getattr(self._draft, "kv", None)
         draft_layers = 0 if draft_pool is None else self._draft.cfg.num_layers
         # device_free=0: budget rows are the dry-run path's business; the fit is done here.
-        if self._sparse is None:
+        if self._sparse is None or self._sparse_min_tokens:
             derived = plan(
                 self._model.cfg,
                 self._model.params,
@@ -2265,7 +2329,7 @@ class Engine:
             self._prefix.evict_until_free(growth)
         dead: set[int] = set()
         for i, (r, q) in enumerate(zip(decodes, q_dec)):
-            if self._sparse is not None:
+            if r.sparse_on:
                 continue  # sparse grows its own pages lazily in _sparse_rows
             # Cover the chain's last position. By count, not by catching alloc_block's
             # raise: `_admit` does the same for the same reason -- its comment says an
@@ -2292,24 +2356,28 @@ class Engine:
                 chains = [c for i, c in enumerate(chains) if i not in dead]
             if not decodes and not prefills:
                 return
+        tick_sparse = bool(decodes or prefills) and (decodes + prefills)[0].sparse_on
         if (
             not prefills
             and decodes
-            and self._sparse is None
+            and not tick_sparse
             and self._decode_graph_on
             and self._run_decode_graph(decodes, chains)
         ):
+            self._hybrid_tick(False)
             return
         if (
             not prefills
             and decodes
+            and tick_sparse
             and self._sparse_graph_on
             and self._run_sparse_decode_graph(decodes, chains)
         ):
+            self._hybrid_tick(True)
             return
         rows = decodes + prefills
         seq_q = q_dec + chunks
-        sparse = self._sparse is not None and rows
+        sparse = tick_sparse
         if sparse:
             # Sparse grows blocks lazily inside selection, so skip the dense pre-allocation
             # of the chain's tail (pages are promoted/allocated by _sparse_rows).
@@ -2403,7 +2471,7 @@ class Engine:
             # instead leaves a hole in its KV and the next position attends over it:
             # measured, the engine then drafted token 79 where full context drafts 61.
             for r in rows:
-                if self._sparse is not None:
+                if r.sparse_on:
                     # The dense draft KV span is fully RESERVED at admit (prompt +
                     # max_new + verify width bound), so the blocks already exist.
                     # This is a bound check, not a grow: allocating here would race
@@ -2427,6 +2495,22 @@ class Engine:
                 self._sparse_process_offers(sparse_offers)
         elif sparse:
             self._sparse_process_offers(sparse_offers)
+        self._hybrid_tick(sparse)
+
+    def _hybrid_tick(self, sparse: bool) -> None:
+        """Per-mode tick accounting and the round-robin flip. Only flips while
+        BOTH modes still have rows: a tick after one mode drained keeps serving
+        the survivor every tick."""
+        if self._sparse_min_tokens == 0:
+            return
+        if sparse:
+            self._sparse_mode_ticks += 1
+        else:
+            self._dense_mode_ticks += 1
+        d = any(not r.sparse_on for r in self._running)
+        s = any(r.sparse_on for r in self._running)
+        if d and s:
+            self._tick_run_sparse = not sparse
 
     def _finish_prefills(self, prefills: list[_Req], chunks: list[int], logits, base: int) -> None:
         done = []
@@ -2453,8 +2537,11 @@ class Engine:
                 pf.interior_published += 1
                 predicted = _last_prefill_boundary(len(pf.tokens))
                 if pf.interior_published == 1:
-                    self._publish_prefix(pf, pf.prefill_from)
-                elif len(pf.tokens) % BLOCK_TOKENS and pf.prefill_from >= predicted:
+                    if not pf.sparse_on:
+                        self._publish_prefix(pf, pf.prefill_from)
+                elif (not pf.sparse_on
+                        and len(pf.tokens) % BLOCK_TOKENS
+                        and pf.prefill_from >= predicted):
                     # Tail window [predicted, n): at most two aligned chunk ends, so
                     # this holds <=2 snapshots per ragged prompt and keeps only the
                     # deepest the actual schedule reached. Not predicted: a decode
@@ -2471,9 +2558,10 @@ class Engine:
         for pf, _, _ in done:
             # The state slot still covers exactly the prompt, so the snapshot is exact.
             prompt_len = len(pf.tokens) - len(pf.output)
-            if pf.phase != _PHASE_DONE and prompt_len % BLOCK_TOKENS == 0:
+            if not pf.sparse_on and pf.phase != _PHASE_DONE and prompt_len % BLOCK_TOKENS == 0:
                 self._publish_prefix(pf, prompt_len)
-            elif pf.phase != _PHASE_DONE and pf.pending_prefix is not None:
+            elif (not pf.sparse_on and pf.phase != _PHASE_DONE
+                    and pf.pending_prefix is not None):
                 # Ragged prompt: the held boundary snapshot is exact and its
                 # blocks are still live; insert it at completion.
                 pos, snap = pf.pending_prefix
@@ -2810,6 +2898,7 @@ class Engine:
             # Retire after the insert -- the entries share blocks -- and only if it succeeded.
             if (
                 i == last
+                and not req.sparse_on
                 and req.phase == _PHASE_DECODE
                 and materialized % BLOCK_TOKENS == 0
                 and self._publish_prefix(req, materialized)
@@ -2863,8 +2952,7 @@ class Engine:
         req.phase = _PHASE_DONE
         if req.state_slot is None:
             return  # never admitted; blocks and slot are taken together in `_admit`
-        if self._sparse is not None:
-            # A finishing publisher (never a prefix-adopting follower: its prompt
+        if req.sparse_on and self._sparse is not None:
             # pages belong to another publisher's blobs) forces its prompt-end
             # frontier closure while device frames and draft blocks are still
             # live: pages a hot pool never dropped get snapshotted from the live
@@ -3179,6 +3267,10 @@ def build_engine(
     sparse_device_select: bool | None = None,
     decode_graph: bool | None = None,
     draft: Any = None,
+    #: Hybrid (sparse_k>0 only): prompts at most this long run DENSE on the
+    #: captured graph and pin their whole context (no sparse sharing); longer ones
+    #: run sparse. 0 = all requests sparse, the pre-hybrid behavior.
+    sparse_min_tokens: int = 0,
     spec_depth: int | None = None,
     decode: Any = None,
 ) -> Engine:
@@ -3382,10 +3474,15 @@ def build_engine(
         )
     if prefix_store is not None:
         store = prefix_store
-    elif sparse_k:
-        # Sparse cannot use the block-retaining PrefixStore (finalize frees the
-        # device pages); sharing is the tracker's SparsePrefixCache, attached now.
+    elif sparse_k and not sparse_min_tokens:
+        # Pure-sparse cannot use the block-retaining PrefixStore (finalize frees
+        # device pages sparse rows do not own); sharing is the tracker's cache.
         store = NoPrefixStore()
+    elif sparse_k:
+        # Hybrid: dense rows share through the block-retaining store, sparse rows
+        # through the tracker's SparsePrefixCache; the per-req sparse_on guard keeps
+        # sparse pages out of the dense store, so finalize freeing them is harmless.
+        store = PrefixStore(kv_pool, **kw)
     else:
         store = PrefixStore(kv_pool, **kw)
     boot_store = None
@@ -3417,4 +3514,5 @@ def build_engine(
         boot_store=boot_store,
         sparse_device_select=sparse_device_select,
         draft_num_blocks=draft_num_blocks,
+        sparse_min_tokens=sparse_min_tokens,
     )
