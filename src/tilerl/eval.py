@@ -60,13 +60,29 @@ def generate(engine: Any, tok: Any, prompts: list[str], sp: Any, concurrency: in
     return [tok.decode(ids) for ids in generate_ids(engine, tok, prompts, sp, concurrency)]
 
 
-def mmlu_questions(n: int, seed: int = 0) -> tuple[list[str], list[str], list[str]]:
-    """The fixed 0-shot MMLU slice (cais/mmlu test): (prompts, gold letters, subjects)."""
+def mmlu_indices(n: int, seed: int = 0, size: int | None = None) -> list[int]:
+    """Ordered dataset row ids of the mmlu_questions(n, seed) slice: a seeded
+    sample of n ids from [0, size), sorted. This is the single sampler for every
+    MMLU arm; note the slice is NOT a prefix of a larger-n sample (sorted
+    samples of different n share only ~80/400 ids at seed 0), so --pair pins
+    the exact ordered set via a hash over these indices."""
+    size = size if size is not None else len(_mmlu_split())
+    if n >= size:
+        return list(range(size))
+    return sorted(random.Random(seed).sample(range(size), n))
+
+
+def _mmlu_split():
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
     from datasets import load_dataset
 
-    ds = load_dataset("cais/mmlu", "all", split="test")
-    idx = sorted(random.Random(seed).sample(range(len(ds)), n) if n < len(ds) else range(len(ds)))
+    return load_dataset("cais/mmlu", "all", split="test")
+
+
+def mmlu_questions(n: int, seed: int = 0) -> tuple[list[str], list[str], list[str]]:
+    """The fixed 0-shot MMLU slice (cais/mmlu test): (prompts, gold letters, subjects)."""
+    ds = _mmlu_split()
+    idx = mmlu_indices(n, seed, len(ds))
 
     def prompt(r):
         subj = r["subject"].replace("_", " ")
