@@ -748,6 +748,10 @@ class SparsePrefixCache:
         # territory and a same-prompt follower with a different continuation
         # cannot match it.
         self._snap: dict[int, dict[int, tuple]] = {}
+        #: req -> boundary pages -> trunk hidden at position m*16-1 (the draft
+        #: head's fc input for a follower's first tail position). One vector per
+        #: frozen boundary, popped when the frontier consumes it.
+        self._snap_hidden: dict[int, dict[int]] = {}
         self._pending: dict[int, dict[int, dict]] = {}
         self._grow: dict[int, dict] = {}
         # Per-publisher prefix-hash state. page_key(tokens, p) rehashes the whole
@@ -770,7 +774,7 @@ class SparsePrefixCache:
         prompt-end publish)."""
         self._prompt_pages[req_id] = prompt_pages
 
-    def note_boundary(self, req_id: int, complete: int, state) -> None:
+    def note_boundary(self, req_id: int, complete: int, state, hidden=None) -> None:
         """Capture the GDN snapshot at the current whole-page boundary, one per
         finalize that lands EXACTLY on one (a decode page crossing or an aligned
         prefill chunk). The recurrent state then advances past the boundary and
@@ -790,6 +794,10 @@ class SparsePrefixCache:
         states, window = state
         window = None if window is None else window.cpu()
         self._snap.setdefault(req_id, {})[complete] = (states.cpu(), window)
+        if hidden is not None:
+            # clone: .cpu() aliases on the CPU cell, and this outlives the frame
+            self._snap_hidden.setdefault(req_id, {})[complete] = \
+                hidden.detach().cpu().clone().reshape(-1)
 
     def _ensure_prefix(self, req_id: int, tokens):
         """Cached (token tuple, per-page content keys) for a publisher. The
@@ -873,6 +881,7 @@ class SparsePrefixCache:
         e["hash"] = chain_hash
         e["state"] = snaps[m]
         snaps.pop(m, None)  # consumed: one snapshot, not a retained second copy
+        e["hidden"] = self._snap_hidden.get(req_id, {}).pop(m, None)
         dup = any(
             x is not e and x["tokens"] == ptokens
             for x in self._entries.get(chain_hash, ()))
@@ -900,6 +909,27 @@ class SparsePrefixCache:
                     self._cold.share_ref(k)
         return out
 
+    def close_request(self, req_id: int, tokens, bounds) -> dict[int, int]:
+        """Force the prompt-end frontier closure when a publisher finishes.
+
+        Drop-only publishing reaches the prompt end only if the last prompt page
+        leaves the resident union; a hot pool (large k) can keep every prompt
+        page resident for the whole run, so without this the frozen prompt entry
+        never forms and a same-prompt follower misses. Pages still resident are
+        offered under their private key tuple, which the engine resolves from
+        the live device frame."""
+        pp = self._prompt_pages.get(req_id)
+        if pp is None:
+            return {}
+        e = self._grow.get(req_id)
+        old_len = 0 if e is None else len(e["keys"])
+        if old_len >= pp:
+            return {}  # already closed through the prompt end via natural drops
+        pend = self._pending.setdefault(req_id, {})
+        for p in range(old_len, pp):
+            pend.setdefault(p, (req_id, p))
+        return self.publish_dropped(req_id, tokens, bounds, pp - 1, pend[pp - 1])
+
     def bound_of_key(self, content_key: int):
         """A page's stored Quest bound from its (possibly spilled) shared blob,
         or None. Adopt reads bounds by field so the bounds plane is not pinned
@@ -916,7 +946,7 @@ class SparsePrefixCache:
             return
         snap = {"eid": self._next_id, "tokens": e["tokens"],
                 "keys": list(e["keys"]), "state": e["state"],
-                "hash": chain_hash}
+                "hash": chain_hash, "hidden": e.get("hidden")}
         self._next_id += 1
         # Refs are NOT bumped here: the engine transfers the blobs to these keys
         # after publish_dropped returns, then calls add_freeze_refs.
@@ -960,7 +990,7 @@ class SparsePrefixCache:
         page shared with a surviving entry keeps its blob (share refcount)."""
         self._by_id.pop(entry["eid"], None)
         chain = self._entries.get(self._chain_hash(entry))
-        if chain is not None:
+        if chain is not None and entry in chain:
             chain.remove(entry)
         for key in entry["keys"]:
             self._cold.share_release(key)
@@ -986,6 +1016,7 @@ class SparsePrefixCache:
         the lookup chains and age out under the normal LRU. Gapped buffers,
         unconsumed snapshots and the grow link are dropped."""
         self._snap.pop(req_id, None)
+        self._snap_hidden.pop(req_id, None)
         self._pending.pop(req_id, None)
         self._grow.pop(req_id, None)
         self._tok_tuple.pop(req_id, None)
@@ -997,6 +1028,7 @@ class SparsePrefixCache:
         for entry in list(self._by_id.values()):
             self._drop(entry)
         self._snap.clear()
+        self._snap_hidden.clear()
         self._pending.clear()
         self._grow.clear()
         self._tok_tuple.clear()
