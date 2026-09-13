@@ -1,7 +1,6 @@
 # Memoize the dense memory ledger off the per-step stats path — V100, 2026-09-13
 
-> Status: pending-remote. CPU gate green; the V100 A-B-A decode number is
-> ops-0b's arm.
+> Status: shipped. V100 A-B-A confirmed 2026-09-13.
 
 ## Context
 
@@ -27,10 +26,15 @@ the per-tick snapshot — the snapshot runs on the forward thread.
 
 ## Results
 
-| date | commit | machine | target | model | config | A ms/tick | B ms/tick | A tok/s | B tok/s |
-|---|---|---|---|---|---|---:|---:|---:|---:|
-| 2026-09-13 | pending | n37-002-027 V100 | sm70 | Qwen3.8-27B NVFP4 | 4/4/8192, draft d1, graph, think-off | | | | |
+V100 n37-002-027, Qwen3.8-27B NVFP4, 4/4/8192, draft d1, `--decode-graph`,
+one card A-B-A (the patched arm needs its own process):
 
-Timeit `e._memory_rows()` ×1000 in the A process: `<pending>` ms/call — closes
-the PR if far below 0.4 ms/call (the regression is ~1 ms/tick, 2 calls/step).
-Raw artifacts: `<server log>`.
+| arm | decode ms/fwd think-off | tok/s think-off | tok/s think-on |
+|---|---:|---:|---:|
+| A main 1137f7b0 | 37.8 / 37.0 | 45.3 / 46.4 | 49.0 / 50.3 |
+| B eb581ed0 | 34.8 | **49.3** | **53.2** |
+
+`_memory_rows()` ×1000 (warm): A median 0.804 ms/call (p10 0.751, p90
+1.034), B 0.001 ms/call. At two stats builds per step that is the measured
+~2.9 ms/fwd delta. B smoke: MMLU 0.70, determinism identical, 400 clean
+requests.
