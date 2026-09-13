@@ -41,7 +41,11 @@ What runs today (H20 unless noted; every number links its entry):
   warm prefix adoption is exact at B=1
   ([errors/2026-09-13-sm90-b8-spec-wave-not-reproducible.md](docs/experience/errors/2026-09-13-sm90-b8-spec-wave-not-reproducible.md),
   [wins/2026-09-13-warm-spec-prefix-adoption.md](docs/experience/wins/2026-09-13-warm-spec-prefix-adoption.md)).
-- **V100 sm70 serves sparse 64k** (3.44 tok/s decode, 343.2 s prefill, RSS 27.92/31 GiB) but the
+- **V100 sm70 runs a stable dense serve** — 4 slots / 8192 ctx, verified 2026-09-13
+  (4×7.4k concurrent prefill peak 27.2/31.7 GiB, 0 OOM; soak 234 turns 0 errors).
+  Endpoint, config and operations: [docs/serve-v100.md](docs/serve-v100.md).
+  Sparse is limited there: 64k serves at B=1 (3.44 tok/s decode, 343.2 s prefill,
+  RSS 27.92/31 GiB) and the
   **256k prefill is SIGKILLed (OOM)** before its spill file is ever written
   ([errors/2026-09-13-v100-256k-sparse-prefill-host-oom](docs/experience/errors/2026-09-13-v100-256k-sparse-prefill-host-oom.md)). P6 fp8 long-ctx fits are ledger-derived,
   not card-measured ([wins/2026-09-11-p6-long-context-budget-on-one-h20.md](docs/experience/wins/2026-09-11-p6-long-context-budget-on-one-h20.md)).
