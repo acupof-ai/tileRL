@@ -287,6 +287,26 @@ def _tp_fork(backend: Backend, x: torch.Tensor) -> torch.Tensor:
     return backend.tp_fork(x) if getattr(backend, "tp_world", 1) > 1 else x
 
 
+def _sparse_attention_args(model, backend, kv, layer_idx: int, x, q):
+    """Packed ``[selected earlier ; own]`` block table and packed seq_len for a
+    sparse paged_attention read; a dense/dummy kv returns its static table.
+
+    Both the fused-attn_prep branch and the unfused prelude branch must read
+    attention through the same descriptor, or the fused path silently attends
+    over the own-window-only static table (errors/2026-09-12-sm90-...). ``q`` is
+    post-norm/post-rope in either branch; the index scorer scores from it."""
+    sf = getattr(kv, "sparse", None)
+    if sf is None:
+        return kv.block_table, kv.seq_len
+    h_idx = None
+    if getattr(sf, "index_scorer", False):
+        # The scorer projects from a FULL-precision post-input-norm H; q is not
+        # that H, and the narrow=f16 h above would round-trip unguarded.
+        h_idx = backend.rmsnorm(x, model.params[f"layers.{layer_idx}.input_norm"],
+                                model.cfg.rms_eps)
+    return sf.attention_args(kv.kv_pool.plane_of(layer_idx), q, h_idx)
+
+
 class Model:
     """``params`` maps :func:`param_specs` keys to bf16 tensors; quantized
     linears carry ``<key>.wq/.scale`` (fp4) or ``<key>.w8/.wscale`` (fp8) plus an
@@ -371,8 +391,10 @@ class Model:
                 gate = autograd.slice(autograd.reshape(
                     autograd.slice(qkv, ..., slice(0, q_rows)), b, t, hq, 2, d), ..., 1, slice(None))
                 k_plane, v_plane, ks, vs = _kv_operands(backend, kv, layer_idx)
+                block_table, seq_len = _sparse_attention_args(
+                    self, backend, kv, layer_idx, x, qn)
                 out = backend.paged_attention(
-                    qn, k_plane, v_plane, kv.block_table, kv.seq_len, 1.0 / math.sqrt(d),
+                    qn, k_plane, v_plane, block_table, seq_len, 1.0 / math.sqrt(d),
                     gate=gate, seq_q_lens=getattr(kv, "seq_q_lens", None),
                     k_scale=ks, v_scale=vs,
                 )
@@ -429,22 +451,8 @@ class Model:
             _refuse_cp_serving(backend)
             backend.write_tokens(k, v, kv, layer_idx)
             k_plane, v_plane, ks, vs = _kv_operands(backend, kv, layer_idx)
-            sf = getattr(kv, "sparse", None)
-            block_table, seq_len = kv.block_table, kv.seq_len
-            if sf is not None:
-                # packed [selected earlier ; own] table + packed seq_len; the slot-causal
-                # kernel masks it correctly (selected pages are complete earlier pages).
-                # The index scorer projects Q from the post-input-norm hidden (the same
-                # H indexer training captures), but it must be a FULL-precision norm:
-                # h above is narrow=True f16 for the quantized qkv linear, and feeding it
-                # into index_scores would be an unguarded f32->f16->f32 round trip. The
-                # bounds scorer does not read H, so it passes None (no extra norm).
-                h_idx = None
-                if getattr(sf, "index_scorer", False):
-                    h_idx = backend.rmsnorm(
-                        x, self.params[f"{p}.input_norm"], cfg.rms_eps)
-                block_table, seq_len = sf.attention_args(
-                    kv.kv_pool.plane_of(layer_idx), q, h_idx)
+            block_table, seq_len = _sparse_attention_args(
+                self, backend, kv, layer_idx, x, q)
             out = backend.paged_attention(
                 q,
                 k_plane,
