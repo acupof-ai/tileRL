@@ -2796,3 +2796,48 @@ def test_hybrid_stats_carries_live_sparse_residency():
         assert "kv_cold_bytes" in st
     finally:
         e.shutdown()
+
+
+def test_hybrid_dense_ledger_is_memoized_but_pure_sparse_stays_live():
+    """#586 all-dense A-B: a hybrid engine must not re-walk memory.plan every
+    stats call (the memoize #581 added for plain dense engines must also cover
+    the hybrid dense whole-pool view). A PURE sparse engine keeps the live ledger
+    (kv_hot moves with residency)."""
+    import tilerl.memory as memory_mod
+
+    cfg = tiny()
+    h = build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+        num_blocks=0, num_slots=4, max_batch=4, max_total_tokens=16384,
+        sparse_k=64, scorer="bounds", kv_cold_bytes=1 << 30,
+        sparse_min_tokens=8192)
+    orig = memory_mod.plan
+    calls = {"n": 0}
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    memory_mod.plan = counting
+    try:
+        h._build_stats()
+        h._build_stats()
+        h._build_stats()
+    finally:
+        memory_mod.plan = orig
+    h.shutdown()
+    assert calls["n"] == 1, f"hybrid ledger not memoized: plan ran {calls['n']}x"
+
+    p = build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+        num_blocks=0, num_slots=1, max_batch=1, max_total_tokens=1024,
+        sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
+    calls["n"] = 0
+    memory_mod.plan = counting
+    try:
+        p._build_stats()
+        p._build_stats()
+    finally:
+        memory_mod.plan = orig
+    p.shutdown()
+    assert calls["n"] == 2, "pure sparse ledger must stay live per stats call"

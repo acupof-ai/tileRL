@@ -1708,10 +1708,19 @@ class Engine:
                         "delta": 0,
                     }
                 )
-        # A dense engine with neither the manual cold seam nor a boot store has a
-        # fully static ledger; memoize so the twice-a-step stats call does not
-        # re-walk the param tensors.
-        if self._sparse is None and self._boot is None and getattr(kv, "cold", None) is None:
+        # Memoize a fully static ledger so the twice-a-step stats call does not
+        # re-walk the param tensors. Plain dense with no live seams qualifies; so
+        # does a HYBRID engine -- it reconciles to the dense whole-pool view, and
+        # its sparse residency is reported by the separate flat stats keys, not by
+        # this ledger. Without the hybrid clause an all-dense hybrid tick paid the
+        # full plan twice per step (measured ~6% vs main, #586 device A-B). A pure
+        # sparse engine keeps the live ledger (kv_hot tracks residency per tick).
+        hybrid = self._sparse is not None and self._sparse_min_tokens
+        if hybrid or (
+            self._sparse is None
+            and self._boot is None
+            and getattr(kv, "cold", None) is None
+        ):
             self._mem_rows = (n_params, rows)
         return rows
 
@@ -2530,11 +2539,22 @@ class Engine:
     def _sparse_live_stats(self) -> dict:
         """Flat sparse residency counters for a hybrid engine. The memory ledger
         reconciles the dense pool view, so without these the sparse rows' hot /
-        bounds / cold occupancy during a concurrent run is invisible."""
+        bounds / cold occupancy during a concurrent run is invisible. When no
+        sparse row is running this returns the cheap zeros only -- the bounds sum
+        must not tax an all-dense tick (the #586 all-dense A-B)."""
+        live = [r for r in self._running if r.sparse_on and r.phase != _PHASE_DONE]
+        if not live:
+            return {
+                "sparse_hot_pages": 0,
+                "sparse_hot_bytes": 0,
+                "page_bounds_bytes": 0,
+                "kv_cold_bytes": 0,
+                "kv_prefix_bytes": 0,
+            }
         from .memory import per_kv_block_bytes
 
         block_n = per_kv_block_bytes(self._model.cfg, self._kv.dtype, self._kv.kv_fp8)
-        hot_pages = sum(len(self._sparse.resident.get(r.req_id, ())) for r in self._running)
+        hot_pages = sum(len(self._sparse.resident.get(r.req_id, ())) for r in live)
         cold = getattr(self._kv, "cold", None)
         shared_n = cold.shared_bytes() if cold is not None else 0
         return {
