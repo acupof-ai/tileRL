@@ -20,7 +20,7 @@ import torch
 from tilerl.config import tiny
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
-from tilerl.model import build_random
+from tilerl.model import Model, build_random
 from tilerl.testing import RefBackend
 
 
@@ -1426,23 +1426,79 @@ def test_drop_reads_the_host_bounds_mask_without_touching_the_device_tensor():
     tr.drop(0)
 
 
-def test_sparse_build_disables_fused_attn_prep_guard():
-    """sm90 fused attn_prep corrupts K/V for >1 ragged sparse row in one packed
-    prefill tick (B=8 dense-vs-sparse g0 max_abs 8-11, mean ~1.1, argmax flips);
-    the unfused write_tokens path is bit-exact. build_engine must force the
-    unfused fallback for sparse (prefill and decode) until the fused twin is
-    fixed. Dense keeps it."""
-    dense = build_engine(
-        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
-        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-        max_num_batched_tokens=512, prefix_store=NoPrefixStore())
-    assert getattr(dense._backend, "no_fused_attn_prep", False) is False
-    dense.shutdown()
+def test_fused_attn_prep_branch_gets_the_sparse_packed_attention_args():
+    """The fused-attn_prep branch and the unfused branch must feed paged_attention
+    the same sparse packed [selected;own] table.
 
-    sparse = build_engine(
-        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
-        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-        max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
-        sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
-    assert sparse._backend.no_fused_attn_prep is True
-    sparse.shutdown()
+    Regression for the sm90 fused path: model._full_attn's fused early-return once
+    called paged_attention with the raw kv.block_table/kv.seq_len (the own-window
+    table) instead of SparseForward.attention_args' packed table, so sparse-fused
+    diverged from sparse-unfused (device gate: B=1 g0 max_abs 7-17, B=8 2-27).
+    RefBackend has no fused kernel (attn_prep returns None), so this uses a
+    subclass that mirrors the unfused prelude and returns qn: same K/V and q, and
+    the two branches' recorded attention args must be identical."""
+    cfg = tiny()
+    hq, d = cfg.num_attention_heads, cfg.head_dim
+    q_rows = hq * 2 * d
+
+    class FusedRefBackend(RefBackend):
+        def attn_prep(self, qkv, wq, wk, positions, theta, rotary_dim, kv,
+                      layer_idx, hq_, hkv_, eps):
+            if layer_idx not in cfg.full_attn_layers:
+                return None
+            b, t, _ = qkv.shape
+            q = qkv[..., :q_rows].reshape(b, t, hq_, 2, d)[..., 0, :]
+            k = qkv[..., q_rows:q_rows + hkv_ * d].reshape(b, t, hkv_, d)
+            v = qkv[..., q_rows + hkv_ * d:].reshape(b, t, hkv_, d)
+            q = self.rmsnorm_f32(q, wq, eps)
+            k = self.rmsnorm_f32(k, wk, eps)
+            q = self.rope(q, positions, theta, rotary_dim=rotary_dim)
+            k = self.rope(k, positions, theta, rotary_dim=rotary_dim)
+            self.write_tokens(k, v, kv, layer_idx)
+            return q
+
+    def fused_params():
+        m = build_random(cfg, seed=11)
+        p = "layers.0"
+        qw = m.params.pop(f"{p}.q_proj").reshape(hq, 2, d, cfg.hidden_size)
+        qw = qw.reshape(q_rows, cfg.hidden_size)
+        m.params[f"{p}.qkv"] = torch.cat(
+            [qw, m.params.pop(f"{p}.k_proj"), m.params.pop(f"{p}.v_proj")], 0).contiguous()
+        return m.params
+
+    def run(fused: bool):
+        be = FusedRefBackend() if fused else RefBackend()
+        e = build_engine(
+            cfg=cfg, model=Model(cfg, fused_params()), backend=be,
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+            sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
+        rec = []
+        orig = be.paged_attention
+
+        def rec_attn(q, kc, vc, bt, sl, scale, gate=None, seq_q_lens=None,
+                     k_scale=None, v_scale=None):
+            if q.shape[1] == 1:  # decode ticks only
+                rec.append((bt.detach().clone(), sl.detach().clone()))
+            return orig(q, kc, vc, bt, sl, scale, gate=gate, seq_q_lens=seq_q_lens,
+                        k_scale=k_scale, v_scale=v_scale)
+        be.paged_attention = rec_attn
+        rng = np.random.default_rng(5)
+        ids = rng.integers(3, cfg.vocab_size, size=320).astype(np.int64)
+        rid = e.submit(ids, SamplingParams(temperature=0.0, seed=0, max_new_tokens=2))
+        for _ in range(400):
+            e.step()
+            if rid in e.poll():
+                break
+        e.shutdown()
+        return rec
+
+    unf = run(False)
+    fus = run(True)
+    assert unf and fus, (len(unf), len(fus))
+    n = min(len(unf), len(fus))
+    for j in range(n):
+        btu, slu = unf[j]
+        btf, slf = fus[j]
+        assert torch.equal(btu, btf), f"decode {j}: fused branch block_table differs\n{btf}\n{btu}"
+        assert torch.equal(slu, slf), f"decode {j}: fused branch seq_len differs {slf} vs {slu}"
