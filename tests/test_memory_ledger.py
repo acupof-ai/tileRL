@@ -642,3 +642,10 @@ def test_dense_memory_rows_computed_once_and_stable(monkeypatch):
     assert again is first
     eng._mem_rows = None
     assert eng._memory_rows() == first
+    # add_lora attaches adapter tensors post-build (the train manifest reads
+    # engine.config after that): the params-length key must force a rebuild.
+    import torch
+    eng._model.params["lora_probe.weight"] = torch.zeros(3)
+    assert eng._memory_rows() != first
+    assert calls == 3
+    assert eng._memory_rows() == eng._memory_rows()
