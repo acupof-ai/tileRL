@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-08
 **Session:** v100-sm70-fp4-55
-**Status:** open — the default is unchanged; see the Fix section for what a change would be.
+**Status:** closed 2026-09-14 — fix 1 landed as the run-time refusal: `--eval-every` now refuses to start when the subset's worst-case binomial SE `50/sqrt(n)` exceeds `--curve-target-pt` (new flag, default 5.0 pt). The post-run `_se_note` stays as the point's-own-rate annotation. Fixes 2/3 (help-text pricing, a different default) were not needed: the target flag makes both constraints inputs instead of a hidden default. At the recorded command sizes nothing changes (n=100/500 both pass); the n=20 default with `--eval-every` now names the problem at start.
 
 ## Context
 

@@ -1,7 +1,11 @@
 # An sm90 B=8 spec wave is not reproducible across identical cold waves — 2026-09-13
 
-> Status: **open.** Owner: cc. The warm-adoption gate (#564) is B=1-exact; this
-> defect is what its B=8 wave was measuring.
+> Status: **open — pending-remote.** Owner: cc. Needs a served-shape sm90
+> probe; H20 is off-limits as of 2026-09-13 and CPU cannot reproduce it.
+> Command at the next card window:
+> `scripts/pod_run.sh warmctl <h20-card> -- bash scripts/probe_warm_control_run.sh`
+> (writes `/work/warmctl_{A,B,warm1,cold1}.json`, then the `compare` cell).
+> The warm-adoption gate (#564) is B=1-exact; this defect is what its B=8 wave was measuring.
 
 ## Context
 

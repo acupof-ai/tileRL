@@ -10,6 +10,7 @@ from tilerl.cli import (
     _EVAL_CONCURRENCY,
     _build_parser,
     _curve_rows,
+    _refuse_blind_curve,
     cmd_ledger,
     cmd_train,
 )
@@ -297,6 +298,18 @@ def test_the_manifest_records_the_engine_config_the_wall_clock_depends_on(tmp_pa
     assert seen[16, 4, 4] > seen[2, 4, 4], f"blocks did not track the group: {seen}"
 
 
+def test_a_curve_that_cannot_resolve_its_effect_is_refused_at_start():
+    """The n=20 default carries an 11.2 pt worst-case SE against the 5 pt effect
+    (errors/2026-09-08): refuse before the run, not warn after it. The boundary
+    is strict se > target, so n=100 (exactly 5.0 pt, the documented knife-edge)
+    is allowed."""
+    with pytest.raises(SystemExit):
+        _refuse_blind_curve(20, 5.0)
+    _refuse_blind_curve(100, 5.0)
+    with pytest.raises(SystemExit):
+        _refuse_blind_curve(100, 4.0)  # a smaller effect needs more rows
+
+
 def test_the_eval_curve_records_the_step_a_score_was_reached_at(tmp_path, monkeypatch):
     """`time_to_score = steps_to_score x seconds_per_step` needs the STEP, and
     gsm8k_before/after cannot say which step a score was crossed at.
@@ -320,7 +333,8 @@ def test_the_eval_curve_records_the_step_a_score_was_reached_at(tmp_path, monkey
     argv = ["--rl", "--data", str(data), "--eval-gsm8k", str(held), "--steps", "4",
             "--group", "2", "--max-new-tokens", "4", "--lora-rank", "4",
             "--allow-short-rollouts", "--eval-max-new-tokens", "4"]
-    _train([*argv, "--eval-every", "2", "--eval-curve-n", "2"])
+    _train([*argv, "--eval-every", "2", "--eval-curve-n", "2",
+            "--curve-target-pt", "40"])  # n=2 worst-case SE is 35.4 pt
     (m,) = list_runs(tmp_path / "runs")
     curve = m["eval_curve"]
     assert curve["every"] == 2 and curve["n"] == 2

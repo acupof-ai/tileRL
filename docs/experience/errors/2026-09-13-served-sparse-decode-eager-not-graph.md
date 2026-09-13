@@ -1,7 +1,11 @@
 # A served sparse engine ran every decode tick eager, never the sparse graph — 2026-09-13
 
-> Status: **open — code fix landed in #557 (CPU forced-graph gates green); the
-> card-2 served-default PATH counters are pending the next H20 window.**
+> Status: **closed (code) — #557 (3218f0aa) landed both fixes and CPU
+> forced-graph gates pin them**: the dense branch is gated on
+> `self._sparse is None` (`engine.py` `_run_forward`) and `build_engine`
+> resolves `sparse_device_select=None` to the decode-graph predicate. The
+> card-2 served-default PATH counters remain device-pending (command below),
+> pending-remote, not an open code defect.
 > Owner: 52 (fix), measurements cc/5f.
 
 ## Context
@@ -41,6 +45,13 @@ eager full-candidate refresh (`SPARSE_REFRESH_TICKS=8`), instead of eager
 re-selection on every tick.
 
 ## Pending device evidence (card-2)
+
+Pending-remote command (H20 off-limits as of 2026-09-13; run at the next card
+window):
+
+```bash
+scripts/pod_run.sh diag557 <card> -- python3 scripts/probe_557_card2.py
+```
 
 The card-2 diag (`scripts/probe_557_diag.py`, `PATH default` arm builds with
 the served kwargs) must show on the default: `sparse_graph` ticks with
