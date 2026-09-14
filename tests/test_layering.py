@@ -76,6 +76,9 @@ def violations(sources: dict[str, str]) -> tuple[set[tuple[str, str]], set[str]]
                         imported = [node.module.split(".")[0]]
                     else:  # `from . import x`
                         imported = [a.name.split(".")[0] for a in node.names]
+                elif node.level == 0 and node.module == "tilerl":
+                    # `from tilerl import x` — a level-0 sibling import.
+                    imported = [a.name.split(".")[0] for a in node.names]
             elif isinstance(node, ast.Import):
                 imported = [
                     a.name.split(".")[1] for a in node.names if a.name.startswith("tilerl.")
@@ -107,6 +110,13 @@ def test_injected_upward_import_is_flagged_through_same_violations() -> None:
         "memory",
         "def f():\n    from .cli import x  # negative control\n",
     )
+    upward, unlayered = violations(sources)
+    assert unlayered == set()
+    assert ("memory", "cli") in upward
+
+
+def test_level0_from_tilerl_import_of_a_higher_module_is_flagged() -> None:
+    sources = _inject(read_sources(), "memory", "from tilerl import cli\n")
     upward, unlayered = violations(sources)
     assert unlayered == set()
     assert ("memory", "cli") in upward
