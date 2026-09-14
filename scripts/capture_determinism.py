@@ -25,13 +25,13 @@ sys.path.insert(0, "/work/tilerl-s-probestats/src")
 import torch
 from tilerl_kernels.backend import get_backend
 
-from tilerl.cli import _build_model
-from tilerl.engine import _DecodeGraph, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import _DecodeGraph
 from tilerl.kv_cache import BLOCK_TOKENS, BatchKv, NoPrefixStore
 
 dev = "cuda"
 backend = get_backend()
-cfg, model = _build_model("qwen38-27b", seed=0, keep_master=False)
+cfg, model = build_model("qwen38-27b", seed=0, keep_master=False)
 engine = build_engine(cfg, model, backend, num_slots=16, max_batch=8,
                       num_blocks=64, max_total_tokens=8192,
                       decode_graph=True, prefix_store=NoPrefixStore())

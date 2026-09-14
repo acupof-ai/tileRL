@@ -41,7 +41,8 @@ def run_worker(
     import torch
     from tilerl_kernels.backend import Backend, resolve_target
 
-    from .engine import SamplingParams, build_engine
+    from .build import build_engine
+    from .engine import SamplingParams
 
     rows = _read_prompts(prompts_path)[rank::world]
     if not rows:

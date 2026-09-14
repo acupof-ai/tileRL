@@ -57,11 +57,10 @@ def main():
 
     from tilerl_kernels.backend import get_backend
 
-    from tilerl.cli import _build_model
-    from tilerl.engine import build_engine
+    from tilerl.build import build_engine, build_model
 
     backend = get_backend()
-    cfg, model = _build_model(args.model, seed=0, keep_master=False)
+    cfg, model = build_model(args.model, seed=0, keep_master=False)
     eng = build_engine(cfg, model, backend, num_blocks=args.blocks, num_slots=2,
                        max_batch=2, max_total_tokens=args.blocks * 16, decode_graph=True)
     if args.model == "qwen38-27b":

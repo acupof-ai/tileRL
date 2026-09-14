@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from tilerl.autograd import Adafactor, AdamW
-from tilerl.cli import _build_model
+from tilerl.build import build_model
 from tilerl.iso import ISO, frame_grads, polar
 from tilerl.testing import RefBackend
 from tilerl.train import train_step
@@ -58,7 +58,7 @@ def test_step_keeps_frames_orthonormal():
 
 def test_spectrum_preserved_on_tiny_model():
     torch.manual_seed(0)
-    _, model = _build_model("tiny", seed=0, keep_master=True)
+    _, model = build_model("tiny", seed=0, keep_master=True)
     opt = ISO(Adafactor(lr=1e-2))
     s0 = {k: torch.linalg.svdvals(p.float()) for k, p in model.params.items() if p.dim() == 2}
     backend, ids = RefBackend(), np.arange(1, 2 * 16 + 1, dtype=np.int64).reshape(2, 16)
@@ -75,7 +75,7 @@ def test_spectrum_preserved_on_tiny_model():
 
 def test_iso_lowers_loss_on_tiny_model():
     torch.manual_seed(0)
-    _, model = _build_model("tiny", seed=0, keep_master=True)
+    _, model = build_model("tiny", seed=0, keep_master=True)
     opt = ISO(Adafactor(lr=1e-2))
     ids = np.random.default_rng(0).integers(1, 300, size=(2, 32))
     backend = RefBackend()
@@ -111,7 +111,7 @@ def test_offloaded_frames_match_resident():
     ids = torch.arange(1, 2 * 16 + 1).reshape(2, 16).numpy()
     outs = []
     for offload in (False, True):
-        _, model = _build_model("tiny", seed=0, keep_master=True)
+        _, model = build_model("tiny", seed=0, keep_master=True)
         opt = ISO(Adafactor(lr=1e-2), offload=offload)
         for _ in range(3):
             train_step(model, ids, RefBackend(), opt)

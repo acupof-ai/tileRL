@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 from tilerl_kernels.backend import get_backend
 
-from tilerl.cli import _build_model
+from tilerl.build import build_model
 from tilerl.sparse_index import (
     WINDOW_PAGES,
     page_scores_for_selector,
@@ -45,7 +45,7 @@ def cap(mass, pages, include_window):
 
 def main():
     backend = get_backend()
-    _cfg, model = _build_model("qwen38-27b", seed=SEED, keep_master=False,
+    _cfg, model = build_model("qwen38-27b", seed=SEED, keep_master=False,
                                backend=backend)
     gen = torch.Generator(device=backend.device).manual_seed(SEED)
     w = init_indexer_weights(model.cfg, gen, backend.device, 128)

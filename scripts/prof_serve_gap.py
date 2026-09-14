@@ -61,20 +61,19 @@ def main() -> None:
 
     from tilerl_kernels.backend import get_backend
 
-    from tilerl import cli
+    import tilerl.build as build  # noqa: E402
     from tilerl import engine as mod
     from tilerl.engine import SamplingParams
     from tilerl.spec import load_draft
-
-    cli._QWEN38_SOURCE = args.source
+    build.QWEN38_SOURCE = args.source
     backend = get_backend()
-    cfg, model = cli._build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build.build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft) if args.draft else None
 
     def sp(n):
         return SamplingParams(temperature=0.0, top_p=1.0, max_new_tokens=n, seed=0)
 
-    e = cli._build_engine(cfg, model, backend, draft=draft, depth=args.depth,
+    e = build.build_serving_engine(cfg, model, backend, draft=draft, depth=args.depth,
                           slots=4, blocks=2048, max_ctx=4096)
     # Distinct prompts: each is a prefix MISS, so each publishes snapshots the
     # way a real conversation does.

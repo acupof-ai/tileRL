@@ -15,20 +15,23 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from .build import (
+    DEFAULT_SPARSE_K,
+    MODEL_NAMES,
+    build_model,
+    build_serving_engine,
+)
+from .build import (
+    NO_WEIGHTS as _NO_WEIGHTS,
+)
+from .build import (
+    QWEN38_SOURCE as _QWEN38_SOURCE,
+)
+from .build import (
+    kv_fp8_dtype as _kv_fp8,
+)
 from .eval import MATCHERS
 from .recipes import RECIPES, flags
-from .sparse_index import DEFAULT_SPARSE_K
-
-_QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")
-
-_NO_WEIGHTS = (
-    "hint: download the checkpoint (or set TILERL_QWEN38_SOURCE to a\n"
-    "      local safetensors directory), or use --model tiny."
-)
-
-#: Every name `_build_model` builds. The single source for the argparse `choices` below, so
-#: a new model cannot be added to one and missed in the other.
-MODEL_NAMES = ("tiny", "tiny-agent", "qwen38-27b")
 
 
 def _progress(as_json: bool):
@@ -68,162 +71,6 @@ def _qwen38_tokenizer():
         sys.exit(1)
 
 
-def _build_model(
-    model_name: str, seed: int, fuse_projections: bool = False, keep_master: bool = False,
-    tp: int = 1, backend=None,
-):
-    """(cfg, model): serving fuses projections, training keeps the bf16 masters.
-
-    ``tp`` > 1 shards both here, because a model can only be sharded where it is
-    built: the config's head counts must already be divided before any layer
-    reshapes with them.
-    """
-    from . import config as config_mod
-    from . import model as model_mod
-
-    # The fall-through below used to accept anything: a typo (`qwen38_27b`), a different
-    # capitalization, or a checkpoint PATH all returned a random 64-hidden 2-layer tiny
-    # without raising, and the run finished with a table that reads like the 27B. Six
-    # scripts pass a user-supplied `--model` here with no argparse `choices`, so the
-    # refusal belongs at this seam rather than in each of them.
-    if model_name not in MODEL_NAMES:
-        raise ValueError(
-            f"unknown model {model_name!r}; expected one of {', '.join(MODEL_NAMES)}. "
-            f"A local 27B checkpoint is selected with --model qwen38-27b plus "
-            f"TILERL_QWEN38_SOURCE=<dir>, not by passing its path here"
-        )
-    if model_name == "qwen38-27b":
-        cfg = config_mod.qwen38_27b()
-        try:
-            model = model_mod.load_hf(
-                cfg, _QWEN38_SOURCE, fuse_projections=fuse_projections, keep_master=keep_master
-            )
-        except Exception as exc:
-            print(
-                f"error: could not load Qwen3-27B weights from {_QWEN38_SOURCE!r}: {exc}\n"
-                f"{_NO_WEIGHTS}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        return _shard(cfg, model, tp, backend, model_mod)
-    # tiny-agent is tiny with room for one real agent turn; see config.tiny().
-    cfg = config_mod.tiny(65536) if model_name == "tiny-agent" else config_mod.tiny()
-    model = model_mod.build_random(
-        cfg, seed=seed, fuse_projections=fuse_projections, keep_master=keep_master
-    )
-    return _shard(cfg, model, tp, backend, model_mod)
-
-
-def _shard(cfg, model, tp: int, backend, model_mod):
-    """Every rank builds the WHOLE model and keeps its slice.
-
-    Wasteful and deliberate: sharding at load time needs a loader that reads
-    per-rank slices out of the checkpoint, and that is a separate change. On the
-    27B this costs each rank a transient full copy.
-    # ponytail: whole-model build then slice, per-rank checkpoint reads when the
-    # 27B's transient copy is the binding constraint
-    """
-    if tp <= 1:
-        return cfg, model
-    from .tensor_parallel import Mesh, shard_params, tp_config
-
-    # dp is DERIVED from the world, never a second flag: two numbers that must
-    # multiply to a third invite a launch where they do not.
-    world = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    if world % tp:
-        raise SystemExit(f"--tp {tp} does not divide WORLD_SIZE={world}")
-    mesh = Mesh(dp=world // tp, tp=tp, rank=rank)  # validates rank < world and the layout
-    # Every rank builds every group, tp first then dp, in the same order:
-    # new_group is collective, so a rank that skips one deadlocks on first use.
-    tp_groups, dp_groups = [], []
-    for r in range(world):
-        m = Mesh(dp=world // tp, tp=tp, rank=r)
-        for g, seen in ((m.tp_group(), tp_groups), (m.dp_group(), dp_groups)):
-            if g not in seen:
-                seen.append(g)
-    backend.init_tp(world, rank, tp_groups, dp_groups)
-    return tp_config(cfg, tp), model_mod.Model(
-        tp_config(cfg, tp), shard_params(model.params, cfg, mesh.tp_rank, tp))
-
-
-def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
-                  blocks=0, max_ctx=0, max_batch=8,
-                  dram_bytes=0, state_bytes=0, kv_fp8="", decode=None,
-                  max_batched_tokens=0, kv_cold_bytes=0, cold_format="",
-                  cold_ssd_path="", cold_ssd_bytes=0,
-                  sparse_k=DEFAULT_SPARSE_K, scorer="bounds", kv_store="",
-                  decode_graph=None, sparse_min_tokens=0,
-                  sparse_prefill_tokens=0):
-    """Serving-size engine on one card. Multi-card serving is one process per card
-    under CUDA_VISIBLE_DEVICES (see generate.py for the process-per-device pattern);
-    the in-process DataParallelEngine wrapper was deleted 2026-09-09 — its hand-written
-    forwarding seam silently missed a method six times in ten days (errors/2026-09-05
-    through 2026-09-07).
-
-    ``max_ctx`` caps the served context; it still defaults to the model's own limit,
-    which for the 27B is 262144 tokens = 275 GB of f32 KV, so it is now a CAP on the
-    fit rather than the pool size. ``blocks`` 0 hands the pool to build_engine, which
-    fits it after materialize and the allocator reclaim — the only point where free
-    memory means anything. Sizing it here instead asked for 10.21 GiB with 4.96 free
-    and OOMed in PagedKvPool.
-
-    ``slots`` sizes the GDN state pool; with a draft each slot also owns spec_steps
-    of step-state, so a 32 GB card needs 4, not 16.
-    """
-    from . import engine as engine_mod
-    from .kv_cache import BLOCK_TOKENS
-
-    # Token budget follows the context; ByteTokenizer makes one token per byte.
-    ctx = int(max_ctx or cfg.max_position_embeddings)
-
-    kw = dict(num_blocks=blocks, num_slots=slots, max_batch=max_batch,
-              max_total_tokens=ctx, max_blocks=(ctx * max_batch) // BLOCK_TOKENS)
-    if draft is not None:
-        kw["draft"], kw["spec_depth"] = draft, depth
-    if dram_bytes:
-        kw["dram_bytes"] = dram_bytes
-    if state_bytes:
-        kw["state_bytes"] = state_bytes
-    if kv_fp8:
-        kw["kv_fp8"] = _kv_fp8(kv_fp8)
-    if kv_cold_bytes:
-        kw["kv_cold_bytes"] = kv_cold_bytes
-    if cold_format:
-        kw["cold_format"] = cold_format
-    if kv_store:
-        kw["kv_store"] = kv_store
-    if cold_ssd_path:
-        kw["cold_ssd_path"] = cold_ssd_path
-        if cold_ssd_bytes:
-            kw["cold_ssd_bytes"] = cold_ssd_bytes
-    # Text stop sequences are matched on decoded ids, so the engine needs the
-    # tokenizer's decode; without it `submit` refuses a request that carries one.
-    if decode is not None:
-        kw["decode"] = decode
-    if max_batched_tokens:
-        kw["max_num_batched_tokens"] = max_batched_tokens
-    # Always forward sparse_k: --sparse-k 0 is the dense opt-out and must reach
-    # build_engine to override its sparse default.
-    kw["sparse_k"] = sparse_k
-    kw["scorer"] = scorer
-    kw["decode_graph"] = decode_graph
-    kw["sparse_min_tokens"] = sparse_min_tokens
-    kw["sparse_prefill_tokens"] = sparse_prefill_tokens
-    if sparse_k:
-        import torch
-
-        from . import memory as _mem
-
-        # Cold pages need somewhere to demote: default the pinned host tier to the whole
-        # written context at its per-block bytes if the caller gave no budget.
-        kw["kv_cold_bytes"] = kv_cold_bytes or (
-            (ctx * max_batch) // BLOCK_TOKENS
-            * _mem.per_kv_block_bytes(cfg, torch.bfloat16,
-                                      _kv_fp8(kv_fp8) if kv_fp8 else None))
-    return engine_mod.build_engine(cfg, model, backend, **kw)
-
-
 def _device_free(args, backend) -> int:
     """--device-free bytes, or the CUDA card's free; off cuda without the flag refuse."""
     import torch
@@ -234,15 +81,6 @@ def _device_free(args, backend) -> int:
         return int(torch.cuda.mem_get_info()[0])
     sys.exit("error: --dry-run budget rows need --device-free BYTES off CUDA "
              "(there is no card to read mem_get_info from)")
-
-
-def _kv_fp8(name: str | None):
-    """The --kv-fp8 flag value as a torch dtype (None when unset)."""
-    if not name:
-        return None
-    import torch
-
-    return {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}[name]
 
 
 def _require_checkpoint_matches(cfg, model_name: str, checkpoint: str) -> None:
@@ -334,7 +172,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                      "drop --checkpoint to serve a built-in model")
         _dry_run_checkpoint(args, backend)
         return
-    cfg, model = _build_model(args.model, seed=0, fuse_projections=True)
+    cfg, model = build_model(args.model, seed=0, fuse_projections=True)
     draft = None
     if args.draft:
         from .spec import load_draft
@@ -342,7 +180,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         draft = load_draft(model, args.draft)
     # Before the engine: it takes the decode for stop sequences.
     tokenizer = _qwen38_tokenizer() if args.model == "qwen38-27b" else get_tokenizer(None)
-    engine = _build_engine(cfg, model, backend,
+    engine = build_serving_engine(cfg, model, backend,
                            draft=draft, depth=args.depth, slots=args.slots,
                            blocks=args.blocks, max_ctx=args.max_ctx,
                            max_batch=args.max_batch, dram_bytes=args.dram_bytes,
@@ -560,7 +398,7 @@ def _train_indexer_warmup(args: argparse.Namespace) -> None:
         print(json.dumps(manifest, indent=1) if args.json else format_run(manifest))
         return
     backend = get_backend()
-    cfg, model = _build_model(args.model, seed=args.seed, keep_master=False)
+    cfg, model = build_model(args.model, seed=args.seed, keep_master=False)
     log = _progress(args.json)
     log(f"tilerl train: indexer warm-up model={cfg.name} steps={args.steps}")
 
@@ -684,7 +522,7 @@ def _train_full(args: argparse.Namespace) -> None:
     manifest["metrics"] = dict.fromkeys(("ce_first", "ce_last", "secs_per_step_median"))
 
     backend = get_backend()
-    cfg, model = _build_model(args.model, seed=args.seed, keep_master=True)
+    cfg, model = build_model(args.model, seed=args.seed, keep_master=True)
     post_step = None
     if args.served_fp4:
         # Keep the served .wq/.scale/.oscale slots beside the bf16 masters and
@@ -1126,9 +964,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
     import torch
     from tilerl_kernels.backend import get_backend
 
+    # Lazy: tests monkeypatch tilerl.build.build_engine to capture training kwargs;
+    # a module-level import binds it before the patch.
     from . import train as train_mod
     from .autograd import AdamW
-    from .engine import build_engine
+    from .build import build_engine
     from .eval import gsm8k_accuracy, mmlu_accuracy, mmlu_questions
     from .kv_cache import NoPrefixStore
     from .ledger import (
@@ -1231,7 +1071,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
 
     backend = get_backend()
     # LoRA on a frozen base needs no bf16 master (~27 GB on the 27B).
-    cfg, model = _build_model(args.model, seed=args.seed, keep_master=False,
+    cfg, model = build_model(args.model, seed=args.seed, keep_master=False,
                               tp=args.tp, backend=backend)
     log(f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
         f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}")
@@ -2166,8 +2006,8 @@ def cmd_bench(args: argparse.Namespace) -> None:
     from . import engine as engine_mod
 
     backend = get_backend()
-    cfg, model = _build_model(args.model, seed=0)
-    engine = _build_engine(cfg, model, backend)
+    cfg, model = build_model(args.model, seed=0)
+    engine = build_serving_engine(cfg, model, backend)
     gen = torch.Generator().manual_seed(0)
 
     def rand_ids(n: int) -> list[int]:

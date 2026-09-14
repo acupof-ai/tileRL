@@ -11,8 +11,7 @@ pending-remote; on the CPU tiny model these rows are exact.
 
 import pytest
 
-from tilerl.cli import _build_model
-from tilerl.engine import build_engine
+from tilerl.build import build_engine, build_model
 from tilerl.kv_cache import PagedKvPool
 from tilerl.memory import (
     draft_per_block_bytes,
@@ -27,7 +26,7 @@ from tilerl.testing import RefBackend
 
 
 def _engine(num_slots=4, num_blocks=8):
-    cfg, model = _build_model("tiny", seed=0)
+    cfg, model = build_model("tiny", seed=0)
     eng = build_engine(cfg, model, RefBackend(), num_blocks=num_blocks, num_slots=num_slots,
                        max_batch=num_slots, max_total_tokens=2048, max_num_batched_tokens=512,
                        sparse_k=0)  # this file prices the DENSE ledger
@@ -462,8 +461,8 @@ def test_ledger_kv_hot_blocks_equal_the_pool_the_engine_allocates():
     one source group, so slots*(1*k + 8-window + chunk) + 1 with k=4, 3 slots and
     a 512-token budget is 3*(4 + 8 + 33) + 1 = 136. A divergent sizing expression
     (e.g. k+window with no group/chunk) makes this fail."""
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import build_engine
     from tilerl.memory import per_kv_block_bytes, sparse_pool_num_blocks, sparse_rows
     from tilerl.model import build_random
     from tilerl.testing import RefBackend

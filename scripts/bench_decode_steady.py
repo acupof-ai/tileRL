@@ -32,7 +32,8 @@ import benchrec  # noqa: E402
 
 from tilerl import config as config_mod  # noqa: E402
 from tilerl import model as model_mod  # noqa: E402
-from tilerl.engine import SamplingParams, build_engine  # noqa: E402
+from tilerl.build import build_engine  # noqa: E402
+from tilerl.engine import SamplingParams  # noqa: E402
 from tilerl.server import get_tokenizer  # noqa: E402
 
 ap = argparse.ArgumentParser()

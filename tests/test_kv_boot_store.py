@@ -24,7 +24,7 @@ def _drain(engine, rid, n):
 
 
 def _engine(cfg, tmp, store: bool):
-    from tilerl.engine import build_engine
+    from tilerl.build import build_engine
     from tilerl.model import build_random
 
     return build_engine(
@@ -175,8 +175,8 @@ def test_dense_bulk_boot_is_refused_with_sparse_k(tmp_path):
     raise at build time rather than admit a row that cannot fit."""
     import pytest
 
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import build_engine
     from tilerl.model import build_random
 
     cfg = tiny()

@@ -24,8 +24,9 @@ import pytest
 import torch
 from tilerl_kernels.backend import get_backend
 
+from tilerl.build import build_engine
 from tilerl.config import tiny
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.engine import SamplingParams
 from tilerl.model import build_random
 from tilerl.spec import DraftHead
 
@@ -254,7 +255,7 @@ def test_the_block_fit_prices_a_block_at_what_the_pools_actually_allocate(monkey
 
     import torch
 
-    import tilerl.engine as eng_mod
+    import tilerl.build as eng_mod
     from tilerl.kv_cache import PagedKvPool
 
     cfg = tiny()
@@ -273,7 +274,7 @@ def test_the_block_fit_prices_a_block_at_what_the_pools_actually_allocate(monkey
     draft1 = pool_bytes_per_block(1, (0,))
 
     for draft_layers, real in ((0, trunk), (1, trunk + draft1)):
-        blocks = eng_mod._fit_blocks(cfg, backend, io, 0, draft_layers=draft_layers)
+        blocks = eng_mod.fit_blocks(cfg, backend, io, 0, draft_layers=draft_layers)
         spent = blocks * real
         budget = free * 2 / 3
         assert 0.999 <= spent / budget <= 1.0, (
@@ -291,10 +292,14 @@ def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
     PagedKvPool -- and the fit is arch- and card-specific, so no CPU gate can catch
     that numerically. Assert the sequence instead.
     """
+    import tilerl.build as build_mod
     import tilerl.engine as eng_mod
 
+    # build_engine moved to build; patch the module its globals resolve from, or
+    # the spies never fire (same-module-instance rule). _serve_draft lives in
+    # engine (shared with the running Engine path), so its real is taken there.
     seen = []
-    real_state, real_fit = eng_mod.LinearStatePool, eng_mod._fit_blocks
+    real_state, real_fit = build_mod.LinearStatePool, build_mod.fit_blocks
     real_quant = eng_mod._quantize_draft
 
     def spy_state(*a, **k):
@@ -309,8 +314,10 @@ def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
         seen.append("draft")
         return real_quant(*a, **k)
 
-    monkeypatch.setattr(eng_mod, "LinearStatePool", spy_state)
-    monkeypatch.setattr(eng_mod, "_fit_blocks", spy_fit)
+    monkeypatch.setattr(build_mod, "LinearStatePool", spy_state)
+    monkeypatch.setattr(build_mod, "fit_blocks", spy_fit)
+    # build_engine calls engine._serve_draft -> engine._quantize_draft, so the
+    # patch goes on engine and is seen through that call.
     monkeypatch.setattr(eng_mod, "_quantize_draft", spy_quant)
     cfg = tiny()
     e = build_engine(cfg, build_random(cfg, seed=7), get_backend(), num_blocks=0,
@@ -611,6 +618,7 @@ def test_serve_decode_graph_flag_plumbs_to_engine_on_sm70(monkeypatch):
     argparse rejects the flag / build_engine never sees the kwarg."""
     from types import SimpleNamespace
 
+    import tilerl.build as build_mod
     import tilerl.engine as engine_mod
     from tilerl import cli
 
@@ -620,13 +628,14 @@ def test_serve_decode_graph_flag_plumbs_to_engine_on_sm70(monkeypatch):
         seen.update(kw)
         return SimpleNamespace(_decode_graph_on=engine_mod._graph_on(backend, kw.get("decode_graph")))
 
-    monkeypatch.setattr(engine_mod, "build_engine", _stub_build_engine)
+    monkeypatch.setattr(build_mod, "build_engine", _stub_build_engine)
     sm70 = SimpleNamespace(device=torch.device("cuda"), arch="sm70")
     parser = cli._build_parser()
 
     args_on = parser.parse_args(["serve", "--model", "tiny", "--decode-graph"])
     cfg = SimpleNamespace(max_position_embeddings=512)
-    cli._build_engine(cfg, None, sm70, decode_graph=getattr(args_on, "decode_graph", None))
+    build_mod.build_serving_engine(
+        cfg, None, sm70, decode_graph=getattr(args_on, "decode_graph", None))
     assert seen["decode_graph"] is True
 
     args_off = parser.parse_args(["serve", "--model", "tiny"])

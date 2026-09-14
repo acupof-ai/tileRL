@@ -255,8 +255,9 @@ def test_compiles_window_counts_a_real_compile():
     import benchrec
     from tilerl_kernels.backend import get_backend
 
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.model import build_random
 
     backend = get_backend()

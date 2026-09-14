@@ -18,16 +18,15 @@ import torch
 sys.path.insert(0, "src")
 from tilerl_kernels.backend import get_backend
 
-from tilerl import cli
-from tilerl.cli import _build_model
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import SamplingParams
 from tilerl.tokenizer import get_tokenizer
 
 SRC = os.environ.get("SRC", "/work/tilerl-ckpt/Qwen3.8-27B-NVFP4")
 STEPS = int(os.environ.get("STEPS", "64"))
 WARM = 8
 K = int(os.environ.get("K", "128"))
-cli._QWEN38_SOURCE = SRC
+QWEN38_SOURCE = SRC
 backend = get_backend()
 tok = get_tokenizer(SRC)
 V = 248068
@@ -47,7 +46,7 @@ def make_prompts(ctx, b):
 
 
 def run(ctx, b, sparse: bool, captured: bool):
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True,
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True,
                               backend=backend)
     kw = dict(num_blocks=0, num_slots=b + 2, max_batch=b,
               max_total_tokens=ctx + STEPS + 64, max_num_batched_tokens=512)

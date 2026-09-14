@@ -455,11 +455,11 @@ def test_a_rejected_submit_does_not_release_the_prefix_stores_blocks():
     The hit needs a LONGER prompt sharing the prefix: _match_prefix treats
     matched >= len(tokens) as a miss, so resubmitting the same tokens never hits.
     """
-    from tilerl.cli import _build_model
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine, build_model
+    from tilerl.engine import SamplingParams
     from tilerl.testing import RefBackend
 
-    cfg, model = _build_model("tiny", seed=0)
+    cfg, model = build_model("tiny", seed=0)
     engine = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=2,
                           max_batch=2, sparse_k=0)
     base = list(range(1, 49))
@@ -510,8 +510,9 @@ def test_a_second_client_waits_for_capacity_instead_of_503ing():
     property of the pool rather than of the scheduler's speed, and lets the precondition be
     asserted BEFORE the arm instead of hoped for.
     """
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.model import build_random
     from tilerl.testing import RefBackend
 
@@ -598,8 +599,9 @@ def test_a_prompt_larger_than_an_empty_pool_still_refuses_at_submit():
     `blocks_for_tokens(total + width - 1) > usable_blocks` refusal: without it such a request
     would sit in `_waiting` until its timeout instead of being told immediately.
     """
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.model import build_random
     from tilerl.testing import RefBackend
 
@@ -624,8 +626,9 @@ def test_a_failed_admission_returns_every_refcount_it_took():
     """
     import time
 
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.model import build_random
     from tilerl.testing import RefBackend
 
@@ -683,8 +686,9 @@ def test_every_key_the_store_publishes_reaches_health_or_is_named_as_dropped():
     `_prefix_hits` (`engine.py:652`, counted per admission), not from the store's counter of
     the same name -- so "the key exists" is true while the store's value goes nowhere.
     """
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import _STORE_STATS_INTERNAL, build_engine
+    from tilerl.engine import _STORE_STATS_INTERNAL
     from tilerl.kv_cache import PrefixStore
     from tilerl.model import build_random
     from tilerl.testing import RefBackend
@@ -735,8 +739,8 @@ def test_blocks_freed_moves_on_the_wire_when_the_store_frees_a_block():
     store's. Without the forwarding line this fails on the KeyError, which is the state the
     #221 merge shipped.
     """
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import build_engine
     from tilerl.model import build_random
     from tilerl.testing import RefBackend
 
@@ -790,8 +794,9 @@ def test_a_ragged_prompt_publishes_the_deepest_boundary_the_walk_reached(n, budg
     there; the other schedules' deepest boundary is their first, which already
     published.
     """
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.model import build_random
     from tilerl.testing import RefBackend
 

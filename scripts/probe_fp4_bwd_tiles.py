@@ -90,11 +90,11 @@ def main() -> int:
     from tilerl_kernels import kernels_linear
     from tilerl_kernels.backend import _MMA_RED, _pad2d, _round_up, get_backend
 
-    from tilerl.cli import _build_model
+    from tilerl.build import build_model
 
     backend = get_backend()
     assert backend.device.type == "cuda", "this sweep needs the card"
-    _, model = _build_model("qwen38-27b", seed=0, keep_master=False)
+    _, model = build_model("qwen38-27b", seed=0, keep_master=False)
     rows = []
 
     for n, k in SHAPES:

@@ -16,7 +16,7 @@ from tilerl_kernels.backend import get_backend
 from tilerl_kernels.reference import dequant_fp4, pack_fp4, top_p_probs, unpack_fp4
 
 from tilerl.autograd import Adafactor, AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
-from tilerl.cli import _build_model
+from tilerl.build import build_engine, build_model
 from tilerl.config import tiny
 from tilerl.engine import (
     _PHASE_DECODE,
@@ -28,7 +28,6 @@ from tilerl.engine import (
     SamplingParams,
     _restrict,
     _step_seed,
-    build_engine,
 )
 from tilerl.kv_cache import (
     DramSnapshots,
@@ -69,7 +68,7 @@ def _fp8_allocatable() -> bool:
     return True
 
 
-def _build_engine(seed: int, decode=None) -> Engine:
+def build_serving_engine(seed: int, decode=None) -> Engine:
     cfg = tiny()
     model = build_random(cfg, seed=seed)
     backend = get_backend()
@@ -118,7 +117,7 @@ def test_rows_that_cut_differently_take_the_per_row_path():
     unexercised, and it fails silently: cutting every row to row 0's rule still
     samples. The two rules disagree on purpose -- one row's allowed_ids exclude
     that row's own argmax -- so row 0's rule applied to the batch moves a token."""
-    eng = _build_engine(seed=3)
+    eng = build_serving_engine(seed=3)
     v = tiny().vocab_size
     torch.manual_seed(11)
     logits = torch.randn(2, v, device=eng._backend.device)
@@ -141,7 +140,7 @@ def test_rows_that_cut_differently_take_the_per_row_path():
 
 def test_generate():
     """Same seed -> identical tokens, different seed -> different tokens."""
-    engine = _build_engine(seed=1234)
+    engine = build_serving_engine(seed=1234)
     try:
         prompt = np.random.default_rng(0).integers(3, 320, size=16).astype(np.int64)
         params_a = SamplingParams(temperature=1.0, top_p=0.95, max_new_tokens=16, seed=7)
@@ -271,7 +270,7 @@ def test_tokens_generated_equals_the_tokens_poll_returned():
     the increment's position. Asserted across three requests at once so a per-request
     reset or a double count on a batched tick shows up too.
     """
-    engine = _build_engine(seed=99)
+    engine = build_serving_engine(seed=99)
     try:
         prompt = np.random.default_rng(3).integers(3, 320, size=8).astype(np.int64)
         ids = [
@@ -322,7 +321,7 @@ def test_blocks_used_is_what_the_engine_owns_not_what_the_pool_holds():
     Checked while a request is live, since a counter that is only inspected at rest
     cannot show a leak that cancels on teardown.
     """
-    engine = _build_engine(seed=99)
+    engine = build_serving_engine(seed=99)
     try:
         rng = np.random.default_rng(1)
         head = rng.integers(3, 320, size=16).astype(np.int64)  # exactly one block
@@ -423,7 +422,7 @@ def test_the_reread_prefix_survives_capacity_pressure():
 
 def test_prefix_cache():
     """A second prompt sharing a block-aligned prefix adopts the cached blocks."""
-    engine = _build_engine(seed=99)
+    engine = build_serving_engine(seed=99)
     try:
         rng = np.random.default_rng(1)
         head = rng.integers(3, 320, size=16).astype(np.int64)  # one full block
@@ -480,7 +479,7 @@ def test_the_engine_stops_at_a_text_sequence_and_names_it():
     the sequence is whatever byte it emits FIRST: that makes the stop certain and
     still exercises the same path, since `_stop_hit` cannot know why the text matched.
     """
-    eng = _build_engine(seed=5)
+    eng = build_serving_engine(seed=5)
     tok = ByteTokenizer()
     prompt = tok.encode("hello")
     plain = SamplingParams(max_new_tokens=12, seed=7)
@@ -489,7 +488,7 @@ def test_the_engine_stops_at_a_text_sequence_and_names_it():
     assert len(ref) == 12, "the unstopped run must reach the cap, or the stop proves nothing"
 
     stop = tok.decode(ref[:1])
-    eng2 = _build_engine(seed=5, decode=tok.decode)
+    eng2 = build_serving_engine(seed=5, decode=tok.decode)
     rid2 = eng2.submit(prompt, replace(plain, stop_texts=(stop,)))
     out = _drain(eng2, [rid2], 1)[rid2]
     # Stops at the token completing the match, and KEEPS it: the caller decodes and
@@ -510,7 +509,7 @@ def test_the_engine_does_not_stop_inside_the_reasoning_block():
     would pass with this gate removed.
     """
     tok = ByteTokenizer()
-    eng = _build_engine(seed=5, decode=tok.decode)
+    eng = build_serving_engine(seed=5, decode=tok.decode)
     # max_think_tokens forces the closer after 3 tokens, so the block is bounded and
     # `output` provably contains text on both sides of it.
     p = SamplingParams(max_new_tokens=24, seed=7, max_think_tokens=3,
@@ -519,7 +518,7 @@ def test_the_engine_does_not_stop_inside_the_reasoning_block():
     ref = _drain(eng, [rid], 24)[rid]
     first = tok.decode(ref[:1])  # a byte INSIDE the reasoning
 
-    eng2 = _build_engine(seed=5, decode=tok.decode)
+    eng2 = build_serving_engine(seed=5, decode=tok.decode)
     rid2 = eng2.submit(tok.encode("hi"), replace(p, stop_texts=(first,)))
     out = _drain(eng2, [rid2], 1)[rid2]
     # Not 1: the reasoning's own bytes are not matchable. Either it never fires, or
@@ -536,11 +535,11 @@ def test_a_stop_that_cannot_fire_is_refused_at_submit():
     """Two ways a stop is accepted and can never match, both silent 200s: no decode
     to match with, and an empty string (which is in every text, so it would end the
     request at token 1 instead of never)."""
-    eng = _build_engine(seed=5)  # no decode= : the default, tokenizer-free
+    eng = build_serving_engine(seed=5)  # no decode= : the default, tokenizer-free
     p = SamplingParams(max_new_tokens=4, stop_texts=("END",))
     with pytest.raises(ValueError, match="stop_texts needs"):
         eng.submit([1, 2, 3], p)
-    eng2 = _build_engine(seed=5, decode=ByteTokenizer().decode)
+    eng2 = build_serving_engine(seed=5, decode=ByteTokenizer().decode)
     with pytest.raises(ValueError, match="non-empty"):
         eng2.submit([1, 2, 3], replace(p, stop_texts=("",)))
 
@@ -1147,9 +1146,9 @@ def test_the_fp8_kv_pool_generates_what_the_bf16_pool_does():
 
     # `--kv-fp8` goes through cli._build_engine; a flag that parses and is never forwarded
     # reads exactly like a working one, which is how `dram_bytes` shipped with no CLI entry.
-    from tilerl.cli import _build_engine as cli_build
+    from tilerl.build import build_serving_engine as cli_build
 
-    cli_cfg, cli_model = _build_model("tiny", seed=11)
+    cli_cfg, cli_model = build_model("tiny", seed=11)
     served = cli_build(cli_cfg, cli_model, backend, slots=2, blocks=64, max_ctx=256,
                        kv_fp8="e4m3", sparse_k=0)
     assert served._kv.k_pool.dtype is torch.float8_e4m3fn, "--kv-fp8 never reached the pool"
@@ -1197,7 +1196,7 @@ def test_prefix_hit_survives_evicting_its_own_entry():
 
 
 def test_stop_token_is_not_returned():
-    engine = _build_engine(seed=6)
+    engine = build_serving_engine(seed=6)
     engine._sample_batch = lambda rows: [7] * len(rows)
     rid = engine.submit([1, 2], SamplingParams(max_new_tokens=4, stop_token_ids=(7,)))
     engine.step()
@@ -1457,7 +1456,7 @@ def test_recompute_matches_stored_activations():
     of a layer's activations and the 27B's group of 8 does not fit without this.
     """
     backend = RefBackend()
-    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    cfg, model = build_model("tiny", seed=0, keep_master=True)
     ids = np.arange(1, 33, dtype=np.int64).reshape(2, 16) % cfg.vocab_size
     pos = np.arange(16, dtype=np.int64)
 
@@ -1485,7 +1484,7 @@ def test_backward_streaming_matches_collecting():
     """Streaming gradients out of backward equals collecting them, bit for bit
     (the 27B cannot hold every weight gradient at once)."""
     backend = RefBackend()
-    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    cfg, model = build_model("tiny", seed=0, keep_master=True)
     ids = np.arange(1, 33, dtype=np.int64).reshape(2, 16) % cfg.vocab_size
     b, t = ids.shape
     pos = np.arange(t, dtype=np.int64)
@@ -1768,7 +1767,7 @@ def test_logprobs_are_returned_and_deterministic():
     """Every sampled token carries log p under the distribution it was drawn
     from: one per token, never positive, reproduced by the same seed."""
     backend = get_backend()
-    cfg, model = _build_model("tiny", seed=0)
+    cfg, model = build_model("tiny", seed=0)
     engine = build_engine(cfg, model, backend, num_blocks=64, num_slots=8)
     sp = SamplingParams(temperature=0.7, max_new_tokens=4, seed=3, logprobs=True)
 
@@ -1831,7 +1830,7 @@ def test_logprobs_are_returned_and_deterministic():
 def test_opd_lora_self_teacher():
     """OPD with LoRA: the frozen base stays bit-identical and some adapter moves."""
     backend = get_backend()
-    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    cfg, model = build_model("tiny", seed=0, keep_master=True)
     teacher = build_engine(cfg, model, backend, num_blocks=64, num_slots=4, decode_graph=False, prefix_store=NoPrefixStore())
     trainable = add_lora(model, rank=4)
     assert trainable, "add_lora attached nothing: nothing for the tape to train"
@@ -1849,7 +1848,7 @@ def test_opd_lora_self_teacher():
 
 def test_prefix_snapshot_includes_conv_window():
     cfg = tiny()
-    engine = _build_engine(seed=5)
+    engine = build_serving_engine(seed=5)
     try:
         prompt = np.random.default_rng(0).integers(3, 320, size=16).astype(np.int64)
         engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
@@ -1868,7 +1867,7 @@ def test_prefix_snapshot_includes_conv_window():
 
 def test_concurrent_prefills_not_starved():
     """Three concurrent requests reach decode together (same-width prefills pack into one forward)."""
-    engine = _build_engine(seed=77)
+    engine = build_serving_engine(seed=77)
     try:
         prompt = np.random.default_rng(0).integers(3, 320, size=8).astype(np.int64)
         params = SamplingParams(temperature=1.0, top_p=0.95, max_new_tokens=8, seed=3)
@@ -2599,7 +2598,7 @@ def test_the_draft_readout_reduction_picks_the_last_valid_row():
 
     This drives the real DraftHead.forward twice on identical input and asserts the
     reduced readout equals the full-width one at the row it claims."""
-    cfg, model = _build_model("tiny", seed=0)
+    cfg, model = build_model("tiny", seed=0)
     backend = get_backend()
     draft = _random_draft(cfg, 21, model)
 
@@ -2728,7 +2727,7 @@ def test_a_mixed_tick_pays_the_widest_rows_width_on_every_row():
     # And a SINGLE-token prefill chunk does not trigger the bucket either (chunk > 1).
     assert rect([1, 1], chunks=[1]) == 2
 
-    engine = _build_engine(seed=91)
+    engine = build_serving_engine(seed=91)
     try:
         rng = np.random.default_rng(5)
         params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=1)
@@ -2905,16 +2904,16 @@ def test_an_unknown_model_name_is_refused_not_silently_tiny():
     ``probe_pad_histogram``, ``recapture_correctness``, ``recapture_arms``), which is why the
     refusal is at this seam rather than in each of them.
     """
-    from tilerl.cli import MODEL_NAMES, _build_model
+    from tilerl.build import MODEL_NAMES, build_model
 
     for bad in ("qwen38_27b", "Qwen38-27B", "/data00/models/Qwen3.8-27B-NVFP4", "27b", ""):
         with pytest.raises(ValueError, match="unknown model"):
-            _build_model(bad, seed=0)
+            build_model(bad, seed=0)
 
     # The negative control the refusal needs: every live name still builds, and builds the
     # config it names. Without it this passes on a `_build_model` that refuses everything,
     # which is the same defect with the sign flipped.
-    built = {n: _build_model(n, seed=0)[0] for n in MODEL_NAMES if n != "qwen38-27b"}
+    built = {n: build_model(n, seed=0)[0] for n in MODEL_NAMES if n != "qwen38-27b"}
     assert built["tiny"].name == "tiny" and built["tiny"].hidden_size == 64
     assert built["tiny-agent"].name == "tiny-agent"
     assert built["tiny-agent"].max_position_embeddings == 65536, (

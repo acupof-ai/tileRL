@@ -22,8 +22,8 @@ import time
 import numpy as np
 from tilerl_kernels.backend import get_backend
 
-from tilerl import cli
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import SamplingParams
 from tilerl.kv_cache import ColdSsdFile
 
 GIB = 1 << 30
@@ -81,11 +81,12 @@ def main() -> None:
 
     os_env = __import__("os").environ
     os_env.setdefault("TILERL_TARGET", "cuda")
-    cli._QWEN38_SOURCE = args.source
+    import tilerl.build as build  # noqa: E402
+    build.QWEN38_SOURCE = args.source
 
     _wrap()
     backend = get_backend()
-    cfg, model = cli._build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     engine = build_engine(
         cfg=cfg, model=model, backend=backend,
         num_slots=1, max_batch=1,

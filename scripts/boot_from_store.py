@@ -53,7 +53,7 @@ def _drain_tokens(engine, rid: int, n: int, *, ticks: int = 1_000_000):
 
 
 def _build_engine(cfg, model, backend, store_dir: str, max_ctx: int):
-    from tilerl.engine import build_engine
+    from tilerl.build import build_engine
 
     return build_engine(
         cfg, model, backend, num_slots=2, max_batch=1,
@@ -83,11 +83,11 @@ def run(model_name: str, store_dir: str, prompt_tokens: int, new_tokens: int,
 
     # Serving builds with fused projections; reuse the exact serve path so the
     # card run exercises what `tilerl serve --kv-store` does.
-    from tilerl.cli import _build_model
+    from tilerl.build import build_model
     from tilerl.engine import SamplingParams
 
     backend = get_backend()
-    cfg, model = _build_model(model_name, seed=seed, fuse_projections=True,
+    cfg, model = build_model(model_name, seed=seed, fuse_projections=True,
                               backend=backend)
     if prompt_file:
         ids = np.asarray(_load_ids(prompt_file), dtype=np.int64)[:prompt_tokens]

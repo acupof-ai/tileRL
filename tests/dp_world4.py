@@ -51,7 +51,7 @@ def _dp_step(rank: int, no_dp: bool, out: dict, streams: bool = False,
 
     from tilerl import model as model_mod
     from tilerl.autograd import Adafactor, AdamW
-    from tilerl.cli import _shard
+    from tilerl.build import _shard
     from tilerl.config import tiny
     from tilerl.tensor_parallel import Mesh
     from tilerl.testing import RefBackend
@@ -96,7 +96,7 @@ def _dp_ref_rank(r: int, out: dict, streams: bool = False) -> None:
 
     from tilerl import model as model_mod
     from tilerl.autograd import Adafactor, AdamW
-    from tilerl.cli import _shard
+    from tilerl.build import _shard
     from tilerl.config import tiny
     from tilerl.testing import RefBackend
     from tilerl.train import train_step

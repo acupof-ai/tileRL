@@ -31,9 +31,11 @@ import torch
 os.environ.setdefault("TILERL_TARGET", "cuda")
 from tilerl_kernels.backend import get_backend  # noqa: E402
 
-from tilerl import cli  # noqa: E402
-from tilerl.cli import _build_model  # noqa: E402
-from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine  # noqa: E402
+from tilerl.build import (
+    build_engine,  # noqa: E402
+    build_model,  # noqa: E402
+)
+from tilerl.engine import _PHASE_DECODE, SamplingParams  # noqa: E402
 from tilerl.spec import load_draft  # noqa: E402
 
 KS = (1, 2, 4, 8, 16, 64)
@@ -47,10 +49,11 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--depth", type=int, default=3)
     args = ap.parse_args()
-    cli._QWEN38_SOURCE = args.source
+    import tilerl.build as build  # noqa: E402
+    build.QWEN38_SOURCE = args.source
 
     be = get_backend()
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft)
     e = build_engine(cfg, model, be, num_blocks=1024, num_slots=4, max_batch=4,
                      max_total_tokens=8192, draft=draft, spec_depth=args.depth)

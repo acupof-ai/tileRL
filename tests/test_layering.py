@@ -124,7 +124,7 @@ def test_unlisted_module_is_flagged() -> None:
 
 
 def test_preplaced_absent_future_modules_do_not_error() -> None:
-    for future in ("build", "decode_graph", "kv_tiers", "bench"):
+    for future in ("decode_graph", "kv_tiers", "bench"):
         assert future in _RANK and not (SRC / f"{future}.py").exists()
     # violations() over the real tree (which lacks them) is already green above.
 

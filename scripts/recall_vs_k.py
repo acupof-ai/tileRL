@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 from tilerl_kernels.backend import get_backend
 
-from tilerl.cli import _build_model
+from tilerl.build import build_model
 from tilerl.train import indexer_capture, quest_bounds_scores, sample_query_positions
 
 KS = (128, 256, 512, 1024, 2048)
@@ -34,7 +34,7 @@ def main():
     corpus = Path(sys.argv[1])
     ctxs = tuple(int(x) for x in sys.argv[2:]) or (8192, 32768)
     backend = get_backend()
-    _cfg, model = _build_model("qwen38-27b", seed=SEED, keep_master=False,
+    _cfg, model = build_model("qwen38-27b", seed=SEED, keep_master=False,
                                backend=backend)
     result = {}
     for ctx in ctxs:

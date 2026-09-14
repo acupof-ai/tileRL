@@ -197,8 +197,8 @@ def _selfcheck() -> int:
         # cheapest gate that fails on this machine instead of on the card.
         import importlib
         pairs = (("tilerl.model", "add_lora"), ("tilerl.autograd", "AdamW"),
-                 ("tilerl.engine", "SamplingParams"), ("tilerl.engine", "build_engine"),
-                 ("tilerl.cli", "_build_model"), ("tilerl.kv_cache", "NoPrefixStore"),
+                 ("tilerl.engine", "SamplingParams"), ("tilerl.build", "build_engine"),
+                 ("tilerl.build", "build_model"), ("tilerl.kv_cache", "NoPrefixStore"),
                  ("tilerl.train", "rl_step"), ("tilerl.train", "group_advantages"),
                  ("tilerl.train", "untruncated"))
         for mod, name in pairs:
@@ -527,8 +527,8 @@ def main() -> int:
     from tilerl_kernels.backend import get_backend
 
     from tilerl.autograd import AdamW
-    from tilerl.cli import _build_model
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine, build_model
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.model import add_lora
     from tilerl.train import group_advantages, rl_step, untruncated
@@ -537,7 +537,7 @@ def main() -> int:
     cuda = backend.device.type == "cuda"
     sync = torch.cuda.synchronize if cuda else (lambda: None)
 
-    cfg, model = _build_model(a.model, seed=0, keep_master=False, tp=a.tp, backend=backend)
+    cfg, model = build_model(a.model, seed=0, keep_master=False, tp=a.tp, backend=backend)
     engine = build_engine(cfg, model, backend, num_blocks=a.blocks, num_slots=a.group,
                           max_batch=a.group, max_total_tokens=a.blocks * 16,
                           decode_graph=False, prefix_store=NoPrefixStore())

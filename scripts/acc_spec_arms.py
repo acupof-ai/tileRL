@@ -24,8 +24,8 @@ from pathlib import Path
 import torch
 from tilerl_kernels.backend import get_backend
 
+from tilerl.build import build_engine
 from tilerl.config import qwen38_27b
-from tilerl.engine import build_engine
 from tilerl.eval import answer_match, generate, letter, mmlu_questions, mmlu_score
 from tilerl.kv_cache import NoPrefixStore
 from tilerl.model import load_hf

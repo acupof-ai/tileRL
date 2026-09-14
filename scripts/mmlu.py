@@ -30,8 +30,8 @@ CONCURRENCY = 8
 def score_tilerl(source: str, prompts: list[str], slots: int = 64, blocks: int = 2048) -> list[str]:
     from tilerl_kernels.backend import get_backend
 
+    from tilerl.build import build_engine
     from tilerl.config import qwen38_27b
-    from tilerl.engine import build_engine
     from tilerl.model import load_hf
 
     model = load_hf(qwen38_27b(), source, fuse_projections=True)

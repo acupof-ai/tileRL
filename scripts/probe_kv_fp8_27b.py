@@ -113,7 +113,8 @@ def _gen(cfg, model, backend, prompts, n_new, kv_fp8, step_ms: list | None = Non
     at B=8 ctx=8k the 65536 prefill tokens chunk into ~128 ticks against 24 decode ticks,
     so the total is 84% prefill and a decode-tick byte model does not bound it.
     """
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import BLOCK_TOKENS
 
     batch = prompts if isinstance(prompts[0], list) else [prompts]
@@ -269,7 +270,8 @@ def arm_boundary(cfg, model, backend, ctx: int, batch: int, n_new: int) -> dict:
     queue drains in correspondingly fewer passes. That is measurable, and it is the thing
     capacity actually buys.
     """
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     prompts = [torch.randint(3, cfg.vocab_size - 1, (ctx,)).tolist() for _ in range(batch)]
     out: dict = {"ctx": ctx, "batch": batch}
     for nick, dt in (("bf16", None), ("fp8", torch.float8_e4m3fn)):

@@ -53,8 +53,8 @@ import torch
 from tilerl_kernels.backend import get_backend
 
 from tilerl.autograd import Adafactor
-from tilerl.cli import _build_model
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import SamplingParams
 from tilerl.eval import MATCHERS
 from tilerl.iso import ISO
 from tilerl.kv_cache import NoPrefixStore
@@ -259,7 +259,7 @@ def main(argv=None):
     # RefBackend is the torch-eager CPU reference (`device = cpu`, hardwired), so a card run
     # must take the real backend or every arm silently runs on the host.
     backend = get_backend() if a.backend == "auto" else RefBackend()
-    cfg, base = _build_model(a.model, seed=a.seed, keep_master=True)
+    cfg, base = build_model(a.model, seed=a.seed, keep_master=True)
     # Full fine-tuning never reads the served bytes -- the tape routes every linear through
     # `master_linear` once a bf16 master exists -- and they are 16.88 GiB on the 27B (9.90 fp8
     # + 6.98 uint8, measured). `cli.py:275` and `:1094` do this at the training entry points;
@@ -371,7 +371,7 @@ if __name__ == "__main__":
     main()
     # A runnable check on the gate's own logic rather than on the measurement:
     # ISO must hold its spectrum to float precision, or `frames` is not freezing Sigma.
-    _cfg, m = _build_model("tiny", seed=0, keep_master=True)
+    _cfg, m = build_model("tiny", seed=0, keep_master=True)
     s0 = spectra(m.params)
     opt = ISO(Adafactor(lr=1e-1))
     rng = np.random.default_rng(0)

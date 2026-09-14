@@ -106,8 +106,8 @@ def main() -> int:
 
     from tilerl_kernels.backend import get_backend
 
-    from tilerl.cli import _build_model, _qwen38_tokenizer
-    from tilerl.engine import build_engine
+    from tilerl.build import build_engine, build_model
+    from tilerl.cli import _qwen38_tokenizer
     from tilerl.eval import answer_match
     from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
     from tilerl.prompt import render_chat
@@ -154,7 +154,7 @@ def main() -> int:
           f"top_p {base.top_p} top_k {base.top_k}")
 
     backend = get_backend()
-    cfg, model = _build_model("qwen38-27b", seed=0, keep_master=True)
+    cfg, model = build_model("qwen38-27b", seed=0, keep_master=True)
     groups = [int(g) for g in args.groups.split(",")]
     ctx = args.gen + max(map(len, prompts)) + 64
     out: dict[str, list] = {}

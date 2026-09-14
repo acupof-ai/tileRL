@@ -60,7 +60,7 @@ def one_lora_step(model, trainable, backend, seq_len, lr, seed=1234):
 
 
 def build(cfg, model, backend, blocks, graph):
-    from tilerl.engine import build_engine
+    from tilerl.build import build_engine
     from tilerl.kv_cache import NoPrefixStore
 
     return build_engine(cfg, model, backend, num_blocks=blocks, num_slots=2,
@@ -110,7 +110,8 @@ def main():
     os.environ["TILERL_QWEN38_SOURCE"] = args.source
     from tilerl_kernels.backend import get_backend
 
-    from tilerl.cli import _build_model, _qwen38_tokenizer
+    from tilerl.build import build_model
+    from tilerl.cli import _qwen38_tokenizer
     from tilerl.model import add_lora
 
     assert torch.cuda.is_available(), "card-only gate"
@@ -124,7 +125,7 @@ def main():
     # the forward never reads (train_step then sees zero grads). Production cli.py
     # attaches in the same order.
     t0 = time.perf_counter()
-    cfg, m_cap = _build_model("qwen38-27b", seed=0, fuse_projections=False)
+    cfg, m_cap = build_model("qwen38-27b", seed=0, fuse_projections=False)
     cap = build(cfg, m_cap, backend, args.blocks, True)
     lora_cap = add_lora(m_cap, rank=args.rank)
     rollout(cap, prompt, args.gen)  # warm / capture
@@ -149,7 +150,7 @@ def main():
 
     # phase 2: eager, same seed adapter + same data step
     t0 = time.perf_counter()
-    cfg, m_eag = _build_model("qwen38-27b", seed=0, fuse_projections=False)
+    cfg, m_eag = build_model("qwen38-27b", seed=0, fuse_projections=False)
     eager = build(cfg, m_eag, backend, args.blocks, False)
     lora_eag = add_lora(m_eag, rank=args.rank)
     rollout(eager, prompt, args.gen)

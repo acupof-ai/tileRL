@@ -160,7 +160,8 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
     """Engine rebuilt per row so the pools are sized for that depth."""
     import benchkit as bk
 
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import BLOCK_TOKENS
 
     _KV_BYTES_PER_TOKEN = 2 * len(cfg.full_attn_layers) * cfg.num_kv_heads * cfg.head_dim * 2
@@ -222,7 +223,8 @@ def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
     """Gated as a ratio against the plain arm measured in the same process."""
     import benchkit as bk
 
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.spec import load_draft
 
     path = Path(source) / "model_mtp.safetensors"
@@ -274,7 +276,7 @@ def suite_prefill(gate, cfg, model, backend, lengths, build, model_name, device)
     import benchkit as bk
     import benchrec
 
-    from tilerl.engine import build_engine
+    from tilerl.build import build_engine
 
     cap = min(8192, cfg.max_position_embeddings)
     engine = build_engine(cfg, model, backend, num_blocks=cap // 16 + 64, num_slots=16,
@@ -310,7 +312,8 @@ def suite_prefill(gate, cfg, model, backend, lengths, build, model_name, device)
 def suite_kv_reuse(gate, cfg, model, backend):
     import benchkit as bk
 
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import BLOCK_TOKENS
 
     print("\n=== kv-reuse / prefix-cache ===")
@@ -597,7 +600,7 @@ def suite_train(gate, backend, source, full=False):
     import numpy as np
 
     from tilerl.autograd import Adafactor, AdamW
-    from tilerl.cli import _build_model
+    from tilerl.build import build_model
     from tilerl.train import train_step
 
     def sync():
@@ -625,7 +628,7 @@ def suite_train(gate, backend, source, full=False):
         shapes = [(1, 64), (1, 128), (1, 256), (2, 256), (4, 256)]
     else:
         model_name = "tiny"
-        cfg, mdl = _build_model(model_name, seed=0, keep_master=True)
+        cfg, mdl = build_model(model_name, seed=0, keep_master=True)
         shapes = [(2, 128), (2, 512)]
     opt = Adafactor(lr=1e-2) if full else AdamW(lr=1e-3)
     print(f"\n=== training-step throughput ({model_name}) ===")
@@ -773,7 +776,7 @@ def main() -> int:
 
     cfg = model = None
     if any(s in gpu_suites for s in suites):
-        from tilerl.cli import _build_model
+        from tilerl.build import build_model
         from tilerl.config import qwen38_27b
         from tilerl.model import load_hf
         if args.source:
@@ -781,7 +784,7 @@ def main() -> int:
             model = load_hf(cfg, args.source, fuse_projections=True)
             cfg = model.cfg
         else:
-            cfg, model = _build_model("tiny", seed=0)
+            cfg, model = build_model("tiny", seed=0)
 
     for s in suites:
         if s == "decode-kv":

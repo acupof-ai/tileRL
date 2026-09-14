@@ -14,8 +14,9 @@ import time
 import torch
 from tilerl_kernels.backend import Backend, resolve_target
 
+from tilerl.build import build_engine
 from tilerl.config import qwen36_27b
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.engine import SamplingParams
 from tilerl.model import _fuse_projections, load_hf
 from tilerl.tensor_parallel import shard_params, tp_config
 

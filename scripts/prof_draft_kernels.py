@@ -27,9 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import torch
 from tilerl_kernels.backend import get_backend
 
-from tilerl import cli
-from tilerl.cli import _build_model
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import SamplingParams
 from tilerl.spec import load_draft
 
 
@@ -44,10 +43,11 @@ def main() -> None:
     # cli binds _QWEN38_SOURCE from the env at IMPORT, which already happened, so
     # --source has to be written back onto the module or _build_model reaches for
     # the HF hub and dies on "Invalid port: ':'".
-    cli._QWEN38_SOURCE = args.source
+    import tilerl.build as build  # noqa: E402
+    build.QWEN38_SOURCE = args.source
 
     backend = get_backend()
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft)
     e = build_engine(cfg, model, backend, num_blocks=512, num_slots=4, max_batch=4,
                      max_total_tokens=8192, draft=draft, spec_depth=args.depth)

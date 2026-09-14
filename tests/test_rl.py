@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from tilerl.autograd import AdamW
-from tilerl.cli import _build_model
+from tilerl.build import build_model
 from tilerl.eval import last_number
 from tilerl.testing import RefBackend
 from tilerl.train import group_advantages, rl_step, train_step
@@ -70,8 +70,9 @@ def test_the_within_group_r_removes_the_prompt_confound():
 
 def test_grpo_loop_records_one_row_per_rollout():
     """The yielded tuple carries means, so a length-vs-reward claim needs the rows."""
-    cfg, model = _build_model("tiny", seed=0)
-    from tilerl.engine import SamplingParams, build_engine
+    cfg, model = build_model("tiny", seed=0)
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.train import grpo_loop
 
@@ -210,7 +211,7 @@ def test_rl_step_matches_sft_at_unit_advantage():
         ("rl", lambda m, o: rl_step(m, ids, np.ones(2), np.ones(2, dtype=np.int64),
                                     backend, o)),
     ):
-        _, model = _build_model("tiny", seed=0, keep_master=True)
+        _, model = build_model("tiny", seed=0, keep_master=True)
         snap = _snapshot(model)
         fn(model, AdamW(lr=1e-3))
         out[name] = {k: model.params[k] - v for k, v in snap.items()}
@@ -220,7 +221,7 @@ def test_rl_step_matches_sft_at_unit_advantage():
 
 def test_rl_step_zero_advantage_is_a_noop():
     ids = np.arange(1, 2 * 12 + 1, dtype=np.int64).reshape(2, 12)
-    _, model = _build_model("tiny", seed=0, keep_master=True)
+    _, model = build_model("tiny", seed=0, keep_master=True)
     snap = _snapshot(model)
     rl_step(model, ids, np.zeros(2), np.full(2, 4, dtype=np.int64), RefBackend(),
             AdamW(lr=1e-3))
@@ -236,7 +237,7 @@ def test_rl_step_ignores_padding():
     other[0, 9:] = 77  # padding past seq_len; causal, so no scored logit sees it
     deltas = []
     for ids in (base, other):
-        _, model = _build_model("tiny", seed=0, keep_master=True)
+        _, model = build_model("tiny", seed=0, keep_master=True)
         snap = _snapshot(model)
         rl_step(model, ids, np.array([1.0]), np.array([3]), RefBackend(),
                 AdamW(lr=1e-3), seq_lens=np.array([9]))
@@ -295,7 +296,7 @@ def test_grpo_length_buckets_preserve_real_token_loss_and_gradients(monkeypatch)
                         losses.append(loss)
                     return RefBackend().cross_entropy_loss_grad(logits, tokens)
 
-            _, model = _build_model("tiny", seed=0, keep_master=True)
+            _, model = build_model("tiny", seed=0, keep_master=True)
             clip = train.clip_grad_norm
 
             def capture(grads, *a):
@@ -342,7 +343,7 @@ def test_micro_batching_is_the_same_update():
 
     deltas = []
     for micro in (0, 1, 3):
-        _, model = _build_model("tiny", seed=0, keep_master=True)
+        _, model = build_model("tiny", seed=0, keep_master=True)
         snap = _snapshot(model)
         rl_step(model, ids, adv, plens, backend, AdamW(lr=1e-3), seq_lens=slens, micro=micro)
         deltas.append({k: model.params[k] - v for k, v in snap.items()})
@@ -357,12 +358,13 @@ def test_grpo_loop_raises_reward():
     """End to end on the tiny model: rollouts through the engine, a reward the
     policy can move, and reward must go up. The engine that samples is the model
     that trains — no second copy of the weights."""
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.train import grpo_loop
 
     torch.manual_seed(0)
-    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    cfg, model = build_model("tiny", seed=0, keep_master=True)
     backend = RefBackend()
     engine = build_engine(cfg, model, backend, num_blocks=256, num_slots=8,
                           decode_graph=False, prefix_store=NoPrefixStore())
@@ -390,11 +392,12 @@ def test_grpo_loop_reports_a_step_before_the_run_ends():
     """A 100-step run that prints only on return says nothing for two hours, so a
     live run cannot be told from a hung one. The first step must be readable
     while later steps are still to come."""
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.train import grpo_loop
 
-    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    cfg, model = build_model("tiny", seed=0, keep_master=True)
     backend = RefBackend()
     engine = build_engine(cfg, model, backend, num_blocks=128, num_slots=4,
                           decode_graph=False, prefix_store=NoPrefixStore())
@@ -428,11 +431,12 @@ def test_an_all_correct_group_is_tied_once_more():
 
 def test_grpo_loop_yields_tied_correctness():
     """grpo_loop yields tied_correctness as the 8th element when correctness_fn is given."""
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.train import grpo_loop
 
-    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    cfg, model = build_model("tiny", seed=0, keep_master=True)
     backend = RefBackend()
     engine = build_engine(cfg, model, backend, num_blocks=128, num_slots=4,
                           decode_graph=False, prefix_store=NoPrefixStore())
@@ -449,7 +453,8 @@ def test_grpo_rollouts_are_drawn_untruncated():
     from it too. A truncated or tempered sampler passed in is overridden, and the
     engine has to see the override -- checking the returned params alone would
     pass even if grpo_loop kept sampling from the caller's values."""
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.train import grpo_loop, untruncated
 
@@ -460,7 +465,7 @@ def test_grpo_rollouts_are_drawn_untruncated():
     assert untruncated(keep).max_new_tokens == 7
     assert untruncated(keep).stop_token_ids == (3,)
 
-    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    cfg, model = build_model("tiny", seed=0, keep_master=True)
     backend = RefBackend()
     engine = build_engine(cfg, model, backend, num_blocks=128, num_slots=4,
                           decode_graph=False, prefix_store=NoPrefixStore())
@@ -486,12 +491,13 @@ def test_opd_keeps_adapter_tensor_identity():
     """A captured decode graph holds the adapter tensor objects. The
     teacher/student swap in opd_loop must copy into them, never rebind — a
     rebind samples from the captured (stale) tensors on CUDA and never raises."""
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.model import add_lora
     from tilerl.train import opd_loop
 
-    cfg, model = _build_model("tiny", seed=0)
+    cfg, model = build_model("tiny", seed=0)
     backend = RefBackend()
     engine = build_engine(cfg, model, backend, num_blocks=64, num_slots=4,
                           decode_graph=False, prefix_store=NoPrefixStore())
@@ -517,14 +523,14 @@ def test_the_train_pool_holds_what_max_new_tokens_asks_for(tmp_path, monkeypatch
     import contextlib
     import json
 
+    from tilerl import build as build_mod
     from tilerl import cli
-    from tilerl import engine as engine_mod
     from tilerl.kv_cache import BLOCK_TOKENS
 
     data = tmp_path / "d.jsonl"
     data.write_text(json.dumps({"prompt": "2+2?", "answer": "4"}) + "\n")
-    seen, real = {}, engine_mod.build_engine
-    monkeypatch.setattr(engine_mod, "build_engine",
+    seen, real = {}, build_mod.build_engine
+    monkeypatch.setattr(build_mod, "build_engine",
                         lambda *a, **kw: (seen.update(kw), real(*a, **kw))[1])
     monkeypatch.setattr("tilerl.ledger.runs_root", lambda: tmp_path)
     want = 4096
@@ -611,8 +617,9 @@ def test_the_gsm8k_eval_reports_the_tokens_it_spent():
     """
     from tilerl_kernels.backend import get_backend
 
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.eval import gsm8k_accuracy
     from tilerl.model import build_random
     from tilerl.tokenizer import get_tokenizer
@@ -652,10 +659,10 @@ def test_a_recapturing_engine_clears_what_the_update_invalidated():
     """
     import pytest
 
-    from tilerl.engine import build_engine
+    from tilerl.build import build_engine
     from tilerl.train import grpo_loop
 
-    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    cfg, model = build_model("tiny", seed=0, keep_master=True)
     run = lambda e, **kw: list(  # noqa: E731
         grpo_loop(e, model, [[1, 2, 3]], lambda p, c: 0.0, 1, RefBackend(), group=2,
                   sampling=SamplingParams(max_new_tokens=4), **kw))
@@ -816,12 +823,12 @@ def test_a_loaded_adapter_actually_changes_the_output(tmp_path, monkeypatch):
     def decode(load: str | None) -> list[int]:
         from tilerl_kernels.backend import get_backend
 
-        from tilerl.cli import _build_engine, _build_model
+        from tilerl.build import build_model, build_serving_engine
         from tilerl.engine import SamplingParams
         from tilerl.model import add_lora
 
-        cfg, model = _build_model("tiny", seed=0, keep_master=False)
-        engine = _build_engine(cfg, model, get_backend())
+        cfg, model = build_model("tiny", seed=0, keep_master=False)
+        engine = build_serving_engine(cfg, model, get_backend())
         trainable = add_lora(model, rank=2)
         if load:
             cli._load_adapter(trainable, load, lambda *a, **k: None)
@@ -865,13 +872,13 @@ def test_the_training_engine_keeps_its_decode_graph(tmp_path, monkeypatch):
     import json
 
     from tilerl import cli
-    from tilerl import engine as engine_mod
     from tilerl import train as train_mod
 
     data = tmp_path / "d.jsonl"
     data.write_text(json.dumps({"prompt": "2+2?", "answer": "4"}) + "\n")
     seen = {}
-    real_build, real_loop = engine_mod.build_engine, train_mod.grpo_loop
+    from tilerl import build as build_mod
+    real_build, real_loop = build_mod.build_engine, train_mod.grpo_loop
 
     def spy_build(*a, **kw):
         seen["decode_graph"] = kw.get("decode_graph")
@@ -881,7 +888,7 @@ def test_the_training_engine_keeps_its_decode_graph(tmp_path, monkeypatch):
         seen["recapture_graph"] = kw.get("recapture_graph")
         return real_loop(*a, **kw)
 
-    monkeypatch.setattr("tilerl.engine.build_engine", spy_build)
+    monkeypatch.setattr("tilerl.build.build_engine", spy_build)
     monkeypatch.setattr("tilerl.train.grpo_loop", spy_loop)
     monkeypatch.setattr("tilerl.ledger.runs_root", lambda: tmp_path)
     with contextlib.suppress(SystemExit):
@@ -1024,11 +1031,11 @@ def test_a_step_of_two_prompts_does_not_normalise_across_them(tmp_path):
     from tilerl_kernels.backend import get_backend
 
     import tilerl.train as train_mod
-    from tilerl.cli import _build_model
-    from tilerl.engine import BLOCK_TOKENS, SamplingParams, build_engine
+    from tilerl.build import build_engine, build_model
+    from tilerl.engine import BLOCK_TOKENS, SamplingParams
     from tilerl.kv_cache import NoPrefixStore
 
-    cfg, model = _build_model("tiny", seed=0)
+    cfg, model = build_model("tiny", seed=0)
     backend = get_backend()
     # Different lengths on purpose: a scalar `plens` (np.full(group, len(prompt)))
     # would mis-mask every row of the shorter prompt.
@@ -1129,7 +1136,8 @@ def test_clearing_the_prefix_after_update_keeps_rollouts_token_for_token_eager(m
     """
     import tilerl.train as train_mod
     from tilerl.autograd import AdamW
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
 
     # Step 1 caches a 256-token prefix (16 blocks); step 2 submits a 336-token extension so
@@ -1158,7 +1166,7 @@ def test_clearing_the_prefix_after_update_keeps_rollouts_token_for_token_eager(m
     def run(*, no_store, clear_prefix):
         captured.clear()
         torch.manual_seed(123)
-        cfg, model = _build_model("tiny", seed=0, keep_master=True)
+        cfg, model = build_model("tiny", seed=0, keep_master=True)
         engine = build_engine(
             cfg, model, RefBackend(), num_blocks=64, num_slots=4, max_batch=4,
             max_total_tokens=4096, sparse_k=0,  # dense: needs a real live PrefixStore arm

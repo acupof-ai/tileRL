@@ -29,8 +29,11 @@ import torch  # noqa: E402
 from tilerl_kernels.backend import get_backend  # noqa: E402
 
 from tilerl.autograd import AdamW  # noqa: E402
-from tilerl.cli import _build_model  # noqa: E402
-from tilerl.engine import SamplingParams, build_engine  # noqa: E402
+from tilerl.build import (  # noqa: E402
+    build_engine,
+    build_model,
+)
+from tilerl.engine import SamplingParams  # noqa: E402
 from tilerl.kv_cache import NoPrefixStore  # noqa: E402
 from tilerl.model import add_lora  # noqa: E402
 from tilerl.train import grpo_loop  # noqa: E402
@@ -46,7 +49,7 @@ ARMS = {
 def run_arm(name, cfg, args, prompts, reward):
     a = ARMS[name]
     backend = get_backend()
-    cfg2, model = _build_model(args.model, seed=0, keep_master=False)
+    cfg2, model = build_model(args.model, seed=0, keep_master=False)
     kw = {} if not a["no_prefix"] else dict(prefix_store=NoPrefixStore())
     engine = build_engine(cfg2, model, backend, num_blocks=args.blocks,
                           num_slots=args.group, max_batch=args.group,

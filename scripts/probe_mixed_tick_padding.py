@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from tilerl_kernels.backend import get_backend
 
-from tilerl.cli import _build_model
-from tilerl.engine import _PREFILL_BUCKET, SamplingParams, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import _PREFILL_BUCKET, SamplingParams
 
 H, D, KVSPLIT = 24, 256, 32  # checkpoint config.json text_config + registry.py:127
 
@@ -24,7 +24,7 @@ def po_bytes(rows: int, width: int) -> int:
 
 
 def main() -> None:
-    cfg, model = _build_model("tiny", seed=0)
+    cfg, model = build_model("tiny", seed=0)
     e = build_engine(cfg, model, get_backend(), num_blocks=256, num_slots=12,
                      max_batch=8, max_total_tokens=512, max_num_batched_tokens=64)
 

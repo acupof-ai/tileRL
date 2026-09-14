@@ -29,9 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from tilerl_kernels import backend as bk_mod
 from tilerl_kernels.backend import get_backend
 
-from tilerl import cli
-from tilerl.cli import _build_model
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import SamplingParams
 
 PROMPTS = (
     "Write a Python function that merges two sorted lists.",
@@ -57,13 +56,14 @@ def main() -> None:
     ap.add_argument("--pad", type=int, default=600, help="repeat the prompt to this length")
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
-    cli._QWEN38_SOURCE = args.source
+    import tilerl.build as build  # noqa: E402
+    build.QWEN38_SOURCE = args.source
 
     from tilerl.server import get_tokenizer
 
     be = get_backend()
     tok = get_tokenizer(args.source)
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     e = build_engine(cfg, model, be, num_blocks=1024, num_slots=4, max_batch=4,
                      max_total_tokens=8192)
 

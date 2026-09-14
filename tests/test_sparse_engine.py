@@ -17,8 +17,9 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from tilerl.build import build_engine
 from tilerl.config import tiny
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.engine import SamplingParams
 from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
 from tilerl.model import Model, build_random
 from tilerl.testing import RefBackend
@@ -2405,7 +2406,7 @@ def test_served_sparse_default_auto_enables_device_select_and_sparse_graph():
     On a backend where graph auto-enables (here simulated), both flags come up;
     explicit decode_graph=False (and the real CPU cell, where _graph_on=False)
     keeps both off."""
-    import tilerl.engine as em
+    import tilerl.build as bm
 
     def _eng():
         return build_engine(
@@ -2420,8 +2421,8 @@ def test_served_sparse_default_auto_enables_device_select_and_sparse_graph():
     e.shutdown()
 
     # a served cuda-like cell: patch the single _graph_on predicate to True
-    orig = em._graph_on
-    em._graph_on = lambda backend, decode_graph: decode_graph is not False
+    orig = bm._graph_on
+    bm._graph_on = lambda backend, decode_graph: decode_graph is not False
     try:
         e = _eng()
         assert e._sparse_device_select is True and e._sparse_graph_on is True, (
@@ -2438,7 +2439,7 @@ def test_served_sparse_default_auto_enables_device_select_and_sparse_graph():
         assert e._sparse_graph_on is False
         e.shutdown()
     finally:
-        em._graph_on = orig
+        bm._graph_on = orig
 
 
 def test_a_shared_spill_failure_lets_requests_finish_token_exact(tmp_path):

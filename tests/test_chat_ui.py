@@ -701,8 +701,8 @@ def test_a_typed_budget_spent_inside_the_block_names_the_number_the_user_typed()
 def _tiny_client():
     from tilerl_kernels.backend import get_backend
 
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import build_engine
     from tilerl.model import build_random
     from tilerl.server import create_app
     from tilerl.tokenizer import get_tokenizer

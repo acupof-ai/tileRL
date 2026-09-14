@@ -18,8 +18,10 @@ os.environ.setdefault("TILERL_TARGET", "cuda")
 
 from tilerl_kernels.backend import get_backend  # noqa: E402
 
-from tilerl.cli import _build_model  # noqa: E402
-from tilerl.engine import build_engine  # noqa: E402
+from tilerl.build import (
+    build_engine,  # noqa: E402
+    build_model,  # noqa: E402
+)
 from tilerl.kv_cache import NoPrefixStore  # noqa: E402
 
 GiB = 2**30
@@ -48,8 +50,8 @@ def inventory(params, tag):
 
 
 report("start")
-cfg, model = _build_model("qwen38-27b", seed=0, keep_master=True)
-report("after _build_model(keep_master=True)")
+cfg, model = build_model("qwen38-27b", seed=0, keep_master=True)
+report("after build_model(keep_master=True)")
 inventory(model.params, "model.params after build")
 
 backend = get_backend()

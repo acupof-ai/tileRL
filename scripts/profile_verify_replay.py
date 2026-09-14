@@ -16,8 +16,9 @@ from collections import defaultdict
 import torch
 from tilerl_kernels.backend import get_backend
 
+from tilerl.build import build_engine
 from tilerl.config import qwen38_27b
-from tilerl.engine import SamplingParams, _DecodeGraph, build_engine
+from tilerl.engine import SamplingParams, _DecodeGraph
 from tilerl.model import load_hf
 
 

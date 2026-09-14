@@ -77,15 +77,14 @@ def main() -> None:
 
     from tilerl_kernels.backend import get_backend
 
-    from tilerl import cli
+    import tilerl.build as build  # noqa: E402
     from tilerl import engine as mod
     from tilerl.spec import load_draft
-
-    cli._QWEN38_SOURCE = args.source
+    build.QWEN38_SOURCE = args.source
     backend = get_backend()
-    cfg, model = cli._build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build.build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft) if args.draft else None
-    e = cli._build_engine(cfg, model, backend, draft=draft, depth=args.depth,
+    e = build.build_serving_engine(cfg, model, backend, draft=draft, depth=args.depth,
                           slots=4, blocks=2048, max_ctx=4096)
 
     t0 = time.perf_counter()

@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from tilerl.autograd import AdamW
-from tilerl.cli import _build_model
+from tilerl.build import build_model
 from tilerl.merge import (
     average_merge,
     dare_merge,
@@ -34,7 +34,7 @@ def _loss(model, ids, backend):
 
 
 def _sft(ids, backend, steps=15):
-    _, model = _build_model("tiny", seed=0, keep_master=True)
+    _, model = build_model("tiny", seed=0, keep_master=True)
     opt = AdamW(lr=1e-3)
     for _ in range(steps):
         train_step(model, ids, backend, opt)
@@ -49,7 +49,7 @@ def test_iso_merge_one_specialist_and_spectrum():
     """K=1 returns the specialist (up to the masked trailing modes), and every
     merged matrix carries the base's singular values."""
     backend = RefBackend()
-    _, base = _build_model("tiny", seed=0, keep_master=True)
+    _, base = build_model("tiny", seed=0, keep_master=True)
     spec = _sft(BATCH_A, backend)
     merged = iso_merge(_f32(base.params), [_f32(spec.params)])
     for k, w in merged.items():
@@ -93,7 +93,7 @@ def test_the_averaging_control_is_balanced_across_both_tasks():
     threshold is a wide band rather than a value fitted to these numbers.
     """
     backend = RefBackend()
-    cfg, base = _build_model("tiny", seed=0, keep_master=True)
+    cfg, base = build_model("tiny", seed=0, keep_master=True)
     a, b = _sft(BATCH_A, backend), _sft(BATCH_B, backend)
 
     def gains(specialists):
@@ -176,7 +176,7 @@ def test_iso_merge_two_specialists():
     `rho_keep` 0.9 -> 0.1 fails at A=21.646 B=21.110.
     """
     backend = RefBackend()
-    cfg, base = _build_model("tiny", seed=0, keep_master=True)
+    cfg, base = build_model("tiny", seed=0, keep_master=True)
     a, b = _sft(BATCH_A, backend), _sft(BATCH_B, backend)
     iso = Model(cfg, iso_merge(base.params, [a.params, b.params]))
     avg = Model(cfg, average_merge(base.params, [a.params, b.params]))
@@ -197,7 +197,7 @@ def test_ties_and_dare_keep_both_tasks_and_iso_beats_them():
     27B verdict that ISO must beat TIES/DARE. Measured at this tree:
     avg 18.46/17.55, ties 18.02/16.45, dare 18.45/17.55, iso 16.00/14.73, base 22.34/21.99."""
     backend = RefBackend()
-    cfg, base = _build_model("tiny", seed=0, keep_master=True)
+    cfg, base = build_model("tiny", seed=0, keep_master=True)
     a, b = _sft(BATCH_A, backend), _sft(BATCH_B, backend)
     arms = {
         name: Model(cfg, fn(base.params, [a.params, b.params]))
@@ -228,7 +228,7 @@ def test_merge_checkpoints_streams_shards_and_records(tmp_path, monkeypatch):
     backend = RefBackend()
     dirs, params = [], []
     for seed in (0, 1, 2):
-        cfg, model = _build_model("tiny", seed=0, keep_master=True)
+        cfg, model = build_model("tiny", seed=0, keep_master=True)
         if seed:
             ids = torch.randint(1, cfg.vocab_size, (2, 16), generator=torch.Generator().manual_seed(seed))
             for _ in range(3):
@@ -280,7 +280,7 @@ def test_merge_checkpoints_ties_and_dare_equal_dict_level(tmp_path):
     backend = RefBackend()
     dirs = []
     for seed in (0, 1):
-        cfg, model = _build_model("tiny", seed=0, keep_master=True)
+        cfg, model = build_model("tiny", seed=0, keep_master=True)
         if seed:
             for _ in range(3):
                 train_step(model, torch.randint(1, cfg.vocab_size, (2, 16)).numpy(),

@@ -24,9 +24,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import torch  # noqa: E402
 from tilerl_kernels.backend import get_backend  # noqa: E402
 
-from tilerl import cli  # noqa: E402
-from tilerl.cli import _build_model  # noqa: E402
-from tilerl.engine import SamplingParams, build_engine  # noqa: E402
+from tilerl.build import (
+    build_engine,  # noqa: E402
+    build_model,  # noqa: E402
+)
+from tilerl.engine import SamplingParams  # noqa: E402
 
 TOKENS = 2048
 NEW = 8
@@ -55,10 +57,11 @@ def main() -> None:
     ap.add_argument("--arm", required=True, choices=["auto", "force"])
     ap.add_argument("--source", required=True)
     args = ap.parse_args()
-    cli._QWEN38_SOURCE = args.source
+    import tilerl.build as build  # noqa: E402
+    build.QWEN38_SOURCE = args.source
     be = get_backend()
     print(f"# arm={args.arm} arch={be.arch} torch={torch.__version__}", flush=True)
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
 
     dg = None if args.arm == "auto" else True
     _run_engine(be, cfg, model, decode_graph=dg, sparse=False)
