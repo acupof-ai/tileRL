@@ -26,7 +26,7 @@ import torch
 from tilerl_kernels.backend import get_backend
 
 from tilerl.build import build_engine, build_model
-from tilerl.engine import _DecodeGraph
+from tilerl.decode_graph import DecodeGraph as _DecodeGraph
 from tilerl.kv_cache import BLOCK_TOKENS, BatchKv, NoPrefixStore
 
 dev = "cuda"

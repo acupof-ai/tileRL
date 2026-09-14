@@ -6,7 +6,7 @@ or a 1+depth draft chain on a verify tick) plus prefill chunks up to
 prefill, after agent-infer's ``build_forward_plan``. ponytail: chunked prefill
 is bounded by ``max_num_batched_tokens``; a prompt over ``max_total_tokens`` is
 still rejected at ``submit``. On CUDA a pure-decode tick
-replays a captured ``_DecodeGraph`` per batch-size bucket; mixed ticks and every
+replays a captured decode graph per batch-size bucket; mixed ticks and every
 other target run eager.
 
 Speculation (``draft=``): a decode row drafts up to ``spec_depth`` tokens and the
@@ -45,6 +45,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from .decode_graph import graph_bucket, make_decode_graph, make_sparse_graph
 from .kv_cache import BLOCK_TOKENS, BatchKv, NoPrefixStore
 from .kv_tiers import SpillWriteError
 from .spec import _PREFILL_BUCKET, LADDER_WIDTHS
@@ -107,9 +108,6 @@ def _graph_on(backend, decode_graph: bool | None) -> bool:
         return False
     return True
 
-
-#: Decode-graph size ladder: a tick pads up to the first bucket >= its row count.
-_GRAPH_BUCKETS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)
 
 _PHASE_PREFILL = 1
 _PHASE_DECODE = 2
@@ -313,279 +311,6 @@ class _Req:
     @property
     def done(self) -> bool:
         return self.phase == _PHASE_DONE
-
-
-class _DecodeGraph:
-    """Captured ``model.forward`` for one (batch, width) bucket: per tick, small
-    H2D copies of the inputs plus one replay. Replay mutates the engine's own
-    pools like the eager path; warmup writes to block 0 / slot 0 are overwritten
-    before any real request reads them.
-    """
-
-    def __init__(
-        self,
-        model,
-        backend,
-        kv_pool,
-        state_pool,
-        batch_size,
-        width=1,
-        pool=None,
-        last_only=False,
-        keep=0,
-        aux_layers=(),
-    ):
-        device = backend.device
-        B, W = batch_size, width
-        # int32 end to end: a long buffer costs a cast launch per use inside the graph.
-        self._b = B
-        self._w = W
-        self._ids = torch.empty(B, W, dtype=torch.int32, device=device)
-        self._pos = torch.empty(B, W, dtype=torch.int32, device=device)
-        self._bt = torch.zeros(B, kv_pool.num_blocks, dtype=torch.int32, device=device)
-        self._sl = torch.empty(B, dtype=torch.int32, device=device)
-        self._ss = torch.empty(B, dtype=torch.int32, device=device)
-        # Uniform W per row, as a static device buffer: a CPU->GPU fallback breaks capture.
-        self._sql = torch.full((B,), W, dtype=torch.int32, device=device)
-        # Pinned staging: an unpinned H2D copy_ is synchronous, ms per tick under contention.
-        self._ids_h = torch.empty(B, W, dtype=torch.int32, pin_memory=True)
-        self._pos_h = torch.empty(B, W, dtype=torch.int32, pin_memory=True)
-        self._bt_h = torch.zeros(B, kv_pool.num_blocks, dtype=torch.int32, pin_memory=True)
-        self._sl_h = torch.empty(B, dtype=torch.int32, pin_memory=True)
-        self._ss_h = torch.empty(B, dtype=torch.int32, pin_memory=True)
-        self._kv = BatchKv(
-            block_table=self._bt,
-            seq_len=self._sl,
-            state_slot=self._ss,
-            kv_pool=kv_pool,
-            state_pool=state_pool,
-            seq_q_lens=self._sql,
-            keep_steps=keep,  # verify ticks only; a W>1 prefill chunk has no step buffers
-        )
-        # Warmup on a side stream: tilelang JIT (host work) must finish before capture.
-        self._ids.fill_(0)
-        self._pos.fill_(0)
-        self._sl.fill_(W)
-        self._ss.fill_(0)
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(2):
-                model.forward(self._ids, self._pos, self._kv, backend, last_only=last_only)
-        torch.cuda.current_stream().wait_stream(s)
-        self._graph = torch.cuda.CUDAGraph()
-        hid: list = []
-        # One memory pool across buckets: a private pool per graph is never returned.
-        with torch.cuda.graph(self._graph, pool=pool):
-            self._logits = model.forward(
-                self._ids,
-                self._pos,
-                self._kv,
-                backend,
-                hidden_out=hid,
-                last_only=last_only,
-                aux_layers=aux_layers,
-            )
-            # inside the capture, so replay rewrites it like every other static buffer
-            aux = torch.cat(hid[: len(aux_layers)], -1) if aux_layers else None
-        self.hidden = hid[-1] if hid else None  # rewritten in place by every replay
-        self.aux = aux
-
-    def run(self, reqs, chains=None, pad=None):
-        """Copy per-tick inputs into the static buffers and replay; returns the
-        static logits [B,W,V], valid until the next replay. ``chains[i]`` is row
-        i's ``[last committed token, drafts...]``. ``pad`` is ``(state_slot,
-        block)`` for rows beyond ``len(reqs)``: padding rows still write to
-        the pools, so they must not land on a slot a live request owns."""
-        for i, r in enumerate(reqs):
-            if r.phase == _PHASE_PREFILL:
-                start = r.prefill_from
-                for j, tok in enumerate(r.tokens[start : start + self._w]):
-                    self._ids_h[i, j] = tok
-                    self._pos_h[i, j] = start + j
-                self._sl_h[i] = start + self._w
-            else:
-                chain = chains[i] if chains else (r.output[-1],)
-                for j, tok in enumerate(chain):
-                    self._ids_h[i, j] = tok
-                    self._pos_h[i, j] = r.seq_len - 1 + j
-                self._sl_h[i] = r.seq_len - 1 + self._w
-            self._ss_h[i] = r.state_slot
-            n = len(r.blocks)
-            self._bt_h[i, :n] = torch.tensor(r.blocks, dtype=torch.int32)
-        if pad is not None and len(reqs) < self._b:
-            pad_slot, pad_block = pad
-            for i in range(len(reqs), self._b):
-                self._ids_h[i, :] = 0
-                self._pos_h[i, :] = 0
-                self._sl_h[i] = self._w
-                self._ss_h[i] = pad_slot
-                self._bt_h[i, :] = pad_block
-        self._ids.copy_(self._ids_h, non_blocking=True)
-        self._pos.copy_(self._pos_h, non_blocking=True)
-        self._sl.copy_(self._sl_h, non_blocking=True)
-        self._ss.copy_(self._ss_h, non_blocking=True)
-        self._bt.copy_(self._bt_h, non_blocking=True)
-        self._graph.replay()
-        return self._logits
-
-
-class _SparseDecodeGraph:
-    """Captured sparse decode/verify tick for one (B, W, cmax) bucket.
-
-    Dense ``_DecodeGraph`` cannot serve sparse rows: it replays the FULL dense
-    block table, but a sparse row's ``r.blocks`` holds only the hot set and
-    attention reads the packed [selected ; own] table the SparseForward builds.
-    This wrapper captures a forward bound to a PERSISTENT, refillable
-    SparseForward (reuse=True):
-
-    - ``fill()`` runs OUTSIDE capture: it resolves the own window, and gathers
-      each row's candidate l2p/bounds into fixed staging tensors.
-    - the replay only reads those staging tensors, so selection, the packed
-      table and write offsets have one fixed shape per bucket and zero host
-      syncs. No promotion happens inside capture; a tick that needs one (or a
-      refresh, prefill, or a larger cmax bucket) runs eager instead.
-    """
-
-    def __init__(
-        self,
-        model,
-        backend,
-        kv_pool,
-        state_pool,
-        tracker,
-        sf,
-        batch_size,
-        width,
-        pool=None,
-        aux_layers=(),
-    ):
-        device = backend.device
-        B, W = batch_size, width
-        self._b, self._w = B, W
-        self.sf = sf
-        self._ids = torch.zeros(B, W, dtype=torch.long, device=device)
-        self._pos = torch.zeros(B, W, dtype=torch.long, device=device)
-        self._slots = torch.zeros(B, dtype=torch.long, device=device)
-        # full per-row logical length for write_tokens offset arithmetic
-        self._sl = torch.zeros(B, dtype=torch.long, device=device)
-        # valid query count per row (chain width for live rows)
-        self._sql = torch.full((B,), W, dtype=torch.long, device=device)
-        self._kv = BatchKv(
-            block_table=sf.own_table,
-            seq_len=self._sl,
-            state_slot=self._slots,
-            kv_pool=kv_pool,
-            state_pool=state_pool,
-            seq_q_lens=self._sql,
-            keep_steps=int(W > 1),
-            page_base=sf.page_base,
-            sparse=sf,
-        )
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(2):
-                model.forward(
-                    self._ids, self._pos, self._kv, backend, last_only=False, aux_layers=aux_layers
-                )
-        torch.cuda.current_stream().wait_stream(s)
-        self._graph = torch.cuda.CUDAGraph()
-        hid: list = []
-        with torch.cuda.graph(self._graph, pool=pool):
-            self._logits = model.forward(
-                self._ids,
-                self._pos,
-                self._kv,
-                backend,
-                hidden_out=hid,
-                last_only=False,
-                aux_layers=aux_layers,
-            )
-            aux = torch.cat(hid[: len(aux_layers)], -1) if aux_layers else None
-        self.hidden = hid[-1] if hid else None
-        self.aux = aux
-
-    def run(self, srows, chains, pad=None):
-        """Fill every static input and the sparse staging buffers, then replay.
-        ``srows`` are the decode geometry dicts (carry ``req``); pad slots past
-        n use ``(slot, block)``."""
-        B, W = self._b, self._w
-        sf = self.sf
-        sf.fill(srows)
-        for i, rw in enumerate(srows):
-            r = rw["req"]
-            chain = chains[i] if chains else (r.output[-1],)
-            self._ids[i, : len(chain)] = torch.tensor(chain, device=self._ids.device)
-            self._pos[i, : len(chain)] = torch.arange(
-                r.seq_len - 1, r.seq_len - 1 + len(chain), device=self._ids.device
-            )
-            self._sl[i] = r.seq_len - 1 + W
-            self._slots[i] = r.state_slot
-            self._sql[i] = len(chain)
-        n = len(srows)
-        if pad is not None and n < B:
-            pad_slot, pad_block = pad
-            for i in range(n, B):
-                self._ids[i, :] = 0
-                self._pos[i, :] = 0
-                self._sl[i] = W
-                self._slots[i] = pad_slot
-                self._sql[i] = W
-                sf.own_table[i, 0] = pad_block
-        self._graph.replay()
-        return self._logits
-
-
-class _CpuSparseGraph:
-    """CPU test seam for _SparseDecodeGraph: fills the same persistent
-    SparseForward staging buffers and runs the model eagerly, so the
-    selection/packed-table math the captured graph replays is exercised without a
-    CUDA card. The tensors the selection reads are the captured-sf staging ones;
-    a test asserts they are reused (stable data_ptr) and no host sync fires."""
-
-    def __init__(self, model, backend, kv_pool, state_pool, sf, B, W):
-        self.sf = sf
-        self._model, self._backend, self._kv, self._states = (model, backend, kv_pool, state_pool)
-        self._b, self._w = B, W
-        self.hidden = None
-
-    def run(self, srows, chains, pad=None):
-        sf = self.sf
-        sf.fill(srows)
-        B, W = self._b, self._w
-        ids = torch.zeros(B, W, dtype=torch.long)
-        pos = torch.zeros(B, W, dtype=torch.long)
-        sl = torch.zeros(B, dtype=torch.long)
-        ss = torch.zeros(B, dtype=torch.long)
-        sql = torch.full((B,), W, dtype=torch.long)
-        for i, rw in enumerate(srows):
-            r = rw["req"]
-            chain = chains[i]
-            ids[i, : len(chain)] = torch.tensor(chain)
-            pos[i, : len(chain)] = torch.arange(r.seq_len - 1, r.seq_len - 1 + len(chain))
-            sl[i] = r.seq_len - 1 + W
-            ss[i] = r.state_slot
-            sql[i] = len(chain)
-        for i in range(len(srows), B):
-            ss[i] = pad[0] if pad else 0
-            if pad:
-                sf.own_table[i, 0] = pad[1]
-        kv = BatchKv(
-            block_table=sf.own_table,
-            seq_len=sl,
-            state_slot=ss,
-            kv_pool=self._kv,
-            state_pool=self._states,
-            seq_q_lens=sql,
-            keep_steps=int(W > 1),
-            page_base=sf.page_base,
-            sparse=sf,
-        )
-        hid: list = []
-        logits = self._model.forward(ids, pos, kv, self._backend, hidden_out=hid, last_only=False)
-        self.hidden = hid[-1] if hid else None
-        return logits
 
 
 class Engine:
@@ -2262,12 +1987,11 @@ class Engine:
                 cmax_cap=key[2],
                 own_w_cap=own_w,
             )
-            try:
-                g = self._make_sparse_graph(sf, B, W)
-            except Exception as exc:
-                warnings.warn(
-                    f"sparse decode graph capture failed for {key} ({exc}); eager fallback"
-                )
+            g, self._graph_pool, err = make_sparse_graph(
+                self._model, self._backend, self._kv, self._states, self._sparse,
+                sf, B, W, self._aux_layers, self._graph_pool)
+            if g is None:
+                warnings.warn(f"sparse decode graph capture failed for {key}: {err}; eager fallback")
                 self._sparse_graph_on = False
                 return False
             self._sparse_graphs[key] = g
@@ -2299,26 +2023,6 @@ class Engine:
             else:
                 self._draft_step_timed(reqs)
         return True
-
-    def _make_sparse_graph(self, sf, B: int, W: int):
-        """_SparseDecodeGraph on cuda (real capture); a plain recorded forward on
-        CPU so the staging-only math is testable without a card."""
-        if self._backend.device.type == "cuda":
-            if self._graph_pool is None:
-                self._graph_pool = torch.cuda.graph_pool_handle()
-            return _SparseDecodeGraph(
-                self._model,
-                self._backend,
-                self._kv,
-                self._states,
-                self._sparse,
-                sf,
-                B,
-                W,
-                pool=self._graph_pool,
-                aux_layers=self._aux_layers,
-            )
-        return _CpuSparseGraph(self._model, self._backend, self._kv, self._states, sf, B, W)
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0, sf=None) -> BatchKv:
         sparse = sf is not None
@@ -2694,31 +2398,19 @@ class Engine:
         next bucket up, or the exact size above the ladder. `precapture` walks
         this over every admissible row count, so the two cannot disagree about
         which graphs exist."""
-        b = next((c for c in _GRAPH_BUCKETS if c >= rows), None)
-        return rows if b is None or self.limits.max_batch < b else b
+        return graph_bucket(rows, self.limits.max_batch)
 
-    def _graph_for(self, B: int, W: int, keep: bool) -> _DecodeGraph | None:
+    def _graph_for(self, B: int, W: int, keep: bool) -> Any | None:
         """The (B, W) graph, capturing it on first use. None (and graphs off) if
         capture fails, so the caller runs eager."""
         g = self._decode_graphs.get((B, W))
         if g is not None:
             return g
-        try:
-            if self._graph_pool is None:
-                self._graph_pool = torch.cuda.graph_pool_handle()
-            g = _DecodeGraph(
-                self._model,
-                self._backend,
-                self._kv,
-                self._states,
-                B,
-                width=W,
-                pool=self._graph_pool,
-                keep=W if keep else 0,
-                aux_layers=self._aux_layers,
-            )
-        except Exception as exc:
-            warnings.warn(f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback")
+        g, self._graph_pool, err = make_decode_graph(
+            self._model, self._backend, self._kv, self._states, B, W, keep,
+            self._aux_layers, self._graph_pool)
+        if g is None:
+            warnings.warn(err)
             self._decode_graph_on = False
             return None
         self._decode_graphs[(B, W)] = g

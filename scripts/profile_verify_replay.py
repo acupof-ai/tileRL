@@ -18,7 +18,8 @@ from tilerl_kernels.backend import get_backend
 
 from tilerl.build import build_engine
 from tilerl.config import qwen38_27b
-from tilerl.engine import SamplingParams, _DecodeGraph
+from tilerl.decode_graph import DecodeGraph as _DecodeGraph
+from tilerl.engine import SamplingParams
 from tilerl.model import load_hf
 
 
