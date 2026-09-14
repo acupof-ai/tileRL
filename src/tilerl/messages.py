@@ -305,6 +305,10 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
                                          "error": {"type": "invalid_request_error",
                                                    "message": str(exc)}})
         except (TimeoutError, RuntimeError) as exc:
+            # A timeout leaves the row generating: cancel frees the slot. On a
+            # RequestFailed RuntimeError the row is already gone and cancel is
+            # a no-op.
+            engine.cancel(rid_box[0])
             return JSONResponse(status_code=503,
                                 content={"type": "error",
                                          "error": {"type": "overloaded_error",

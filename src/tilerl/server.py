@@ -346,11 +346,16 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         except ClientDisconnected:
             return Response(status_code=499)
         except TimeoutError as exc:
+            # The server gave up waiting but the row is still generating: cancel
+            # frees the slot; cancel() on a row the engine already failed (the
+            # RuntimeError below) is a False-returning no-op.
+            engine.cancel(request_id)
             return JSONResponse(
                 status_code=504,
                 content={"error": {"message": str(exc), "type": "api_error"}},
             )
         except RuntimeError as exc:
+            engine.cancel(request_id)
             return JSONResponse(
                 status_code=500,
                 content={"error": {"message": str(exc), "type": "api_error"}},
@@ -475,6 +480,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                 time.sleep(0.02)
             output_ids = _await_completion(request_id)
         except (TimeoutError, RuntimeError) as exc:
+            engine.cancel(request_id)
             yield "error", {"message": str(exc), "type": "api_error"}, seen
             return
         except Exception as exc:

@@ -1764,9 +1764,11 @@ def test_the_routes_cancel_when_the_client_hangs_up():
     from tilerl import server
 
     src = inspect.getsource(server)
-    assert src.count("engine.cancel(request_id)") == 3, (
-        "expected the WebSocketDisconnect branch, the SSE generator's GeneratorExit "
-        f"and the non-stream chat route's CancelledError; found "
+    # WS disconnect + SSE GeneratorExit + chat CancelledError + SSE and chat
+    # timeout/error branches cancel the row before giving up (audit finding 3).
+    assert src.count("engine.cancel(request_id)") == 6, (
+        "expected the WS, SSE GeneratorExit, chat CancelledError, chat 504, "
+        f"chat 500 and SSE error branches to cancel; found "
         f"{src.count('engine.cancel(request_id)')}"
     )
     assert "except GeneratorExit:" in src, (
@@ -2027,3 +2029,145 @@ def test_await_or_cancel_polls_disconnect_at_interval_not_spin():
     import asyncio
 
     asyncio.run(main())
+
+
+@pytest.mark.parametrize("path,body,status", [
+    ("/v1/chat/completions",
+     {"model": "m", "max_tokens": 4,
+      "messages": [{"role": "user", "content": "hi"}]}, 504),
+    ("/v1/messages",
+     {"model": "m", "max_tokens": 4,
+      "messages": [{"role": "user", "content": "hi"}]}, 503),
+    ("/v1/responses",
+     {"model": "m", "max_output_tokens": 4,
+      "input": [{"role": "user", "content": [{"type": "input_text",
+                                              "text": "hi"}]}]}, 503),
+])
+def test_completion_timeout_cancels_the_still_running_row(path, body, status):
+    """A 504/503 from a completion TIMEOUT returns to the client but the engine
+    row is still generating. The route must cancel it, else slot and blocks
+    run to max_new_tokens for nobody (audit finding 3)."""
+    class _TimeoutEngine:
+        cancelled: list[int] = []
+
+        def submit(self, input_ids, params) -> int:
+            return 7
+
+        def room_for(self, prompt_tokens: int) -> int:
+            return 16
+
+        def take(self, request_id: int):
+            raise TimeoutError(f"request {request_id} timed out")
+
+        def cancel(self, request_id: int) -> bool:
+            self.cancelled.append(request_id)
+            return True  # the row was live: cancel dropped it
+
+        def stats(self) -> dict:
+            return {}
+
+        def stop_text(self, request_id: int):
+            return None
+
+        def logprobs(self, request_id: int):
+            return []
+
+    engine = _TimeoutEngine()
+    client = TestClient(create_app(engine, _ByteTokenizer()))
+    r = client.post(path, json=body)
+    assert r.status_code == status, (path, r.status_code, r.text)
+    assert engine.cancelled == [7], (path, "the timed-out row was never cancelled")
+
+
+@pytest.mark.parametrize("path,body", [
+    ("/v1/chat/completions",
+     {"model": "m", "max_tokens": 4,
+      "messages": [{"role": "user", "content": "hi"}]}),
+    ("/v1/messages",
+     {"model": "m", "max_tokens": 4,
+      "messages": [{"role": "user", "content": "hi"}]}),
+    ("/v1/responses",
+     {"model": "m", "max_output_tokens": 4,
+      "input": [{"role": "user", "content": [{"type": "input_text",
+                                              "text": "hi"}]}]}),
+])
+def test_completion_failure_cancel_is_a_noop_not_a_double_release(path, body):
+    """RuntimeError (engine already failed the row, e.g. pool exhausted): the
+    route still calls cancel, but the row is gone so it returns False and no
+    block is double-freed."""
+    freed: list[int] = []
+
+    class _FailedEngine:
+        def submit(self, input_ids, params) -> int:
+            return 9
+
+        def room_for(self, prompt_tokens: int) -> int:
+            return 16
+
+        def take(self, request_id: int):
+            raise RuntimeError(f"request {request_id} failed: pool exhausted")
+
+        def cancel(self, request_id: int) -> bool:
+            freed.append(request_id)
+            return False  # already gone: must not release twice
+
+        def stats(self) -> dict:
+            return {}
+
+        def stop_text(self, request_id: int):
+            return None
+
+        def logprobs(self, request_id: int):
+            return []
+
+    engine = _FailedEngine()
+    client = TestClient(create_app(engine, _ByteTokenizer()))
+    r = client.post(path, json=body)
+    assert r.status_code in (500, 503), (path, r.status_code, r.text)
+    assert freed == [9], "cancel called once as a no-op"
+
+
+@pytest.mark.parametrize("path,body", [
+    ("/v1/chat/completions",
+     {"model": "m", "max_tokens": 4,
+      "messages": [{"role": "user", "content": "hi"}]}),
+    ("/v1/messages",
+     {"model": "m", "max_tokens": 4,
+      "messages": [{"role": "user", "content": "hi"}]}),
+    ("/v1/responses",
+     {"model": "m", "max_output_tokens": 4,
+      "input": [{"role": "user", "content": [{"type": "input_text",
+                                              "text": "hi"}]}]}),
+])
+def test_a_successful_completion_never_cancels(path, body):
+    """The cancel additions must not touch the success path."""
+    class _OkEngine:
+        cancelled: list[int] = []
+
+        def submit(self, input_ids, params) -> int:
+            return 3
+
+        def room_for(self, prompt_tokens: int) -> int:
+            return 16
+
+        def take(self, request_id: int):
+            return [10, 11, 12, 13]
+
+        def cancel(self, request_id: int) -> bool:
+            self.cancelled.append(request_id)
+            return True
+
+        def stats(self) -> dict:
+            return {}
+
+        def stop_text(self, request_id: int):
+            return None
+
+        def logprobs(self, request_id: int):
+            return []
+
+    engine = _OkEngine()
+    client = TestClient(create_app(engine, _ByteTokenizer()))
+    r = client.post(path, json=body)
+    assert r.status_code == 200, (path, r.status_code, r.text)
+    assert engine.cancelled == [], "success must not cancel"
