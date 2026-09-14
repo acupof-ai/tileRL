@@ -1555,30 +1555,11 @@ class Engine:
         if decodes and prefills:
             self._mixed_forwards += 1
         if self._draft is not None:
-            # The draft writes position seq_len-1 on EVERY row it sees, including a
-            # row that just left prefill this tick -- and the growth loop above only
-            # covers `decodes`. A 15-token prompt therefore reached the draft owning
-            # one block while position 15 needs the second, which raised
-            # `IndexError: index 1 is out of bounds` from kv_cache.py:149, three
-            # frames away inside the trunk's own writer. Clamping the draft's span
-            # instead leaves a hole in its KV and the next position attends over it:
-            # measured, the engine then drafted token 79 where full context drafts 61.
-            for r in rows:
-                if r.sparse_on:
-                    # The dense draft KV span is fully RESERVED at admit (prompt +
-                    # max_new + verify width bound), so the blocks already exist.
-                    # This is a bound check, not a grow: allocating here would race
-                    # another row for the shared draft pool.
-                    end = r.seq_len - 1 + self._width - 1
-                    assert len(r.draft_blocks) * BLOCK_TOKENS > end, (
-                        f"draft needs position {end} but admit reserved "
-                        f"{len(r.draft_blocks)} blocks"
-                    )
-                    continue
-                while r.blocks and len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 1:
-                    r.blocks.append(self._kv.alloc_block())
-                    r.own_blocks += 1
-                    self._blocks_used += 1
+            # Grow every decode row's blocks to cover the draft's post-commit
+            # write BEFORE draft.step, via the one planner shared with the
+            # captured-graph path (#621). Also covers a row that left prefill
+            # this tick (the growth loop above only handles `decodes`).
+            rows = self.ensure_draft_write_blocks(rows)
             self._draft_step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
             if sparse:
                 # draft K/V for this tick's dropped pages now exist: publish them
@@ -1869,10 +1850,55 @@ class Engine:
                     r.hidden, r.hidden_from = g.hidden[i : i + 1], r.seq_len - 1
             self._sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
         if self._draft is not None:
-            # No block-growth loop needed here: this path runs only with `not prefills`, so
-            # the pre-fork `seq_len - 1 + q` loop already covers the draft's furthest write.
+            # Grow to cover the post-commit write via the SAME planner the eager
+            # path uses: pre-fork growth covers the verifier chain but is one
+            # block short when a commit lands exactly on a 16-boundary (#621).
+            reqs = self.ensure_draft_write_blocks(reqs)
+            if not reqs:
+                return True
             self._draft_step(reqs)
         return True
+
+    def ensure_draft_write_blocks(self, rows: list[_Req]) -> list[_Req]:
+        """Grow each decode row's blocks so they cover the draft's post-commit
+        write ``hi = seq_len-1`` (plus, for a sparse row, the verifier tail),
+        immediately before ``draft.step``. One shared planner for the eager and
+        captured-graph paths: the graph path used to rely on pre-fork growth
+        sized for the verifier chain, which is one block short when a commit
+        lands exactly on a 16-token boundary (#621). Mutates ``rows`` in place,
+        dropping rows the pool cannot fit (failed alone, ``pool_exhausted``);
+        returns the same list."""
+        if self._draft is None:
+            return rows
+        kept = rows
+        for r in list(rows):
+            if r.sparse_on:
+                # The dense draft KV span is fully RESERVED at admit (prompt +
+                # max_new + verify width bound), so the blocks already exist.
+                # This is a bound check, not a grow: allocating here would race
+                # another row for the shared draft pool.
+                end = r.seq_len - 1 + self._width - 1
+                assert len(r.draft_blocks) * BLOCK_TOKENS > end, (
+                    f"draft needs position {end} but admit reserved "
+                    f"{len(r.draft_blocks)} blocks")
+                continue
+            need = max(0, (r.seq_len + BLOCK_TOKENS - 1) // BLOCK_TOKENS - len(r.blocks))
+            if need > self._kv.free_blocks:
+                # By count, not catching alloc_block's raise: an exception out of
+                # here reaches step()'s handler and fails EVERY running request.
+                self._finish(
+                    r,
+                    error=f"PagedKvPool exhausted: need {need} block(s), "
+                    f"{self._kv.free_blocks} free",
+                    reason="pool_exhausted",
+                )
+                kept.remove(r)
+                continue
+            while len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 1:
+                r.blocks.append(self._kv.alloc_block())
+                r.own_blocks += 1
+                self._blocks_used += 1
+        return kept
 
     def _draft_step(self, rows: list[_Req]) -> None:
         """One named tick-step binding for the draft head: timed when the engine
