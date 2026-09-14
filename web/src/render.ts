@@ -326,10 +326,31 @@ export const paint = (t: Turn): void => {
   t.answerTail.replaceChildren(markdown(t.answer.slice(t.settled)))
 }
 
-/** The end state. `truncated` is the only one that writes a notice: the reasoning
- * is already on screen and stays open, so the reader sees what the budget was
- * spent on instead of an empty bubble. */
-export const settle = (t: Turn, kind: "answered" | "truncated" | "empty", cap: number): void => {
+/** Cap the rendered log at `max` finished turns. Conversation history is text
+ * and stays intact; only on-screen nodes go. The in-flight turn (`.pending`)
+ * and the last turn are exempt even past the cap, so pruning can never remove
+ * what is streaming or the freshest reply. */
+export const pruneTurns = (el: HTMLElement, max: number): void => {
+  const kids = Array.from(el.children)
+  let extra = kids.length - max
+  for (const k of kids) {
+    if (extra <= 0) break
+    if (k === kids.at(-1)) continue
+    if ((k as HTMLElement).classList.contains("pending")) continue
+    k.remove()
+    extra -= 1
+  }
+}
+
+/** The end state. `truncated` and `dropped` write a notice: truncated keeps the
+ * reasoning open so the reader sees what the budget was spent on; `stopped`
+ * writes nothing because a user stop is not a failure and the partial reply
+ * already on screen is the answer. */
+export const settle = (
+  t: Turn,
+  kind: "answered" | "truncated" | "empty" | "stopped" | "dropped",
+  cap: number,
+): void => {
   t.root.classList.remove("pending")
   if (kind === "truncated") {
     t.fold.open = true
@@ -342,5 +363,8 @@ export const settle = (t: Turn, kind: "answered" | "truncated" | "empty", cap: n
   } else if (kind === "empty") {
     t.note.hidden = false
     t.note.replaceChildren(document.createTextNode("the model returned an empty reply"))
+  } else if (kind === "dropped") {
+    t.note.hidden = false
+    t.note.replaceChildren(document.createTextNode("connection lost before the reply finished"))
   }
 }

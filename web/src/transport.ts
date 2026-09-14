@@ -1,4 +1,4 @@
-import { type Frame, parseFrame } from "./protocol"
+import { type CloseKind, type Frame, classifyClose, parseFrame } from "./protocol.ts"
 
 /** One request, one socket, closed when the stream ends.
  *
@@ -6,9 +6,11 @@ import { type Frame, parseFrame } from "./protocol"
  * engine request per connection, so a shared socket would need request ids and a
  * demultiplexer for a page that never has two turns in flight.
  *
- * `onFrame` is called for each frame; the promise settles when the socket closes,
- * and rejects only on a transport error. The caller's `finally` is what releases
- * the composer, so a dropped connection cannot leave the page stuck.
+ * Resolves with why the socket closed (see `classifyClose`): a user stop, a
+ * close after a terminal frame, or an abnormal mid-turn drop. There is no
+ * auto-reconnect: the protocol carries no frame ids, so a resend regenerates
+ * the turn and every streamed token would appear twice. The caller decides
+ * whether a `dropped` turn offers a manual retry.
  *
  * `onStop` receives a function that closes the socket. Handing it out rather than
  * returning the socket keeps the WebSocket itself inside this file -- the caller
@@ -19,8 +21,10 @@ export const ask = (
   body: unknown,
   onFrame: (f: Frame) => void,
   onStop?: (stop: () => void) => void,
-): Promise<void> =>
-  new Promise<void>((resolve, reject) => {
+): Promise<CloseKind> =>
+  new Promise<CloseKind>((resolve) => {
+    let stopped = false
+    let terminal = false
     const ws = new WebSocket(url)
     ws.onopen = () => ws.send(JSON.stringify(body))
     ws.onmessage = (e) => {
@@ -29,16 +33,19 @@ export const ask = (
       // and the next frame may be fine. Logged so protocol drift is visible
       // rather than silently rendering short.
       if (f === null) console.warn("tilerl: unparseable frame", e.data)
-      else onFrame(f)
+      else {
+        if (f.t !== "delta") terminal = true
+        onFrame(f)
+      }
     }
-    // onclose fires for a clean close too, so resolve there rather than waiting
-    // on a `done` frame that a dropped connection never sends.
-    ws.onclose = () => resolve()
-    ws.onerror = () => reject(new Error("connection failed"))
-    // resolve on user stop: closing the socket cancels the request server-side
+    ws.onclose = () => resolve(classifyClose(stopped, terminal))
+    // A failed handshake fires onerror then onclose; with no terminal frame that
+    // classifies as "dropped", which is the honest reason too.
+    ws.onerror = () => {}
+    // Closing the socket cancels the request server-side.
     onStop?.(() => {
+      stopped = true
       ws.close()
-      resolve()
     })
   })
 

@@ -8,6 +8,9 @@
     "exactOptionalPropertyTypes": true,
     "noUncheckedIndexedAccess": true,
     "noEmit": true,
+    // Internal imports carry .ts so node:test can run the sources directly via
+    // type stripping (node --test); vite/tsc resolve the same specifiers.
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true
   },
   "include": ["src"]

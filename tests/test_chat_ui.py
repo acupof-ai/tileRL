@@ -186,16 +186,20 @@ const mk = (tag) => ({
     add(...c){ c.forEach((x) => this._s.add(x)); },
     remove(...c){ c.forEach((x) => this._s.delete(x)); },
     contains(c){ return this._s.has(c); } },
-  appendChild(c){ this.children.push(c); return c; },
+  appendChild(c){ this.children.push(c); c._parent = this; return c; },
   // Real ordering, not an append alias: `paint` inserts finished blocks BEFORE
   // the streaming tail, so a stub that ignored the ref node would hide a tail
   // that drifted out of last place.
   insertBefore(c, ref){ const i = this.children.indexOf(ref);
     const kids = c.tagName === "#FRAGMENT" ? c.children : [c];
+    kids.forEach((k) => { k._parent = this; });
     this.children.splice(i === -1 ? this.children.length : i, 0, ...kids); return c; },
-  append(...c){ this.children.push(...c); },
+  append(...c){ this.children.push(...c); c.forEach((k) => { k._parent = this; }); },
   replaceChildren(...c){ this.children = c.flatMap((x) =>
-    x.tagName === "#FRAGMENT" ? x.children : [x]); },
+    x.tagName === "#FRAGMENT" ? x.children : [x]);
+    this.children.forEach((k) => { k._parent = this; }); },
+  remove(){ const p = this._parent; if (p) {
+    const i = p.children.indexOf(this); if (i !== -1) p.children.splice(i, 1); } },
   addEventListener(ev, fn){ (this._h ||= {})[ev] = fn; },
   focus(){}, scrollIntoView(){},
   // Scroll geometry, so the page's "am I at the bottom" check has something to
@@ -214,6 +218,11 @@ globalThis.document = {
 globalThis.window = { location: { protocol: "http:", host: "x", href: "http://x/" },
   addEventListener(){} };
 globalThis.location = globalThis.window.location;
+// Frames replay synchronously, so a paint frame runs synchronously too: the
+// coalescing collapses to paint-per-frame, which is the behaviour these gates
+// already assert. A rAF that deferred would put every assertion ahead of the
+// paint it checks.
+globalThis.requestAnimationFrame = (fn) => { fn(); return 0; };
 // One socket, driven from the test: the bundle opens it, we replay the captured
 // frames into onmessage, then close. No network, no timing.
 globalThis.SENT = [];
@@ -221,7 +230,10 @@ globalThis.WebSocket = class {
   constructor(url){ globalThis.SOCK = this; this.url = url;
     queueMicrotask(() => this.onopen && this.onopen()); }
   send(d){ SENT.push(d); queueMicrotask(() => {
-    for (const f of FRAMES) this.onmessage({ data: f });
+    // DROP: replay every frame EXCEPT the terminal one, then close -- a server
+    // restart mid-turn. The bundle must call this "dropped", not "stopped".
+    const out = DROP ? FRAMES.slice(0, -1) : FRAMES;
+    for (const f of out) this.onmessage({ data: f });
     this.onclose && this.onclose();
   }); }
   close(){}
@@ -408,7 +420,8 @@ def test_the_websocket_protocol_library_is_installed():
 
 
 def _page_after(frames: list[str], budget: str = "",
-                scroll_top: int | None = None, stop_after: bool = False) -> dict:
+                scroll_top: int | None = None, stop_after: bool = False,
+                drop: bool = False) -> dict:
     """Run the shipped bundle over `frames`; return what landed in the DOM.
 
     ``budget`` is what the user typed in the budget box; "" is the shipped default
@@ -430,6 +443,7 @@ def _page_after(frames: list[str], budget: str = "",
         "const FRAMES = " + json.dumps(frames) + ";\n"
         + ("const SCROLLTOP = " + json.dumps(scroll_top) + ";\n" if scroll_top is not None else "")
         + "const STOP = " + ("true" if stop_after else "false") + ";\n"
+        + "const DROP = " + ("true" if drop else "false") + ";\n"
         + _DOM_STUB
         + "".join(f'IDS["{i}"] = mk("div");\n' for i in ids)
         + "".join(f'IDS["{i}"].checked = true;\n' for i in sorted(checked))
@@ -630,6 +644,20 @@ def test_stopping_settles_the_turn_instead_of_raising():
     got = _page_after(_ws_frames(["</think>\npartial answer"], max_tokens=512), stop_after=True)
     assert got["note"] is None, f"a user stop rendered an error: {got['note']}"
     assert got["pending"] is False, "the turn stayed pending after a stop"
+
+
+def test_a_close_before_the_terminal_frame_is_a_drop_not_a_stop():
+    """A server restart mid-turn must not look like a deliberate stop.
+
+    The frames arrive but the final `done` frame never does, then the socket
+    closes. The page names this a lost connection with a retry, and keeps the
+    partial answer on screen. The control (a clean stop) carries no note at all,
+    so an "everything is stopped" regression passes one arm without the other.
+    """
+    got = _page_after(_ws_frames(["</think>\nhalf a reply"], max_tokens=512), drop=True)
+    assert got["note"] and "connection lost" in got["note"], got
+    assert "half a reply" in got["answer"], got["answer"]
+    assert got["pending"] is False, "the dropped turn stayed pending"
 
 
 def test_the_page_renders_the_frames_this_server_sends():
