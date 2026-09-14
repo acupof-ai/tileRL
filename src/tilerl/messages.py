@@ -313,12 +313,15 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         except (TimeoutError, RuntimeError) as exc:
             # A timeout leaves the row generating: cancel frees the slot. On a
             # RequestFailed RuntimeError the row is already gone and cancel is
-            # a no-op.
+            # a no-op. EngineOverloaded never submitted, so no cancel applies.
             engine.cancel(rid_box[0])
+            from .server import overloaded_body
+            err = (overloaded_body(exc)
+                   or {"type": "api_error", "message": str(exc)})
             return JSONResponse(status_code=503,
                                 content={"type": "error",
-                                         "error": {"type": "overloaded_error",
-                                                   "message": str(exc)}})
+                                         "error": {"type": err["type"],
+                                                   "message": err["message"]}})
         headers = {"x-tilerl-request-id": str(rid)}
         if not req.stream:
             return JSONResponse(content=body, headers=headers)
