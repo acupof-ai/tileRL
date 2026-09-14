@@ -602,3 +602,15 @@ def test_pack_fp4_chunked_matches_whole_pack():
     assert torch.equal(wq_c, wq_w)
     assert torch.equal(sc_c, sc_w)
     assert torch.equal(os_c, os_w)
+
+
+def test_row_target_argument_is_written_not_the_sm90_literal():
+    """F18: _row took target but the dict hardcoded "sm90", so a V100 calibration
+    wrote sm70 rows into the sm90 population. The argument must round-trip and two
+    arches must stay separate populations (the actual corruption was the mix)."""
+    r70 = cal._row(cal.BW_METRIC, 800.0, "GB/s", V100, 0, "d", "sm70")
+    r90 = cal._row(cal.BW_METRIC, 3312.0, "GB/s", H20, 0, "d", "sm90")
+    assert r70["target"] == "sm70"
+    assert r90["target"] == "sm90"
+    # Separation the roofline relies on: exact-name match plus distinct target.
+    assert {r70["target"], r90["target"]} == {"sm70", "sm90"}

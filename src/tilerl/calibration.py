@@ -275,7 +275,7 @@ def measure_fp8_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> flo
 
 
 def _row(metric: str, value: float, unit: str, device_name: str, card: int,
-         derivation: str, uuid: str | None = None, target: str = "sm90"):
+         derivation: str, target: str, uuid: str | None = None):
     from .ledger import _benchrec
 
     br = _benchrec()
@@ -286,7 +286,7 @@ def _row(metric: str, value: float, unit: str, device_name: str, card: int,
         "metric": metric,
         "value": float(value),
         "unit": unit,
-        "target": "sm90",
+        "target": target,
         "build": "eager",
         "model": "device",
         "shape": {"card": card},
@@ -343,8 +343,8 @@ def calibrate_rows(card: int) -> list[dict]:
             device_name,
             card,
             "sustained D2D copy >=1 GiB, read+write, CUDA-event median; floor = this measurement",
-            uuid,
-            target=arch,
+            arch,
+            uuid=uuid,
         )]
     if arch == "sm70":
         rows.append(_row(
@@ -354,8 +354,8 @@ def calibrate_rows(card: int) -> list[dict]:
             device_name,
             card,
             "one large fp16 square GEMM (2n^3 flops), CUDA-event median; sm70 has no bf16 tensor path",
-            uuid,
-            target=arch))
+            arch,
+            uuid=uuid))
         return rows
     rows += [
         _row(
@@ -365,8 +365,8 @@ def calibrate_rows(card: int) -> list[dict]:
             device_name,
             card,
             "one large bf16 square GEMM (2n^3 flops), CUDA-event median; floor = this measurement",
-            uuid,
-            target=arch),
+            arch,
+            uuid=uuid),
         _row(
             FP8_PEAK_METRIC,
             measure_fp8_peak_tflops(card),
@@ -375,8 +375,8 @@ def calibrate_rows(card: int) -> list[dict]:
             card,
             "one large fp8 (e4m3) scaled square GEMM (2n^3 flops) through torch._scaled_mm, "
             "CUDA-event median; the ceiling for fp8 GEMM rows",
-            uuid,
-            target=arch),
+            arch,
+            uuid=uuid),
         _row(
             PCIE_METRIC,
             measure_pcie_h2d_gbs(card),
@@ -385,8 +385,8 @@ def calibrate_rows(card: int) -> list[dict]:
             card,
             "sustained pinned host->device copy >=1 GiB (one-way), CUDA-event median; "
             "the sparse cold-page PCIe fetch floor",
-            uuid,
-            target=arch),
+            arch,
+            uuid=uuid),
     ]
     return rows
 
