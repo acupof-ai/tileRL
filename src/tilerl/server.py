@@ -32,12 +32,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .messages import _COMPLETION_TIMEOUT_S, _parse_tool_calls, mount_messages
 from .prompt import (
+    await_completion,
     cut_at_stop,
+    flatten_tools,
     refuse_unsupported,
     render_prompt,
     sampling,
     split_think,
     stop_texts,
+    thinking_enabled,
     unknown_fields,
 )
 from .responses import mount_responses
@@ -106,20 +109,6 @@ def _normalize_thinking(body: dict) -> dict:
                                         "enable_thinking": body.pop("enable_thinking")}
     return body
 
-
-def _flatten_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
-    """OpenAI's ``{type, function: {name, description, parameters}}`` as the flat
-    ``{name, description, input_schema}`` the template renders and
-    ``messages._parse_tool_calls`` reads schemas from. One tool vocabulary for
-    both routes, so a call parses identically whichever API asked for it."""
-    if not tools:
-        return None
-    out = []
-    for t in tools:
-        fn = t.get("function") or t
-        out.append({"name": fn.get("name"), "description": fn.get("description", ""),
-                    "input_schema": fn.get("parameters") or fn.get("input_schema") or {}})
-    return out
 
 
 def _render_chat(messages: list[ChatMessage], thinking: bool | None = None,
@@ -236,10 +225,11 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         if thinking is None:
             # The checkpoint's template treats an undefined enable_thinking as TRUE and
             # always emits <think> one way or the other, so leaving it unset made the model
-            # open the tag in its own output. Default to the template's answer, but only for
-            # a tokenizer that HAS the tag: ByteTokenizer spells it as 7 raw bytes, and its
+            # open the tag in its own output. cap == 0 (reasoning_effort none) switches
+            # thinking off; otherwise default to the template's answer, but only for a
+            # tokenizer that HAS the tag - ByteTokenizer spells it as 7 raw bytes and its
             # bare turn is the tiny/dev path the None state exists for.
-            thinking = (len(tokenizer.encode("<think>")) == 1 or None) if cap != 0 else False
+            thinking = thinking_enabled(tokenizer, None, cap == 0)
         # We render tools into the prompt and cannot force or forbid a call, so a
         # tool_choice stronger than a hint is refused rather than echoed.
         unknown_fields(req)  # warns; this route has no recorder, so the warn is all there is
@@ -249,7 +239,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         choice = req.tool_choice
         named = choice if isinstance(choice, str) else (choice or {}).get("type")
         refuse_unsupported(tool_choice=named not in ("auto", "none", None))
-        tools = _flatten_tools(req.tools)
+        tools = flatten_tools(req.tools)
         input_ids = tokenizer.encode(_render_chat(
             req.messages, thinking, kw.get("reasoning_effort") or req.reasoning_effort, tools
         ))
@@ -271,15 +261,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
     def _await_completion(request_id: int,
                           timeout_s: float = _COMPLETION_TIMEOUT_S) -> list[int]:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            # take() pops only this request: poll() would steal other
-            # concurrent requests' completions (single-consumer semantics).
-            done = engine.take(request_id)
-            if done is not None:
-                return done
-            time.sleep(0.02)
-        raise TimeoutError(f"request {request_id} did not finish within {timeout_s}s")
+        return await_completion(engine, request_id, timeout_s)
 
     @app.get("/health")
     def health() -> dict:

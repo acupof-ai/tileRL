@@ -33,7 +33,6 @@ import asyncio
 import json
 import os
 import re
-import time
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -41,6 +40,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .prompt import (
+    await_completion,
     blocks_to_text,
     cut_at_stop,
     refuse_unsupported,
@@ -209,17 +209,7 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         rid = engine.submit(input_ids, params)
         if rid_box is not None:
             rid_box[0] = rid
-        deadline = time.monotonic() + _COMPLETION_TIMEOUT_S
-        out: list[int] | None = None
-        while time.monotonic() < deadline:
-            out = engine.take(rid)
-            if out is not None:
-                break
-            time.sleep(0.02)
-        if out is None:
-            raise TimeoutError(
-                f"request {rid} did not finish within {_COMPLETION_TIMEOUT_S}s"
-            )
+        out = await_completion(engine, rid, _COMPLETION_TIMEOUT_S)
         scores = engine.logprobs(rid)  # single reader; a second one raises
         reasoning, text = split_think(tokenizer.decode(out), opened=_thinking(req))
         stopped = engine.stop_text(rid)

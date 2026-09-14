@@ -37,11 +37,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .messages import _COMPLETION_TIMEOUT_S, _parse_tool_calls
 from .prompt import (
+    await_completion,
     cut_at_stop,
+    flatten_tools,
     refuse_unsupported,
     render_prompt,
     sampling,
     split_think,
+    thinking_enabled,
     unknown_fields,
     unsupported_choice,
 )
@@ -130,15 +133,6 @@ def _hosted_tools(tools: list[dict[str, Any]] | None) -> dict[str, Any]:
     return {f"tools[type={k}]": True for k in sorted(kinds)}
 
 
-def _flatten_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
-    """Responses' ``{type, name, parameters}`` as the flat shape the template
-    renders and ``_parse_tool_calls`` reads schemas from -- the same vocabulary
-    the other two routes use, so a call means one thing across all three."""
-    if not tools:
-        return None
-    return [{"name": t.get("name"), "description": t.get("description", ""),
-             "input_schema": t.get("parameters") or t.get("input_schema") or {}}
-            for t in tools]
 
 
 def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
@@ -147,14 +141,10 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
     from .server import ClientDisconnected, await_or_cancel
 
     def _thinking(req: ResponsesRequest) -> bool | None:
-        # An explicit override wins; "none" effort switches it off; otherwise the
-        # template's own default, which needs a tokenizer that HAS the tag.
+        # Responses input adapter: explicit chat_template_kwargs, then effort=none.
         explicit = (req.chat_template_kwargs or {}).get("enable_thinking")
-        if explicit is not None:
-            return bool(explicit)
-        if (req.reasoning or {}).get("effort") == "none":
-            return False
-        return len(tokenizer.encode("<think>")) == 1 or None
+        effort_none = (req.reasoning or {}).get("effort") == "none"
+        return thinking_enabled(tokenizer, explicit, effort_none)
 
     def _run(req: ResponsesRequest, rid_box: list | None = None) -> dict[str, Any]:
         unknown_fields(req)  # warns; no recorder on this route either
@@ -167,7 +157,7 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
             tool_choice=unsupported_choice(req.tool_choice),
             **_hosted_tools(req.tools))
         thinking = _thinking(req)
-        tools = _flatten_tools(req.tools)
+        tools = flatten_tools(req.tools)
         prompt = render_prompt(_to_messages(req.input), req.instructions, tools,
                                thinking, (req.reasoning or {}).get("effort"))
         input_ids = tokenizer.encode(prompt)
@@ -181,15 +171,7 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         rid = engine.submit(input_ids, params)
         if rid_box is not None:
             rid_box[0] = rid
-        deadline = time.monotonic() + _COMPLETION_TIMEOUT_S
-        out = None
-        while time.monotonic() < deadline:
-            out = engine.take(rid)
-            if out is not None:
-                break
-            time.sleep(0.02)
-        if out is None:
-            raise TimeoutError(f"request {rid} did not finish within {_COMPLETION_TIMEOUT_S}s")
+        out = await_completion(engine, rid, _COMPLETION_TIMEOUT_S)
         reasoning, text = split_think(tokenizer.decode(out), bool(thinking))
         stopped = engine.stop_text(rid)
         text, calls = _parse_tool_calls(cut_at_stop(text, stopped), tools)
