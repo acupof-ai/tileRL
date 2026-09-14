@@ -50,11 +50,15 @@ def fan_in() -> collections.Counter[str]:
             in_src = root == "src" and "tilerl_kernels" not in str(p)
             for n in ast.walk(tree):
                 found = []
-                if isinstance(n, ast.ImportFrom) and n.module:
-                    if n.module.startswith("tilerl."):
+                if isinstance(n, ast.ImportFrom):
+                    if n.module and n.module.startswith("tilerl."):
                         found.append(n.module.split(".")[1])
                     elif n.level and in_src:
-                        found.append(n.module)
+                        # `from . import x` (module is None) or `from . import x, y`
+                        if n.module:
+                            found.append(n.module)
+                        else:
+                            found.extend(a.name for a in n.names)
                 for m in found:
                     if m in names:
                         edges[m] += 1
