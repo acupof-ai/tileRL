@@ -16,7 +16,7 @@ deletion that the existing gates can check.
 | God CLI | `cli.py` is 2,820 lines and four products (parser 381, train/RL loop with eval statistics ~1,100, bench renderers ~280, ledger rendering ~100). It imports 20 tilerl modules. `_train_adapters` alone is 608 lines, `_build_parser` 381, `cmd_bench_kernels` 173 |
 | Two builders | `engine.build_engine` (324 lines) and `cli._build_engine` / `cli._build_model` both assemble an engine; tests and 89 scripts call one or the other |
 | Import cycles | `autograd`↔`sparse_index`, `calibration`↔`cli`, `cli`↔`memory`, `dflash2`↔`spec`, `model`↔`tensor_parallel` |
-| Upward imports | `memory` and `calibration` import `cli`; `prompt` imports `engine` |
+| Upward imports | `memory` and `calibration` import `cli`; `autograd` imports `sparse_index` |
 | Three API routes, three request paths | OpenAI, Anthropic and Responses routes each copy the completion wait loop, thinking resolution and the non-stream post-processing |
 | Storage is one file | `kv_cache.py` (1,919 lines) mixes device pools, host and SSD tiers, the boot store and the prefix store |
 | Docs describe a removed engine | 13 stale sections in design-engine, design-kernels, design-sparse-kv and design-cost-model: no hybrid serve, `NoPrefixStore` for sparse, the old `tilerl.ops` path |
@@ -36,13 +36,13 @@ L4  build.py                    config + checkpoint -> Model, Engine (the only a
 L3  schedule   engine.py        submit/poll/StepLimits, admit, plan, commit, release, loop
                decode_graph.py  captured dense and sparse decode graphs, buckets, precapture
                sparse_engine.py SparseTracker, SparseForward, SparsePrefixCache, sparse runtime
-               spec.py          draft + verify (dflash2 merged in)
+               spec.py          draft + verify (dflash2.py merged in at step 6)
                memory.py        byte plan + measured ledger rows (engine stats call it)
 L2  storage    kv_cache.py      PagedKvPool, LinearStatePool, PrefixStore, BatchKv
                kv_tiers.py      HostKvPages, ColdSsdFile, DramSnapshots, KvBootStore
                sparse_index.py  page bounds and selection math
 L1  model      model.py tensor_parallel.py autograd.py
-L0  base       precision.py config.py tokenizer.py
+L0  base       precision.py config.py tokenizer.py testing.py
     kernels    packages/tilerl-kernels (backend, registry, kernels_*, reference)
 ```
 
