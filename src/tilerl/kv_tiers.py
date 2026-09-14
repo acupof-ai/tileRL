@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import pickle
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -949,6 +950,9 @@ class KvBootStore:
                 vs = as_tensor(vsf, sshape, torch.float32)
                 scales = (ks, vs)
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            # The store stays loud about corrupt on-disk state; the ENGINE's
+            # admit path narrows these into a cache miss. Raising here keeps a
+            # direct store user (and tests) able to tell corruption from a miss.
             raise RuntimeError(f"corrupt or unreadable boot entry {h:016x}: {exc}") from exc
 
         out_blocks: list[int] = []
@@ -972,13 +976,16 @@ class KvBootStore:
                 ks, vs = scales
                 pool.k_scale.index_copy_(1, idx, ks.permute(1, 0, 2, 3).to(dev, non_blocking=nb))
                 pool.v_scale.index_copy_(1, idx, vs.permute(1, 0, 2, 3).to(dev, non_blocking=nb))
-        except Exception:
+            if pool.k_pool.is_cuda:
+                torch.cuda.synchronize(pool.device)
+            state = None
+            if mf.get("has_state"):
+                # Inside the cleanup block: aux.pt loads AFTER the page copies, so
+                # a torch.load failure must free the freshly allocated blocks
+                # (F19), then re-raise for the engine's admit path to miss.
+                state = torch.load(os.path.join(d, self.AUX), map_location="cpu")
+        except (OSError, RuntimeError, pickle.UnpicklingError, EOFError):
             for b in out_blocks:
                 pool.free_block(b)
             raise
-        if pool.k_pool.is_cuda:
-            torch.cuda.synchronize(pool.device)
-        state = None
-        if mf.get("has_state"):
-            state = torch.load(os.path.join(d, self.AUX), map_location="cpu")
         return {"blocks": out_blocks, "state": state, "length": len(tokens)}

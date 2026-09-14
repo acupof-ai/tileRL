@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import re
 import sys
 import threading
@@ -1111,11 +1112,25 @@ class Engine:
         boot_state: Any = None
         boot_loaded = False
         if boot_len:
-            loaded = self._boot.boot(req.tokens[:boot_len], self._kv)
+            # The store is loud on purpose (a corrupt k.bin/truncated aux.pt raises);
+            # an admit path must turn that into a miss, or step()'s handler fails every
+            # running request for one bad on-disk entry. The types are what torch.load
+            # and the file/manifest/CRC reads actually raise — no broad Exception.
+            try:
+                loaded = self._boot.boot(req.tokens[:boot_len], self._kv)
+            except (OSError, EOFError, pickle.UnpicklingError, RuntimeError):
+                loaded = None
             if loaded is None:
-                return False  # corrupt/vanished between exists() and load: admit as miss next tick
-            hit_blocks, boot_state = loaded["blocks"], loaded["state"]
-            matched, boot_loaded = loaded["length"], True
+                # Corrupt/vanished entry: admit as a normal prefill miss. Not
+                # `return False` — exists() is still true, so the next _admit
+                # tick would fail the same way forever.
+                boot_len = 0
+                needed = total_blocks - len(hit_blocks)
+                if self._kv.free_blocks < needed:
+                    return False
+            else:
+                hit_blocks, boot_state = loaded["blocks"], loaded["state"]
+                matched, boot_loaded = loaded["length"], True
         if matched:
             if boot_loaded:
                 self._boot_hits += 1
