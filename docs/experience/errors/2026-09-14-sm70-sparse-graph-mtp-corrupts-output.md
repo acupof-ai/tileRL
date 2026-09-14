@@ -1,0 +1,33 @@
+# sm70 sparse decode graph + MTP d1 corrupts multi-token output — 2026-09-14
+
+> Status: open. H1 (warmup/capture scribbling live block 0) disproved on
+> device; #585 closed. H2 (a capture at a cmax-bucket transition) untested.
+> The hybrid engine (#586) avoids the defect by forcing the sparse graph off.
+
+## Context
+
+V100 sm70, sparse k=128 + MTP depth 1 + `--decode-graph` deterministically
+corrupts multi-token decode; 1-token answers stay exact. Under B=4 the same
+configuration hit an illegal memory access with leaked slots. All eager
+variants and dense+graph soaks are exact. Sparse graphs are captured lazily
+per `(B,W,cmax,own_w)` key on the first matching tick.
+
+## Root cause
+
+Unknown. H1 — warmup forwards on zeroed static buffers addressing physical
+block 0 and flipping `win_parity` on live slot 0 — was #585's hypothesis;
+the device probe came back MAIN_BUG-free with H1 fixed, disproving it. H2, a
+capture firing at a cmax-bucket transition while live rows change buckets,
+is untested.
+
+## Fix
+
+None. Workaround in force: the hybrid (#586) keeps sparse ticks eager even
+with `--decode-graph` on (`_sparse_graph_on` forced false under hybrid,
+asserted in a CPU gate). Next arm: capture at a forced bucket transition and
+compare first-logit and `win_parity` state to eager.
+
+## Rule
+
+A lazy capture keyed on a live-traffic shape is a live-mutation hazard until
+every key transition is captured against a pad frame, not just the first.
