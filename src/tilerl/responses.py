@@ -155,7 +155,7 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
             return False
         return len(tokenizer.encode("<think>")) == 1 or None
 
-    def _run(req: ResponsesRequest) -> dict[str, Any]:
+    def _run(req: ResponsesRequest, rid_box: list | None = None) -> dict[str, Any]:
         unknown_fields(req)  # warns; no recorder on this route either
         refuse_unsupported(
             previous_response_id=req.previous_response_id,
@@ -178,6 +178,8 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         params = sampling(tokenizer, thinking, max_new,
                           temperature=req.temperature, top_p=req.top_p, stop=req.stop)
         rid = engine.submit(input_ids, params)
+        if rid_box is not None:
+            rid_box[0] = rid
         deadline = time.monotonic() + _COMPLETION_TIMEOUT_S
         out = None
         while time.monotonic() < deadline:
@@ -258,9 +260,13 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
 
     @app.post("/v1/responses")
     async def responses(req: ResponsesRequest):
+        rid_box: list = [-1]
         try:
             # to_thread, same reason as messages.py.
-            body = await asyncio.to_thread(_run, req)
+            body = await asyncio.to_thread(_run, req, rid_box)
+        except asyncio.CancelledError:
+            engine.cancel(rid_box[0])
+            raise
         except ValueError as exc:
             return JSONResponse(status_code=400,
                                 content={"error": {"message": str(exc),

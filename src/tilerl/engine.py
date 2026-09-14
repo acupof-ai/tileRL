@@ -3123,10 +3123,18 @@ class Engine:
             for queue in (self._running, self._waiting):
                 req = next((r for r in queue if r.req_id == request_id), None)
                 if req is not None:
+                    # Same flag a cold-spill failure row carries: _release then skips
+                    # close_request, which would publish and maybe spill a prefix for a
+                    # reader that is already gone.
+                    req.failed = True
                     self._release(req)
                     self._failed[request_id] = (None, "cancelled: the reader disconnected")
                     self._finished_count += 1
                     queue.remove(req)
+                    # A cancel leaves no rows, so the loop idles and step()'s post-tick
+                    # refresh never runs: without this /health keeps reporting the dead row.
+                    if self._thread is not None:
+                        self._stats_snapshot = self._build_stats()
                     return True
             return False
 
