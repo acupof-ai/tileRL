@@ -6,7 +6,7 @@
 > `insert` publishes — are not, because there is no second stream on `"c"` and a
 > local test of either would pass for the wrong reason.
 >
-> Row 50 PR B. Approach: [`docs/design-ssd-read-path.md`](../../design-ssd-read-path.md).
+> Row 50 PR B. Approach: [`docs/design-ssd-read-path.md`](../../history/design-ssd-read-path.md).
 > Batching prep: [`2026-09-07-load-kv-writes-two-copies-not-two-per-block.md`](2026-09-07-load-kv-writes-two-copies-not-two-per-block.md).
 
 ## Context

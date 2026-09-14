@@ -1,6 +1,6 @@
 # The SSD read path: proposed async-with-deadline, landed off-tick reader — 2026-09-09
 
-**Status:** closed. The design doc (`design-ssd-read-path.md`, marked SUPERSEDED
+**Status:** closed. The design doc (`history/design-ssd-read-path.md`, marked SUPERSEDED
 2026-09-09) proposed an async fetch with a deadline; what shipped was an off-tick
 reader thread.
 

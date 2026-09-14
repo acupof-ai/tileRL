@@ -79,7 +79,7 @@ off the generated source without a pod round trip.
 cannot show:
 
 ```bash
-python3 -c 'import torch; from tilerl.ops.kernels_linear import make_linear_fp4_gemv as m
+python3 -c 'import torch; from tilerl_kernels.kernels_linear import make_linear_fp4_gemv as m
 src = m("cuda", 8, 4).get_kernel_source(torch.zeros(1,17408,dtype=torch.bfloat16),
     torch.zeros(5120,8704,dtype=torch.uint8), torch.zeros(5120,1088), 32, 4, 16)
 open("/work/k.cu","w").write(src)'

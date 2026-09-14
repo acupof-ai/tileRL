@@ -11,7 +11,7 @@ unchanged — they are the contract.
 | Scheduling | `engine.py` | `submit(input_ids, params) -> req_id`, `poll() -> {req_id: tokens}`, `StepLimits`. Continuous batching, one forward per tick. |
 | Model | `model.py` | `load_hf` (every checkpoint format) + forward. Calls backend ops only. |
 | Adapter | `packages/tilerl-kernels/src/tilerl_kernels/backend.py` | `(precision, arch) → kernels` registry — see [design-kernels.md](design-kernels.md). |
-| Storage | `kv_cache.py` | `PagedKvPool` (paged blocks, COW on shared prefix) + `LinearStatePool` (GDN recurrent state) + rolling-hash prefix cache. |
+| Storage | `kv_cache.py`, `sparse_engine.py` | `PagedKvPool` (paged blocks, COW on shared prefix) + `LinearStatePool` (GDN recurrent state) + rolling-hash prefix cache. The sparse cold path adds `HostKvPages` (pinned-host KV tier), `ColdSsdFile` (mmap spill, `--cold-ssd-path`/`--cold-ssd-bytes`) and `DramSnapshots` (demoted GDN state, `--dram-bytes`). |
 
 Training shares the stack: `train.py` drives the same `model.py` forward
 through the hand-written tape (`autograd.py`), same backend ops. One runtime.
@@ -25,20 +25,42 @@ through the hand-written tape (`autograd.py`), same backend ops. One runtime.
   `build_forward_plan`): waiting/running queues, a per-tick token budget
   (`StepLimits.max_num_batched_tokens`), decode rows first plus at most one
   prefill chunk sharing the forward. No preemption/swap day-1.
-- **The decode tick is a captured kernel sequence, not an interpreted one.**
-  Decode is memory-bound and static: the same ops, the same shapes, every
+- **The decode tick is a captured kernel sequence on the dense serving path.**
+  Dense decode is memory-bound and static: the same ops, the same shapes, every
   token, for the life of the process. A static sequence repeated 10⁴+ times is
-  compiled once and replayed — eager per-op dispatch is the dev/parity mode,
-  never the serving path. The capture lives behind the engine seam: `step()`
+  compiled once and replayed — eager per-op dispatch is the dev/parity mode on
+  that path. The capture lives behind the engine seam: `step()`
   has an eager implementation (correctness, parity) and a captured one
   (CUDA graph per shape bucket, serving); the model and backend don't know
-  which is running.
+  which is running. Two exceptions: sm70's AUTO path disables capture (dense
+  capture fails there and poisons the allocator), and the hybrid long-prompt
+  path below runs eager on purpose.
 - **Storage owns three things**: paged KV, GDN state, prefix cache. The engine
   asks for prefix hits and block tables; it never touches KV memory directly.
 - **The model is backend-neutral**: no TileLang/torch calls above `ops/`.
 - **Prefix sharing is read-only, not COW**: shared blocks are never modified
   after publishing; `PrefixStore.insert` enforces that no block is written
-  after sharing.
+  after sharing. Sparse builds use a second store, `SparsePrefixCache`
+  (host-blob backed, content-hash namespaced): it holds published pages' host
+  blobs and bounds, never the live device blocks, and the same read-only rule
+  applies. `NoPrefixStore` is now an explicit opt-out only (the RL path), not
+  the sparse default.
+
+## Hybrid serve (#586)
+
+One engine serves two regimes:
+
+- Prompts no longer than `--sparse-min-tokens` run **dense** on the captured
+  decode graph and pin their whole context in the device pool (no sparse
+  sharing).
+- Longer prompts run **sparse** with eager ticks and the host/SSD cold tiers.
+- A dense prompt that could never fit the device pin even with the pool empty
+  reroutes sparse in `submit` instead of queueing on an impossible admit.
+
+Admit therefore has two regimes, and the dense regime reserves the sparse hot
+ceiling so both can coexist. The sparse side is documented in
+[design-sparse-kv.md](design-sparse-kv.md); the `submit`/`poll` seam and
+one-forward-per-tick loop are unchanged.
 
 ## Physics (what the design must satisfy)
 
