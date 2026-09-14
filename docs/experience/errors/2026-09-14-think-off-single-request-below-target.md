@@ -1,6 +1,6 @@
 # Think-off single request runs at 48.1 tok/s, below the 50 target — 2026-09-14
 
-> Status: open. Unexplained; one bimodal run recorded on V100 sm70.
+> Status: closed 2026-09-14 by decision. The 50 tok/s single-request target is withdrawn (ckl): 48.1 tok/s, 4% short, and the bimodal-timing investigation is not worth the cost. The record stays for anyone who reopens single-request latency.
 
 ## Context
 
