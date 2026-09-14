@@ -127,20 +127,35 @@ output fidelity settle.
 KL(dense‖sparse), top-1 agreement and greedy-continuation agreement vs the
 dense forward (`scripts/output_fidelity.py`,
 `scripts/fidelity_checks.py`): diffuse mass can still yield token-equal
-outputs, so mass fraction is the wrong acceptance quantity. The chosen k is
-pending the sm70 full-k continuity row (k = pages−8 must be KL ≈ 0 / top1 ≈ 1)
-and the multi-span dense-vs-sparse table; no k above 128 is the default yet.
+outputs, so mass fraction is the wrong acceptance quantity. The sm70 full-k
+continuity row landed in #546 (k=all is token-identical: KV writers had ignored
+`page_base`); the remaining pending item is the multi-span dense-vs-sparse
+fidelity table. No k above 128 is the default yet.
 
-**k > 128 also needs an engine/ledger change, not just a flag.** The hot pool
-is sized `slots × (n_groups·k + WINDOW_PAGES + chunk) + 1` — the four source
-groups each reserve their own k pages (no cross-group union). Measured on the
-V100 (#539 review): k=128 → 1107 blocks / 1.08 GiB; k=1024 → 4137 pages per
-slot ≈ 4.0 GiB f32 K (≈ 8 GiB K+V) at one slot and 33,097 blocks ≈ 32 GiB K at
-the default 8 slots, which does not fit with the 27B weights on a 32 GB sm70
-card. Any k decision above 128 requires the per-tick resident set to hold the
-cross-group union (engine change), and the ledger `kv_hot` row must count
-`n_groups·k` rather than `k`. See the [#539](https://github.com/acupof-ai/tileRL/pull/539)
-review thread.
+**k > 128 also needs an engine change, not just a flag.** The hot pool
+is sized `slots × (n_groups·k + WINDOW_PAGES + chunk) + 1` and `memory.sparse_rows`
+prices that allocated pool exactly (the ledger half landed; see "Cost model
+rows"). Measured on the V100 (#539 review): k=128 → 1107 blocks / 1.08 GiB;
+k=1024 → 4137 pages per slot ≈ 4.0 GiB f32 K (≈ 8 GiB K+V) at one slot and
+33,097 blocks ≈ 32 GiB K at the default 8 slots, which does not fit with the
+27B weights on a 32 GB sm70 card. What remains for k above 128 is only the
+per-tick cross-group UNION engine change (`union_cap`, parked — see below).
+See the [#539](https://github.com/acupof-ai/tileRL/pull/539) review thread.
+
+## Hybrid dense/sparse serve (#586)
+
+`--sparse-min-tokens N` runs prompts up to N tokens **dense** on the captured
+decode graph: the whole context is pinned in the device pool and no sparse
+sharing applies. Longer prompts run the sparse path (eager ticks, this
+document). A prompt whose dense pin would not fit the device pool even empty is
+rerouted sparse in `submit` instead of queueing.
+
+The two regimes share one engine, so dense admit reserves the sparse hot
+ceiling (`memory.sparse_rows`'s `kv_hot`): without that reservation a sparse
+row admitted alongside dense ones raises "hot pool undersized" when the
+selector's victim search cannot find a frame. `--sparse-prefill-tokens` bounds
+one sparse prefill tick so a dense request's wait on the mixed engine stays
+near one second.
 
 ## Selection is page-granular
 
@@ -206,24 +221,19 @@ the current `l2p >= 0` mask AND "the page survives the marginality clipping",
 computed from the same batched scores with no new host sync. Demotion still
 goes through the one-batch D2H context.
 
-**Ledger.** There is no existing row equal to the pool ceiling; today's two
-`kv_hot` readings are:
-- *Plan/dry-run row* (`memory.sparse_rows`): `k + WINDOW_PAGES` — no
-  `n_groups` factor, and `hot_extra_pages` (the chunk) has no nonzero caller in
-  `src/`. At k=128 on the 27B that is 136 pages while the pool allocates
-  `4*128+8+33 = 553`, so the plan-derived `kv_hot` under-prices the real device
-  pool by ~n_groups on multi-group models (and misses the chunk).
-- *Live engine row* (`_memory_rows`): per-tick residency (`sum(len(r.blocks))`
-  / `_measured_peak` on current residents), held pages this tick, not allocated
-  capacity.
+**Ledger.** The plan row already equals the pool ceiling: `memory.sparse_rows`
+prices the allocated pool — `num_slots × (n_groups·k + WINDOW_PAGES + chunk)
++ 1` spare, matching `sparse_pool_num_blocks`. The live engine row
+(`_memory_rows`) stays different on purpose: per-tick residency
+(`sum(len(r.blocks))` / `_measured_peak` on current residents), the HELD set
+this tick, not allocated capacity — never assert the two are equal.
 
-Introducing `union_cap` fixes the plan row: thread the real pool sizing (the
-union, or the worst case `n_groups*k + W + chunk`) into `sparse_rows` /
-`_sparse_spec` so the dry-run row matches the pool's `num_blocks`, and price
-`union_cap` per slot. The live row stays per-tick residency; stats gains one
-measured counter, the tick union size, so the bench prints the planned ceiling
-vs held-union distribution. The eager refresh promotes the
-highest-aggregate-score missing pages up to free union slots.
+Introducing `union_cap` keeps that split: the plan row prices `union_cap` per
+slot (the union, or the worst case `n_groups*k + W + chunk` that reproduces
+today's pool), while stats gains one measured counter, the tick union size, so
+the bench prints the planned ceiling vs held-union distribution. The eager
+refresh promotes the highest-aggregate-score missing pages up to free union
+slots.
 
 **Gates (CPU tiny):** (1) `h_pages` large enough that the union never clips —
 token-identical to the current per-group sizing; (2) `union_cap = k` with
@@ -243,7 +253,7 @@ default needs `union_cap`. Revive when a measured k above ~128 is chosen.
 
 ```
 index_keys  device  count = pages_resident x 4 source layers x 4 heads, fmt = Format(bits=8, scales=((128, f32),)), shape [128]   (learned indexer; bounds scorer: pages x 16 layers x [2, 4, 256] bf16)
-kv_hot      device  count = rows x (k_pages + 8 window) hot pages, bytes = one whole KV block per hot page   (today: no n_groups factor — under-prices the multi-group pool by ~n_groups; the union_cap change above makes this rows x union_cap == pool num_blocks)
+kv_hot      device  count = num_slots × (n_groups·k_pages + 8 window + chunk) + 1 spare — the pool build_engine allocates (worst-case disjoint groups), bytes = one whole KV block per hot page   (the parked union_cap change replaces n_groups·k with the measured union)
 kv_cold     host|ssd count = pages_written - pages_on_device, per_kv_block_bytes
 ```
 
@@ -310,78 +320,44 @@ table already gathers pages, and the selected set is a shorter block table.
 The indexer and selector are new ops with CPU twins first, under the same
 registry rules as every other kernel.
 
-## Prefix sharing under sparsity (stopgap, then the host-tier publish)
+## Prefix sharing under sparsity (shipped in #526)
 
-The first sparse engine ships with prefix caching **off for sparse builds**
-(`build_engine(sparse_k>0)` forces `NoPrefixStore`). The dense publish path
-hands `req.blocks[:length//16]` — live device blocks — to `PrefixStore.insert`,
-but sparse finalize demotes every private page to the host tier each tick, so
-at a publish boundary that slice is empty and the store raises
-("64 tokens need 4 blocks, got 0"). Building the default store anyway crashed
-the first request whose prompt crossed one interior chunk boundary (≥ 64
-tokens), which is why the refusal is enforced in `build_engine`, not left as a
-documentation warning.
+Sparse builds share prefixes through `SparsePrefixCache`, a host-blob-backed
+index wired in `build_engine` when the sparse tracker has sharing enabled. It
+exists because sparse finalize demotes private pages to the host each tick, so
+the dense `PrefixStore` (which retains live device blocks) cannot serve sparse:
 
-The upgrade that restores prefix sharing for sparse builds:
+1. **Content-hash namespace.** A published page names its shared host blob by
+   the page content hash (`HostKvPages.share_hold`), keyed independently of the
+   request-private `(req_id, logical_page)` demotion key; no id allocation and
+   equal pages dedupe for free.
+2. **Entries carry bounds and a GDN snapshot.** A hit adopts the published
+   pages' Quest bounds exactly as a dense hit adopts a state snapshot, zero
+   recompute.
+3. **Lazy promote-on-select.** Adopt adopts the shared keys without promotion;
+   `resolve` copies a selected page into a private block via
+   `promote_keyed((rid, page))` the first time the selector names it, reconciling
+   the shared and private keys there.
+4. **Three-way eviction.** Dropping an entry releases the shared blob refs
+   (`share_release`/`forget`, refcounted so a page shared with a surviving entry
+   stays), the bounds and any device promotion together.
 
-1. **Publish at the boundary after demotion, into a shared namespace.**
-   Finalize demotes the chunk-boundary pages, then publishes them; a
-   published entry names host-held pages, not device blocks. Private cold
-   blobs are keyed `(req_id, logical_page)` via
-   `demote_page(block, key=…)` (#528) — the physical frame is freed and
-   recycled, so there is no stable block id to name. That key is
-   request-private and cannot identify a prefix shared *across requests*,
-   so publishing does not hand over the private blob: it clone-holds the
-   page in a SECOND, req-independent namespace keyed by the page's content
-   hash (`HostKvPages.share_hold`). The choice of namespace is the load-
-   bearing one — a store-owned prefix id or a content/logical key works;
-   the content hash needs no id allocation and deduplicates equal pages
-   for free.
-2. **Store entries carry the bounds snapshot with the pages.** The
-   selector's `SparseTracker` bounds are request-private in the first cut;
-   a prefix entry must adopt the published pages' Quest bounds (device-
-   resident, small — the `page_bounds` cost row: 64 KiB/page on the 27B)
-   exactly as a dense entry carries the GDN state snapshot. A hit then
-   restores bounds and shared cold blobs with zero host copies: the page
-   stays cold until the selector names it, and promotion copies the
-   read-only shared blob into a private fresh block through
-   `promote_keyed((rid, page))` for the request's PRIVATE copy (the
-   #500 `promote_page` phys-keyed seam is not this path).
-3. **Hit adoption promotes lazily, reconciling the two keys.** `_admit`'s
-   retain-and-refcount path assumes live device blocks; the sparse hit
-   adopts bounds + the shared content keys without promotion, records each
-   page's content key for the request, and `_sparse_resolve` looks the
-   selected page up by that shared key, copies it into a private block
-   keyed `(rid, page)`, and unlinks the page from the shared entry —
-   first use does the shared→private key reconciliation. The store's
-   read-only rule is unchanged.
-4. **Eviction is three-way coherent.** Dropping a prefix entry must
-   release the shared blob references (a page shared with a surviving
-   entry keeps its blob), the bounds, and any device promotion together;
-   the shared blob is refcounted for this, and the host tier's
-   `share_release`/`forget` are the two host handles.
-
-Until this lands, sparse serving pays a full prefill per distinct prompt; the
-dense engine keeps prefix caching unchanged.
+Only a contiguous longest-frontier prefix is published (dropped pages buffer
+until 0..m-1 have all left the resident union and a state snapshot at m exists).
+The store is read-only in the same sense as the dense store. `NoPrefixStore` is
+now an explicit opt-out only (`sharing_enabled=False`; the RL path), no longer
+forced for sparse builds.
 
 ## What does not change
 
 `submit`/`poll`, `StepLimits`, the one-forward-per-tick loop, the captured
-decode tick (the selector runs inside it at a fixed k), `PagedKvPool`'s block
+dense decode tick (the sparse long-prompt path is eager; the selector runs
+inside the tick at a fixed k), `PagedKvPool`'s block
 API, `paged_attention`'s signature, the prefix store's read-only rule, and the
 `peak = static + transient` invariant, which now has three more static rows.
-The one first-cut exception is the bullet above: a sparse build runs with
-`NoPrefixStore` until host-tier publishing lands.
 
 ## Ownership
 
-| Unit | Owner | Gate |
-|------|-------|------|
-| A. `plan` rows `index_keys`/`kv_hot`/`kv_cold`, `--sparse-k` dry-run, `kernel_cost` indexer rows | 52 | derived == storage bytes on tiny |
-| B. page-bounds scorer + selector, CPU twins, `k >= context` equals dense; then the sm70 cell and the V100 256k bench | cc | `test_sparse_equals_dense_at_full_k`; V100 tokens/s + device bytes table at 128k/256k |
-| C. page `location`, demote/promote of KV blocks on `DramSnapshots`' path | 5f | a demoted page promoted reads back byte-equal; decode tokens equal with and without demotion |
-| D. learned indexer in V4.1 form (page keys, source layers, window), KL warm-up recipe, indexer backward, sparse attention backward | 65 | gradcheck on tiny; warm-up recipe runs one step on tiny |
-| E. sm90 cell: indexer + selector from `deepseek_v32`, bench rows with `%bound` | after the runbook, cards 0-7 | roofline table in the wins entry |
-
-A-D start now in parallel and need no card; B's V100 half follows its CPU half. Each unit is one PR with a non-author review on goal fit,
-entropy (no second KV mechanism, no field without a consumer) and the 27B path.
+Units A–D started in parallel with no card needed; B's V100 half followed its
+CPU half. That work is complete (the historical A–E table is in
+[history/ownership-tables.md](history/ownership-tables.md)).

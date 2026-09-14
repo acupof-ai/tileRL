@@ -5,7 +5,7 @@
 > `wins/2026-09-05-the-ssd-tiers-read-path-did-not-exist.md`'s **1.738–1.821x**,
 > and it fills this entry in the next card window. No CHANGELOG line until then.
 >
-> Row 50 PR A. Approach: `docs/design-ssd-read-path.md`.
+> Row 50 PR A. Approach: `docs/history/design-ssd-read-path.md`.
 
 ## Context
 

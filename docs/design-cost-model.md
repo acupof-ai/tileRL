@@ -96,6 +96,12 @@ counted tiny tape (`tests/test_train_plan.py`); a nonzero static-row delta on
 27B is an error entry, not a tolerance. Nothing runs in the tick — `plan` is
 build-time arithmetic, the table reads counters.
 
+The sparse owners (`index_keys`/`page_bounds`, `kv_hot`, `kv_cold`) come from
+`memory.sparse_rows`: `kv_hot` prices the allocated pool
+(`num_slots × (n_groups·k + 8-window + chunk) + 1 spare`, matching
+`sparse_pool_num_blocks`) and hybrid admit reserves that sparse hot ceiling.
+See [design-sparse-kv.md](design-sparse-kv.md) "Cost model rows".
+
 ## Kernel cost
 
 Each launched kernel declares a pure helper next to its registry entry:
@@ -137,9 +143,5 @@ their wins/errors entries with a one-line rerun command.
 
 ## Ownership
 
-| Unit | Owner | PRs |
-|------|-------|-----|
-| `Format`/`nbytes`, call sites, checkpoint faces, byte gate | cc | #458, #462 |
-| `plan`, dry-run, residency, transient peak | 52 | #460, #465, #469 |
-| kernel roofline, prefill rows, calibration | 5f | #457, #463, #466, #468 |
-| recompute recorded numbers, delete superseded probes | 65 | #461, #470 |
+All units landed; the historical table is in
+[history/ownership-tables.md](history/ownership-tables.md).
