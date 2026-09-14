@@ -41,9 +41,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .prompt import (
     await_completion,
+    bad_effort,
     blocks_to_text,
     choice_name,
     cut_at_stop,
+    effort_text,
     refuse_unsupported,
     render_prompt,
     render_tool_call,
@@ -51,6 +53,7 @@ from .prompt import (
     sampling,
     split_think,
     strip_think,
+    think_cap,
     tools_for_render,
     unknown_fields,
     unsupported_choice,
@@ -170,11 +173,14 @@ def _thinking(req: MessagesRequest) -> bool:
 
 
 def _effort(req: MessagesRequest) -> str | None:
-    """The template's reasoning_effort. It knows xhigh/medium/low only, and
-    aliases high; Claude Code's "max" has to be aliased too or it silently
-    renders as medium."""
+    """The prompt-text effort (xhigh/medium/low) for the rendered template."""
+    return effort_text(_effort_raw(req))
+
+
+def _effort_raw(req: MessagesRequest) -> str | None:
+    """The caller's effort string, lowercased; feeds the shared cap/validation."""
     e = ((req.output_config or {}).get("effort") or "").lower()
-    return "xhigh" if e in ("high", "max") else (e or None)
+    return e or None
 
 
 def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: str) -> FastAPI:
@@ -196,7 +202,9 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
 
     def _run(req: MessagesRequest, rollout: str | None = None, rid_box: list | None = None
              ) -> tuple[dict[str, Any], int]:
+        effort_raw = _effort_raw(req)
         refuse_unsupported(*_unsatisfied_edits(req.context_management),
+                           reasoning_effort=bad_effort(effort_raw),
                            tool_choice=unsupported_choice(req.tool_choice))
         input_ids = tokenizer.encode(_render(req))
         if not input_ids:
@@ -209,6 +217,7 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         # ceiling checks at 0.
         params = sampling(tokenizer, _thinking(req), max(1, min(req.max_tokens, budget)),
                           temperature=req.temperature, top_p=req.top_p, logprobs=True,
+                          max_think_tokens=think_cap(effort_raw),
                           stop=req.stop_sequences)
         rid = engine.submit(input_ids, params)
         if rid_box is not None:

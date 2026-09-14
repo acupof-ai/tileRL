@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .messages import _COMPLETION_TIMEOUT_S, _parse_tool_calls, mount_messages
 from .prompt import (
     await_completion,
+    bad_effort,
     choice_name,
     cut_at_stop,
     flatten_tools,
@@ -42,6 +43,7 @@ from .prompt import (
     sampling,
     split_think,
     stop_texts,
+    think_cap,
     thinking_enabled,
     tools_for_render,
     unknown_fields,
@@ -99,10 +101,6 @@ class ChatCompletionRequest(BaseModel):
 
     # One assignment: a second would replace this config, not merge into it.
     model_config = ConfigDict(populate_by_name=True, extra="allow")
-
-
-#: reasoning_effort -> cap on <think> tokens; "none" switches thinking off in the prompt.
-_MAX_THINK = {"none": 0, "minimal": 128, "low": 512, "medium": 2048, "high": 8192}
 
 
 def _ws_body(ask: dict) -> dict:
@@ -228,7 +226,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         return JSONResponse(status_code=400, content=body)
 
     def _submit(req: ChatCompletionRequest) -> tuple[int, int, int, bool, list | None]:
-        cap = _MAX_THINK.get((req.reasoning_effort or "").lower())
+        effort = (req.reasoning_effort or "").lower()
+        cap = think_cap(effort or None)
         kw = req.chat_template_kwargs or {}
         thinking = kw.get("enable_thinking")
         if thinking is None:
@@ -243,7 +242,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         # tool_choice stronger than a hint is refused rather than echoed.
         unknown_fields(req)  # warns; this route has no recorder, so the warn is all there is
         named = choice_name(req.tool_choice)
-        refuse_unsupported(tool_choice=named not in ("auto", "none", None),
+        refuse_unsupported(reasoning_effort=bad_effort(effort or None),
+                          tool_choice=named not in ("auto", "none", None),
                           **hosted_tool_fields(req.tools))
         tools = tools_for_render(flatten_tools(req.tools), req.tool_choice)
         input_ids = tokenizer.encode(_render_chat(
