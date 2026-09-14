@@ -157,3 +157,24 @@ helper. sm90/H20 parity is **deferred (H20 unavailable by decision
 (sparse rows own a separate dense draft pool, reserved at admit). When that
 code moves post-step-11, give the planner a sparse-row unit case (admit
 reservation vs post-commit end) rather than assuming the dense gate covers it.
+
+## Fix (landed 2026-09-15)
+
+`Engine.ensure_draft_write_blocks(rows)` in `src/tilerl/engine.py` is the one
+post-commit growth planner: for each decode row it grows `r.blocks` until they
+strictly cover `seq_len-1` (the dense draft's `hi`), finishing a row the pool
+cannot fit as `pool_exhausted`; a sparse row is bound-checked against its
+admit-reserved `r.draft_blocks` (verifier tail) and never trunk-grown. Both the
+eager path (`_run_forward`) and the captured-graph path (`_run_decode_graph`)
+call it immediately before `_draft_step`; the graph path's "pre-fork growth is
+enough" assumption is gone. The eager inline post-commit loop is deleted.
+
+Gates `tests/test_dense_d1_growth.py` (4), constructed rows, no forward:
+q=1 four-row boundary grow; q=2 two-token verifier-tail row (post-verify
+`seq_len = k*16+2`); pool-exhaustion finishes the short row alone and restores
+its blocks/slot; sparse row uses reserved draft_blocks with zero trunk growth.
+The pre-fork verifier-tail coverage is unchanged — the planner only adds the
+boundary-crossing block the anchor math (`seq_len+q-2`) misses. CPU: e2e 81,
+sparse 62, rl 33 (on-policy graph/recapture), server 73, decode-graph/dflash
+29, all green. Device forced-graph smoke (the 4x2k warmup shape) runs on the
+V100 after merge by ops.
