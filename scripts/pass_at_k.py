@@ -56,8 +56,9 @@ def main() -> int:
 
     from tilerl_kernels.backend import get_backend
 
-    from tilerl.cli import _build_model, _qwen38_tokenizer
-    from tilerl.engine import BLOCK_TOKENS, build_engine
+    from tilerl.build import build_engine, build_model
+    from tilerl.cli import _qwen38_tokenizer
+    from tilerl.engine import BLOCK_TOKENS
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.math_answer import boxed_match
     from tilerl.prompt import render_chat
@@ -70,7 +71,7 @@ def main() -> int:
     print(f"pass_at_k: {len(rows)} problems x k={args.k} at cap {args.max_new_tokens}, "
           f"temperature {args.temperature}", flush=True)
 
-    cfg, model = _build_model(args.model, seed=0)
+    cfg, model = build_model(args.model, seed=0)
     # The tiny path exists so this script's own logic is exercisable without a card.
     tok = _qwen38_tokenizer() if args.model == "qwen38-27b" else get_tokenizer(None)
     backend = get_backend()

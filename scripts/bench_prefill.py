@@ -31,9 +31,8 @@ import benchrec  # noqa: E402
 import torch
 from tilerl_kernels.backend import get_backend
 
-from tilerl import cli
-from tilerl.cli import _build_model
-from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import _PHASE_DECODE, SamplingParams
 
 CTXS = (512, 1024, 2048, 4096)
 
@@ -45,10 +44,11 @@ def main() -> None:
     benchrec.add_record_args(ap, default_target="sm70", default_device=None)
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
-    cli._QWEN38_SOURCE = args.source
+    import tilerl.build as build  # noqa: E402
+    build.QWEN38_SOURCE = args.source
 
     be = get_backend()
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     e = build_engine(cfg, model, be, num_blocks=1024, num_slots=4, max_batch=4,
                      max_total_tokens=8192)
 

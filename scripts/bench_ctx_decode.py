@@ -29,9 +29,8 @@ import benchrec  # noqa: E402
 import torch
 from tilerl_kernels.backend import get_backend
 
-from tilerl import cli
-from tilerl.cli import _build_model
-from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import _PHASE_DECODE, SamplingParams
 from tilerl.kv_cache import BLOCK_TOKENS
 from tilerl.spec import load_draft
 
@@ -258,10 +257,11 @@ def main() -> None:
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
     # cli binds _QWEN38_SOURCE from the env at import, which already happened.
-    cli._QWEN38_SOURCE = args.source
+    import tilerl.build as build  # noqa: E402
+    build.QWEN38_SOURCE = args.source
 
     backend = get_backend()
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft) if args.draft else None
     # max_batch tracks the submissions. It used to be floored at 4, which quadrupled a
     # B=1 run's block pool and its graph count for rows that could never be admitted --

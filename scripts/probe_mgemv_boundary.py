@@ -47,10 +47,10 @@ def main():
     import tilerl_kernels.backend as B
     from tilerl_kernels.backend import get_backend
 
-    from tilerl.cli import _build_model
+    from tilerl.build import build_model
 
     backend = get_backend()
-    _, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
+    _, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     dev = torch.device("cuda")
     for k, v in list(model.params.items()):
         if v.device.type != "cuda":

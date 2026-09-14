@@ -18,8 +18,9 @@ import numpy as np
 import pytest
 import torch
 
+from tilerl.build import build_engine
 from tilerl.config import tiny
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.engine import SamplingParams
 from tilerl.model import build_random
 from tilerl.train import _training_kv
 

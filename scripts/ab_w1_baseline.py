@@ -25,7 +25,6 @@ sys.path.insert(
 )
 
 from ab_draft_depth import (  # noqa: E402
-    _build_model,
     _engine_sha,
     _sha,
     bucket,
@@ -34,7 +33,7 @@ from ab_draft_depth import (  # noqa: E402
 from corpus import wikitext_ids  # noqa: E402
 from tilerl_kernels.backend import get_backend  # noqa: E402
 
-from tilerl.engine import build_engine  # noqa: E402
+from tilerl.build import build_engine, build_model  # noqa: E402
 from tilerl.kv_cache import BLOCK_TOKENS  # noqa: E402
 from tilerl.server import get_tokenizer  # noqa: E402
 
@@ -56,7 +55,7 @@ def main() -> None:
 
     be = get_backend()
     arch = getattr(be, "arch", "") or "sm70"
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     prompts = wikitext_ids(get_tokenizer(a.source), a.prompts, a.ctx)
 
     print(f"# probe {_sha(__file__)}, engine tree {_engine_sha()}, arch {arch}")

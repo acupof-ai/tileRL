@@ -47,8 +47,11 @@ sys.path.insert(0, "packages/tilerl-kernels/src")
 from tilerl_kernels.backend import get_backend  # noqa: E402
 
 from tilerl.autograd import AdamW  # noqa: E402
-from tilerl.cli import _build_model  # noqa: E402
-from tilerl.engine import SamplingParams, build_engine  # noqa: E402
+from tilerl.build import (
+    build_engine,  # noqa: E402
+    build_model,  # noqa: E402
+)
+from tilerl.engine import SamplingParams  # noqa: E402
 from tilerl.kv_cache import NoPrefixStore  # noqa: E402
 from tilerl.model import add_lora  # noqa: E402
 from tilerl.train import group_advantages, rl_step, untruncated  # noqa: E402
@@ -233,7 +236,7 @@ def main() -> int:
         return _selfcheck()
 
     backend = get_backend()
-    cfg, model = _build_model(a.model, seed=0, keep_master=False)
+    cfg, model = build_model(a.model, seed=0, keep_master=False)
     # The pool must hold every row's whole sequence, and the rollout submits all --group at
     # once, so a --blocks sized for a narrower arm dies mid-drain rather than at build:
     # measured, `--group 16 --gen 6144 --blocks 3700` (the group-8 size) exhausted 3701

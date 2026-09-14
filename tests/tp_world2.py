@@ -137,7 +137,7 @@ def _step_run(rank: int, world: int, local_clip: bool, out: dict,
 
     from tilerl import model as model_mod
     from tilerl.autograd import Adafactor, AdamW
-    from tilerl.cli import _shard
+    from tilerl.build import _shard
     from tilerl.config import tiny
     from tilerl.testing import RefBackend
     from tilerl.train import train_step
@@ -218,7 +218,7 @@ def _refusals() -> bool:
     instead of joining -- reaching it at all is the failure.
     """
     from tilerl import model as model_mod
-    from tilerl.cli import _shard
+    from tilerl.build import _shard
     from tilerl.config import tiny
 
     class _NoJoin:

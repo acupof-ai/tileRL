@@ -35,8 +35,8 @@ import torch
 from tilerl_kernels.backend import get_backend
 
 from tilerl import model as model_mod
-from tilerl.cli import _build_model
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import SamplingParams
 from tilerl.spec import DraftHead, load_draft
 
 TORCH_MARKS = ("elementwise_kernel", "index_elementwise", "unrolled_elementwise",
@@ -125,7 +125,7 @@ def main() -> None:
 
     instrument()
     backend = get_backend()
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True, source=args.source)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True, source=args.source)
     draft = load_draft(model, args.draft) if args.depth else None
     e = build_engine(cfg, model, backend, num_blocks=512, num_slots=4, max_batch=4,
                      max_total_tokens=8192, draft=draft, spec_depth=args.depth,

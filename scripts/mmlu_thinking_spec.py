@@ -116,10 +116,9 @@ def _drain(engine, tok, prompts, sp, deadline_s, on_done=None):
 def run_arm(source: str, prompts: list[str], k: int, draft_path: str | None,
             tok, backend, max_ctx: int, deadline_s: float | None,
             on_done=None, force_think: bool = True) -> dict:
-    from tilerl.cli import _build_model
-    from tilerl.engine import build_engine
+    from tilerl.build import build_engine, build_model
 
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True,
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True,
                               backend=backend)
     draft = None
     if draft_path:
@@ -196,7 +195,7 @@ def selftest():
     prompts = ["A. 1 B. 2 Answer: "] * 2
 
     def arm(k):
-        from tilerl.engine import build_engine
+        from tilerl.build import build_engine
 
         e = build_engine(cfg, build_random(cfg, 0), backend, num_blocks=64,
                          num_slots=4, max_batch=2, max_total_tokens=1024,

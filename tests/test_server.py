@@ -18,8 +18,9 @@ import pytest
 from fastapi.testclient import TestClient
 from tilerl_kernels.backend import get_backend
 
+from tilerl.build import build_engine, build_serving_engine
 from tilerl.config import tiny
-from tilerl.engine import Engine, SamplingParams, build_engine
+from tilerl.engine import Engine, SamplingParams
 from tilerl.messages import render_tool_call
 from tilerl.model import build_random
 from tilerl.server import create_app, get_tokenizer
@@ -1253,7 +1254,6 @@ def test_serve_sizes_its_pools_from_the_flags_not_the_context():
     that the default is still derived from the context, which is what a
     large-card target relies on.
     """
-    from tilerl import cli
     from tilerl.engine import _graph_on
     from tilerl.kv_cache import BLOCK_TOKENS
 
@@ -1267,12 +1267,12 @@ def test_serve_sizes_its_pools_from_the_flags_not_the_context():
     # which made an intentional reservation look like an off-by-one in _fit_blocks.
     pad = int(_graph_on(be, None))
 
-    e = cli._build_engine(cfg, model, be, blocks=64, max_ctx=256, max_batch=2, sparse_k=0)
+    e = build_serving_engine(cfg, model, be, blocks=64, max_ctx=256, max_batch=2, sparse_k=0)
     assert e._kv.num_blocks - pad == 64
     assert e.limits.max_total_tokens == 256, "a request must not outgrow the pool"
     assert e.limits.max_batch == 2
 
-    d = cli._build_engine(cfg, model, be, sparse_k=0)
+    d = build_serving_engine(cfg, model, be, sparse_k=0)
     assert d._kv.num_blocks - pad == (4096 * d.limits.max_batch) // BLOCK_TOKENS, (
         "the default pool must cover max_batch rows of the context — no more "
         "(bytes are the long-context limit) and no less (a full batch must fit). "

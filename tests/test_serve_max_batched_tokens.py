@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from tilerl import cli
+from tilerl.build import build_serving_engine
 
 
 @pytest.fixture
@@ -22,8 +23,8 @@ def _captured_kw(fake_cfg, **kwargs):
         captured.update(kw)
         return object()
 
-    with patch("tilerl.engine.build_engine", fake_build_engine):
-        cli._build_engine(fake_cfg, None, None, **kwargs)
+    with patch("tilerl.build.build_engine", fake_build_engine):
+        build_serving_engine(fake_cfg, None, None, **kwargs)
     return captured
 
 

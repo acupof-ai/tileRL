@@ -252,9 +252,9 @@ def main() -> None:
     import torch
     from tilerl_kernels.backend import get_backend
 
-    from tilerl import cli
     from tilerl import engine as mod
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine, build_model, build_serving_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
 
     backend = get_backend()
@@ -264,7 +264,7 @@ def main() -> None:
 
     # ONE process, ONE card, ONE set of weights: config is the only variable. Two models
     # would make weight layout a second difference and the arm would name nothing.
-    cfg, model = cli._build_model("qwen38-27b", seed=0, fuse_projections=False)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=False)
     ctx = args.prompt + args.tokens + 64
     prompts = [list(range(1000 * (i + 1), 1000 * (i + 1) + args.prompt))
                for i in range(args.group * 2 + 1)]
@@ -294,7 +294,7 @@ def main() -> None:
         # wins/2026-09-06-b8-speculation-loses-to-no-speculation.md:79 -- so slots is set to
         # admit that batch in both arms; it moves from the bundle to the controlled set and
         # the bisection's slot+batch group is smaller by one.
-        return cli._build_engine(cfg, model, backend, slots=args.group,
+        return build_serving_engine(cfg, model, backend, slots=args.group,
                                  blocks=args.serve_blocks, max_ctx=4096,
                                  max_batch=args.group)
 

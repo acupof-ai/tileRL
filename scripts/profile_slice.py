@@ -229,8 +229,8 @@ def main() -> None:
 
     from tilerl_kernels.backend import get_backend
 
+    from tilerl.build import build_engine
     from tilerl.config import qwen36_27b
-    from tilerl.engine import build_engine
     from tilerl.model import load_hf
 
     backend = get_backend()

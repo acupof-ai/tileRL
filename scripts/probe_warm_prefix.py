@@ -25,8 +25,9 @@ import time
 import numpy as np
 from tilerl_kernels.backend import get_backend
 
+from tilerl.build import build_engine
 from tilerl.config import qwen38_27b
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.engine import SamplingParams
 from tilerl.kv_cache import NoPrefixStore
 from tilerl.model import load_hf
 

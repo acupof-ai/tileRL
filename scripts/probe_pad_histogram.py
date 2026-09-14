@@ -70,14 +70,14 @@ def main():
     from tilerl_kernels.backend import get_backend
 
     from tilerl.autograd import AdamW
-    from tilerl.cli import _build_model
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine, build_model
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.model import add_lora
     from tilerl.train import grpo_loop
 
     backend = get_backend()
-    cfg, model = _build_model(args.model, seed=0, keep_master=False)
+    cfg, model = build_model(args.model, seed=0, keep_master=False)
     engine = build_engine(cfg, model, backend, num_blocks=args.blocks,
                           num_slots=args.group, max_batch=args.group,
                           max_total_tokens=args.blocks * 16,

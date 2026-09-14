@@ -29,9 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import torch
 from tilerl_kernels.backend import get_backend
 
-from tilerl import cli
-from tilerl.cli import _build_model
-from tilerl.engine import SamplingParams, build_engine
+import tilerl.build as build
+from tilerl.build import build_engine, build_model
+from tilerl.engine import SamplingParams
 from tilerl.spec import load_draft
 
 BUCKETS: dict[str, list[float]] = {}
@@ -69,10 +69,11 @@ def main() -> None:
     args = ap.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     os.environ.setdefault("TILERL_TARGET", "cuda")
-    cli._QWEN38_SOURCE = args.source  # cli binds this from the env at import time
+    build.QWEN38_SOURCE = args.source  # build binds this from the env at import time
+    os.environ['TILERL_QWEN38_SOURCE'] = args.source
 
     backend = get_backend()
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft) if args.depth else None
     # slots > max_batch: a tick narrower than its graph bucket keeps one slot for the
     # padding rows for good (engine.py:827) -- bench_ctx_decode.py died on this twice.

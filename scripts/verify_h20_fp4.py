@@ -142,8 +142,9 @@ import torch  # noqa: E402  — must follow the CUDA_VISIBLE_DEVICES pin
 from tilerl_kernels import reference  # noqa: E402
 from tilerl_kernels.backend import get_backend  # noqa: E402
 
+from tilerl.build import build_engine  # noqa: E402
 from tilerl.config import qwen38_27b, tiny  # noqa: E402
-from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine  # noqa: E402
+from tilerl.engine import _PHASE_DECODE, SamplingParams  # noqa: E402
 from tilerl.model import build_random, load_hf  # noqa: E402
 
 GIB = float(2**30)

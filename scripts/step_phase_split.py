@@ -41,8 +41,8 @@ def main() -> int:
     import numpy as np
     from tilerl_kernels.backend import Backend, resolve_target
 
-    from tilerl.cli import _build_model
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine, build_model
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.model import add_lora
     from tilerl.train import AdamW, grpo_loop
@@ -51,7 +51,7 @@ def main() -> int:
         a.gen, a.group, a.steps = 8, 2, 2
 
     backend = Backend(resolve_target())
-    cfg, model = _build_model("tiny" if a.tiny else "qwen38-27b", seed=0, keep_master=False)
+    cfg, model = build_model("tiny" if a.tiny else "qwen38-27b", seed=0, keep_master=False)
     prompts = [np.arange(8 if a.tiny else 256, dtype=np.int64)]
 
     # Sized off the ask, the way cli.py:538 does it, so this measures the configuration

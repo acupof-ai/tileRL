@@ -38,8 +38,9 @@ def main() -> None:
     a = ap.parse_args()
 
     Backend._c = _counting
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.model import build_random
 
     be = get_backend()

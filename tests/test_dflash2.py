@@ -398,7 +398,8 @@ _PROMPT = [11, 42, 7, 99, 3, 56]
 
 def _engine_run(head, spec, n):
     """Greedy ``n`` tokens through the engine, with and without the block drafter."""
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
 
     engine = build_engine(
@@ -503,7 +504,8 @@ def test_engine_block_equals_the_full_context_block(tmp_path):
     """
     import numpy as np
 
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.train import _training_kv
 
@@ -546,7 +548,7 @@ def test_spec_draft_rejected_behind_a_real_prefix_store(tmp_path):
     (NoPrefixStore) must build, or the test can't tell the gate from an
     always-raise bug.
     """
-    from tilerl.engine import build_engine
+    from tilerl.build import build_engine
     from tilerl.kv_cache import NoPrefixStore
 
     head = _tiny_head(tmp_path)

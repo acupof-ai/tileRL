@@ -26,8 +26,9 @@ import torch  # noqa: E402
 from tilerl_kernels.backend import get_backend  # noqa: E402
 
 from tilerl.autograd import AdamW  # noqa: E402
+from tilerl.build import build_engine  # noqa: E402
 from tilerl.config import tiny  # noqa: E402
-from tilerl.engine import SamplingParams, build_engine  # noqa: E402
+from tilerl.engine import SamplingParams  # noqa: E402
 from tilerl.kv_cache import NoPrefixStore  # noqa: E402
 from tilerl.model import build_random  # noqa: E402
 

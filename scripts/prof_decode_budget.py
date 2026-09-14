@@ -28,9 +28,8 @@ import torch
 from tilerl_kernels.backend import get_backend
 from torch.profiler import ProfilerActivity, profile
 
-from tilerl import cli
-from tilerl.cli import _build_model
-from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import _PHASE_DECODE, SamplingParams
 from tilerl.spec import LADDER_WIDTHS, load_draft
 from tilerl.tokenizer import get_tokenizer
 
@@ -114,10 +113,11 @@ def main() -> None:
     args = ap.parse_args()
     ctxs = [int(c) for c in args.ctx.split(",")]
     os.environ.setdefault("TILERL_TARGET", "cuda")
-    cli._QWEN38_SOURCE = args.source
+    import tilerl.build as build  # noqa: E402
+    build.QWEN38_SOURCE = args.source
 
     backend = get_backend()
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft) if args.draft else None
     e = build_engine(cfg, model, backend, num_blocks=1024, num_slots=4, max_batch=4,
                      max_total_tokens=8192, draft=draft, spec_depth=3 if draft else 1)

@@ -29,8 +29,8 @@ import numpy as np
 import torch
 from tilerl_kernels.backend import get_backend
 
-from tilerl import cli
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import SamplingParams
 from tilerl.sparse_engine import SPARSE_REFRESH_TICKS
 
 GIB = 1 << 30
@@ -55,10 +55,11 @@ def main() -> None:
     args = ap.parse_args()
 
     os.environ.setdefault("TILERL_TARGET", "cuda")
-    cli._QWEN38_SOURCE = args.source
+    import tilerl.build as build  # noqa: E402
+    build.QWEN38_SOURCE = args.source
 
     backend = get_backend()
-    cfg, model = cli._build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
 
     engine = build_engine(
         cfg=cfg, model=model, backend=backend,

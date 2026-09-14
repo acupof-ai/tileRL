@@ -47,7 +47,7 @@ from tilerl_kernels.backend import get_backend  # noqa: E402
 
 from tilerl import autograd as ag  # noqa: E402
 from tilerl import model as model_mod  # noqa: E402
-from tilerl.cli import _build_model  # noqa: E402
+from tilerl.build import build_model  # noqa: E402
 from tilerl.train import _training_kv  # noqa: E402
 
 
@@ -102,7 +102,7 @@ def main() -> None:
     be = get_backend()
     if be.device.type != "cuda":
         raise SystemExit("reads torch.cuda.memory_allocated; run on cuda")
-    cfg, model = _build_model(a.model, seed=0, fuse_projections=True)
+    cfg, model = build_model(a.model, seed=0, fuse_projections=True)
 
     t = a.prompt_tokens + a.gen
     ids = np.random.default_rng(0).integers(3, cfg.vocab_size, size=(1, t)).astype(np.int64)

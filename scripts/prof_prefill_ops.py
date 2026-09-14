@@ -57,8 +57,11 @@ sys.path.insert(0, "packages/tilerl-kernels/src")
 from tilerl_kernels.backend import get_backend  # noqa: E402
 from tilerl_kernels.registry import _REGISTRY  # noqa: E402
 
-from tilerl.cli import _build_model  # noqa: E402
-from tilerl.engine import _PHASE_PREFILL, SamplingParams, build_engine  # noqa: E402
+from tilerl.build import (
+    build_engine,  # noqa: E402
+    build_model,  # noqa: E402
+)
+from tilerl.engine import _PHASE_PREFILL, SamplingParams  # noqa: E402
 from tilerl.kv_cache import NoPrefixStore  # noqa: E402
 
 _MAX_TICKS = 20000
@@ -291,7 +294,7 @@ def main() -> int:
     name = "tiny-agent" if args.model == "tiny" and ctx > 512 else args.model
     if name != args.model:
         print(f"note: --model tiny caps at 512 positions; using {name} for ctx={ctx}")
-    cfg, model = _build_model(name, seed=7, keep_master=False)
+    cfg, model = build_model(name, seed=7, keep_master=False)
     if ctx > cfg.max_position_embeddings:
         raise SystemExit(f"{name} holds {cfg.max_position_embeddings} positions; "
                          f"--tokens asks for {ctx}")

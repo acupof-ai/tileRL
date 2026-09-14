@@ -29,9 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import torch
 from tilerl_kernels.backend import get_backend
 
-from tilerl import cli
-from tilerl.cli import _build_model
-from tilerl.engine import SamplingParams, build_engine, card_guard
+from tilerl.build import build_engine, build_model
+from tilerl.engine import SamplingParams, card_guard
 from tilerl.kv_cache import BLOCK_TOKENS
 from tilerl.spec import load_draft
 
@@ -59,12 +58,13 @@ def main() -> None:
     ap.add_argument("--decode", type=int, default=8, help="decode this many tokens to prove it runs")
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
-    cli._QWEN38_SOURCE = args.source
+    import tilerl.build as build  # noqa: E402
+    build.QWEN38_SOURCE = args.source
 
     backend = get_backend()
     print(f"slots={args.slots} depth={args.depth} max_batch={args.max_batch} "
           f"reclaim={args.reclaim}")
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     # Draft BEFORE materialize, the order cli.py serves in: materialize rewrites the
     # fp4 lm_head into wq/scale/oscale, and read_head_params then rejects all three.
     draft = load_draft(model, args.draft) if args.draft else None

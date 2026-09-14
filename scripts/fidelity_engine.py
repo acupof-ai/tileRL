@@ -31,7 +31,8 @@ import json
 import numpy as np
 import torch
 
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.build import build_engine
+from tilerl.engine import SamplingParams
 from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
 
 
@@ -375,10 +376,10 @@ def main27b(args):
 
     from tilerl_kernels.backend import get_backend
 
-    from tilerl.cli import _build_model
+    from tilerl.build import build_model
 
     backend = get_backend()
-    _c, model = _build_model("qwen38-27b", seed=0, keep_master=False, backend=backend)
+    _c, model = build_model("qwen38-27b", seed=0, keep_master=False, backend=backend)
     with open(Path(args.corpus) / f"held_{args.ctx}.jsonl") as fh:
         r = json.loads(fh.readlines()[args.span])
     ids = np.asarray(r["ids"], dtype=np.int64)[: args.ctx]

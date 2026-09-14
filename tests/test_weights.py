@@ -213,7 +213,8 @@ def test_rope_and_tie_guards_raise(tmp_path):
 
 def test_fp4_on_load_and_forward(tmp_path):
     """fp4=True packs linears on load, keeps no bf16 master, and still generates."""
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.testing import RefBackend
 
     cfg = tiny()
@@ -248,7 +249,8 @@ def test_fp4_on_load_and_forward(tmp_path):
 def test_fp4_save_load_roundtrip(tmp_path):
     """load_hf(save_hf(m)) re-quantizes nothing: .wq/.scale/.oscale bit-identical,
     same greedy tokens. Untied so lm_head is packed too."""
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.build import build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.testing import RefBackend
 
     cfg = replace(tiny(), fp4=True, tie_word_embeddings=False)

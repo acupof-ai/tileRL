@@ -229,13 +229,12 @@ def test_on_policy_guard_refuses_cached_engines():
     """
     import pytest
 
-    from tilerl.cli import _build_model
-    from tilerl.engine import build_engine
+    from tilerl.build import build_engine, build_model
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.testing import RefBackend
     from tilerl.train import grpo_loop
 
-    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    cfg, model = build_model("tiny", seed=0, keep_master=True)
     run = lambda e: list(grpo_loop(e, model, [[1, 2, 3]], lambda p, c: 0.0, 1, RefBackend()))
 
     # prefix cache on, graph off (dense: sparse turns both off and makes the guard vacuous)
@@ -275,12 +274,11 @@ def test_opd_refuses_a_cached_engine_with_no_adapters_too():
     """
     import pytest
 
-    from tilerl.cli import _build_model
-    from tilerl.engine import build_engine
+    from tilerl.build import build_engine, build_model
     from tilerl.testing import RefBackend
     from tilerl.train import opd_loop
 
-    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    cfg, model = build_model("tiny", seed=0, keep_master=True)
     # Prefix store on: the same cached-engine condition the adapter arm is refused for.
     cached = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=4, sparse_k=0)
     with pytest.raises(ValueError, match="on-policy"):

@@ -40,7 +40,7 @@ def main() -> None:
 
     from tilerl_kernels.backend import _resolve, get_backend
 
-    from tilerl.cli import _build_model
+    from tilerl.build import build_model
 
     backend = get_backend()
     ks = _resolve(backend.precision, backend.arch)
@@ -48,8 +48,8 @@ def main() -> None:
           f"gdn_state_scan={'gdn_state_scan' in ks} "
           f"gdn_chunk_fused={'gdn_chunk_fused' in ks}")
 
-    cfg, model = _build_model("qwen38-27b", 0, fuse_projections=True)
-    from tilerl.engine import build_engine
+    cfg, model = build_model("qwen38-27b", 0, fuse_projections=True)
+    from tilerl.build import build_engine
 
     engine = build_engine(cfg, model, backend, num_blocks=0, num_slots=8,
                           max_batch=1, max_total_tokens=t + 64, prefix_store=None,

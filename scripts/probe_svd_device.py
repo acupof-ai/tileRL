@@ -18,13 +18,13 @@ import torch
 
 os.environ.setdefault("TILERL_TARGET", "cuda")
 
-from tilerl.cli import _build_model  # noqa: E402
+from tilerl.build import build_model  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--limit", type=int, default=4, help="largest N shape classes to time")
 a = ap.parse_args()
 
-cfg, model = _build_model("qwen38-27b", seed=0, keep_master=True)
+cfg, model = build_model("qwen38-27b", seed=0, keep_master=True)
 two_d = {k: v for k, v in model.params.items() if v.dim() == 2}
 devs = Counter(str(v.device) for v in two_d.values())
 print(f"2D params: {len(two_d)}, devices: {dict(devs)}")

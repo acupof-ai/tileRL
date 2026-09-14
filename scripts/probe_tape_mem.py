@@ -64,9 +64,9 @@ def main() -> None:
         model.materialized = True
         trainable = add_lora(model, rank=args.lora_rank)
     else:
-        from tilerl.cli import _build_model
+        from tilerl.build import build_model
 
-        cfg, model = _build_model("tiny", seed=0, keep_master=True)
+        cfg, model = build_model("tiny", seed=0, keep_master=True)
         trainable = None
 
     b, t = args.group, args.length

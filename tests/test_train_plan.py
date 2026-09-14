@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from tilerl.autograd import Adafactor, AdamW, RecordingBackend, Tape
-from tilerl.cli import _build_model
+from tilerl.build import build_model
 from tilerl.config import tiny
 from tilerl.iso import ISO
 from tilerl.memory import (
@@ -51,7 +51,7 @@ def _ids(cfg, b, s):
 
 
 def test_adapter_and_adamw_rows_equal_lora_trainer_storage():
-    cfg, model = _build_model("tiny", seed=0, keep_master=False)
+    cfg, model = build_model("tiny", seed=0, keep_master=False)
     rank = 4
     trainable = add_lora(model, rank=rank)
     spec = param_specs(cfg)
@@ -69,7 +69,7 @@ def test_tape_row_equals_the_real_recorded_tape_layer_segments():
     """B*S > 1280 takes segment='layer' (train._MLP_SEGMENT_MAX_T): the tape keeps
     only the embedding, the per-layer boundary hiddens, the final norm, the head
     tensors and the logits — every in-layer activation is recomputed in backward."""
-    cfg, model = _build_model("tiny", seed=0, keep_master=False)
+    cfg, model = build_model("tiny", seed=0, keep_master=False)
     add_lora(model, rank=4)
     backend = RefBackend()
     b, s = 1, 1300
@@ -81,7 +81,7 @@ def test_tape_row_equals_the_real_recorded_tape_layer_segments():
 
 
 def test_tape_row_full_sft_layer_segments():
-    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    cfg, model = build_model("tiny", seed=0, keep_master=True)
     backend = RefBackend()
     b, s = 1, 1300
     ids = _ids(cfg, b, s)
@@ -92,7 +92,7 @@ def test_tape_row_full_sft_layer_segments():
 
 
 def test_full_sft_adafactor_and_iso_rows_equal_allocator_storage():
-    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    cfg, model = build_model("tiny", seed=0, keep_master=True)
     drop_quantized(model)
     spec = param_specs(cfg)
     ada = Adafactor()

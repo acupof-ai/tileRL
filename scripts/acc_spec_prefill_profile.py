@@ -28,8 +28,8 @@ import torch
 from tilerl_kernels.backend import Backend
 
 from tilerl import engine as engine_mod
+from tilerl.build import build_engine
 from tilerl.config import qwen38_27b
-from tilerl.engine import build_engine
 from tilerl.eval import generate
 from tilerl.kv_cache import NoPrefixStore
 from tilerl.model import Model, load_hf

@@ -59,7 +59,7 @@ class Probe(TorchDispatchMode):
 
 
 def _engine(backend, cfg, model, **kw):
-    from tilerl.engine import build_engine
+    from tilerl.build import build_engine
 
     return build_engine(cfg, model, backend, num_blocks=64, num_slots=8,
                         max_batch=8, max_total_tokens=512, **kw)

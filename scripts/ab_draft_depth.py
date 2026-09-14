@@ -47,9 +47,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import torch
 from tilerl_kernels.backend import get_backend
 
-from tilerl import cli
-from tilerl.cli import _build_model
-from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine
+from tilerl.build import build_engine, build_model
+from tilerl.engine import _PHASE_DECODE, SamplingParams
 from tilerl.kv_cache import BLOCK_TOKENS
 from tilerl.spec import LADDER_WIDTHS, load_draft
 from tilerl.tokenizer import get_tokenizer
@@ -349,14 +348,15 @@ def main() -> None:
                 f"would silently drop {args.prompts % B} passage(s) from the last group "
                 "and compare batch sizes over different text")
     os.environ.setdefault("TILERL_TARGET", "cuda")
-    cli._QWEN38_SOURCE = args.source
+    import tilerl.build as build  # noqa: E402
+    build.QWEN38_SOURCE = args.source
 
     be = get_backend()
     arch = getattr(be, "arch", "") or "sm70"
     # _build_model reads TILERL_QWEN38_SOURCE, not --source: without it cli.py:20 falls
     # back to the Hub and the run dies on a network error after the backend is up.
     os.environ.setdefault("TILERL_QWEN38_SOURCE", args.source)
-    cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft)
     if args.prompt == "wikitext":
         prompts = wikitext_ids(get_tokenizer(args.source), args.prompts, args.ctx)

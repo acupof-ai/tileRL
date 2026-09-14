@@ -233,8 +233,9 @@ def test_engine_decode_tokens_equal_across_a_full_demote_promote_round_trip():
         import pytest
 
         pytest.skip("model-forward parity gate is the CPU cell; card runs the pool gates")
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.model import build_random
 
@@ -306,8 +307,9 @@ def test_narrow_f16_path_prices_half_and_decodes_like_dense():
         import pytest
 
         pytest.skip("model-forward parity gate is the CPU cell; card runs the pool gates")
+    from tilerl.build import build_engine
     from tilerl.config import tiny
-    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.engine import SamplingParams
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.memory import per_cold_kv_block_bytes
     from tilerl.model import build_random
