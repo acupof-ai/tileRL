@@ -38,7 +38,7 @@ import threading
 import time
 import warnings
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -188,6 +188,14 @@ class RequestFailed(RuntimeError):
         self.reason = reason
 
 
+class EngineOverloaded(RuntimeError):
+    """submit() refused because the engine already holds ``max_inflight`` live
+    requests (running + waiting). Raised synchronously, before the request is
+    enqueued, so the caller can back off instead of holding a slot in an
+    unbounded queue until its own deadline. A RuntimeError so the existing 503
+    mapping contains it; routes map it to 503 with the cap in the error body."""
+
+
 @dataclass(frozen=True)
 class SamplingParams:
     temperature: float = 1.0
@@ -244,6 +252,19 @@ class StepLimits:
     max_batch: int = 8
     max_total_tokens: int = 512
     max_num_batched_tokens: int = 512
+    #: Cap on live requests (running + waiting). None = unbounded (submit never
+    #: refuses for queue depth). build_engine passes the _INFLIGHT_AUTO sentinel
+    #: for its serving default (twice usable_slots): one running wave plus one
+    #: queued wave, enough to keep every slot saturated (a freed slot is
+    #: refilled from the queue in the same step). A deeper queue cannot raise
+    #: throughput and only grows per-request host RAM and hides head-of-line
+    #: latency, so an over-capacity submit raises EngineOverloaded.
+    max_inflight: Any = None  # int cap, None (unbounded), or _INFLIGHT_AUTO
+
+
+#: Sentinel for "derive max_inflight from usable_slots (two waves)". A distinct
+#: object so None (unbounded) and any int cap keep their own meaning.
+_INFLIGHT_AUTO = object()
 
 
 @dataclass
@@ -386,7 +407,6 @@ class Engine:
         self._prefix = prefix_store
         #: KvBootStore for cold-start KV (--kv-store); None = no on-disk boot context.
         self._boot = boot_store
-        self.limits = limits
 
         self._decode_graph_on = _graph_on(backend, decode_graph)
         self._decode_graphs: dict = {}
@@ -412,6 +432,12 @@ class Engine:
         # request's worth of it partway through a run.
         self._graph_capture = GraphCapture(
             state_pool.alloc_slot, kv_pool.alloc_block, reserve=self._decode_graph_on)
+        # Resolve the in-flight cap against usable_slots (known only after the
+        # pad row is reserved). build_engine passes the AUTO sentinel for its
+        # two-wave default; an explicit int is honored; None stays unbounded.
+        if limits.max_inflight is _INFLIGHT_AUTO:
+            limits = replace(limits, max_inflight=2 * self.usable_slots)
+        self.limits = limits
         # A slot is held from submit() to finish, so usable_slots -- not max_batch --
         # is the real concurrency ceiling, and _build_plan's max_batch is unreachable.
         # The excess QUEUES: `submit` has no slot check and `_admit` returns False on
@@ -695,6 +721,17 @@ class Engine:
                 self._finished[rid] = []
                 self._finished_count += 1
                 return rid
+
+            # Bound the queue: count rows actually occupying a slot or queued for
+            # one. max_inflight None = unbounded. Refuse BEFORE enqueue so an
+            # over-capacity client backs off now instead of pinning its prompt in
+            # a deep queue to a deadline.
+            cap = self.limits.max_inflight
+            if cap is not None and len(self._running) + len(self._waiting) >= cap:
+                raise EngineOverloaded(
+                    f"engine is saturated: {len(self._running) + len(self._waiting)} "
+                    f"in-flight requests and the cap is {cap} (running + waiting); "
+                    f"retry later")
 
             # Unallocated: allocating here refuses permanently, since `submit` has no later
             # tick to retry on. The prefix match moves to `_admit` with the allocation.

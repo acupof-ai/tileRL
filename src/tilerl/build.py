@@ -13,6 +13,7 @@ from . import config as config_mod
 from . import memory, precision
 from . import model as model_mod
 from .engine import (
+    _INFLIGHT_AUTO,
     Engine,
     StepLimits,
     _graph_on,
@@ -233,6 +234,11 @@ def build_engine(
     sparse_prefill_tokens: int = 0,
     spec_depth: int | None = None,
     decode: Any = None,
+    #: Cap on live (running + waiting) requests submit will accept. build_engine
+    #: defaults to two usable_slots waves (one running, one queued); pass an int
+    #: to override, or None for unbounded. Over-capacity submit raises
+    #: EngineOverloaded.
+    max_inflight=_INFLIGHT_AUTO,
 ) -> Engine:
     """Wire a model + backend into an Engine; pool shapes come from ``cfg``.
     ``decode_graph`` None auto-enables the captured decode tick on CUDA.
@@ -467,6 +473,7 @@ def build_engine(
             max_batch=max_batch,
             max_total_tokens=max_total_tokens,
             max_num_batched_tokens=max_num_batched_tokens,
+            max_inflight=max_inflight,
         ),
         decode_graph=decode_graph,
         draft=draft,
