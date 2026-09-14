@@ -8,6 +8,7 @@ states a number it did not measure.
 
 | Doc | Answers |
 |---|---|
+| [design-architecture.md](design-architecture.md) | Target module layout for the wrap-up refactor: seven layers, imports point down only, one assembler, the hybrid `SparseRuntime` seam, and the PR sequence with its gates. |
 | [design-engine.md](design-engine.md) | The four layers and the one seam each — frontend, scheduling, model, storage. Why the decode tick is a captured kernel sequence, why prefix sharing is read-only, and the physics the design has to satisfy. |
 | [design-kernels.md](design-kernels.md) | The kernel tree's file contracts, the registry rule (arch cell = CPU floor + overrides), the SOTA-copy provenance header, and the precision-before-tiles order a perf campaign follows. |
 | [design-rl-stack.md](design-rl-stack.md) | The three pieces of the RL product: the ISO optimizer and merger, the DFlash2 draft head and what keeps it on-policy, and the ledger CLI an agent drives. Marks what is settled and what is not. |
