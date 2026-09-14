@@ -112,17 +112,16 @@ of 52, MMLU n=50 equal to 0.70, one unique 32k request answered.
 | 0 | This doc | coordinator | review |
 | 1 | `tests/test_layering.py` + allowlist, red on an injected upward import | fixkv | CI |
 | 2 | Stale design docs: rev-87's 13 items; archive `arch-review-2026-09-09`, `design-ssd-read-path` (KvTier removed) and completed ownership tables to `docs/history/` | fixmisc | CI |
-| 3 | Dead code in the serving core, grep-proven (removed-feature residue, unused helpers) | fixkv | CI + device |
 | 4 | Dead code in cli, server and API routes, grep-proven; `rollout.py` if its only consumer is its own test | fixmisc | CI |
 | 5 | scripts/: delete dead one-off probes, keeping anything a doc, test, CI job or `test_main_selfchecks` glob reaches | ops | CI |
-| 6 | Break the 5 cycles and 3 upward imports (small moves); shrink the allowlist | fixkv | CI |
+| 6 | Break the 5 cycles and 3 upward imports; move `_rolling_hash` (sparse content hash) out of `kv_cache.py` and `group_map` into `sparse_index.py`; shrink the allowlist | fixkv | CI |
 | 7 | `build.py`: one assembler; callers of `cli._build_*` and `engine.build_engine` in src, tests and the 89 scripts are rewritten in the same PR (no re-export shim) | fixmisc | CI + device |
 | 8 | `cli.py` split: training orchestration → `train.py`, bench commands → `bench.py`; the CLI surface is unchanged (`_EXPECTED_CLI_FLAGS`) | fixmisc | CI |
 | 9 | `kv_tiers.py` split out of `kv_cache.py` | fixkv | CI |
 | 10 | `decode_graph.py` + ledger rows → `memory.py` | fixkv | CI + device |
 | 11 | `SparseRuntime` seam in `sparse_engine.py` | fixkv | CI + device (+ one unique 128k request) |
 
-Order reason: deletions (3–5) shrink what the moves have to carry. Cycle breaks (6) make the
+The serving core has no dead code: a grep inventory of engine, sparse_engine and kv_cache found a caller for every symbol, so its gains come only from the moves. Order reason: deletions (4–5) shrink what the moves have to carry. Cycle breaks (6) make the
 moves mechanical. The engine seam (11) goes last because it touches the hot path of both
 regimes.
 
