@@ -59,15 +59,16 @@ spec-on, 32k context); do not use it for this serve.
   concurrent long prefills V100 prefill throughput is the binding term; small
   prompts serve at p50 ~9 s. ttft p50 0.35 s.
 
-## Known issue: `/health` can stall under long prefill
+## Resolved: `/health` no longer stalls under long prefill
 
-While a long prefill runs, `/health` can intermittently fail to respond
-(client sees 000/timeout). The completion path is unaffected and retries
-succeed. Cause (2026-09-13 trace): `chat_completions` / `ws_chat` call
-`engine.submit` on the ASGI event-loop thread, so a request admission blocks
-the loop that also answers `/health`. (An earlier stats-lock stall in
-`stats()` was fixed on 2026-09-07 and is not this event.) Clients must retry
-`/health`; do not treat a prefill-window stall as the server being down.
+`/health` used to intermittently fail to respond while a long prefill ran
+(client saw 000/timeout). The completion path was unaffected and retries
+succeeded. The 2026-09-13 trace found `chat_completions` / `ws_chat` calling
+`engine.submit` on the ASGI event-loop thread, so request admission blocked the
+loop that also answers `/health` (an earlier stats-lock stall in `stats()` was
+fixed on 2026-09-07). Fixed by #577 — submit no longer blocks the event loop —
+and the fix is verified on the live sm70 serve. Retrying `/health` remains the
+correct handling for an ordinary network hiccup.
 
 Sparse long context is a separate, limited path: 64k serves only at B=1 and
 256k prefills are OOM-killed — see

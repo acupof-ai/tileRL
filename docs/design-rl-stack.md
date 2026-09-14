@@ -141,11 +141,11 @@ tilerl ledger  [--lineage <id>] [--json]        # what exists, what it descends 
 ```
 
 Every flag above ships except `serve --run`: `serve` takes `--model/--draft/--blocks/
---slots/--max-batch/--max-ctx/--host/--port/--devices/--depth/--no-warmup` plus the
+--slots/--max-batch/--max-ctx/--host/--port/--depth/--no-warmup` plus the
 tier flags `--dram-bytes`/`--cold-ssd-path`
 (`wins/2026-09-06-dram-bytes-flag-and-health-gate.md`), so an adapter
-is loaded by path, not by run id. The block reads as a status list precisely because 7 of
-its 8 flags are real, which is why the one that is not says so.
+is loaded by path, not by run id. Every flag in the list is real; the one exception is
+named in the sentence above.
 
 Command names stay as they are in the tree (`train`, `merge`, `serve`,
 `ledger`); `eval` is a flag on `train` until a run needs re-scoring alone.

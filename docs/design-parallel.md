@@ -8,14 +8,14 @@ Not greenfield, and the design has to say what it is *adding*:
 
 | shipped | where |
 |---|---|
-| `Backend.all_reduce` / `all_gather` / `tp_fork` | `backend.py:153`, `:164`, `:176` |
+| `Backend.tp_fork` / `all_reduce` / `all_gather` | `backend.py` |
 | weight sharding, column/row split tables, fp4/fp8 alignment checks | `tensor_parallel.py` |
-| `pad_vocab`, `kv_replicas`, `tp_config` | `tensor_parallel.py:59`, `:65`, `:79` |
-| row-parallel all-reduce in the forward | `model.py:191` (`_add_via`) |
+| `pad_vocab`, `kv_replicas`, `tp_config` | `tensor_parallel.py` |
+| row-parallel all-reduce in the forward (`Model._add_via`) | `model.py` |
 | data-parallel engines, one per card | deleted in #399 (`DataParallelEngine` / `parallel.py`) — this page is about training-side TP/CP/SP, not the serving wrapper |
 | NCCL cost: **20.6 µs per call, flat 20 KB → 1.3 MB** | [measured](experience/wins/2026-09-07-the-nccl-floor-was-measured-a-week-early.md) |
 
-**The backward landed in #115.** `_BWD` (`autograd.py:245`) now registers
+**The backward landed in #115.** `_BWD` in `autograd.py` now registers
 `all_reduce`, `all_gather` and `tp_fork`, gated by `tests/tp_world2.py` on two
 gloo ranks. The sharded cross-entropy followed in #119. **What remains of this
 document is the mesh** — nothing yet selects a `(dp, tp, cp)` layout — and CP/SP
@@ -293,7 +293,7 @@ revisit-when-measured standing.
 ## Two risks worth stating now
 
 - **TP forfeits the decode graph** until `Backend.all_reduce` is capturable
-  (`tensor_parallel.py:21` already says so). The graph is worth **2.16× on the RL
+  (`tensor_parallel.py` already says so in its module note). The graph is worth **2.16× on the RL
   step** (measured 2026-09-05 on card 6: 73.62 → 34.09 s, n=10 pooled over both
   arm orders — `wins/2026-09-05-recapture-after-update.md`), and it is now the
   default there. So TP-8 that loses it starts 2× behind and has to win that back
