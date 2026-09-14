@@ -29,6 +29,24 @@ from torch import Tensor
 
 from .kv_cache import BLOCK_TOKENS
 
+
+def group_map(cfg) -> tuple[list[int], dict[int, int]]:
+    """Full-attn PLANE indices -> (source planes, plane -> group). A group's
+    layers reuse the source layer's selection. Tiny (<4 full-attn): each layer
+    is its own source/group."""
+    n = len(cfg.full_attn_layers)
+    if n >= 4:
+        _, groups = index_source_groups(n)
+    else:
+        groups = [[j] for j in range(n)]
+    src, of = [], {}
+    for g, idxs in enumerate(groups):
+        src.append(idxs[0])
+        for j in idxs:
+            of[j] = g
+    return src, of
+
+
 #: Index query heads and per-head dim (V4.1-Flash releases 32/128; one H20
 #: holds 4/128 per the sparse-KV design). Kept as module constants for the
 #: derived byte rows; tiny gates use small values.

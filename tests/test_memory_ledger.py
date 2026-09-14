@@ -431,8 +431,7 @@ def test_sparse_source_count_matches_group_map_at_every_plane_count(n_full, grou
 
     from tilerl.config import tiny
     from tilerl.memory import sparse_source_count
-    from tilerl.sparse_engine import group_map
-    from tilerl.sparse_index import sparse_group_count
+    from tilerl.sparse_index import group_map, sparse_group_count
 
     cfg = replace(tiny(), num_layers=n_full, full_attn_layers=tuple(range(n_full)))
     assert sparse_group_count(n_full) == groups
