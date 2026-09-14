@@ -96,3 +96,72 @@ green after.
 An off-by-one block check that only fires when N rows align at a boundary in
 one tick is a concurrency-ordering defect, not a capacity defect: size-based
 single-row probes pass forever. The repro must force the multi-row alignment.
+
+## Deterministic gate
+
+The ~1/3 card warmup is the bug report, not the gate. The acceptance gate is a
+deterministic CPU/tiny test that forces the four-row alignment the card only
+hits by timing. Lives in `tests/test_e2e.py` beside the dense spec suite
+(reuses `_random_draft`, `_drain`, `tiny()`, `RefBackend`).
+
+Build knobs — dense d1 (the bug is the dense trunk-reuse path `r.blocks`, not
+the sparse-owned `r.draft_blocks`):
+
+```python
+cfg = tiny()  # 2 layers, idx 0 full-attn / idx 1 gated; BLOCK_TOKENS = 16
+engine = build_engine(cfg, build_random(cfg, seed=7), get_backend(),
+    num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096,
+    draft=_random_draft(cfg, 7, model), spec_depth=1, sparse_k=0)
+```
+
+Force the crossing: every prompt is `L = k*16 + 1` tokens (`L = 49 = 3*16+1`
+fits the pool). After prefill a row sits one token past a block boundary, so
+its first decode drafts at `hi = seq_len - 1 = k*16`, which owns `k+1` blocks
+under the strict `len(blocks)*16 > hi` check — the one-block-short condition.
+
+Submit all four BEFORE draining and drive the engine with `step()` directly
+so the rows batch in one tick instead of racing on poll timing:
+
+```python
+prompts = [np.arange(7, 7 + L) + i * 1000 for i in range(4)]  # distinct, equal length
+rids = [e.submit(p, SamplingParams(temperature=0, max_new_tokens=4, seed=i))
+        for i, p in enumerate(prompts)]
+```
+
+Then step until the alignment precondition holds, and make the NEXT step the
+probe — this is what turns ~1/3 into every run:
+
+```python
+for _ in range(N):
+    e.step()
+    live = [r for r in e._running]
+    if (len(live) == 4
+            and all(r.phase == _PHASE_DECODE for r in live)
+            and len({r.seq_len for r in live}) == 1):
+        break
+e.step()  # the tick that drafts all four at hi == k*16
+```
+
+Red today: that step raises the `spec.py` AssertionError (`pytest.raises`
+marks it red pre-fix; one tick 500s every running request). Fixed asserts:
+
+```python
+# no exception; rows still running, not failed by the tick
+for r in e._running:
+    assert len(r.blocks) * BLOCK_TOKENS > r.seq_len - 1   # owns the block it drafted
+outs = [_drain(e, [rid], 4)[rid] for rid in rids]
+assert all(len(o) == 4 for o in outs)                     # all four complete
+assert e._kv.free_blocks == free_before                  # zero block leak
+```
+
+Expected fixed behavior: before `_draft.step(rows)` plans, each dense row has
+grown — or the plan is computed against — the blocks covering
+`seq_len - 1 + depth` for the tick, so draft position and the post-growth
+owned-block count agree for four rows aligned at the boundary in one batch.
+
+**Sparse symmetry note:** the same plan logic has a `r.draft_blocks` branch
+(sparse rows own a separate dense draft pool). When that code moves in the
+post-step-11 work, give it an equivalent forced-alignment gate (sparse
+`sparse_k>0` build, four sparse rows at a `k*16+1` crossing) rather than
+assuming the dense gate covers it — the card failure was dense, but the
+one-block-short arithmetic is written in the shared function.
