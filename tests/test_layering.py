@@ -33,7 +33,6 @@ LAYERS: dict[str, frozenset[str]] = {
             "math_answer",
             "bench",
             "train",
-            "rollout",
             "iso",
             "merge",
             "calibration",
