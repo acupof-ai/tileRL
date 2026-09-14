@@ -60,13 +60,13 @@ runner=$(REMOTE_DIR="$TMP/work/tilerl-alpha" POD_RUN_EMIT_RUNNER=1 \
 code=$(printf '%s\n' "$runner" | grep -vE '^\s*(#|$)')
 tree_at=$(printf '%s\n' "$code" | grep -n 'pod_run: tree' | head -1 | cut -d: -f1)
 [ -n "$tree_at" ] || fail "the runner never prints its tree"
-[ "$tree_at" -le 3 ] || fail "the tree line is executable line $tree_at, too late to be read"
-# Nothing that can exit non-zero may precede it. `cd` can, and does when the tree is gone,
-# which is precisely the case where the sha matters most -- so it may only be preceded by
-# set/cd, nothing else.
+# Only set/cd and redirected marker echoes may precede the tree line: `cd` can fail
+# precisely when the tree is gone (the case where the sha matters most), and the
+# .pod_running echo writes to a file. A bare stdout echo before the tree line would
+# be read as the runner's output, so it is rejected.
 before=$(printf '%s\n' "$code" | sed -n "1,$((tree_at - 1))p")
-printf '%s\n' "$before" | grep -qvE '^(set |cd )' \
-  && fail "something other than set/cd precedes the tree line: $before"
+printf '%s\n' "$before" | grep -vE '^(set |cd |echo( |$).* >>? )' | grep -q . \
+  && fail "an executable line other than set/cd/a redirected echo precedes the tree line: $before"
 
 # Run it: `unknown` must be visibly different from a real sha, or the line is decoration.
 echo_line=$(printf '%s\n' "$code" | grep 'pod_run: tree' | head -1)
@@ -120,7 +120,11 @@ for launcher in pod_run.sh pod_sync.sh pod_fan.sh; do
   grep -qE "(export [^\"']*|[[:space:]])REMOTE_DIR=\\\$?REMOTE_DIR" "$ROOT/scripts/$launcher" \
     || fail "$launcher does not export REMOTE_DIR; a job resolving its own paths falls back to /work/tilerl"
 done
-for b in bench_ssd_restart bench_write_through bench_tier_wall_clock; do
+# Derived, not listed: two of the original three went with the dense SSD tier (#568);
+# every surviving bench script that takes --repo must read its default from REMOTE_DIR.
+for f in "$ROOT"/scripts/bench_*.py; do
+  grep -q '"--repo"' "$f" || continue
+  b=$(basename "$f" .py)
   # argparse's own default, not a regex over the source: the first attempt matched to the
   # first comma and tried to eval `os.environ.get("REMOTE_DIR"`.
   parser="

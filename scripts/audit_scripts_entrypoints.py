@@ -109,6 +109,37 @@ def set3_imports() -> dict[str, set[str]]:
                 add(node.module.split(".")[0], p)
                 for a in node.names:
                     add(a.name, p)
+        # importlib.util.spec_from_file_location(name, path): neither arg is an import
+        # node, so without this a test that loads scripts/board.py via spec read DEAD.
+        # Path spellings handled: a ".../scripts/x.py" literal, and
+        # os.path.join(..., "scripts", "x.py"); other dynamic paths are not resolvable.
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "spec_from_file_location"
+            ):
+                continue
+            if node.args:  # the explicit module name ("board", "benchrec", ...)
+                first = node.args[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    add(first.value, p)
+            if len(node.args) > 1:
+                path_arg = node.args[1]
+                if isinstance(path_arg, ast.Constant):
+                    m = re.search(r"scripts[/\\]([A-Za-z0-9_]+)\.py$", path_arg.value)
+                    if m:
+                        add(m.group(1), p)
+                elif isinstance(path_arg, ast.Call):
+                    consts = [
+                        a.value
+                        for a in path_arg.args
+                        if isinstance(a, ast.Constant) and isinstance(a.value, str)
+                    ]
+                    if "scripts" in consts:
+                        for c in consts:
+                            if c.endswith(".py"):
+                                add(c[:-3], p)
         # runpy / exec / subprocess reaching a path: textual, since it is not an import node
         for m in re.finditer(r"scripts/([A-Za-z0-9_]+)\.py", src):
             add(m.group(1), p)

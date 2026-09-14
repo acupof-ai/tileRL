@@ -12,13 +12,14 @@ Three arms, in the order that can stop the next one.
 3. BYTES, then tok/s. The bytes-per-tick fraction is printed BEFORE any rate, because a
    decode tick reads the weights every token regardless and fp8 KV is a fraction of it.
 
-  scripts/pod_run.sh kvfp8-27b 0 -- python3 scripts/probe_kv_fp8_27b.py --source /work/Qwen3.8-27B-NVFP4
+  scripts/pod_run.sh kvfp8-27b 0 -- python3 scripts/probe_kv_fp8_27b.py
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -336,7 +337,10 @@ def arm_boundary(cfg, model, backend, ctx: int, batch: int, n_new: int) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--source", default="/work/Qwen3.8-27B-NVFP4")
+    ap.add_argument(
+        "--source",
+        default=os.environ.get("TILERL_QWEN38_SOURCE", "/work/tilerl-ckpt/Qwen3.8-27B-NVFP4"),
+    )
     ap.add_argument("--model", default="qwen38-27b", choices=["qwen38-27b", "tiny"],
                     help="tiny is for smoke-testing this script's plumbing off the card")
     ap.add_argument("--prompt-tokens", type=int, default=2048)
