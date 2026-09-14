@@ -10,6 +10,7 @@ LOC     = current line count
 A module high on churn and fan-in is where defects and merge conflicts land;
 LOC alone measures size, not risk.
 """
+
 from __future__ import annotations
 
 import ast
@@ -25,7 +26,10 @@ SRC = ROOT / "src" / "tilerl"
 def churn(since: str) -> collections.Counter[str]:
     out = subprocess.run(
         ["git", "log", f"--since={since}", "--name-only", "--format=", "--", "src/tilerl"],
-        cwd=ROOT, capture_output=True, text=True, check=True,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout
     c: collections.Counter[str] = collections.Counter()
     for line in out.splitlines():
@@ -69,7 +73,7 @@ def main() -> None:
     ch, fi = churn(since), fan_in()
     rows = []
     for f in sorted(SRC.glob("*.py")):
-        rows.append((ch[f.name], fi[f.stem], sum(1 for _ in open(f)), f.stem))
+        rows.append((ch[f.name], fi[f.stem], len(f.read_text().splitlines()), f.stem))
     rows.sort(key=lambda r: (r[0] * max(r[1], 1), r[2]), reverse=True)
     print(f"# since {since}  (score = churn x max(fan-in,1))")
     print(f"{'module':18} {'churn':>6} {'fan-in':>7} {'LOC':>6}")
