@@ -96,8 +96,9 @@ judged by lines removed.
 ## Guardrail first
 
 Before any move, add one structural test, `tests/test_layering.py`. It parses every module
-under `src/tilerl` with `ast` and fails on an import from a higher layer, reading the layer
-table above as data. Today's violations go into an explicit allowlist in that test, and the
+under `src/tilerl` with `ast` and fails on an import from a higher layer, with the layer table above as a
+literal in the test; the test is the source of truth once it lands, and a module missing from
+the table fails, so every new file is placed on purpose. Today's violations go into an explicit allowlist in that test, and the
 allowlist may only shrink. It holds the direction while five people cut code in parallel,
 because a wrong import is rejected when written, not caught in review. Its negative control
 is an added `from .cli import x` in `memory.py`, which must fail.
