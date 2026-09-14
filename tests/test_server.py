@@ -1870,3 +1870,160 @@ def test_a_nonstream_client_disconnect_cancels_its_request():
         asyncio.run(main())
     finally:
         engine.shutdown()
+
+
+def test_a_real_http_disconnect_event_cancels_without_task_cancellation():
+    """uvicorn sends http.disconnect without cancelling the request task.
+
+    A route that only awaits to_thread(completion) and catches CancelledError
+    never sees that: the httpx test above cancels the whole task and covers only
+    that path. All three non-stream routes must poll is_disconnected() while the
+    completion worker runs, call engine.cancel(rid), and answer 499.
+    """
+    import asyncio
+    import threading
+
+    class _HangingEngine:
+        def __init__(self) -> None:
+            self.cancelled: list[int] = []
+            self._release = threading.Event()
+
+        def submit(self, input_ids, params) -> int:
+            return 42
+
+        def take(self, request_id: int):
+            # Block like an unfinished row; cleanup releases the worker.
+            self._release.wait(2.0)
+            raise RuntimeError("cancelled")
+
+        def cancel(self, request_id: int) -> bool:
+            self.cancelled.append(request_id)
+            return True
+
+        def room_for(self, prompt_tokens: int) -> int:
+            return 512
+
+        limits = None
+        stats = lambda self: {}
+        stop_text = lambda self, rid: None
+        logprobs = lambda self, rid: []
+
+        def __getattr__(self, name):  # rendering runs only after completion
+            raise AssertionError(f"unexpected engine call: {name}")
+
+    engines: list[_HangingEngine] = []
+
+    async def scenario(path: str, body: bytes, delay_s: float) -> None:
+        engine = _HangingEngine()
+        engines.append(engine)
+        app = create_app(engine, _ByteTokenizer())
+        received: list[dict] = []
+        peeks = {"n": 0}
+        t0 = time.monotonic()
+
+        async def receive():
+            # First call delivers the body. Starlette peeks receive under a
+            # cancelled scope while connected; an empty http.request stands for
+            # "nothing yet" (a buffered channel), then the disconnect arrives
+            # after delay_s - mid-worker, not at request start.
+            n = peeks["n"]
+            peeks["n"] += 1
+            if n == 0:
+                return {"type": "http.request", "body": body, "more_body": False}
+            if delay_s and time.monotonic() - t0 < delay_s:
+                return {"type": "http.request"}
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            received.append(message)
+
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                 "method": "POST", "scheme": "http", "path": path,
+                 "query_string": b"", "root_path": "",
+                 "headers": [(b"content-type", b"application/json")],
+                 "client": ("test", 1234), "server": ("test", 80)}
+        task = asyncio.ensure_future(app(scope, receive, send))
+        # Poll interval is 0.05 s; the route must react well inside 1 s.
+        deadline = time.monotonic() + 1.0
+        while not engine.cancelled and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert engine.cancelled == [42], (
+            f"{path}: engine.cancel not called on http.disconnect within 1 s")
+        await asyncio.wait_for(task, timeout=2.0)
+        status = next((m.get("status") for m in received
+                       if m["type"] == "http.response.start"), None)
+        assert status == 499, f"{path}: expected 499 on disconnect, got {status}"
+        if delay_s:
+            # Polled, not spun: 0.25 s at a 0.05 s interval is ~5 fresh peeks;
+            # a busy loop (a reused one-shot watcher) makes thousands.
+            assert peeks["n"] - 1 <= 12, (
+                f"{path}: {peeks['n'] - 1} disconnect peeks in {delay_s}s - spinning")
+
+    async def main():
+        for body3 in (
+            ("/v1/chat/completions",
+             b'{"model":"m","max_tokens":512,'
+             b'"messages":[{"role":"user","content":"hi"}]}'),
+            ("/v1/messages",
+             b'{"model":"m","max_tokens":512,'
+             b'"messages":[{"role":"user","content":"hi"}]}'),
+            ("/v1/responses",
+             b'{"model":"m","max_output_tokens":512,'
+             b'"input":[{"role":"user","content":'
+             b'[{"type":"input_text","text":"hi"}]}]}'),
+        ):
+            await scenario(body3[0], body3[1], 0.0)     # disconnect at start
+            await scenario(body3[0], body3[1], 0.25)    # delayed, mid-worker
+
+    try:
+        asyncio.run(main())
+    finally:
+        # Release orphaned completion workers so the executor joins at teardown.
+        for engine in engines:
+            engine._release.set()
+
+
+def test_await_or_cancel_polls_disconnect_at_interval_not_spin():
+    """The disconnect watcher is awaited FRESH once per 0.05 s tick. A reused
+    one-shot task resolves False while connected and then busy-waits forever;
+    this bounds the number of is_disconnected() calls over 0.25 s.
+    """
+    import threading
+
+    from tilerl.server import ClientDisconnected, await_or_cancel
+
+    class _Req:
+        def __init__(self) -> None:
+            self.peeks = 0
+            self.t0 = time.monotonic()
+
+        async def is_disconnected(self) -> bool:
+            self.peeks += 1
+            return time.monotonic() - self.t0 >= 0.25
+
+    class _Eng:
+        def __init__(self) -> None:
+            self.cancelled: list[int] = []
+            self._go = threading.Event()
+
+        def cancel(self, rid: int) -> bool:
+            self.cancelled.append(rid)
+            return True
+
+        def take(self, rid: int):
+            self._go.wait(2.0)
+            raise RuntimeError("cancelled")
+
+    async def main() -> None:
+        req, eng = _Req(), _Eng()
+        with pytest.raises(ClientDisconnected):
+            await asyncio.wait_for(
+                await_or_cancel(req, eng, [7], eng.take, 7), timeout=1.0)
+        assert eng.cancelled == [7]
+        # 0.25 s / 0.05 s ~= 5 ticks; a spin loop makes thousands.
+        assert req.peeks <= 12, f"{req.peeks} is_disconnected peeks in 0.25 s - spinning"
+        eng._go.set()
+
+    import asyncio
+
+    asyncio.run(main())

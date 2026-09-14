@@ -31,8 +31,8 @@ import json
 import time
 from typing import Any
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .messages import _COMPLETION_TIMEOUT_S, _parse_tool_calls
@@ -144,6 +144,7 @@ def _flatten_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] |
 def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
                     model_name: str) -> FastAPI:
     """Add POST /v1/responses to an existing app, sharing its engine."""
+    from .server import ClientDisconnected, await_or_cancel
 
     def _thinking(req: ResponsesRequest) -> bool | None:
         # An explicit override wins; "none" effort switches it off; otherwise the
@@ -259,14 +260,15 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         return items
 
     @app.post("/v1/responses")
-    async def responses(req: ResponsesRequest):
+    async def responses(req: ResponsesRequest, request: Request):
         rid_box: list = [-1]
         try:
-            # to_thread, same reason as messages.py.
-            body = await asyncio.to_thread(_run, req, rid_box)
+            body = await await_or_cancel(request, engine, rid_box, _run, req, rid_box)
         except asyncio.CancelledError:
             engine.cancel(rid_box[0])
             raise
+        except ClientDisconnected:
+            return Response(status_code=499)
         except ValueError as exc:
             return JSONResponse(status_code=400,
                                 content={"error": {"message": str(exc),

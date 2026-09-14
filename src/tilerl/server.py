@@ -26,7 +26,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -155,6 +155,43 @@ def _usage(prompt_tokens: int, completion_tokens: int) -> dict:
     }
 
 
+class ClientDisconnected(Exception):
+    """A real http.disconnect arrived while the completion worker still runs."""
+
+
+_DISCONNECT_POLL_S = 0.05
+
+
+async def await_or_cancel(request: Request, engine: Any, rid_box: list,
+                          run_fn: Any, *args: Any) -> Any:
+    """Poll a blocking completion fn in a thread and watch the ASGI disconnect.
+
+    uvicorn delivers a client hang-up as http.disconnect WITHOUT cancelling the
+    request task, so a bare ``await asyncio.to_thread(poll)`` never sees it (the
+    httpx path that cancels the task still reaches the CancelledError branch).
+    The worker is created once; ``is_disconnected()`` is awaited FRESH each tick
+    — Starlette's one-shot peek returns False while connected and never flips, so
+    a reused task detects nothing (and busy-waits). The wait timeout is the poll
+    interval, not just a timeout. On disconnect the row is cancelled (that frees
+    the slot) and ClientDisconnected is raised for a 499; the orphaned worker is
+    not awaited.
+    """
+    worker = asyncio.ensure_future(asyncio.to_thread(run_fn, *args))
+    try:
+        while True:
+            done, _ = await asyncio.wait({worker}, timeout=_DISCONNECT_POLL_S)
+            if worker in done:
+                return worker.result()
+            if await request.is_disconnected():
+                engine.cancel(rid_box[0])
+                raise ClientDisconnected()
+    finally:
+        if not worker.done():
+            # The cancelled row makes its next take() raise; consume it so the
+            # exception is never reported as unretrieved.
+            worker.add_done_callback(lambda t: t.exception())
+
+
 # ---------------------------------------------------------------------------
 # App factory.
 # ---------------------------------------------------------------------------
@@ -271,7 +308,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         }
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(req: ChatCompletionRequest):
+    async def chat_completions(req: ChatCompletionRequest, request: Request):
         req = ChatCompletionRequest.model_validate(_normalize_thinking(req.model_dump()))
         request_id = -1
         try:
@@ -298,12 +335,16 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
+        rid_box = [request_id]
         try:
-            output_ids = await asyncio.to_thread(_await_completion, request_id)
+            output_ids = await await_or_cancel(
+                request, engine, rid_box, _await_completion, request_id)
         except asyncio.CancelledError:
             # Client hung up before the non-stream reply; stop generating for nobody.
             engine.cancel(request_id)
             raise
+        except ClientDisconnected:
+            return Response(status_code=499)
         except TimeoutError as exc:
             return JSONResponse(
                 status_code=504,

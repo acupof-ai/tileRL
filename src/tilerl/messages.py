@@ -37,7 +37,7 @@ import time
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .prompt import (
@@ -177,6 +177,7 @@ def _effort(req: MessagesRequest) -> str | None:
 
 def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: str) -> FastAPI:
     """Add POST /v1/messages to an existing app, sharing its engine."""
+    from .server import ClientDisconnected, await_or_cancel
     # For the recorder row only: a `budget` below `engine_limit - prompt_len` was pool-capped.
     engine_limit = getattr(getattr(engine, "limits", None), "max_total_tokens", 0)
 
@@ -291,11 +292,13 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         rollout = request.headers.get(_ROLLOUT_HEADER)
         rid_box: list = [-1]
         try:
-            # to_thread: `_run` polls take() with sleep, which on the loop starves every route.
-            body, rid = await asyncio.to_thread(_run, req, rollout, rid_box)
+            body, rid = await await_or_cancel(
+                request, engine, rid_box, _run, req, rollout, rid_box)
         except asyncio.CancelledError:
             engine.cancel(rid_box[0])
             raise
+        except ClientDisconnected:
+            return Response(status_code=499)
         except ValueError as exc:
             return JSONResponse(status_code=400,
                                 content={"type": "error",
