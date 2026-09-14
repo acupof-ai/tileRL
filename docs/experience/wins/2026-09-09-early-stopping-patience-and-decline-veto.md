@@ -104,3 +104,5 @@ A run with `--patience 1 --eval-every 5` on the GSM8K recipe stops at step 10 (t
 non-improving point after the step-5 peak), ships `adapter-best.safetensors` at step 5,
 and the manifest's `early_stopped.reason` is `"patience"`. A collapse-shaped run stops at
 the collapse point with `reason: "decline"` and `kept_step` at the pre-collapse peak.
+
+> **Provenance (2026-09-14 cleanup):** the raw-score replay on the RECORDED n=100 curve (no subsampling), with the adjacent-diff distribution and the running-max exceedance `p_hat`, came from `python3 scripts/replay_recorded_curve.py <run_dir>`; it also reports the manifest-sec cost and the geometric-model dead end.

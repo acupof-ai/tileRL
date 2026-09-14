@@ -277,3 +277,5 @@ run.
 
 Corollary: every A/B probe carries a correctness column. This one's would have
 shipped a 13% "win" that computed half the matrix.
+
+> **Provenance (2026-09-14 cleanup):** the M=8 mma8-vs-unreachable-w4a8 A/B table (lines ~198-208) came from `CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src TILERL_TARGET=cuda python3 scripts/probe_fp4_decode_paths.py`. The paired W8-off/on tick rows (lines ~244-257: B=4 1.037x, B=8 ~1.00x, 565 ms in-process contamination) came from `TILERL_TARGET=cuda python3 scripts/probe_w8_e2e.py` in one process on the same weights.

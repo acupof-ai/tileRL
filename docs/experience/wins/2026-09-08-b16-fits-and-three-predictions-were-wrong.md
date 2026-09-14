@@ -289,3 +289,5 @@ durable part; its conclusion is not.
   `getattr` fallback makes the guard pass for everyone, which is the same as not having it.
 - **A literal in a test is only safe while production also has a literal.** When the value
   starts being computed, the assertion has to be computed too or it goes green over nothing.
+
+> **Provenance (2026-09-14 cleanup):** the B=8/B=16 peak table above (25.99 / 30.13 GiB of 95.2) came from `scripts/pod_run.sh b16mem 2 -- python3 scripts/probe_batch16_mem.py` on the 27B at gen 1024 with decode_graph off and no prefix store.

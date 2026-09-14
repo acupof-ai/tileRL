@@ -212,3 +212,7 @@ the guard reports "unread", so a wrong fix reads as *still unread* rather than a
 
 Backward-only change; no serving path touched (`linear_fp4_bwd` is reached only from
 `autograd.py:250`). `backward_secs` 31.339 -> 23.755 is the metric, above.
+
+> **Provenance (2026-09-14 cleanup):** the four-cell tile/thread table above came from `scripts/pod_run.sh fp4thr 6 -- python3 -u scripts/probe_fp4_bwd_tiles.py` (rerun shape; numbers are the 31.339→23.755 s / 2.765x rows in this entry).
+>
+> The fleet-wide mma.sync-vs-wgmma census behind it came from `python3 scripts/audit_mma_class.py [--cache DIR]` (pod: reads `TILELANG_CACHE_DIR`): 15,989 `device_kernel.cu` kernels, 40 sm90 kernels, 8 mma.sync@64 candidates; the three false-cell classes split 1715 write_tokens / 1344 rope / 942 silu, 19 rows→8, with a `_CUDA_PLAN` call-site indirection. **Standing question** — new kernels land (hybrid #586), so the census is re-run on each kernel batch, not retired.
