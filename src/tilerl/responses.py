@@ -274,6 +274,9 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
                                 content={"error": {"message": str(exc),
                                                    "type": "invalid_request_error"}})
         except (TimeoutError, RuntimeError) as exc:
+            # Timeout: the row keeps generating until the server cancels it;
+            # RuntimeError (RequestFailed) makes cancel a no-op.
+            engine.cancel(rid_box[0])
             return JSONResponse(status_code=503,
                                 content={"error": {"message": str(exc),
                                                    "type": "api_error"}})
