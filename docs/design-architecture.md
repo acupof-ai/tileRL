@@ -1,6 +1,6 @@
 # Target architecture (wrap-up refactor)
 
-Baseline: origin/main `0e247634`, 2026-09-14. `src/tilerl` is 20,185 lines in 41 flat modules.
+Baseline: origin/main `0e247634`, 2026-09-14. `src/tilerl` is 20,185 lines in 33 files (32 modules plus `__init__`).
 `packages/tilerl-kernels` is 8,368 lines. `scripts/` holds 248 files, 78 of them `probe_*`.
 `tests/` holds 79 files.
 
@@ -13,7 +13,7 @@ deletion that the existing gates can check.
 | Problem | Evidence |
 |---|---|
 | God class | `Engine` is 2,568 lines: core loop 1,236, sparse runtime 640, memory ledger and stats 326, decode graphs 167, spec and sampling 121 |
-| God CLI | `cli.py` is 2,820 lines and four products (parser 381, train/RL loop with eval statistics ~1,100, bench renderers ~280, ledger rendering ~100). It imports 20 tilerl modules. `_train_adapters` alone is 608 lines, `_build_parser` 381, `cmd_bench_kernels` 173 |
+| God CLI | `cli.py` is 2,820 lines and four products (parser 381, train/RL loop with eval statistics ~1,100, bench renderers ~280, ledger rendering ~100). It imports 19 tilerl modules at top level, 23 including lazy in-function imports. `_train_adapters` alone is 608 lines, `_build_parser` 381, `cmd_bench_kernels` 173 |
 | Two builders | `engine.build_engine` (324 lines) and `cli._build_engine` / `cli._build_model` both assemble an engine; tests and 89 scripts call one or the other |
 | Import cycles | `autograd`↔`sparse_index`, `calibration`↔`cli`, `cli`↔`memory`, `dflash2`↔`spec`, `model`↔`tensor_parallel` |
 | Upward imports | `memory` and `calibration` import `cli`; `autograd` imports `sparse_index` |
@@ -31,7 +31,7 @@ Nothing imports `cli`.
 L6  cli.py                      argparse + thin cmd_* dispatch
 L5  apps       server messages responses prompt ui_assets   (serving front end)
                generate eval judge math_answer bench        (offline use)
-               train rollout iso merge calibration recipes ledger kernel_cost
+               train iso merge calibration recipes ledger kernel_cost
 L4  build.py                    config + checkpoint -> Model, Engine (the only assembler)
 L3  schedule   engine.py        submit/poll/StepLimits, admit, plan, commit, release, loop
                decode_graph.py  captured dense and sparse decode graphs, buckets, precapture
@@ -43,6 +43,8 @@ L2  storage    kv_cache.py      PagedKvPool, LinearStatePool, PrefixStore, Batch
                sparse_index.py  page bounds and selection math
 L1  model      model.py tensor_parallel.py autograd.py
 L0  base       precision.py config.py tokenizer.py testing.py
+
+`rollout.py` is deleted in step 4 and is absent from the table.
     kernels    packages/tilerl-kernels (backend, registry, kernels_*, reference)
 ```
 
@@ -69,11 +71,16 @@ methods and `if r.sparse_on` branches spread across `Engine`. `Engine` holds an 
 
 | Call | Replaces | When the loop calls it |
 |---|---|---|
-| `admit_headroom()` | `_sparse_hot_headroom` | dense admit |
-| `rows(plan)` | `_sparse_rows`, `_sparse_decode_rows` | building a tick |
+| `route(req)` | the `sparse_on` decision and dense-too-big reroute in `submit` | submit |
+| `attach(req, hit)` | the prefix adoption block in `_admit`: `SparseTracker.attach`, `SparsePrefixCache.lookup`/`set_bounds`, `_sparse_warm_draft` | admit |
+| `admit_headroom()` | `_sparse_hot_headroom` | admit |
+| `rows(plan)` | `_sparse_rows`, `_sparse_decode_rows`, the `do_refresh` / `_sparse_device_select` / `_sparse_prefill_cap` decision | building a tick |
 | `run(plan)` | `_run_sparse_decode_graph` and the eager path | forward |
-| `finalize(req)` | `_sparse_finalize` + offers | release |
+| `process_offers()` | `_sparse_process_offers` | mid-loop |
+| `release(req)` | `_sparse_finalize`, offers, `SparsePrefixCache.close_request`, `_sparse_transfer_to_shared` and its freeze/share refs | release |
 | `stats()` | `_sparse_live_stats` | stats |
+| `retier(keep)` | `Engine.sparse_retier` | public #500 manual seam; thin delegation, kept |
+| `selection_recall()` | `sparse_selection_recall` | test/observability surface; kept |
 
 A dense-only engine holds `None`, and the dense path contains no sparse branch. This is the
 largest move and runs last, behind a device gate.
@@ -107,17 +114,18 @@ is an added `from .cli import x` in `memory.py`, which must fail.
 
 Each row is one PR. Each is behaviour-preserving and passes CI (full suite). Rows marked
 *device* also need a V100 smoke on the PR head before merge: short think-on tok/s within 2%
-of 52, MMLU n=50 equal to 0.70, one unique 32k request answered.
+of 52 on the same question set; MMLU n=200 against the same gold-question list (pair by question hash, not seed; at n=50 the binomial half-width is ~0.13 and cannot gate equality), paired accuracy within 0.05; one unique 32k request answered.
 
 | # | PR | Owner | Gate |
 |---|---|---|---|
 | 0 | This doc | coordinator | review |
 | 1 | `tests/test_layering.py` + allowlist, red on an injected upward import | fixkv | CI |
 | 2 | Stale design docs: rev-87's 13 items; archive `arch-review-2026-09-09`, `design-ssd-read-path` (KvTier removed) and completed ownership tables to `docs/history/` | fixmisc | CI |
-| 4 | Dead code in cli, server and API routes, grep-proven: the `tilerl pretrain` subcommand (no invoker; `train.pretrain` stays), `rollout.py` if its only consumer is its own test, single-use cli helpers inlined | fixmisc | CI |
+| 4 | Dead code in cli, server and API routes, grep-proven: the `tilerl pretrain` subcommand (no invoker; `train.pretrain` stays and is gated by test_pretrain), delete `rollout.py`/`run_rollout` (only tests/test_rollout.py consumes it; that test is deleted with it), inline single-use cli helpers | fixmisc | CI |
 | 5 | scripts/: delete dead one-off probes, keeping anything a doc, test, CI job or `test_main_selfchecks` glob reaches | ops | CI |
-| 6 | Break the 5 cycles and 3 upward imports; move `_rolling_hash` (sparse content hash) out of `kv_cache.py` and `group_map` into `sparse_index.py`; shrink the allowlist | fixkv | CI |
-| 7 | `build.py`: one assembler; callers of `cli._build_*` and `engine.build_engine` in src, tests and the 89 scripts are rewritten in the same PR (no re-export shim) | fixmisc | CI + device |
+| 6 | Break the 5 cycles and 3 upward imports; merge `dflash2.py` into `spec.py` (this is the dflash2↔spec cycle fix); move `_rolling_hash` (sparse content hash) out of `kv_cache.py` and `group_map` into `sparse_index.py`; shrink the allowlist | fixkv | CI |
+| 7a | `build.py`: one assembler; src callers rewritten in the same PR (no re-export shim) | fixmisc | CI + device |
+| 7b | Migrate the 89 script and 21 test-file call sites in numbered batches; each batch is one PR. The ~600-line cap counts authored lines and excludes mechanical call-site rewrites | fixmisc | CI |
 | 8 | `cli.py` split: training orchestration → `train.py`, bench commands → `bench.py`; the CLI surface is unchanged (`_EXPECTED_CLI_FLAGS`) | fixmisc | CI |
 | 8b | One request path for the three API routes: the completion wait loop (3 copies), thinking/effort resolution (3), `_flatten_tools` (2) and the non-stream tail (split_think/stop/tool-call parse, 3) move to one helper each in `prompt.py`; response JSON unchanged (`test_server`, `test_api_sdk`) | fixmisc | CI |
 | 9 | `kv_tiers.py` split out of `kv_cache.py` | fixkv | CI |
