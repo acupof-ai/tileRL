@@ -10,7 +10,7 @@ decorative gates; this file catches wrong comparators.
 
 import pytest
 
-from tilerl import cli
+from tilerl import ledger
 
 
 def _manifest(metrics: dict) -> dict:
@@ -62,7 +62,7 @@ def test_gate_comparator_rejects(tmp_path, monkeypatch, name, metrics):
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path))
     m = _manifest(metrics)
     with pytest.raises(SystemExit):
-        cli._finish(m, as_json=False)
+        ledger.finish_run(m, as_json=False)
     g = _gate(m, name)
     assert g["passed"] is False, f"{name} should be red on {metrics}"
     assert not g["skipped"], f"{name} should not be skipped"
@@ -82,7 +82,7 @@ def test_reward_rises_operand_does_not_contain_eval_correctness(tmp_path, monkey
                    "gsm8k_before": 450, "gsm8k_after": 400,
                    "gsm8k_before_total": 500})
     with pytest.raises(SystemExit):
-        cli._finish(m, as_json=False)
+        ledger.finish_run(m, as_json=False)
     # reward_rises is green (reward rose) while gsm8k_improves is red (eval fell).
     assert _gate(m, "reward_rises")["passed"] is True
     assert _gate(m, "gsm8k_improves")["passed"] is False
@@ -103,7 +103,7 @@ def test_none_value_does_not_pass_gate(tmp_path, monkeypatch):
         "tied_group_fraction": 0.17,
     })
     with pytest.raises(SystemExit):
-        cli._finish(m, as_json=False)
+        ledger.finish_run(m, as_json=False)
     g = _gate(m, "gsm8k_improves")
     assert g["passed"] is None, f"None value must not pass; got {g['passed']}"
     assert not g["skipped"], "unmeasured is not the same as explicitly skipped"

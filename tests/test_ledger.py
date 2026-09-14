@@ -6,16 +6,10 @@ import json
 
 import pytest
 
-from tilerl.cli import (
-    _EVAL_CONCURRENCY,
-    _build_parser,
-    _curve_rows,
-    _refuse_blind_curve,
-    cmd_ledger,
-    cmd_train,
-)
+from tilerl.cli import _build_parser, cmd_ledger
 from tilerl.kv_cache import BLOCK_TOKENS
 from tilerl.ledger import (
+    finish_run,
     format_run,
     gates_pass,
     lineage,
@@ -26,6 +20,7 @@ from tilerl.ledger import (
     run_id,
     write_manifest,
 )
+from tilerl.train import _EVAL_CONCURRENCY, _curve_rows, cmd_train
 
 
 def test_run_id_is_canonical():
@@ -303,11 +298,13 @@ def test_a_curve_that_cannot_resolve_its_effect_is_refused_at_start():
     (errors/2026-09-08): refuse before the run, not warn after it. The boundary
     is strict se > target, so n=100 (exactly 5.0 pt, the documented knife-edge)
     is allowed."""
+    from tilerl.ledger import refuse_blind_curve
+
     with pytest.raises(SystemExit):
-        _refuse_blind_curve(20, 5.0)
-    _refuse_blind_curve(100, 5.0)
+        refuse_blind_curve(20, 5.0)
+    refuse_blind_curve(100, 5.0)
     with pytest.raises(SystemExit):
-        _refuse_blind_curve(100, 4.0)  # a smaller effect needs more rows
+        refuse_blind_curve(100, 4.0)  # a smaller effect needs more rows
 
 
 def test_the_eval_curve_records_the_step_a_score_was_reached_at(tmp_path, monkeypatch):
@@ -442,7 +439,7 @@ def test_time_to_score_returns_the_crossing_point_and_never_interpolates():
         {"step": 10, "correct": 300, "total": 500, "score": 0.60, "secs": 9.0}]}}, 0.55)
     assert wide["se_pt"] == 2.19, wide         # 300/500 = 0.60
     # 2.19 < 5.0 so the reader stays silent there, and 11.12 >= 5.0 so it warns.
-    from tilerl.cli import _se_note
+    from tilerl.ledger import _se_note
     assert _se_note(wide) == "" and "sampling-limited" in _se_note(hit)
 
     # The fixtures above all sit near p=0.5, where `p(1-p)` is flat -- the old
@@ -612,10 +609,10 @@ def test_mmlu_score_reports_the_concurrency_it_used():
     assert "concurrency" in src.split("return")[-1], (
         "mmlu_accuracy must return the concurrency it scored at:\n" + src)
 
-    cli = inspect.getsource(__import__("tilerl.cli", fromlist=["_"]))
-    call = next(ln for ln in cli.splitlines() if "mmlu_accuracy(" in ln and "import" not in ln)
-    assert call.count(",") >= 2 and "conc" in call, f"cli.py drops the concurrency: {call!r}"
-    assert '_concurrency"] = conc' in cli, "cli.py must record it in the manifest"
+    train_src = inspect.getsource(__import__("tilerl.train", fromlist=["_"]))
+    call = next(ln for ln in train_src.splitlines() if "mmlu_accuracy(" in ln and "import" not in ln)
+    assert call.count(",") >= 2 and "conc" in call, f"train.py drops the concurrency: {call!r}"
+    assert '_concurrency"] = conc' in train_src, "train.py must record it in the manifest"
 
 
 def _gate(name, metrics):
@@ -625,12 +622,11 @@ def _gate(name, metrics):
     the SystemExit is expected rather than an error -- the manifest it wrote is still on
     `m`, and that is what carries the verdict.
     """
-    from tilerl.cli import _finish
 
     m = new_manifest("train", {"steps": 100, "source": "tiny"}, [])
     m["metrics"] = dict(metrics)
     with contextlib.suppress(SystemExit):
-        _finish(m, as_json=True)
+        finish_run(m, as_json=True)
     return next(g for g in m["gates"] if g["name"] == name)
 
 
@@ -704,7 +700,7 @@ def test_mcnemar_is_paired_and_reports_no_discordance_distinctly():
     input: the first is a real result with nothing to resolve, the second is no result.
     Conflating them would let a broken pairing read as perfect agreement.
     """
-    from tilerl.cli import _mcnemar
+    from tilerl.train import _mcnemar
 
     def rows(flags):
         return [{"dataset": "gsm8k", "i": i, "correct": c} for i, c in enumerate(flags)]
@@ -743,12 +739,11 @@ def test_validity_gates_cannot_make_p1_read_pass(capsys):
             "mmlu_before": 0.601, "mmlu_after": 0.60}
 
     def run(metrics):
-        from tilerl.cli import _finish
 
         m = new_manifest("train", {"steps": 100, "source": "tiny"}, [])
         m["metrics"] = dict(metrics)
         with contextlib.suppress(SystemExit):
-            _finish(m, as_json=True)
+            finish_run(m, as_json=True)
         capsys.readouterr()
         return m
 
@@ -774,12 +769,11 @@ def test_validity_gates_cannot_make_p1_read_pass(capsys):
     # smoke-test invocation does, and a `None` collapsed to True would report that run as
     # having passed P1. An absent metric now reports passed=None (not-measured), and
     # verdict_of filters those from the scored set -- see the cases below.
-    from tilerl.cli import _finish
 
     m0 = new_manifest("train", {"steps": 0, "source": "tiny"}, [])
     m0["metrics"] = dict(base, gsm8k_after=206)
     with contextlib.suppress(SystemExit):
-        _finish(m0, as_json=True)
+        finish_run(m0, as_json=True)
     capsys.readouterr()
     assert all(g["skipped"] for g in m0["gates"]), m0["gates"]
     assert verdict_of(m0, "verdict") is None, m0["gates"]

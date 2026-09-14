@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -466,6 +467,185 @@ def append_residency(row: dict, path: str | None = None) -> str:
     finally:
         br.STORE = old
 
+
+def _paired_delta(run_dir: Path) -> dict | None:
+    """`_mcnemar` over the two arms' `eval-{before,after}.jsonl`, or None if either is absent.
+
+    Reads the record rather than in-memory state so it works on the cache-hit path too:
+    a cached before-arm goes through `_write_eval_rows` like a fresh one, so the file
+    exists either way.
+    """
+    def rows(tag):
+        f = run_dir / f"eval-{tag}.jsonl"
+        if not f.is_file():
+            return None
+        return [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
+
+    before, after = rows("before"), rows("after")
+    if before is None or after is None:
+        return None
+    from .train import _mcnemar  # lazy: train imports ledger inside its orchestration fns
+
+    return _mcnemar(before, after)
+
+
+def _timing_snapshot(m: dict) -> None:
+    """Compare this run's speed against the SOTA baseline row and record the verdict.
+
+    steps/SECOND, not seconds/step: every row in bench-baseline.json is higher-is-better
+    and the gate's three comparisons are all `>`, so raw seconds would make a SLOWER run
+    read as a new record (tests/test_bench_gate.py holds that).
+
+    Best-effort: a run's result is the manifest, and a missing bench harness must not
+    fail the run that produced it.
+    """
+    import importlib.util
+
+
+    secs = (m.get("metrics") or {}).get("secs_per_step_median")
+    if not secs:
+        return
+    hp = Path(__file__).resolve().parents[2] / "scripts" / "bench_harness.py"
+    spec = importlib.util.spec_from_file_location("bench_harness", hp)
+    if spec is None or spec.loader is None:
+        return
+    try:
+        bh = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bh)
+        i = m["inputs"]
+        shape = f"{i['model']}-{i['algo']}-g{i.get('group')}-t{i.get('max_new_tokens')}"
+        # seed_only=False AND never dirty: seeding writes the tracked json, and every
+        # pytest run of grpo-tiny-smoke would seed a row -- five junk CPU rows landed in
+        # it the first time this ran. A run reports against the baseline; it never
+        # edits it. Adding a key stays a deliberate act.
+        gate = bh.Gate(os.environ.get("TILERL_TARGET", "cpu"))
+        gate.check("train-run", shape, 1.0 / secs, unit="step/s")
+        gate.dirty = False
+        gate.finish(Path(runs_root()) / m["id"] / "baseline-candidate.json")
+    except Exception as exc:  # noqa: BLE001 - the manifest is already written
+        print(f"  (timing snapshot skipped: {exc})")
+
+
+#: Gates whose value comes from the after-arm. A guard stop skips that arm, so these
+#: are "not measured" rather than passed -- `_finish` scores a None value as True.
+_AFTER_GATES = frozenset({"mmlu_holds", "gsm8k_improves"})
+
+
+#: The two classes a gate can belong to, recorded on the gate itself.
+#:
+#: VERDICT answers "did P1 pass": the two exit criteria `docs/roadmap.md:57-58` states.
+#: VALIDITY answers "is this run interpretable at all", and the roadmap already draws
+#: that line -- the tied-group criterion reads "< 50% (else the task is too easy for
+#: this model and the run says nothing)". Saying nothing is not failing.
+#:
+#: `reward_rises` is the reason this split matters. Reward is the quantity GRPO
+#: optimizes, so it rising is the definition of the optimizer working, not evidence for
+#: P1's claim that RL moves a DOWNSTREAM number -- and rising reward is fully
+#: compatible with a falling eval, which is what reward hacking looks like. So it must
+#: never be able to make P1 read `pass`. Reward NOT rising is informative (run 2
+#: collapsed that way), and that failure is coarse enough for a zero threshold to
+#: catch, which is why this needs no invented number.
+_VALIDITY_GATES = frozenset({"groups_untied", "reward_rises", "ce_falls",
+                             "rollouts_within_cap"})
+
+
+def finish_run(m: dict, as_json: bool) -> None:
+    """Gate, write the manifest, print it, exit non-zero on a failed gate.
+    A gate whose metric was not evaluated reports passed=None (not measured)."""
+
+    if not m["finished"]:
+        g = m["metrics"]
+        # .get, not [...]: a metric set that never had the key (an SFT run's
+        # manifest) reads as None, which the gate below records as not-measured.
+        # UNITS, and they differ 13 lines apart in the writer: `mmlu_{tag}` is a
+        # FRACTION (`c / n`, :575) and `gsm8k_{tag}` is a COUNT (`c`, :588), with the
+        # denominator alongside it as `gsm8k_{tag}_total` (:590). So the roadmap's two
+        # exit numbers encode differently, and a threshold is meaningless without the
+        # units of the quantity it thresholds.
+        mmlu_floor = None if g.get("mmlu_before") is None else g["mmlu_before"] - 0.02
+        # roadmap P1: "GSM8K held-out (500 q) after - before >= +5 pt (SE ~ 2 pt)". The
+        # +5 is a sampling margin, not a taste -- the same-batch instrument is exact, so
+        # `after > before` is a real +0.2 pt, but +1 question of 500 is a gain a
+        # symmetric null passes about half the time on a different set. Derived from
+        # `_total`, never hardcoded to 25: `--eval-n` is a flag and the recipe's 500 is
+        # not a constant.
+        gsm_total = g.get("gsm8k_after_total") or g.get("gsm8k_before_total")
+        gsm_floor = (None if g.get("gsm8k_before") is None or not gsm_total
+                     else g["gsm8k_before"] + 0.05 * gsm_total)
+        # The paired test, RECORDED beside the threshold rather than replacing it. The
+        # threshold is the roadmap's exit criterion and stays the gate; McNemar says
+        # whether the observed move is resolvable at all, which the threshold cannot --
+        # an unpaired read of n=500 has an 80%-power MDE of 7.70 pt, above the +5 pt the
+        # gate asks for. Falls back silently to threshold-only when the per-question rows
+        # are absent, which is what P1 did once already for want of them.
+        paired = _paired_delta(Path(runs_root()) / m["id"])
+        if paired is not None:
+            m["metrics"]["gsm8k_paired"] = paired
+        skipped = m["inputs"].get("steps") == 0
+        after_skipped = bool(m.pop("gates_skip_after", False))
+        # `ce_falls` has no threshold on the RL path: `ce_first` is written only by the
+        # SFT loop (:281), never by the GRPO branch (:679-690), so the vacuous-pass rule
+        # below made it report `passed` over nothing on every RL run. Not measured is the
+        # honest record, and the gate stays live where the SFT path does write both.
+        unmeasured = frozenset() if g.get("ce_first") is not None else frozenset({"ce_falls"})
+        # Symmetric: RL gates have no metrics on the SFT path.
+        if g.get("reward_first") is None:
+            unmeasured |= frozenset({"reward_rises", "groups_untied"})
+        m["gates"] += [
+            {"name": n, "value": v, "threshold": t,
+             "kind": "validity" if n in _VALIDITY_GATES else "verdict",
+             "skipped": skipped or n in unmeasured or (after_skipped and n in _AFTER_GATES),
+             "passed": None if skipped or n in unmeasured
+             or (after_skipped and n in _AFTER_GATES)
+             or v is None or t is None
+             else ok(v, t)}
+            for n, v, t, ok in (
+                ("reward_rises", g.get("reward_last"), g.get("reward_first"), lambda v, t: v > t),
+                ("mmlu_holds", g.get("mmlu_after"), mmlu_floor, lambda v, t: v >= t),
+                ("gsm8k_improves", g.get("gsm8k_after"), gsm_floor, lambda v, t: v >= t),
+                ("groups_untied", g.get("tied_group_fraction"), 0.5, lambda v, t: v < t),
+                ("ce_falls", g.get("ce_last"), g.get("ce_first"), lambda v, t: v < t),
+            )]
+        m["finished"] = now()
+        write_manifest(runs_root(), m)
+        _timing_snapshot(m)
+    print(json.dumps(m, indent=1) if as_json else format_run(m))
+    if not gates_pass(m):
+        sys.exit(1)
+
+
+def refuse_blind_curve(n: int, target_pt: float) -> None:
+    """Refuse a curve whose subset cannot resolve the effect it exists to locate,
+    BEFORE the run spends the time. Worst-case binomial SE (p=0.5), in points:
+    50/sqrt(n). The post-run `_se_note` warns at the point's own rate, but a
+    warning after a 99-minute run cannot un-spend it (errors/2026-09-08). The
+    comparison is strict: SE exactly equal to the target is the documented
+    knife-edge (n=100, 5.0 pt against P1's +5.6 pt effect, "1.1 sigma")."""
+    se = 50.0 / (n ** 0.5)
+    if n > 0 and se > target_pt:
+        raise SystemExit(
+            f"--eval-curve-n {n} carries a worst-case binomial SE of {se:.1f} pt, "
+            f"above the --curve-target-pt {target_pt:g} effect the curve locates: "
+            f"the crossing step would be chosen by which rows fell where. Raise "
+            f"--eval-curve-n to >={(50.0 / target_pt) ** 2:.0f}, or raise the target")
+
+
+def _se_note(r: dict) -> str:
+    """The subset's sampling width, when it is wide enough to set the answer.
+
+    5.0 pt is P1's own target effect (`roadmap.md`), so an SE at or above it means the
+    crossing step is chosen by which rows are in the subset as much as by the policy.
+    Silent below that: a note on every line would be read as boilerplate and skipped.
+
+    The width comes from the point's own rate (`ledger.time_to_score`), so this fires on
+    the subset's real resolution rather than on p=0.5's worst case -- which at n=50 and
+    n=100 warned about subsets that do resolve the effect.
+    """
+    se = r.get("se_pt")
+    if se is None or se < 5.0:
+        return ""
+    return (f"  [subset n={r['n']}, binomial SE {se:.1f} pt >= P1's +5 pt target: the "
+            f"crossing step is sampling-limited, raise --eval-curve-n to narrow it]")
 
 if __name__ == "__main__":  # runnable check
     assert run_id({"a": 1, "b": [2]}) == run_id({"b": [2], "a": 1})

@@ -4,12 +4,18 @@ pretrain share ``_step``; serving and training share the model and weights.
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import math
 import os
+import random
+import statistics
+import sys
+import tempfile
 import time
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,8 +23,12 @@ from typing import Any
 import numpy as np
 import torch
 
+from . import ledger as _ledger
 from .autograd import AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
+from .build import QWEN38_SOURCE as _QWEN38_SOURCE
+from .build import build_model
 from .engine import RequestFailed, SamplingParams
+from .eval import MATCHERS
 from .kv_cache import BLOCK_TOKENS, LinearStatePool, NoPrefixStore, PagedKvPool
 from .model import save_hf
 
@@ -1251,3 +1261,1336 @@ def pretrain(
     if ckpt_path is not None:
         save_hf(model, ckpt_path / "final")
     return losses
+
+
+# --- CLI orchestration helpers (moved from cli.py in the step-8a split) ---
+
+def _progress(as_json: bool):
+    if not as_json:
+        return print
+    return lambda *a, **k: print(*a, **{**k, "file": sys.stderr, "flush": True})
+
+
+def _qwen38_tokenizer():
+    from .tokenizer import get_tokenizer
+
+    try:
+        return get_tokenizer(_QWEN38_SOURCE)
+    except Exception as exc:
+        first = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+        sys.exit(f"error: could not load the Qwen3-27B tokenizer from "
+                 f"{_QWEN38_SOURCE!r}: {first}")
+
+
+
+
+
+
+def _train_dry_run(args: argparse.Namespace) -> None:
+    """--dry-run on `train`: print the training rows (adapter, optimizer state,
+    ISO frames, the layer-segment tape) without building anything. B is the
+    micro-batch rows (--micro, else the RL group), S is the max token length the
+    tape segments against (--train-seq-len, else the recipe's max_new_tokens)."""
+    from . import config as config_mod
+    from .memory import format_memory_table, memory_table, train_plan
+
+    cfg = {"tiny": config_mod.tiny, "tiny-agent": lambda: config_mod.tiny(65536),
+           "qwen38-27b": config_mod.qwen38_27b}[args.model]()
+    b = args.batch or args.micro or args.group
+    s = args.train_seq_len or args.max_new_tokens
+    is_lora = args.rl or args.opd
+    rows = train_plan(cfg, b, s, lora_rank=args.lora_rank if is_lora else None,
+                      optim=args.optim)
+    table = memory_table(rows, {}, None)
+    if args.json:
+        print(json.dumps(table, indent=1))
+    else:
+        algo = f"LoRA r{args.lora_rank} + AdamW" if is_lora else f"full SFT {args.optim}"
+        print(f"tilerl train --dry-run: model={cfg.name} {algo} B={b} S={s}")
+        print(format_memory_table(table))
+
+
+def _train_indexer_recall(args: argparse.Namespace, backend, model, log) -> dict:
+    """27B science run over prepared corpus spans (scripts/prepare_indexer_corpus):
+    recall@k_pages before/after per span length, KL curve, tokens seen."""
+    import time
+
+    import torch
+
+    from . import train as train_mod
+    from .ledger import file_hash
+
+    cdir = Path(args.indexer_corpus)
+
+    def load(split: str, max_total: int = 0):
+        groups = {}
+        for path in sorted(cdir.glob(f"{split}_*.jsonl")):
+            rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+            ctx = rows[0]["ctx"]
+            groups[str(ctx)] = [
+                torch.tensor(r["ids"], dtype=torch.long, device=backend.device).unsqueeze(0)
+                for r in rows]
+        labels = sorted(groups)
+        for ctx in labels:
+            log(f"{split} ctx={ctx}: {len(groups[ctx])} prompts available")
+        if max_total:
+            # balanced round-robin across the sorted lengths: 16 over 3 -> 6/5/5,
+            # so the cut run is not weighted to cheap 8k spans.
+            import itertools
+            picked: dict[str, int] = {ctx: 0 for ctx in labels}
+            for ctx in itertools.islice(itertools.cycle(labels), max_total):
+                if picked[ctx] < len(groups[ctx]):
+                    picked[ctx] += 1
+            groups = {ctx: groups[ctx][: picked[ctx]] for ctx in labels}
+            for ctx in labels:
+                log(f"{split} ctx={ctx}: using {picked[ctx]} spans (balanced cut)")
+        return groups
+
+    held = load("held", getattr(args, "held_spans", 0))
+    train_groups = load("train")
+    # cycle training prompts across lengths in an interleaved order
+    import itertools
+    train_batches = [b for row in itertools.zip_longest(*train_groups.values())
+                     for b in row if b is not None]
+    t0 = time.perf_counter()
+    out = train_mod.indexer_warmup_run(
+        model, backend, train_batches, held, args.k_pages, args.steps, args.lr,
+        seed=args.seed, di=args.indexer_di,
+        q_samples=args.q_samples, q_min_pos=args.q_min_pos)
+    out["secs_total"] = time.perf_counter() - t0
+    out["corpus"] = file_hash(str(cdir / "manifest.json")) if (cdir / "manifest.json").exists() else None
+    # Optional cross-corpus control: held-only recall before/after under the SAME
+    # trained weights (e.g. English cosmo 8k after training on Chinese wiki),
+    # showing recall is not a tokenization/language artifact.
+    if args.indexer_control_corpus:
+        cdir2 = Path(args.indexer_control_corpus)
+        out["control"] = train_mod.indexer_held_recall(
+            model, backend, cdir2, out["weights"], args.k_pages,
+            q_samples=args.q_samples, q_min_pos=args.q_min_pos, seed=args.seed)
+        out["control_corpus"] = file_hash(str(cdir2 / "manifest.json")) \
+            if (cdir2 / "manifest.json").exists() else None
+    for i, v in enumerate(out["kl_curve"]):
+        if (i + 1) % max(1, args.steps // 20) == 0 or i == 0:
+            log(f"step {i + 1:4d}/{args.steps}  kl {v:.4f}")
+    return out
+
+
+def _train_indexer_warmup(args: argparse.Namespace) -> None:
+    """Learned-indexer KL warm-up on the frozen base (sparse-KV unit D). With
+    --indexer-corpus DIR this is the 27B recall science run (recall@k_pages
+    before/after per 8k/16k/32k held-out length); without it, the tiny/CPU
+    one-step gate path."""
+    import math
+    import time
+
+    from tilerl_kernels.backend import get_backend
+
+    from . import train as train_mod
+    from .ledger import commit, format_run, gates_pass, new_manifest, now, runs_root, write_manifest
+
+    manifest = new_manifest("train", {
+        "model": args.model, "recipe": args.recipe,
+        "source": _QWEN38_SOURCE if args.model == "qwen38-27b" else "tiny",
+        "commit": commit(), "algo": "indexer-warmup", "steps": args.steps,
+        "lr": args.lr, "seed": args.seed,
+        "k_pages": getattr(args, "k_pages", None),
+        "indexer_di": getattr(args, "indexer_di", None),
+        "indexer_corpus": args.indexer_corpus,
+        "indexer_control_corpus": args.indexer_control_corpus})
+    if args.steps == 0:
+        manifest["gates"] = []
+        manifest["finished"] = now()
+        write_manifest(runs_root(), manifest)
+        print(json.dumps(manifest, indent=1) if args.json else format_run(manifest))
+        return
+    backend = get_backend()
+    cfg, model = build_model(args.model, seed=args.seed, keep_master=False)
+    log = _progress(args.json)
+    log(f"tilerl train: indexer warm-up model={cfg.name} steps={args.steps}")
+
+    if args.indexer_corpus:
+        out = _train_indexer_recall(args, backend, model, log)
+        acc = args.recall_threshold
+        metrics = {
+            "tokens_seen": out["tokens_seen"], "k_pages": out["k_pages"], "di": out["di"],
+            "kl_first": out["kl_curve"][0], "kl_last": out["kl_curve"][-1],
+            "secs_total": out["secs_total"], "corpus": out.get("corpus"),
+            "q_samples": out.get("q_samples", 0), "q_min_pos": out.get("q_min_pos")}
+
+        def flatten(tag, book):
+            # book: {ctx: {"index"|"bounds": {mean,min,per_span}}}
+            for ctx, scorers in book.items():
+                for sc, st in scorers.items():
+                    metrics[f"recall_{tag}_{sc}_{ctx}"] = st["mean"]
+                    if tag in ("before", "after"):
+                        metrics[f"recall_{tag}_{sc}_min_{ctx}"] = st["min"]
+
+        flatten("before", out["recall_before"])
+        flatten("after", out["recall_after"])
+        if "control" in out:
+            metrics["control_corpus"] = out.get("control_corpus")
+            for ctx, scorers in out["control"].items():
+                for sc, st in scorers.items():
+                    metrics[f"control_recall_{sc}_{ctx}"] = st["mean"]
+        manifest["recall_detail"] = {
+            "before": out["recall_before"], "after": out["recall_after"]}
+        manifest["metrics"] = metrics
+        # Accept: mean LEARNED-indexer after-recall over held lengths clears the
+        # threshold; the training-free bounds recall is a reported baseline, not a
+        # gate. Per-length mean, per-span min and per-span values are recorded.
+        afters = [v["index"]["mean"] for v in out["recall_after"].values()]
+        mean_after = sum(afters) / len(afters)
+        worst_span = min(v["index"]["min"] for v in out["recall_after"].values())
+        bounds_after = [v["bounds"]["mean"] for v in out["recall_before"].values()]
+        bounds_mean = sum(bounds_after) / len(bounds_after)
+        manifest["gates"] = [{
+            "name": "indexer_recall_at_k", "value": mean_after, "threshold": acc,
+            "kind": "verdict", "skipped": False, "passed": mean_after >= acc,
+            "per_span_min": worst_span,
+            "training_free_bounds_recall_mean": bounds_mean}]
+        manifest["finished"] = now()
+        write_manifest(runs_root(), manifest)
+        print(json.dumps(manifest, indent=1) if args.json else format_run(manifest))
+        if not gates_pass(manifest):
+            sys.exit(1)
+        return
+
+    t0 = time.perf_counter()
+    losses = train_mod.indexer_warmup(model, backend, args.steps, seed=args.seed, lr=args.lr)
+    for i, v in enumerate(losses):
+        log(f"step {i + 1:4d}/{args.steps}  kl {v:.4f}")
+    finite = all(math.isfinite(v) for v in losses)
+    manifest["metrics"] = {"kl_first": losses[0], "kl_last": losses[-1],
+                          "secs_total": time.perf_counter() - t0}
+    # The tiny teacher (random QK) is near-uniform, so the CPU gate is that the
+    # chain RUNS a step with a finite loss, not that KL halves -- learnability on
+    # a real teacher is pinned separately in test_sparse_index's KL-halving gate.
+    manifest["gates"] = [{
+        "name": "indexer_warmup_step_runs", "value": args.steps if finite else None,
+        "threshold": args.steps, "kind": "validity", "skipped": False,
+        "passed": finite}]
+    manifest["finished"] = now()
+    write_manifest(runs_root(), manifest)
+    print(json.dumps(manifest, indent=1) if args.json else format_run(manifest))
+    if not gates_pass(manifest):
+        sys.exit(1)
+
+
+def cmd_train(args: argparse.Namespace) -> None:
+    if getattr(args, "dry_run", False):
+        return _train_dry_run(args)
+    if getattr(args, "indexer_warmup", False):
+        return _train_indexer_warmup(args)
+    if args.rl or args.opd:
+        if getattr(args, "served_fp4", False):
+            sys.exit("error: --served-fp4 is full-parameter SFT only; LoRA keeps the frozen served faces")
+        if not args.data and not (args.recipe == "grpo-tiny-smoke" and args.model == "tiny"):
+            sys.exit("error: --data is required for RL/OPD training")
+        return _train_adapters(args)
+    _train_full(args)
+
+
+def _jsonl(path: str | None) -> list[dict]:
+    if not path:
+        return []
+    rows = [json.loads(ln) for ln in Path(path).read_text().splitlines() if ln.strip()]
+    # A named file with no rows is silent otherwise: cmd_train's `or [...]` falls back
+    # to random prompts, so a 100-step GRPO run trains on noise and reports a reward.
+    if not rows:
+        sys.exit(f"error: {path} has no rows")
+    return rows
+
+
+def _train_full(args: argparse.Namespace) -> None:
+    """Full-parameter SFT on random tokens: Adafactor or ISO, streamed updates."""
+    import torch
+    from tilerl_kernels.backend import get_backend
+
+    from . import train as train_mod
+    from .autograd import Adafactor, cosine_warmup
+    from .ledger import commit, new_manifest, read_manifest, runs_root
+    from .model import drop_quantized
+
+    log = _progress(args.json)
+    # The ledger is per-RUN, not per-algorithm: sft-iso-27b exists to produce a
+    # P3 verdict and had nowhere to record one.
+    manifest = new_manifest("train", {
+        "model": args.model, "recipe": args.recipe,
+        "source": _QWEN38_SOURCE if args.model == "qwen38-27b" else "tiny",
+        "commit": commit(), "algo": "sft", "optim": args.optim,
+        "steps": args.steps, "lr": args.lr, "seed": args.seed})
+    prev = read_manifest(runs_root(), manifest["id"])
+    if prev and prev["finished"] and not args.force:
+        log(f"run {prev['id']} already finished; --force reruns")
+        return _ledger.finish_run(prev, args.json)
+    if args.steps == 0:
+        return _ledger.finish_run(manifest, args.json)
+    manifest["metrics"] = dict.fromkeys(("ce_first", "ce_last", "secs_per_step_median"))
+
+    backend = get_backend()
+    cfg, model = build_model(args.model, seed=args.seed, keep_master=True)
+    post_step = None
+    if args.served_fp4:
+        # Keep the served .wq/.scale/.oscale slots beside the bf16 masters and
+        # refresh them after every step; otherwise full SFT frees them on sight.
+        from .model import requantize_fp4
+
+        if not cfg.fp4:
+            sys.exit("error: --served-fp4 needs an fp4 config (qwen38-27b)")
+        post_step = lambda: requantize_fp4(model)  # noqa: E731
+    else:
+        drop_quantized(model)
+    # Adam's m+v on the 27B is 200.4 GiB; Adafactor is 0.03 GiB and streams its updates.
+    optimizer = Adafactor(lr=args.lr, weight_decay=0.1)
+    if args.optim == "iso":
+        from .iso import ISO
+
+        optimizer = ISO(optimizer)
+    gen = torch.Generator().manual_seed(args.seed)
+    log(f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
+        f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}")
+    losses, secs = [], []
+    for step in range(args.steps):
+        # ponytail: random-token batch; a real corpus plugs in here without touching train_step.
+        input_ids = torch.randint(0, cfg.vocab_size, (2, 64), generator=gen)
+        optimizer.lr = cosine_warmup(step, args.steps, 5, args.lr)
+        t0 = time.perf_counter()
+        loss = train_mod.train_step(model, input_ids, backend, optimizer, post_step=post_step)
+        secs.append(time.perf_counter() - t0)
+        losses.append(loss)
+        log(f"step {step + 1:4d}/{args.steps}  loss {loss:.4f}  {secs[-1]:.1f}s")
+    manifest["metrics"].update(
+        ce_first=losses[0], ce_last=losses[-1],
+        secs_per_step_median=statistics.median(secs))
+    if torch.cuda.is_available():
+        manifest["metrics"]["peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
+    # Save the trained bf16 model only on request: on 27B this writes ~54 GiB and does
+    # a per-tensor .cpu().contiguous() sync, and save_hf over the fused/master keys is
+    # only exercised on GPU. The merge path needs bf16 masters (merge refuses fp4), so
+    # --save-model is the producer flag for a merge specialist (set by sft-iso-27b).
+    if args.save_model:
+        from .model import save_hf
+
+        out_dir = Path(runs_root()) / manifest["id"] / "model"
+        save_hf(model, out_dir)
+        manifest["artifacts"]["out"] = str(out_dir)
+    return _ledger.finish_run(manifest, args.json)
+
+
+def _load_adapter(trainable: dict, path: str, log) -> None:
+    """Copy a saved adapter INTO the tensors add_lora just attached.
+
+    ``copy_``, never rebind: the forward reads the objects add_lora put in
+    ``model.params``, so assigning new tensors here would load an adapter the model
+    never sees and re-score the base while reporting a trained number.
+
+    Unknown or missing keys are refused rather than skipped. An adapter saved before
+    the dead-adapter fix (#98) carries ``<weight>.scale.lora_*`` and ``conv1d.lora_*``
+    keys that no longer exist, and silently dropping them would load a partial adapter
+    under a full adapter's name.
+    """
+    import torch
+    from safetensors.torch import load_file
+
+    saved = load_file(path)
+    extra, missing = set(saved) - set(trainable), set(trainable) - set(saved)
+    if extra or missing:
+        raise SystemExit(
+            f"error: {path} does not match this model's adapter\n"
+            + (f"  {len(extra)} unknown key(s), e.g. {sorted(extra)[:3]}\n" if extra else "")
+            + (f"  {len(missing)} missing key(s), e.g. {sorted(missing)[:3]}\n" if missing else "")
+            + "  hint: an adapter saved before the dead-adapter fix carries "
+              ".scale/.conv1d adapters that no longer exist; retrain or strip them")
+    with torch.no_grad():
+        for k, v in saved.items():
+            t = trainable[k]
+            if tuple(v.shape) != tuple(t.shape):
+                raise SystemExit(
+                    f"error: {path}: {k} is {tuple(v.shape)}, expected {tuple(t.shape)}")
+            t.copy_(v.to(device=t.device, dtype=t.dtype))
+    log(f"loaded adapter {sum(v.numel() for v in saved.values()) / 1e6:.1f}M params <- {path}")
+
+
+def _before_eval_key(args, cfg, backend, eval_params, mmlu_set) -> str | None:
+    """The cache key, or None when the base model's identity is not in it.
+
+    ``weights`` is always present and never absent-by-omission: the 27B keys on its
+    checkpoint files, `tiny` is a pure function of ``--seed`` and says so, and any
+    other model REFUSES to cache rather than key on a base it cannot identify --
+    a key that silently omits the weights serves one model's before-arm for another.
+    """
+    from .ledger import file_hash
+
+    if args.model == "qwen38-27b":
+        source = Path(_QWEN38_SOURCE)
+        if not source.is_dir():
+            from huggingface_hub import snapshot_download
+
+            source = Path(snapshot_download(_QWEN38_SOURCE, local_files_only=True))
+        weights = [(str(p.resolve()), s.st_size, s.st_mtime_ns)
+                   for p in sorted(source.iterdir()) if p.is_file() for s in [p.stat()]]
+    elif args.model.startswith("tiny"):
+        weights = None  # built by build_random(seed), and the seed is in `sampling`
+    else:
+        return None
+    inputs = {
+        "version": 2, "weights": weights, "config": asdict(cfg),
+        # cfg is already tp_config(cfg, tp) here, so tp reaches the key through the
+        # sharded dims -- but only while that call order holds. Explicit is cheaper.
+        "tp": args.tp,
+        "target": backend.target, "precision": backend.precision,
+        "eval_file": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
+        "eval_n": args.eval_n, "matcher": args.reward, "sampling": asdict(eval_params),
+        "thinking": args.max_think_tokens > 0 if args.model == "qwen38-27b" else None,
+        "mmlu": mmlu_set, "concurrency": 8,
+    }
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+
+def _write_eval_rows(run_id: str, tag: str, rows: list) -> float:
+    """One JSON row per problem, so two arms over the same set can be compared
+    paired. Returns the mean completion length. P1 fell back to the unpaired
+    interval because only totals were kept.
+
+    Creates the run directory: `_finish` makes it, and `_finish` runs AFTER both
+    eval arms, so a `not is_dir(): return` here silently wrote nothing at all --
+    which is what it did on the first MATH run.
+    """
+    from .ledger import runs_root
+
+    d = Path(runs_root()) / run_id
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / f"eval-{tag}.jsonl").open("w") as f:
+        f.writelines(json.dumps(r) + "\n" for r in rows)
+    return sum(r["tokens"] for r in rows) / max(1, len(rows))
+
+
+def _eval_row_appender(run_id: str, tag: str):
+    """Append scored rows to eval-<tag>.jsonl as they land: a killed eval arm keeps
+    what finished -- the MATH before-arm died at 1h40m with zero rows on disk,
+    because the write happened only after the whole arm (errors/2026-09-09-the-
+    killed-eval-arm-kept-nothing.md). One open/close per row, so a kill loses at
+    most the row in flight.
+
+    Coverage is the GSM8K arm and the curve points: gsm8k_accuracy streams rows
+    through on_row. The MMLU arm still lands whole -- mmlu_accuracy has no
+    on_row -- so a kill mid-MMLU still loses that arm (about 12% of before/after
+    wall time)."""
+    from .ledger import runs_root
+
+    path = Path(runs_root()) / run_id / f"eval-{tag}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(row: dict) -> None:
+        with path.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+
+    return append
+
+
+def _read_eval_rows(run_id: str, tag: str) -> list:
+    """Per-problem rows of one eval arm, or [] if the arm was not written."""
+    from .ledger import runs_root
+
+    f = Path(runs_root()) / run_id / f"eval-{tag}.jsonl"
+    return [json.loads(l) for l in f.read_text().splitlines() if l.strip()] if f.is_file() else []
+
+
+def _mcnemar(before: list, after: list, dataset: str = "gsm8k") -> dict | None:
+    """Paired significance on the per-question rows both arms wrote, or None.
+
+    The comparison IS paired: `cli.py` scores one `eval_rows` list in both arms and
+    `gsm8k_accuracy` forces temperature 0, so question i is the same question on both
+    sides. Keeping only the two totals threw that away and left the unpaired interval,
+    whose 80%-power one-sided MDE at n=500 is 7.70 pt -- ABOVE the roadmap's +5 pt
+    target, so a real effect at the standard would have failed to register. The paired
+    SE is `sqrt(b + c) / n` over the discordant counts, 1.00-1.41 pt at a 5-10% flip
+    rate, which puts +5 pt at 3.5-5 SE instead.
+
+    None when the arms cannot be paired -- different lengths, a missing `i`, or no
+    discordant pairs at all. `b + c == 0` is not a failure: it means the two arms
+    agreed on every question, so there is nothing for a paired test to resolve.
+    """
+    def by_i(rows):
+        out = {}
+        for r in rows:
+            if r.get("dataset", dataset) == dataset and "i" in r:
+                out[r["i"]] = bool(r["correct"])
+        return out
+
+    lo, hi = by_i(before), by_i(after)
+    if not lo or lo.keys() != hi.keys():
+        return None
+    b = sum(1 for i in lo if lo[i] and not hi[i])   # was right, now wrong
+    c = sum(1 for i in lo if not lo[i] and hi[i])   # was wrong, now right
+    n = len(lo)
+    if b + c == 0:
+        return {"n": n, "b": b, "c": c, "delta": 0.0, "se": None, "z": None}
+    se = (b + c) ** 0.5 / n
+    return {"n": n, "b": b, "c": c, "delta": (c - b) / n, "se": se,
+            "z": ((c - b) / n) / se}
+
+
+#: the before-arm's mean completion must leave headroom under the rollout cap. 0.8
+#: rather than 1.0 because the MEAN fitting exactly means half the rollouts do not.
+_ROLLOUT_HEADROOM = 0.8
+
+
+#: How many eval prompts the before/after/curve arms submit at once. A constant because
+#: the KV pool is sized for the WIDER of this and the rollout group -- one engine, two
+#: consumers. It was three literal 8s while the rollout width was also 8, so --group 2
+#: sized the pool for 2 rows and the eval arm's 8 exhausted it mid-step.
+_EVAL_CONCURRENCY = 8
+
+
+def _curve_rows(eval_rows: list, n: int, seed: int) -> list:
+    """The curve subset: a fixed-seed shuffle's first ``n`` rows, not the file's.
+
+    ``gsm8k_test.jsonl`` is ordered -- its first 200 rows run 5 pt low (z=3.05,
+    errors/2026-09-04-the-eval-cap-measured-itself.md) -- and a 5 pt bias is the
+    size of the effect the curve measures. The seed is fixed across runs so a
+    curve point is paired across steps and comparable to the historical anchor.
+    """
+    pool = list(eval_rows)
+    random.Random(seed).shuffle(pool)
+    return pool[:n]
+
+
+def _write_rollout_rows(run_id: str, rows: list, written: int = 0) -> int:
+    """Append the rows not yet on disk, and return the new count.
+
+    One JSON row per completion, so length and reward stay paired. Run 2's mechanism
+    claim -- short rollouts score better, so the policy lengthens -- was made from two
+    group MEANS per step, which is a cross-step correlation confounded by prompt
+    difficulty; each step draws a different prompt
+    (wins/2026-09-06-what-a-length-term-can-recover.md). Nothing could have been
+    re-derived from that run because the pairing never reached disk.
+
+    Per step rather than once at the end, because nothing in this package handles a
+    signal: run 2 took a SIGTERM at step 45 and never reached any writer. A run killed
+    that way now loses at most the step in flight.
+    """
+    from .ledger import runs_root
+
+    if len(rows) <= written:
+        return written
+    d = Path(runs_root()) / run_id
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / "rollouts.jsonl").open("a" if written else "w") as f:
+        f.writelines(json.dumps(r) + "\n" for r in rows[written:])
+    return len(rows)
+
+
+def _length_aware(match, gold, tok, lam: float, cap: int):
+    """The RL reward: correctness minus ``lam`` times the completion's fraction of the cap.
+
+    A correctness-only reward is indifferent between two right answers of any two lengths, so
+    an all-right group ties at zero advantage and produces no gradient -- run 2 collapsed that
+    way at step 41 of 100 (errors/2026-09-06-the-rollouts-grew-into-the-cap.md).
+
+    Here and NOT in `match`: `MATCHERS` also feeds `gsm8k_accuracy`, whose count becomes
+    `manifest["metrics"]["gsm8k_*"]`, the number P1's exit criterion reads. A length term in
+    the matcher contract would sit inside the gate.
+
+    `lam` is a switch, not a dial. In an all-right group it cancels exactly -- the advantage
+    divides by the group std, so `-(L_i - Lbar)/std(L)` has no `lam` in it -- and in a mixed
+    group `lam <= cap/(cap-1)` keeps a short wrong answer from outranking a long right one
+    (2048/2047 = 1.000488520, measured).
+
+    An all-wrong group is the third case: every match is 0, so `r_i = -lam * L_i / cap` and
+    the normalized advantage is again `-(L_i - Lbar) / std(L)` -- `lam` cancels for every
+    lam > 0, so its magnitude does not tune this gradient and only lam = 0 turns it off (zero
+    reward spread, and `group_advantages` zeroes a tied group). The difference is what the
+    gradient says: length is the only signal, the shortest wrong answer gets the highest
+    advantage, and on a problem the model cannot solve it learns "answer shorter" and nothing
+    else. That buys seconds_per_step and cannot outrank a right answer (the bound above still
+    holds). What neither covers is the direction itself: this pressure points at empty
+    outputs, and `_refuse_short_rollouts` only reads the BASE policy's length before training
+    -- `--allow-short-rollouts` disables it and the in-loop drift check, and it cannot see a
+    policy that shortens mid-training -- while the `live` mask in `group_advantages` only
+    keeps an empty row from polluting its group's normalization, not the live rows' gradient
+    toward shorter. A 2026-09-09 run collapsed to all-empty outputs (GSM8K 0/500) with both
+    guards in place; that run had lam=0, so it is not this gradient's doing, but it shows the
+    path is reachable on this model.
+    """
+    def reward(prompt, completion):
+        text = tok.decode([int(t) for t in completion])
+        r = float(match(text, gold[tuple(int(t) for t in prompt)]))
+        return r - lam * (len(completion) / cap)
+
+    return reward
+
+
+def _within_group_r(rows: list) -> float | None:
+    """Pearson r of (tokens, reward) POOLED over within-group deviations.
+
+    Centering per group is what removes prompt difficulty: a hard prompt shifts
+    both its lengths and its rewards, and that shift is the confound. A tied group
+    contributes zero deviation in reward and so cannot move r -- which is correct,
+    it carries no signal, and it is also why r is None on a run where every group
+    tied.
+
+    Recorded, never gated: the consumer is a person reading a finished P1 run, not code.
+    The sign says whether the length term is doing what run 2's diagnosis said it would,
+    and that reading needs the number together with the run's context.
+    """
+    import collections
+
+    groups = collections.defaultdict(list)
+    for r in rows:
+        groups[r["step"]].append((r["tokens"], r["reward"]))
+    dx: list[float] = []
+    dy: list[float] = []
+    for g in groups.values():
+        if len(g) < 2:
+            continue
+        mx = sum(t for t, _ in g) / len(g)
+        my = sum(v for _, v in g) / len(g)
+        dx.extend(t - mx for t, _ in g)
+        dy.extend(v - my for _, v in g)
+    sxx = sum(a * a for a in dx)
+    syy = sum(b * b for b in dy)
+    if sxx <= 0 or syy <= 0:
+        return None
+    return sum(a * b for a, b in zip(dx, dy)) / (sxx * syy) ** 0.5
+
+
+def _refuse_short_rollouts(mean_len: float | None, cap: int, allow: bool = False) -> None:
+    """Stop before training when the rollouts cannot reach an answer.
+
+    The base policy's own completion length is measured by the before-arm that just
+    ran, so this compares two known numbers rather than guessing. Truncated rollouts
+    never emit the answer, every sample in a group scores 0, and GRPO trains on a
+    reward that is constant -- 100 steps of tied-at-the-floor groups, which looks
+    like a hard task rather than a misconfiguration (measured: MATH level 5 needs
+    1038 tokens against a 512 cap, 5 of the first 6 steps tied at 1.00, reward 0).
+
+    The mirror of it is the eval cap, which scores the cap instead of the policy
+    (errors/2026-09-04-the-eval-cap-measured-itself.md). Same family: a length
+    parameter set without measuring the length it bounds.
+    """
+    if not mean_len or allow or mean_len <= _ROLLOUT_HEADROOM * cap:
+        return
+    sys.exit(
+        f"error: the base policy averages {mean_len:.0f} completion tokens but "
+        f"--max-new-tokens is {cap}. Rollouts would be truncated before they answer, "
+        f"so every group ties at the floor and no gradient flows. Raise the cap above "
+        f"{mean_len / _ROLLOUT_HEADROOM:.0f}, pick an easier task, or pass "
+        f"--allow-short-rollouts if the truncation is deliberate."
+    )
+
+
+def _emit_eval_records(correct: int, total: int, ntok: int, token_lens: list,
+                       steps: int, backend) -> None:
+    """Append the arm's two operands to the bench store. A training run with
+    eval arms IS the collector — the numbers exist here and nowhere else.
+
+    tokens/correct is the view rollout_tokens / gsm8k_pct, never stored: a
+    stored ratio gets one chance to drift from its operands."""
+    import math
+
+    from .ledger import _benchrec
+    benchrec = _benchrec()
+    p = correct / total
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    import torch
+    cuda = backend.device.type == "cuda" and torch.cuda.is_available()
+    # The seven common fields are record_common's contract; building them here
+    # forked the device-name decision twice (a hardcoded "H20", then a second
+    # cuda predicate that diverged from record_common's on CI). The namespace is
+    # the adapter: record_common eats argparse namespaces, and a server-side
+    # write takes the torch-probe path with no --device-name gate.
+    args = argparse.Namespace(
+        target=backend.arch, model_name="27B-nvfp4",
+        card=int(vis.split(",")[0]) if cuda and vis else None,
+        device_name=None, new_device=False,
+    )
+    common = {
+        "shape": {"steps": steps},
+        # compiles=0 means "not applicable": accuracy and greedy length are
+        # compile-invariant (JIT time enters a seconds figure, not a proportion
+        # or token count), not "measured zero compiles in the window".
+        "warm": {"state": "warm", "compiles": 0},
+        "n": total,
+        **benchrec.record_common(args, build="eager"),
+    }
+    acc = {
+        "metric": "gsm8k_pct", "value": round(100 * p, 1), "unit": "%",
+        "spread": round(100 * math.sqrt(p * (1 - p) / total), 2), **common,
+    }
+    acc["floor"] = benchrec.measured_best_floor(acc, lower_is_better=False)
+    benchrec.append(acc)
+    tok = {
+        "metric": "rollout_tokens", "value": round(ntok / total, 1), "unit": "tokens",
+        "spread": round(statistics.stdev(token_lens), 1) if total >= 2 else 0.0, **common,
+    }
+    # rollout_tokens has no monotonic direction (a shorter rollout can be a
+    # better policy or a collapsed one): the floor is the measurement itself,
+    # judged only alongside gsm8k_pct.
+    tok["floor"] = {
+        "kind": "reference", "value": tok["value"], "unit": tok["unit"],
+        "derivation": "no monotonic direction; read alongside gsm8k_pct",
+    }
+    benchrec.append(tok)
+
+
+def _train_adapters(args: argparse.Namespace) -> None:
+    """GRPO or OPD: LoRA on the frozen base, the engine samples, the ledger gates."""
+    if getattr(args, "eval_every", 0):
+        _ledger.refuse_blind_curve(args.eval_curve_n, args.curve_target_pt)
+    import torch
+    from tilerl_kernels.backend import get_backend
+
+    # Lazy: tests monkeypatch tilerl.build.build_engine to capture training kwargs;
+    # a module-level import binds it before the patch.
+    from . import train as train_mod
+    from .autograd import AdamW
+    from .build import build_engine
+    from .eval import gsm8k_accuracy, mmlu_accuracy, mmlu_questions
+    from .kv_cache import NoPrefixStore
+    from .ledger import (
+        EarlyStop,
+        commit,
+        curve_churn,
+        file_hash,
+        find_run_for_artifact,
+        new_best_point,
+        new_manifest,
+        paired_se,
+        read_manifest,
+        require_paired_width,
+        runs_root,
+        significant_decline,
+        write_manifest,
+    )
+    from .model import add_lora
+    from .prompt import render_chat, sampling
+    from .tokenizer import get_tokenizer
+
+    real = args.model == "qwen38-27b"
+    log = _progress(args.json)
+    tok = _qwen38_tokenizer() if real else get_tokenizer(None)
+    rows = _jsonl(args.data)
+    _eval_all = _jsonl(args.eval_gsm8k)
+    # Held-out means held-out: every CLI gate test once passed the SAME file to
+    # --data and --eval-gsm8k, so the encoded gate was green at a contamination
+    # fraction of 1.0 and no check asserted the eval was a distinct slice. Check
+    # the FULL eval file, not the eval_n slice: a prompt scored later must not be
+    # a prompt the policy trained on, whichever row --eval-n kept.
+    if rows and _eval_all:
+        train_q = {r.get("prompt") for r in rows}
+        overlap = sum(1 for r in _eval_all if r.get("prompt") in train_q)
+        if overlap:
+            sys.exit(f"error: --eval-gsm8k shares {overlap} prompts with --data; "
+                     "the eval arm must be held out from training")
+    eval_rows = _eval_all[: args.eval_n]
+    thinking = (args.max_think_tokens > 0) if real else None
+    params = sampling(tok, thinking, args.max_new_tokens, temperature=args.temperature,
+                      max_think_tokens=args.max_think_tokens, seed=args.seed)
+    # A SEPARATE params for the eval arms. Sharing `params` scored the policy at the
+    # ROLLOUT cap, so the eval measured the cap: 38.4% with mean completion 238.7
+    # against a 256 cap, ~82.5% uncapped
+    # (errors/2026-09-04-the-eval-cap-measured-itself.md). Same prompt template and
+    # stop ids -- only the length differs, and gsm8k_accuracy forces temperature 0.
+    eval_params = sampling(tok, thinking, args.eval_max_new_tokens,
+                           temperature=args.temperature,
+                           max_think_tokens=args.max_think_tokens, seed=args.seed)
+
+    # Same inputs = same run: a finished one is returned instead of retrained.
+    manifest = new_manifest("train", {
+        "model": args.model, "recipe": args.recipe, "source": _QWEN38_SOURCE if real else "tiny",
+        "commit": commit(), "algo": "grpo" if args.rl else "opd",
+        "data": file_hash(args.data) if args.data else None, "steps": args.steps,
+        "group": args.group, "prompts_per_step": args.prompts_per_step,
+        "max_new_tokens": args.max_new_tokens,
+        "allow_short_rollouts": args.allow_short_rollouts,
+        "temperature": params.temperature, "max_think_tokens": args.max_think_tokens,
+        "lr": args.lr, "lora_rank": args.lora_rank, "seed": args.seed, "eval_mmlu": args.eval_mmlu,
+        # In the id: tp=1 and tp=4 are different runs, and without this the second
+        # would be handed the first's finished manifest and never train.
+        "tp": args.tp,
+        "reward": args.reward,
+        # In the id: it changes what the reward MEANS, so two runs differing only here are
+        # not the same run and the second must not be handed the first's manifest. Stays a
+        # float although the help calls it a switch -- narrowing the type would change every
+        # already-recorded id and orphan those runs' manifests.
+        "length_penalty": args.length_penalty,
+        # In the id: with the judge on, judged ordering replaces the length-shaped
+        # reward inside saturated groups, so a judge run is a different reward.
+        "judge": args.judge,
+        "eval_max_new_tokens": args.eval_max_new_tokens,
+        "load_adapter": file_hash(args.load_adapter) if args.load_adapter else None,
+        "eval_gsm8k": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
+        "eval_n": args.eval_n,
+        # In the id: it selects which problems the curve scores, so two runs differing
+        # only here are not the same run.
+        "eval_curve_seed": args.eval_curve_seed,
+        # In the id: they decide which problems the curve scores, how dense it is, and
+        # where the run stops. A patience on/off pair sharing an id would hand the
+        # second run the first's finished manifest -- silent, and the pair is the
+        # evidence for the default-flip decision.
+        "eval_every": args.eval_every, "eval_curve_n": args.eval_curve_n,
+        "patience": args.patience})
+    prev = read_manifest(runs_root(), manifest["id"])
+    if prev and prev["finished"] and not args.force:
+        log(f"run {prev['id']} already finished; --force reruns")
+        return _ledger.finish_run(prev, args.json)
+    # Lineage: a continued adapter run descends from the run that produced the file
+    # loaded through --load-adapter. Resolved before this manifest is written, so the
+    # search can never match the current run; an unlinked file contributes no parent.
+    if args.load_adapter:
+        parent = find_run_for_artifact(runs_root(), args.load_adapter)
+        if parent is not None:
+            manifest["parents"] = [parent]
+    manifest["metrics"] = dict.fromkeys((
+        "mmlu_before", "mmlu_after", "gsm8k_before", "gsm8k_after",
+        "gsm8k_before_tokens", "gsm8k_after_tokens", "peak_gib"))
+
+    backend = get_backend()
+    # LoRA on a frozen base needs no bf16 master (~27 GB on the 27B).
+    cfg, model = build_model(args.model, seed=args.seed, keep_master=False,
+                              tp=args.tp, backend=backend)
+    log(f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
+        f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}")
+    gen = torch.Generator().manual_seed(args.seed)
+    prompts = [tok.encode(render_chat([("user", r["prompt"])], thinking)) for r in rows] or [
+        torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist() for _ in range(8)]
+    draft = None
+    if args.opd and args.draft:
+        from .spec import load_draft
+
+        draft = load_draft(model, args.draft)
+    # The pool holds every in-flight row's whole sequence, so a flat 512 blocks is
+    # 8192 tokens across 8 slots -- 1024 each. Past that the rollout dies mid-step on
+    # "PagedKvPool exhausted" (kv_cache.py:80), so --max-new-tokens above ~1024 was
+    # unreachable however the recipe was written. Size the pool from the ask instead.
+    from .kv_cache import BLOCK_TOKENS
+
+    # 1024 floor = the old flat 512 blocks. max_total_tokens only guards one request and
+    # costs no memory, so it never drops below the 8192 default.
+    # Hand-computed, so `_fit_blocks` never runs here: passing num_blocks truthy is what
+    # skips it (engine.py:1645), and it is the only path that measures free memory instead
+    # of deriving a pool from context. That is deliberate for now -- training also holds
+    # gradients, the tape and the optimizer state, which `_fit_blocks` does not model, so
+    # its two-thirds rule is calibrated for serve. Whether training should use it is a
+    # card-pending question, not an oversight.
+    #
+    # Two consumers, each priced on its OWN rows and its OWN length, then max(). Crossing
+    # the axes instead -- widest rows x longest sequence -- costs `--group 16` twice the
+    # blocks the eval needs, and over-allocation here is not slack: this path also holds the
+    # gradients, the tape and the optimizer state.
+    #
+    # #320 took the max on the ROW axis alone and left per-row length at the rollout's cap,
+    # which still exhausted at the default --eval-max-new-tokens 2048 (measured: `--group 8`,
+    # 520 blocks, needs 1099). Its arms passed only because `max(2, 8)` handed the narrow
+    # group 4x the rows it used, absorbing the length shortfall on the wrong axis.
+    rollout_ctx = max(map(len, prompts)) + args.max_new_tokens + 64
+    # 515: MMLU's longest rendered prompt, the figure the 1024 floor was chosen for. GSM8K's
+    # 183 sits under any floor, so the MMLU arm is the only eval prompt that can exceed the
+    # training prompts -- and this function never sees either.
+    eval_ctx = max(max(map(len, prompts)), 515 if args.eval_mmlu else 0) \
+        + args.eval_max_new_tokens + 64
+    # Sized from --group, not a literal 8: grpo_loop submits the whole group at once
+    # (train.py, one submit per g), so a group wider than the engine runs in waves and
+    # every rollout in the second wave decodes at a batch the tensor core underfills.
+    # The three used to be 8 while --group was a settable flag defaulting to 8, so
+    # --group 16 quietly became two waves of 8.
+    # A step is --prompts-per-step groups, all submitted at once, so the rollout's width is
+    # their product, not --group. At the default 1 this is `max(args.group, 1)` exactly.
+    rollout_batch = max(args.group, 1) * max(args.prompts_per_step, 1)
+    # min(), not _EVAL_CONCURRENCY: the eval arms ask for _EVAL_CONCURRENCY rows but only
+    # num_slots of them hold blocks at once, since a submit past the slots queues inside the
+    # engine. Measured on the discriminating case -- `--group 4`, 520 blocks, eval cap 1500:
+    # 4 rows need 384 and pass, 8 would need 768 -- and `tilerl-0a` predicted the group-16
+    # exhaustion (1033 blocks) from the same model before `tilerl-48` hit it.
+    eval_rows_in_flight = min(rollout_batch, _EVAL_CONCURRENCY)
+    blocks = max(rollout_batch * -(-rollout_ctx // BLOCK_TOKENS),
+                 eval_rows_in_flight * -(-eval_ctx // BLOCK_TOKENS)) + 8
+    ctx = max(rollout_ctx, eval_ctx, 1024)
+    engine = build_engine(cfg, model, backend, num_slots=rollout_batch,
+                          max_batch=rollout_batch, draft=draft,
+                          num_blocks=blocks,
+                          max_total_tokens=max(ctx, 8192),
+                          spec_depth=args.depth,
+                          decode_graph=not args.deterministic,
+                          sparse_k=0,  # on-policy training needs the dense full-context tape
+                          prefix_store=NoPrefixStore())
+    # Not in `inputs`: the id is a hash of it, so recording the pool there would make
+    # every pool change a different run and hand nothing back on a rerun. It is beside
+    # `metrics` because it is a property of the run, and read off the built engine
+    # because the kwargs and the pool disagree (max_blocks clamps, the graph adds a row).
+    manifest["engine"] = engine.config
+    # After build_engine: it materializes the params an adapter must point at.
+    trainable = add_lora(model, rank=args.lora_rank)
+    if args.load_adapter:
+        _load_adapter(trainable, args.load_adapter, log)
+    optimizer = AdamW(lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
+
+    mean_len: dict[str, float | None] = {}
+    mmlu_set = mmlu_questions(args.eval_mmlu) if args.eval_mmlu else None
+    cache = None
+    if (eval_rows or mmlu_set) and not args.load_adapter and not args.draft:
+        key = _before_eval_key(args, cfg, backend, eval_params, mmlu_set)
+        if key is not None:
+            cache = Path(runs_root()) / "eval-cache" / f"{key}.json"
+            manifest["eval_before_cache"] = {"key": key, "cache_hit": cache.is_file()}
+
+    def evals(tag):
+        # Timed on BOTH paths, so the cache's payoff is a recorded number rather than an
+        # argument: a hit writes ~0 s here and a miss writes what the arm cost, and the
+        # difference is what wins/2026-09-05-before-eval-cache.md has owed since it landed
+        # `pending-remote` -- 55 lines of mechanism plus 129 of test is worth it at 15 min
+        # per hit and is not at 40 s.
+        t_eval = time.perf_counter()
+        if tag == "before" and cache is not None and cache.is_file():
+            saved = json.loads(cache.read_text())
+            manifest["metrics"].update(saved["metrics"])
+            _write_eval_rows(manifest["id"], tag, saved["rows"])
+            mean_len[tag] = saved["mean_len"]
+            manifest["eval_before_cache"]["cache_hit"] = True
+            manifest["metrics"][f"eval_{tag}_secs"] = time.perf_counter() - t_eval
+            log(f"eval before: cache hit {cache.stem}")
+            return
+        rows_out: list = []
+        append = _eval_row_appender(manifest["id"], tag)
+        if args.eval_mmlu:
+            # Per-arm, because `eval_{tag}_secs` is the SUM of both arms and no historical run
+            # can be decomposed into them -- not even by subtraction, since the gsm8k arm was
+            # never timed either. MMLU is prefill-dominated (1000 questions x ~515 prompt
+            # tokens, 1 token generated), so its cost does not follow from any decode figure.
+            t_mmlu = time.perf_counter()
+            c, n, conc = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=_EVAL_CONCURRENCY,
+                                       questions=mmlu_set, per_problem=rows_out)
+            for r in rows_out:
+                append(r)  # mmlu first, then the gsm8k stream: same order the cache replays
+            manifest["metrics"][f"mmlu_{tag}_secs"] = time.perf_counter() - t_mmlu
+            manifest["metrics"][f"mmlu_{tag}"] = c / n
+            manifest["metrics"][f"mmlu_{tag}_concurrency"] = conc
+            manifest["metrics"][f"mmlu_{tag}_correct"] = c
+            manifest["metrics"][f"mmlu_{tag}_total"] = n
+            log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}% (seed 0, concurrency {conc}) "
+                f"in {manifest['metrics'][f'mmlu_{tag}_secs']:.1f}s")
+        if eval_rows:
+            gsm_rows: list = []
+            t_gsm = time.perf_counter()
+            c, n, ntok = gsm8k_accuracy(engine, tok, eval_rows, eval_params, concurrency=_EVAL_CONCURRENCY,
+                                        thinking=thinking,
+                                        match=MATCHERS[args.reward],
+                                        per_problem=gsm_rows,
+                                        on_row=lambda r: append(dict(r, dataset="gsm8k")))
+            manifest["metrics"][f"gsm8k_{tag}_secs"] = time.perf_counter() - t_gsm
+            mean_len[tag] = sum(r["tokens"] for r in gsm_rows) / max(1, len(gsm_rows))
+            rows_out.extend(dict(r, dataset="gsm8k") for r in gsm_rows)
+            manifest["metrics"][f"gsm8k_{tag}"] = c
+            manifest["metrics"][f"gsm8k_{tag}_tokens"] = ntok
+            manifest["metrics"][f"gsm8k_{tag}_total"] = n
+            # tokens/correct, not tokens: the ratio is what a length claim compares
+            # on, and it cannot be improved by getting fewer questions right.
+            per = f"  {ntok} tokens ({ntok / c:.1f}/correct)" if c else f"  {ntok} tokens"
+            log(f"gsm8k greedy {c}/{n} = {100 * c / n:.1f}%{per}")
+            if real:
+                _emit_eval_records(c, n, ntok, [r["tokens"] for r in gsm_rows],
+                                   0 if tag == "before" else args.steps, backend)
+        # rows_out (mmlu + gsm8k, prompt order) feeds the before-arm cache payload;
+        # the file itself was streamed above, mmlu rows in-block and gsm8k per row.
+        # Read before the cache write so a hit's cost excludes the write only a miss pays,
+        # but stored after it, because a duration is not a cacheable result: it belongs to
+        # the run that paid it. Inside the payload it would replay a past cost onto a hit
+        # -- 0.74 s where 0.0013 s was spent -- and `_secs` matches the `_before` filter.
+        elapsed = time.perf_counter() - t_eval
+        if tag == "before" and cache is not None:
+            # `_secs` excluded, not just `eval_before_secs` by ordering: a duration belongs to
+            # the run that paid it, and the per-arm timings added beside the scores DO match
+            # the `_before` filter, so caching them would replay a miss's minutes onto a hit.
+            saved = {"metrics": {k: v for k, v in manifest["metrics"].items()
+                                 if "_before" in k and not k.endswith("_secs")},
+                     "rows": rows_out, "mean_len": mean_len.get(tag)}
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", dir=cache.parent, delete=False) as f:
+                json.dump(saved, f)
+            os.replace(f.name, cache)
+        manifest["metrics"][f"eval_{tag}_secs"] = elapsed
+
+    drift = {"name": "rollouts_within_cap", "value": None,
+             "threshold": _ROLLOUT_HEADROOM * args.max_new_tokens,
+             # Pre-seeded rather than built in `_finish`, so it carries its own `kind`:
+             # a gate without one would read as `verdict` to any consumer that defaults.
+             "kind": "validity",
+             "skipped": True, "passed": None}
+    if args.rl:
+        manifest["gates"].append(drift)
+    # Before the eval arms, and for BOTH algos: `write_manifest` otherwise runs only
+    # inside `_finish`, so a run killed anywhere earlier left no manifest and
+    # `tilerl ledger` could not see it. Measured on cpu: SIGTERM at step 6 of a grpo
+    # run left 12 rollout rows and no manifest; the same kill on an opd run left no
+    # run DIRECTORY at all. `_finish` overwrites this with the finished manifest.
+    write_manifest(runs_root(), manifest)
+    # No eval configured: the eval gates have nothing to measure and must be
+    # explicitly skipped, not left to the vacuous-pass rule.
+    if not args.eval_mmlu and not args.eval_gsm8k:
+        manifest["gates_skip_after"] = True
+    evals("before")  # LoRA B is zero at init: the base model's score
+    if args.steps == 0:
+        evals("after")
+        manifest["engine"] = engine.config  # re-read: see the comment at the other _finish
+        return _ledger.finish_run(manifest, args.json)
+    _refuse_short_rollouts(mean_len.get("before"), args.max_new_tokens,
+                           args.allow_short_rollouts)
+    # The weights behind the best curve point. Every intermediate policy is otherwise
+    # destroyed: `AdamW.step_one` ends in `p.copy_()` (in place, which is what lets the
+    # engine keep its captured graphs), so a run that peaks mid-way can neither stop there
+    # nor roll back to it. Measured 2026-09-08: score 87.4 -> 93.2 -> 93.4 -> 82.4 -> 91.2,
+    # so the run shipped 91.2 and the 93.4 it had reached was gone. Out here, not in the RL
+    # branch, because the save site below is shared with opd.
+    best: dict = {}
+    if args.rl:
+        if rows:
+            gold = {tuple(p): r["answer"] for p, r in zip(prompts, rows)}
+            match = MATCHERS[args.reward]
+            reward = _length_aware(match, gold, tok, args.length_penalty,
+                                   max(int(args.max_new_tokens), 1))
+
+            # binary correctness before the length term — the tied_correctness input
+            def correctness(prompt, completion):
+                text = tok.decode([int(t) for t in completion])
+                return float(match(text, gold[tuple(int(t) for t in prompt)]))
+        else:
+            # No length term: this reward is a RATE, so its expectation does not grow with
+            # length and the defect above is absent by construction -- a longer completion
+            # earns no more, so nothing pressures the policy to lengthen. True even if this
+            # path stops being the smoke-test one.
+            half = cfg.vocab_size // 2
+
+            def reward(prompt, completion):
+                return sum(1 for t in completion if t < half) / max(len(completion), 1)
+
+        tiebreak = _judge_tiebreak(engine, tok, params) if args.judge else None
+
+        # `steps_to_score x seconds_per_step` needs the step at which a score was crossed,
+        # and gsm8k_before/after cannot say which step that was. So: score a fixed held-out
+        # subset every `--eval-every` steps and keep (step, score, cumulative_secs).
+        # cumulative_secs is summed rather than `secs_per_step_median x step` because the
+        # step length is not constant within a run -- it changes once a run hits the rollout
+        # cap. The threshold stays at the READING end: the curve records the scores, and
+        # which one counts as "the score" is not the ledger's business.
+        #
+        # `secs` is TRAINING time and excludes this scoring: grpo_loop stops its clock
+        # at `train.py:496`, before the yield, so the probe's own cost is outside every
+        # point. That is the quantity `time_to_score` wants -- production does not pay the
+        # probe -- but it means the curve's last point is `secs_total`, not wall clock.
+        # Scoring at the yield is also the only correct place: grpo_loop calls
+        # `invalidate_weights()` before yielding (`:492`), so the eval sees the policy the
+        # step just produced, with the decode graph already dropped.
+        # Sliced from `eval_rows`, which `--eval-n` has already capped, so asking for more
+        # curve rows than eval rows quietly scores fewer. `curve["n"]` records the real
+        # size, but a reader looking at the run WHILE it happens sees only this line.
+        curve_rows = _curve_rows(eval_rows, args.eval_curve_n, args.eval_curve_seed)
+        if curve_rows and args.eval_every and len(curve_rows) < args.eval_curve_n:
+            log(f"curve subset is {len(curve_rows)} rows, not the {args.eval_curve_n} asked "
+                f"for: --eval-n {args.eval_n} caps it")
+        # Early stopping is a verdict about the curve: with no curve points the switch can
+        # never fire, so refuse at startup instead of running to --steps behind dead code.
+        if args.patience and not (args.eval_every and curve_rows):
+            sys.exit("--patience early-stops on the eval curve, but this run produces no "
+                     "curve points: pass --eval-every and an eval set (--eval-curve-n rows).")
+        curve: list[dict] = []
+        # `train_secs`, not `elapsed`: the timings loop below rebinds `elapsed` on every
+        # step, so an accumulator by that name silently became the last timing value --
+        # measured, the curve read 0.143 s at step 4 against 0.148 at step 2, a
+        # cumulative figure going DOWN.
+        train_secs = 0.0
+        # Patience is in curve POINTS, not steps: one unit is one `--eval-every` interval.
+        # 0 never stops -- the default; flipping it on needs the seed-1 verdict.
+        early = EarlyStop(args.patience)
+
+        def score_curve(step: int) -> bool:
+            nonlocal best
+            # `eval_secs` per point, so the "keep the scoring under 5% of a step" criterion
+            # is a fact checkable AFTER a run rather than a guess before one. Estimating it
+            # from another config's eval would extrapolate across n, generation length and
+            # batch shape -- and an estimated default is harder to overturn than no default,
+            # because it looks calibrated. Same idiom as `eval_{tag}_secs` (#309).
+            t_eval = time.perf_counter()
+            # `per_problem` for the LENGTHS, not just the count. A score is not
+            # interpretable without them: the same 60% can be a policy answering in 300
+            # tokens or one being cut off, and 2026-09-04 shipped a 39.0% that was the
+            # cap's number rather than the policy's. `at_cap` is the reading that
+            # distinguishes them, so it travels with every point.
+            per: list = []
+            append = _eval_row_appender(manifest["id"], f"curve-{step}")
+            c, n, ntok = gsm8k_accuracy(engine, tok, curve_rows, eval_params,
+                                        concurrency=_EVAL_CONCURRENCY, thinking=thinking,
+                                        match=MATCHERS[args.reward], per_problem=per,
+                                        on_row=lambda r: append(dict(r, dataset="gsm8k")))
+            eval_secs = time.perf_counter() - t_eval
+            at_cap = sum(p["tokens"] >= args.eval_max_new_tokens for p in per)
+            # The rows stream to disk as they land (on_row above), because the whole
+            # point of the curve is comparing its points to each other and that
+            # comparison is PAIRED: every point scores the same `curve_rows`. Unpaired,
+            # adjacent points carry a 1.90 pt difference SE at n=500; paired at 5%
+            # discordant it is 1.00 pt, and "has it stopped rising" is exactly a
+            # question about a difference smaller than the arms. P1 fell back to the
+            # unpaired interval for want of these rows, and `per` was being built here
+            # and dropped. Streaming also means a killed run keeps the points that
+            # finished.
+            # Churn vs the previous point: the run's own instrument reading, recorded per
+            # point so a "these two points differ by N questions" claim has N's measurement
+            # beside it. Zero new evals -- these rows were just written and the previous
+            # point's are in the same run dir. First point: null, not 0.
+            churn = churn_dir = None
+            if curve:
+                prev_rows = _read_eval_rows(manifest["id"], f"curve-{curve[-1]['step']}")
+                pair = curve_churn(prev_rows, per)
+                if pair is None:
+                    log(f"  curve step {step}: churn null -- {len(prev_rows)} rows at step "
+                        f"{curve[-1]['step']} vs {len(per)} now, not comparable")
+                else:
+                    churn, churn_dir = pair[0] + pair[1], list(pair)
+            # The first point compiles the eval's shapes and every later one hits the cache,
+            # so its eval_secs is 5.6x the steady state and --eval-curve-n is calibrated off
+            # point two -- recorded, because the curve is a list of equal-looking dicts.
+            #
+            # `tied` is the RUN's tie fraction over the steps since the previous point, not
+            # anything about the eval. It is the only way to tell a plateau where the policy
+            # stopped improving from one where its groups stopped disagreeing: score flat
+            # with tied rising is the usable set self-consuming, both flat is another cause.
+            # A whole-run mean cannot separate them -- the 2026-09-05 P1 run went 0.50 ->
+            # 0.87 across its own steps while reward rose with it, so the two are confounded
+            # in any single aggregate.
+            since = [h[3] for h in hist[curve[-1]["step"] if curve else 0:]]
+            curve.append({"step": step, "correct": c, "total": n, "score": c / max(n, 1),
+                          "secs": round(train_secs, 3), "eval_secs": round(eval_secs, 3),
+                          "mean_len": round(ntok / max(n, 1), 1), "at_cap": at_cap,
+                          "tied": round(statistics.mean(since), 4) if since else None,
+                          "churn": churn, "churn_dir": churn_dir,
+                          "jit": not curve})
+            # SIGNIFICANTLY greater, not merely greater. Measured 2026-09-08: re-scoring
+            # one fixed set of weights across processes at temperature 0.0 moved 438/500
+            # to 437/500, so this eval's own floor is 0.2 pt -- and the run's step-50 point
+            # led step 25 by exactly one question. Taking the numerically higher point
+            # would have bought 501.2 s of extra training for a reading inside the
+            # instrument. A tie goes to the earlier point, which is not an arbitrary
+            # tie-break: `time_to_score` is the objective, so when two options are the same
+            # score the cheaper one wins, and "the same" is defined by the measured floor.
+            # The criterion lives in `ledger.new_best_point` next to the SE formulas, so
+            # the run and its post-hoc readers cannot drift apart -- its `__main__` check
+            # runs this exact curve, plus the one-question case, the paired-vs-unpaired
+            # case, and each one's negative control.
+            #
+            # The width is PAIRED: every curve point scores the same `curve_rows`, and the
+            # best point's per-problem rows are on disk from when it was scored. The
+            # unpaired width is 1.9x wider here (8.6% discordant, measured 2026-09-08), so
+            # it would make this criterion never fire on a slow rise -- a selection that
+            # always keeps the first point and does not say so. Rows missing (old runs)
+            # fall back to the conservative width, marked in `se_kind` so nobody reads a
+            # conservative "not greater" as "the two points are the same". With --patience
+            # on, a missing width refuses instead: stopping on a width-less curve decides
+            # without a sampling width, and the unpaired fallback is too wide to ever fire -- both silent.
+            if best:
+                rows = _read_eval_rows(manifest["id"], f"curve-{best['step']}")
+                se = paired_se(rows, per)
+                se_kind = "paired" if se is not None else "unpaired (conservative)"
+                require_paired_width(se, args.patience, best["step"])
+            else:
+                se = se_kind = None  # first point: no comparison installed it
+            replaced = new_best_point(curve[-1], best or None, se)
+            if replaced:
+                # `mean_len` and `tok_per_correct` ride with the snapshot so a downstream
+                # consumer can trade score against answer cost -- the 2026-09-05 run bought
+                # most of its +6% as 2.74x shorter answers, and score alone cannot show that.
+                best = {"step": step, "score": curve[-1]["score"],
+                        "mean_len": curve[-1]["mean_len"],
+                        "tok_per_correct": round(ntok / c, 1) if c else None,
+                        "se_kind": se_kind,
+                        "tensors": {k: v.detach().to("cpu", copy=True)
+                                    for k, v in trainable.items()}}
+            # A significant decline stops immediately and spends no patience: the collapse
+            # is the event this feature exists for, and stopping never loses anything --
+            # the best snapshot is kept either way. seed 0's recovery (412 -> 456) still
+            # ended below the peak (467), so waiting for it bought less than keeping it.
+            reason = early.update(replaced, significant_decline(curve[-1], best, se))
+            if reason:
+                manifest["early_stopped"] = {"at_step": step, "kept_step": best["step"],
+                                             "patience": args.patience, "reason": reason}
+                why = ("a significant decline" if reason == "decline"
+                       else f"{args.patience} curve points without a significant gain")
+                log(f"  early stop ({reason}) at step {step}: {why}; keeping step "
+                    f"{best['step']} ({100 * best['score']:.1f}%)")
+                return True
+            log(f"  curve step {step}: {c}/{n} = {100 * c / max(n, 1):.1f}% "
+                f"tied {curve[-1]['tied']} "
+                f"at {train_secs:.1f}s cumulative, mean {ntok / max(n, 1):.0f} tok, "
+                # tokens/correct, the ratio the before/after arms already log (`per`, :718).
+                # It separates two things a score cannot: the 2026-09-05 run moved
+                # tokens/correct 394.0 -> 143.8 (2.74x) while accuracy moved 88.0 -> 93.6
+                # (+6%), so most of what that RL bought was shorter answers. A curve read on
+                # score alone records that as "the rate of learning to be right".
+                # Derived, not stored: it is mean_len * total / correct from fields already
+                # in the point, and a second copy in the dict could disagree with them.
+                f"{ntok / c if c else float('nan'):.1f} tok/correct, "
+                f"{at_cap}/{n} at cap, scored in {eval_secs:.1f}s")
+            return False
+
+        hist = []
+        rollouts: list = []
+        written = 0
+        for i, (r, ce, secs, tied, ntok, timings, width, tied_c) in enumerate(
+                train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
+                                    group=args.group, prompts_per_step=args.prompts_per_step,
+                                    sampling=params, seed=args.seed,
+                                    trainable=trainable, micro=args.micro,
+                                    tiebreak=tiebreak, recapture_graph=True,
+                                    per_rollout=rollouts, decode=tok.decode,
+                                    correctness_fn=correctness if rows else None,
+                                    length_penalty=args.length_penalty,
+                                    length_cap=max(int(args.max_new_tokens), 1))):
+            hist.append((r, ce, secs, tied, ntok, tied_c))
+            train_secs += secs
+            written = _write_rollout_rows(manifest["id"], rollouts, written)
+            if (curve_rows and args.eval_every and (i + 1) % args.eval_every == 0
+                    and score_curve(i + 1)):
+                break
+            for phase, elapsed in timings.items():
+                manifest["metrics"][phase] = manifest["metrics"].get(phase, 0.0) + elapsed
+            tied_c_str = f"  tied_c {tied_c:.2f}" if tied_c is not None else ""
+            log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
+                f"tied {tied:.2f}{tied_c_str}  tok {ntok:.0f}  width {width}  {secs:.1f}s  "
+                f"rollout {timings['rollout_secs']:.3f}s  "
+                # .get: rl_step writes these, and a test or caller that substitutes it
+                # still gets a log line rather than a KeyError mid-run.
+                f"fwd {timings.get('forward_secs', 0.0):.3f}s  "
+                f"bwd {timings.get('backward_only_secs', 0.0):.3f}s  "
+                f"optimizer {timings['optimizer_secs']:.6f}s  "
+                f"other {timings.get('other_secs', 0.0):.3f}s", flush=True)
+            if len(hist) >= 5 and not args.allow_short_rollouts:
+                mean = statistics.mean(h[4] for h in hist[-5:])
+                drift.update(value=mean, step=i + 1, skipped=False,
+                             passed=mean <= drift["threshold"])
+                manifest["metrics"]["rollout_window_mean"] = mean
+                if not drift["passed"]:
+                    drift["reason"] = (
+                        f"error: at step {i + 1} the last 5 steps average {mean:.1f} "
+                        f"completion tokens but --max-new-tokens is {args.max_new_tokens}. "
+                        f"Rollouts risk truncation before they answer. Raise the cap above "
+                        f"{mean / _ROLLOUT_HEADROOM:.0f}, pick an easier task, or pass "
+                        f"--allow-short-rollouts if the truncation is deliberate.")
+                    log(drift["reason"], flush=True)
+                    break
+        # Windowed means, not hist[0] vs hist[-1]: per-step reward moves with the
+        # sampled prompt, so two single steps compare two draws, not two policies
+        # (tests/test_rl.py::test_grpo_loop_raises_reward uses the same windows).
+        w = max(1, len(hist) // 4)
+        tc = [h[5] for h in hist if h[5] is not None]
+        manifest["metrics"].update(
+            steps_completed=len(hist),
+            reward_first=statistics.mean(h[0] for h in hist[:w]),
+            reward_last=statistics.mean(h[0] for h in hist[-w:]),
+            ce_last=hist[-1][1],
+            secs_per_step_median=statistics.median(h[2] for h in hist),
+            secs_total=sum(h[2] for h in hist),
+            tied_group_fraction=statistics.mean(h[3] for h in hist),
+            # Binary-correctness tie fraction, pre-length-term. `tied` is structurally
+            # 0 at lam>0; this is the validity gate's real input.
+            tied_correctness=statistics.mean(tc) if tc else None,
+            # --judge drives tied_group_fraction toward 0 by construction, so it
+            # cannot report a bad judge. Length is the signal that can.
+            tokens_first=statistics.mean(h[4] for h in hist[:w]),
+            tokens_last=statistics.mean(h[4] for h in hist[-w:]))
+        manifest["metrics"]["length_reward_r"] = _within_group_r(rollouts)
+        # Its own top-level key, not a metric: `format_run` prints every metric inline on
+        # one `tilerl ledger` row, so a curve in there would push the row past a screen.
+        if curve:
+            manifest["eval_curve"] = {"n": len(curve_rows), "every": args.eval_every,
+                                      "points": curve}
+    else:
+        losses = train_mod.opd_loop(engine, model, prompts, args.steps, backend, optimizer,
+                                    seed=args.seed, trainable=trainable, sampling=params,
+                                    recapture_graph=True)
+        for i, loss in enumerate(losses):
+            log(f"step {i + 1:4d}/{args.steps}  loss {loss:.4f}")
+        manifest["metrics"]["ce_last"] = losses[-1]
+    if torch.cuda.is_available():  # the number the group size is really bounded by
+        manifest["metrics"]["peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
+        log(f"peak allocated {manifest['metrics']['peak_gib']:.2f} GiB")
+    # Before the after-eval, not after it: a gsm8k_after that beats its own baseline is
+    # the run's whole claim, and without the weights that produced it nobody can check
+    # whether the metric moved or the reward was gamed. An eval that dies still leaves
+    # the adapter behind.
+    from safetensors.torch import save_file
+
+    d = Path(runs_root()) / manifest["id"]
+    d.mkdir(parents=True, exist_ok=True)
+    save_file({k: v.detach().cpu().contiguous() for k, v in trainable.items()},
+              str(d / "adapter.safetensors"))
+    manifest["artifacts"]["adapter"] = "adapter.safetensors"
+    log(f"adapter {sum(v.numel() for v in trainable.values()) / 1e6:.1f}M params -> {d}")
+    # `best_curve_point`, never `best_step`: the snapshot is taken inside `score_curve`, so
+    # its resolution is `--eval-every`. At 25 a true peak at 40 is recorded as 50. This is
+    # the best point we LOOKED AT, and a name promising the best step would be read as an
+    # optimum.
+    if args.rl and best:
+        save_file({k: v.contiguous() for k, v in best.pop("tensors").items()},
+                  str(d / "adapter-best.safetensors"))
+        manifest["artifacts"]["adapter_best"] = "adapter-best.safetensors"
+        manifest["best_curve_point"] = {**best, "every": args.eval_every}
+        log(f"adapter-best step {best['step']} score {100 * best['score']:.1f}% "
+            f"(best of {len(curve)} curve points, resolution {args.eval_every} steps)")
+    if drift["passed"] is not False:
+        evals("after")
+    else:
+        # The after-arm never ran, so `mmlu_after`/`gsm8k_after` are None -- and
+        # `_finish`'s `v is None or ...` would score both gates PASS on a run that
+        # measured neither. Mark them skipped so the manifest says "not measured".
+        manifest["gates_skip_after"] = True
+    # Re-read, not the build-time copy: `_graph_for` sets `_decode_graph_on = False`
+    # in its `except` on a capture failure, so a snapshot taken at build time can
+    # record graph-on for a run that decoded eagerly -- and the whole point of this
+    # block is that a wall clock is read against it.
+    manifest["engine"] = engine.config
+    return _ledger.finish_run(manifest, args.json)
+
+
+def _judge_tiebreak(engine, tok, params):
+    """Rank rollouts the binary reward cannot separate, using the policy as its own judge.
+
+    `answer_match` decides first and the judge only reorders inside the all-pass or
+    all-fail subgroup (judge.py enforces that split), so no judgement can lift a wrong
+    answer over a right one. All C(K,2) pairs are generated in ONE batch and looked up,
+    because judge_rewards asks pair by pair and 56 sequential round trips per step
+    would cost more than the training step itself.
+    """
+    from dataclasses import replace
+
+    from .eval import generate
+    from .judge import judge_rewards
+    from .prompt import render_chat
+
+    sp = replace(params, temperature=0.0, max_new_tokens=4, max_think_tokens=0)
+
+    def ask(q, a, b):
+        return render_chat([("user",
+            f"Problem:\n{q}\n\nTwo worked solutions.\n\n[A]\n{a}\n\n[B]\n{b}\n\n"
+            "Which shows the better reasoning: clearer steps, no unjustified leaps, "
+            "no wasted work? Reply with exactly one token: A or B or tie.")], False)
+
+    def pick(t):
+        t = (t or "").strip().upper()
+        return "A" if t.startswith("A") else "B" if t.startswith("B") else "tie"
+
+    def tiebreak(prompt, comps, passed):
+        q = tok.decode([int(t) for t in prompt])
+        texts = [tok.decode([int(t) for t in c]) for c in comps]
+        pairs = [(i, j) for i in range(len(comps)) for j in range(i + 1, len(comps))]
+        # Both orders for every pair: pair_verdict abstains unless the swapped call
+        # agrees, which is the position-bias control and is not optional.
+        prompts = [ask(q, texts[i], texts[j]) for i, j in pairs] + \
+                  [ask(q, texts[j], texts[i]) for i, j in pairs]
+        out = generate(engine, tok, prompts, sp, 8)
+        n = len(pairs)
+        seen = {(i, j): (pick(out[k]), pick(out[k + n])) for k, (i, j) in enumerate(pairs)}
+        scores, _ = judge_rewards(list(range(len(comps))), passed,
+                                  lambda a, b: seen[(a, b)] if (a, b) in seen
+                                  else tuple(reversed(seen[(b, a)])))
+        return scores
+
+    return tiebreak

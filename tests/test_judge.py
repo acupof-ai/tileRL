@@ -102,9 +102,9 @@ def test_tiebreak_generates_all_56_judgements_in_one_batched_call():
     batch width at the generate seam; a per-pair loop goes red.
 
     The tiebreaker closes over eval.generate, so it is stubbed here — what is under
-    test is the batching in cli._judge_tiebreak, not the engine.
+    test is the batching in _judge_tiebreak, not the engine.
     """
-    from tilerl.cli import _judge_tiebreak
+    from tilerl.train import _judge_tiebreak
 
     calls = []
 

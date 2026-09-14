@@ -3,7 +3,7 @@ the cross-process nondeterminism source
 (errors/2026-09-09-a-flag-deleted-in-plain-sight.md)."""
 import inspect
 
-from tilerl import cli
+from tilerl import cli, train
 
 
 def test_deterministic_flag_wires_decode_graph():
@@ -13,4 +13,4 @@ def test_deterministic_flag_wires_decode_graph():
     assert args_on.deterministic is True
     assert args_off.deterministic is False
     # The wiring in _train_adapters: decode_graph=not args.deterministic
-    assert "not args.deterministic" in inspect.getsource(cli._train_adapters)
+    assert "not args.deterministic" in inspect.getsource(train._train_adapters)

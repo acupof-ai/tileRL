@@ -8,7 +8,8 @@ import json
 import pytest
 import torch
 
-from tilerl import cli, ledger
+from tilerl import ledger
+from tilerl.train import _emit_eval_records
 
 
 class _Backend:
@@ -38,11 +39,11 @@ def test_emit_eval_records(tmp_store, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda d: "NVIDIA H20")
     lens = list(range(200))  # mean 99.5, nonzero spread
-    cli._emit_eval_records(190, 200, sum(lens), lens, 0, _Backend())
-    cli._emit_eval_records(196, 200, 20000, [100] * 200, 100, _Backend())
+    _emit_eval_records(190, 200, sum(lens), lens, 0, _Backend())
+    _emit_eval_records(196, 200, 20000, [100] * 200, 100, _Backend())
     # A rerun of the same arm: rollout_tokens has no monotonic direction, so its
     # floor is the measurement itself (reference), never the population's best.
-    cli._emit_eval_records(190, 200, 22000, [110] * 200, 100, _Backend())
+    _emit_eval_records(190, 200, 22000, [110] * 200, 100, _Backend())
     rows = [json.loads(l) for l in tmp_store.STORE.read_text().splitlines()]
     assert len(rows) == 6
     by = {(r["metric"], r["shape"]["steps"], r["value"]): r for r in rows}
@@ -70,7 +71,7 @@ def test_emit_eval_records_cpu(tmp_store, monkeypatch):
     grouping key reads .get("card"), so missing-key and null are one population.
     """
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    cli._emit_eval_records(190, 200, 20000, [100] * 200, 0, _CPUBackend())
+    _emit_eval_records(190, 200, 20000, [100] * 200, 0, _CPUBackend())
     rows = [json.loads(l) for l in tmp_store.STORE.read_text().splitlines()]
     assert len(rows) == 2
     for r in rows:
