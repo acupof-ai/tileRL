@@ -13,10 +13,11 @@ deletion that the existing gates can check.
 | Problem | Evidence |
 |---|---|
 | God class | `Engine` is 2,568 lines: core loop 1,236, sparse runtime 640, memory ledger and stats 326, decode graphs 167, spec and sampling 121 |
-| God CLI | `cli.py` is 2,820 lines. It imports 20 tilerl modules. `_train_adapters` alone is 608 lines, `_build_parser` 381, `cmd_bench_kernels` 173 |
+| God CLI | `cli.py` is 2,820 lines and four products (parser 381, train/RL loop with eval statistics ~1,100, bench renderers ~280, ledger rendering ~100). It imports 20 tilerl modules. `_train_adapters` alone is 608 lines, `_build_parser` 381, `cmd_bench_kernels` 173 |
 | Two builders | `engine.build_engine` (324 lines) and `cli._build_engine` / `cli._build_model` both assemble an engine; tests and 89 scripts call one or the other |
 | Import cycles | `autograd`↔`sparse_index`, `calibration`↔`cli`, `cli`↔`memory`, `dflash2`↔`spec`, `model`↔`tensor_parallel` |
 | Upward imports | `memory` and `calibration` import `cli`; `prompt` imports `engine` |
+| Three API routes, three request paths | OpenAI, Anthropic and Responses routes each copy the completion wait loop, thinking resolution and the non-stream post-processing |
 | Storage is one file | `kv_cache.py` (1,919 lines) mixes device pools, host and SSD tiers, the boot store and the prefix store |
 | Docs describe a removed engine | 13 stale sections in design-engine, design-kernels, design-sparse-kv and design-cost-model: no hybrid serve, `NoPrefixStore` for sparse, the old `tilerl.ops` path |
 | Measurement sprawl | 248 scripts; the 09-09 review measured probe creation at ~11 per day |
@@ -112,11 +113,12 @@ of 52, MMLU n=50 equal to 0.70, one unique 32k request answered.
 | 0 | This doc | coordinator | review |
 | 1 | `tests/test_layering.py` + allowlist, red on an injected upward import | fixkv | CI |
 | 2 | Stale design docs: rev-87's 13 items; archive `arch-review-2026-09-09`, `design-ssd-read-path` (KvTier removed) and completed ownership tables to `docs/history/` | fixmisc | CI |
-| 4 | Dead code in cli, server and API routes, grep-proven; `rollout.py` if its only consumer is its own test | fixmisc | CI |
+| 4 | Dead code in cli, server and API routes, grep-proven: the `tilerl pretrain` subcommand (no invoker; `train.pretrain` stays), `rollout.py` if its only consumer is its own test, single-use cli helpers inlined | fixmisc | CI |
 | 5 | scripts/: delete dead one-off probes, keeping anything a doc, test, CI job or `test_main_selfchecks` glob reaches | ops | CI |
 | 6 | Break the 5 cycles and 3 upward imports; move `_rolling_hash` (sparse content hash) out of `kv_cache.py` and `group_map` into `sparse_index.py`; shrink the allowlist | fixkv | CI |
 | 7 | `build.py`: one assembler; callers of `cli._build_*` and `engine.build_engine` in src, tests and the 89 scripts are rewritten in the same PR (no re-export shim) | fixmisc | CI + device |
 | 8 | `cli.py` split: training orchestration → `train.py`, bench commands → `bench.py`; the CLI surface is unchanged (`_EXPECTED_CLI_FLAGS`) | fixmisc | CI |
+| 8b | One request path for the three API routes: the completion wait loop (3 copies), thinking/effort resolution (3), `_flatten_tools` (2) and the non-stream tail (split_think/stop/tool-call parse, 3) move to one helper each in `prompt.py`; response JSON unchanged (`test_server`, `test_api_sdk`) | fixmisc | CI |
 | 9 | `kv_tiers.py` split out of `kv_cache.py` | fixkv | CI |
 | 10 | `decode_graph.py` + ledger rows → `memory.py` | fixkv | CI + device |
 | 11 | `SparseRuntime` seam in `sparse_engine.py` | fixkv | CI + device (+ one unique 128k request) |
