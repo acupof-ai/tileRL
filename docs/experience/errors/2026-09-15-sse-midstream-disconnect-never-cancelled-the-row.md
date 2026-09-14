@@ -54,9 +54,12 @@ equivalent watcher.
 `next(sync_gen)` at a time through `asyncio.to_thread`, with the same 0.05 s
 poll as `await_or_cancel`, and poll a FRESH `request.is_disconnected()` while
 each fetch blocks. On disconnect it calls `engine.cancel(request_id)` (idempotent:
-a row that finishes the race wins, cancel on it is a harmless no-op) and stops
-the body, which surfaces as 499. Normal completion returns before any
-disconnect tick can cancel a finished row. The old `except GeneratorExit`
+a row that finishes the race wins, cancel on it is a harmless no-op) and simply
+returns — the SSE 200 response headers are already committed, so the stream
+ends on a closed socket rather than a 499 (499 is the NON-stream route only:
+its disconnect happens before `await_or_cancel` returns any response).
+Normal completion returns before any disconnect tick can cancel a finished
+row. The old `except GeneratorExit`
 branch in `_stream` is retained and re-documented as GC/process-teardown
 defense-in-depth — the live path is the watcher, and the comment no longer
 claims a client hang-up reaches it. The ws route is unchanged: its
