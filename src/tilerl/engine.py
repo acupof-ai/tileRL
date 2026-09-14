@@ -1215,14 +1215,15 @@ class Engine:
             if entry is not None:
                 matched = len(entry["tokens"])
                 req.seq_len = matched
-                if (self._draft is not None and matched == len(req.tokens)
+                if (matched == len(req.tokens)
                         and matched % BLOCK_TOKENS == 0):
-                    # A warm spec follower whose prompt matches a page-aligned
-                    # prefix in WHOLE has zero residual tokens, so no chunk would
-                    # forward and the row stuck in PREFILL with no first-token
-                    # logits. Re-forward the last adopted page (its promote is a
-                    # fresh private copy): the boundary hidden conditions the
-                    # first draft and logits at matched-1 appear.
+                    # A follower whose prompt matches a page-aligned prefix in
+                    # WHOLE has zero residual tokens, so no chunk would forward
+                    # and the row stuck in PREFILL with no first-token logits.
+                    # Re-forward the last adopted page (its promote is a fresh
+                    # private copy): the boundary hidden conditions the next
+                    # step and logits at matched-1 appear. Runs with or without
+                    # a draft — the no-draft follower needs those logits too.
                     req.prefill_from = matched - BLOCK_TOKENS
                 else:
                     req.prefill_from = matched
