@@ -63,6 +63,17 @@ export const parseFrame = (raw: string): Frame | null => {
   return null
 }
 
+/** Why a stream's socket closed. The close code alone cannot say it: the server
+ * ends a finished turn with 1000 and a user stop also sends 1000, and a 1001
+ * after a `done` frame is a normal post-terminal shutdown, not a dropped turn.
+ * Track the two facts that actually distinguish the cases. */
+export type CloseKind = "stopped" | "terminal" | "dropped"
+
+export const classifyClose = (stopped: boolean, terminal: boolean): CloseKind => {
+  if (stopped) return "stopped"
+  return terminal ? "terminal" : "dropped"
+}
+
 /** What the page shows once the stream ends.
  *
  * The state ckl hit: thinking on, the 512-token default budget spent inside the

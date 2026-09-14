@@ -1,6 +1,6 @@
-import { outcome } from "./protocol"
-import { newTurn, paint, settle, type Turn } from "./render"
-import { ask, socketUrl } from "./transport"
+import { outcome } from "./protocol.ts"
+import { newTurn, paint, pruneTurns, settle, type Turn } from "./render.ts"
+import { ask, socketUrl } from "./transport.ts"
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id)
@@ -15,35 +15,67 @@ const thinking = $<HTMLInputElement>("thinking")
 const budget = $<HTMLInputElement>("budget")
 const meter = $("meter")
 const stop = $<HTMLButtonElement>("stop")
+const toBottom = $<HTMLButtonElement>("to-bottom")
 
 /** Within a few px of the bottom. Not `=== 0`: sub-pixel layout and zoom leave a
  * fractional remainder on a log the reader has scrolled all the way down. */
 const atBottom = (el: HTMLElement): boolean =>
   el.scrollHeight - el.scrollTop - el.clientHeight < 32
 
-/** Follow the stream only while the reader is already at the bottom.
- *
- * Measured BEFORE the paint and applied after: once the new tokens are in the
- * DOM the old scroll position is no longer at the bottom, so a check after the
- * fact can never tell "following along" from "reading back". Scrolling someone
- * away from the line they are on is the failure this exists to prevent.
- */
-const following = (el: HTMLElement, paintFn: () => void): void => {
-  const stick = atBottom(el)
-  paintFn()
-  if (stick) el.scrollTop = el.scrollHeight
+/** Render at most once per display frame. Frames can arrive far faster than the
+ * screen paints, and every paint re-lexes the block still streaming; a 128k
+ * reply repainted per token is the page freeze. Whether to follow the stream is
+ * measured at PAINT time (before the nodes change): measuring when the frame
+ * arrived would decide against the scroll state the reader is looking at. */
+let frameQueued = false
+let paintingTurn: Turn | null = null
+const schedulePaint = (turn: Turn): void => {
+  paintingTurn = turn
+  if (frameQueued) return
+  frameQueued = true
+  requestAnimationFrame(() => {
+    frameQueued = false
+    const t = paintingTurn
+    paintingTurn = null
+    if (t === null) return
+    // A stop or drop settles the turn while a paint is still queued; a `done`
+    // frame paints synchronously before releasing pending. Either way a late
+    // frame only churns a finished DOM.
+    if (t.root.classList.contains("pending") === false) return
+    const stick = atBottom(log)
+    paint(t)
+    if (stick) log.scrollTop = log.scrollHeight
+  })
 }
+
+/** A long session is a long DOM: cap the rendered log. Conversation history is
+ * text and stays intact; the in-flight turn and the freshest reply are exempt
+ * inside pruneTurns. A "clear history" affordance is a later change. */
+const MAX_TURNS = 40
 
 const history: Array<{ role: "user" | "assistant"; content: string }> = []
 let inFlight = false
 
-const fail = (turn: Turn, cap: number, message: string): void => {
-  settle(turn, "empty", cap)
+const note = (turn: Turn, message: string, retry?: () => void): void => {
   turn.note.hidden = false
   turn.note.replaceChildren(document.createTextNode(message))
+  if (retry !== undefined) {
+    const b = document.createElement("button")
+    b.className = "ghost retry"
+    b.appendChild(document.createTextNode("Retry"))
+    b.addEventListener("click", retry)
+    turn.note.appendChild(b)
+  }
 }
 
-const stream = (turn: Turn, cap: number | null): Promise<void> =>
+const fail = (turn: Turn, cap: number, message: string): void => {
+  settle(turn, "empty", cap)
+  note(turn, message)
+}
+
+let stopStream: (() => void) | null = null
+
+const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<void> =>
   ask(
     socketUrl(window.location, "/ws/chat"),
     {
@@ -55,11 +87,18 @@ const stream = (turn: Turn, cap: number | null): Promise<void> =>
       enable_thinking: thinking.checked,
     },
     (f) => {
+      // A terminal frame ends the turn; anything after it on this socket belongs
+      // to a connection the server is already shutting down.
+      if (turn.root.classList.contains("final")) return
       if (f.t === "delta") {
         if (f.reasoning_content !== undefined) turn.reasoning += f.reasoning_content
         if (f.content !== undefined) turn.answer += f.content
-        following(log, () => paint(turn))
+        schedulePaint(turn)
       } else if (f.t === "done") {
+        turn.root.classList.add("final")
+        // Flush the coalesced paint before settling, or the last tokens can miss
+        // the DOM of a turn that is already marked finished.
+        paint(turn)
         // The notice names the budget that was actually spent, so with no typed cap
         // it comes from usage -- the page has no other honest number to quote.
         settle(turn, outcome(f.finish_reason, turn.answer, turn.reasoning !== ""),
@@ -74,29 +113,41 @@ const stream = (turn: Turn, cap: number | null): Promise<void> =>
         // replaying an empty answer teaches the model to answer nothing.
         if (turn.answer !== "") history.push({ role: "assistant", content: turn.answer })
       } else {
+        turn.root.classList.add("final")
         fail(turn, cap ?? 0, f.message)
       }
     },
     (close) => {
       stopStream = close
     },
-  )
+  ).then((kind) => {
+    if (kind === "dropped") {
+      settle(turn, "dropped", cap ?? 0)
+      note(turn, "connection lost before the reply finished — retry?", resend)
+    } else if (kind === "stopped") {
+      settle(turn, "stopped", cap ?? 0)
+      // A `done` frame that crossed the close in flight already pushed the
+      // answer; the final guard is what keeps it out of history twice.
+      if (turn.answer !== "" && turn.root.classList.contains("final") === false) {
+        history.push({ role: "assistant", content: turn.answer })
+      }
+    }
+  })
 
-let stopStream: (() => void) | null = null
-
-const submit = async (): Promise<void> => {
-  const text = composer.value.trim()
-  if (text === "" || inFlight) return
+const submit = async (text?: string): Promise<void> => {
+  const typed0 = text ?? composer.value.trim()
+  if (typed0 === "" || inFlight) return
   inFlight = true
   send.disabled = true
   stop.hidden = false
-  composer.value = ""
+  toBottom.hidden = true
+  if (text === undefined) composer.value = ""
 
   const you = newTurn(log, "user")
-  you.answer = text
+  you.answer = typed0
   paint(you)
   settle(you, "answered", 0)
-  history.push({ role: "user", content: text })
+  history.push({ role: "user", content: typed0 })
 
   const turn = newTurn(log, "assistant")
   turn.root.classList.add("pending")
@@ -104,8 +155,18 @@ const submit = async (): Promise<void> => {
   const typed = budget.value.trim()
   const cap = typed === "" ? null : Math.max(1, Number(typed) || 1)
 
+  // Manual resend after a dropped connection: this turn's user message is the
+  // last history entry, and no assistant answer followed it. Pop the message and
+  // the dead turn, then submit the same text again. No auto-resend: the protocol
+  // has no frame ids, so an automatic reconnect regenerates and duplicates.
+  const resend = (): void => {
+    if (history.at(-1)?.role === "user") history.pop()
+    turn.root.remove()
+    void submit(typed0)
+  }
+
   try {
-    await stream(turn, cap)
+    await stream(turn, cap, resend)
   } catch (e) {
     fail(turn, cap ?? 0, String(e))
   } finally {
@@ -116,6 +177,7 @@ const submit = async (): Promise<void> => {
     stop.hidden = true
     stopStream = null
     turn.root.classList.remove("pending")
+    pruneTurns(log, MAX_TURNS)
     composer.focus()
   }
 }
@@ -127,4 +189,13 @@ composer.addEventListener("keydown", (e) => {
     e.preventDefault()
     void submit()
   }
+})
+
+// Shown only while the reader has scrolled away from the live end; clicking it
+// restores the follow state, and the next paint sticks.
+toBottom.addEventListener("click", () => {
+  log.scrollTop = log.scrollHeight
+})
+log.addEventListener("scroll", () => {
+  toBottom.hidden = atBottom(log)
 })
