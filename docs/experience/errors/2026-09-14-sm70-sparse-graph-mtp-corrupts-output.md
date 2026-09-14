@@ -16,9 +16,10 @@ per `(B,W,cmax,own_w)` key on the first matching tick.
 
 Unknown. H1 — warmup forwards on zeroed static buffers addressing physical
 block 0 and flipping `win_parity` on live slot 0 — was #585's hypothesis;
-the device probe came back MAIN_BUG-free with H1 fixed, disproving it. H2, a
-capture firing at a cmax-bucket transition while live rows change buckets,
-is untested.
+the pad-frame fix still emitted degenerate loops on V100 (the sm70
+win_parity probe stayed inconclusive — instrument blind), disproving it.
+H2, a capture firing at a cmax-bucket transition while live rows change
+buckets, is untested.
 
 ## Fix
 
