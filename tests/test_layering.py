@@ -18,7 +18,7 @@ LAYERS: dict[str, frozenset[str]] = {
     "L0": frozenset({"precision", "config", "tokenizer", "testing"}),
     "L1": frozenset({"model", "tensor_parallel", "autograd"}),
     "L2": frozenset({"kv_cache", "kv_tiers", "sparse_index"}),
-    "L3": frozenset({"engine", "decode_graph", "sparse_engine", "spec", "memory"}),
+    "L3": frozenset({"engine", "decode_graph", "sparse_engine", "sparse_runtime", "spec", "memory"}),
     "L4": frozenset({"build"}),
     "L5": frozenset(
         {

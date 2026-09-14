@@ -45,10 +45,12 @@ from typing import Any
 import numpy as np
 import torch
 
-from .decode_graph import GraphCapture, graph_bucket, make_decode_graph, make_sparse_graph
+from .decode_graph import GraphCapture, graph_bucket, make_decode_graph
 from .kv_cache import BLOCK_TOKENS, BatchKv, NoPrefixStore
 from .kv_tiers import SpillWriteError
 from .memory import held_storage, measured_peak_bytes, memory_rows
+from .sparse_runtime import SparseCtx, SparseRuntime
+from .sparse_runtime import retier as sparse_retier_pages
 from .spec import _PREFILL_BUCKET, LADDER_WIDTHS
 
 
@@ -350,7 +352,7 @@ class Engine:
         self._decode = decode
         self._kv = kv_pool
         self._states = state_pool
-        self._sparse = sparse_tracker
+        self._sparse: SparseRuntime | None = None
         self._sparse_k = sparse_k
         # Hybrid mode (sparse engine only): prompts longer than this go sparse;
         # shorter ones run dense on the captured graph and pin their whole context.
@@ -380,12 +382,7 @@ class Engine:
             192 if sparse_min_tokens else 0)
         #: decode ticks build the packed table with pure device selection (no host
         #: sync) — the capture-ready path; valid only with the pin steady state.
-        self._sparse_device_select = sparse_device_select and sparse_tracker is not None
-        #: decode ticks since the last eager full-candidate refresh; device ticks
-        #: score only resident candidates, so every R-th decode tick goes eager to
-        #: score ALL candidates and promote the ones the hot set is missing.
-        self._sparse_ticks_since_refresh = 0
-        self._sparse_graphs: dict = {}
+        sparse_device_on = sparse_device_select and sparse_tracker is not None
         self._prefix = prefix_store
         #: KvBootStore for cold-start KV (--kv-store); None = no on-disk boot context.
         self._boot = boot_store
@@ -400,12 +397,14 @@ class Engine:
         # Hybrid mode runs sparse ticks EAGER on purpose: it needs only the dense
         # precaptured graph, so the sparse capture (and its warmup-frame hazard)
         # is not required; eager sparse is token-exact on sm70.
-        self._sparse_graph_on = (
+        sparse_graph_on = (
             sparse_tracker is not None
             and not self._sparse_min_tokens
-            and self._sparse_device_select
+            and sparse_device_on
             and (self._decode_graph_on or backend.device.type != "cuda")
         )
+        if sparse_tracker is not None:
+            self._sparse = SparseRuntime(sparse_tracker, sparse_device_on, sparse_graph_on)
         # A replay's padding rows write to both pools, so they need a slot and a
         # block of their own. Reserved here, not on the first tick that pads:
         # ``build_engine`` sized the pools for this row, and taking it up front
@@ -511,10 +510,8 @@ class Engine:
         self._slots_used = 0
         self._prefix_hits = 0
         self._prefix_misses = 0
-        #: spec followers that adopted a WARM entry (draft K/V + boundary hidden),
-        #: distinct from _prefix_hits so "0 warm adoptions" is observable, not
-        #: indistinguishable from the path never running.
-        self._prefix_warm_adoptions = 0
+        #: spec followers that adopted a WARM entry (draft K/V + boundary hidden);
+        #: the SparseRuntime owns the count, stats reads it through the facade.
         #: cold-start KV boot store: contexts loaded from --kv-store, and load calls.
         self._boot_hits = 0
         # Matched tokens, not just hit count: a hit that matches 512 of 30826 is a miss wearing a
@@ -549,7 +546,54 @@ class Engine:
         self._taken_logprobs: set[int] = set()
         self._last_logprobs: list[float] | None = None
 
+        if self._sparse is not None:
+            # The only Engine surface a sparse tick touches: immutable pools and
+            # the named callbacks that mutate engine rows/counters.
+            self._sparse.ctx = SparseCtx(
+                model=model,
+                backend=backend,
+                kv=kv_pool,
+                states=state_pool,
+                draft=draft,
+                width=self._width,
+                aux_layers=self._aux_layers,
+                max_batch=limits.max_batch,
+                graph_capture=self._graph_capture,
+                verify=self._verify,
+                sample_commit=self._sample_commit,
+                draft_step=self._draft_step,
+                bump_decode_forwards=self._bump_decode_forwards,
+            )
+
     # ------------------------------------------------------------------ API
+
+    @property
+    def _prefix_warm_adoptions(self) -> int:
+        return self._sparse.warm_adoptions if self._sparse is not None else 0
+
+    @property
+    def _sparse_graphs(self) -> dict:
+        return self._sparse.graphs if self._sparse is not None else {}
+
+    @property
+    def _sparse_device_select(self) -> bool:
+        return self._sparse is not None and self._sparse.device_select
+
+    @property
+    def _sparse_ticks_since_refresh(self) -> int:
+        return self._sparse.ticks_since_refresh if self._sparse is not None else 0
+
+    @property
+    def _sparse_graph_on(self) -> bool:
+        return self._sparse is not None and self._sparse.graph_on
+
+    @_sparse_graph_on.setter
+    def _sparse_graph_on(self, value: bool) -> None:
+        if self._sparse is not None:
+            self._sparse.graph_on = value
+
+    def _bump_decode_forwards(self) -> None:
+        self._decode_forwards += 1
 
     @property
     def usable_blocks(self) -> int:
@@ -979,7 +1023,7 @@ class Engine:
                 if snap_windows is not None:
                     self._states.window_restore(slot, snap_windows)
                 if self._draft is not None:
-                    self._sparse_warm_draft(req, entry, matched)
+                    self._sparse.warm_draft(req, entry, matched)
                 self._prefix_hits += 1
                 req.sparse_matched = matched
         if matched and not sparse:
@@ -1273,61 +1317,8 @@ class Engine:
         return rows
 
     def sparse_retier(self, keep: frozenset[int]) -> tuple[int, int]:
-        """Apply one selector decision to the live pages. ``keep`` names the
-        physical block ids this tick selects; the caller passes the UNION of the
-        chunk's selected sets (a V4.1 index source shares one selection across its
-        group of 4 full-attn layers, and a block id is one physical page moved
-        across all its planes in a single host fetch) and never names the last 8
-        pages (the 128-token window).
+        return sparse_retier_pages(self._kv, keep, self._running, self._waiting)
 
-        A private page not selected demotes to the pinned host tier (prefix-shared
-        pages are refused by the pool); a selected host page promotes into a FRESH
-        device block. Either way the page keeps its immutable logical index, so the
-        rebuilt block list stays in sequence order — paged_attention derives
-        causal positions from that order. Returns ``(demoted, promoted)``.
-        """
-        pool = self._kv
-        cold = pool.cold
-        if cold is None:
-            raise RuntimeError("sparse_retier: engine built without a cold page tier")
-        d0, p0 = cold.demotions, cold.promotions
-        remap: dict[int, int] = {}
-        reqs = list(self._running) + list(self._waiting)
-        # Batch this retier's D2Hs: demoted frames stay live until the single
-        # end sync, so an interleaved promote's alloc_block cannot recycle a
-        # frame a non-blocking D2H is still reading.
-        with pool.demotions():
-            for r in reqs:
-                cold_map = dict(r.cold_pages)  # logical index -> host block id
-                live = iter(r.blocks)
-                n = len(r.blocks) + len(cold_map)
-                ordered: list[tuple[int, int, bool]] = []
-                for idx in range(n):
-                    ordered.append(
-                        (idx, cold_map[idx], True) if idx in cold_map else (idx, next(live), False)
-                    )
-                new_live: list[int] = []
-                new_cold: list[tuple[int, int]] = []
-                for idx, b, was_cold in ordered:
-                    if b in keep:
-                        if was_cold:  # selected host page -> one fetch, a fresh block
-                            if b not in remap:
-                                remap[b] = pool.promote_page(b)
-                            new_live.append(remap[b])
-                        else:
-                            new_live.append(b)  # selected device page, untouched
-                    elif was_cold:
-                        new_cold.append((idx, b))  # still unselected on the host
-                    elif pool.is_shared(b):
-                        new_live.append(b)  # prefix-shared: read-only, never demoted
-                    else:
-                        pool.demote_page(b)
-                        new_cold.append((idx, b))
-                # Both lists were appended in ascending logical idx, so the live block
-                # table is in sequence order and cold pages keep their absolute index.
-                r.blocks = new_live
-                r.cold_pages = new_cold
-        return cold.demotions - d0, cold.promotions - p0
 
     # -------------------------------------------------------------- internals
 
@@ -1343,481 +1334,23 @@ class Engine:
         return matched, list(hit.blocks[: matched // BLOCK_TOKENS]), hit.state
 
     def sparse_selection_recall(self, req_id: int, target_mass: torch.Tensor) -> dict[int, float]:
-        """Recall of the LAST tick's served selection against an offline dense
-        page-mass target ``[1, n_groups, nq, pages]`` (window excluded), per
-        source group. Lets the card run score what the engine actually selected
-        rather than only the offline teacher. Full k -> 1.0."""
-        sel = self._sparse.last_selected.get(req_id)
-        if sel is None:
-            return {}
-        out: dict[int, float] = {}
-        for g, (cand, chosen) in sel.items():
-            k = min(self._sparse.k_pages, len(cand))
-            if k == 0:
-                out[g] = 0.0
-                continue
-            ci = torch.tensor(cand, device=target_mass.device)
-            mass = target_mass[0, g].sum(0).index_select(0, ci)
-            dense = {cand[int(i)] for i in mass.topk(k).indices.tolist()}
-            out[g] = len(dense & set(chosen)) / k
-        return out
+        return self._sparse.recall(req_id, target_mass)
 
-    def _sparse_rows(self, rows: list[_Req], seq_q: list[int], decodes: list[_Req]):
-        """Build this tick's SparseForward: per-row own span (allocated/promoted),
-        earlier complete candidate pages, and a resolve closure that promotes a cold
-        selection. The model scores and installs page_sel mid-forward."""
-        from .sparse_engine import SparseForward
-        from .sparse_index import WINDOW_PAGES as _WP
+    def _sparse_rows(self, rows, seq_q, decodes):
+        return self._sparse.build_rows(rows, seq_q, decodes)
 
-        tr = self._sparse
-        srows = []
-        for r, tq in zip(rows, seq_q):
-            decoding = r in decodes
-            reserved: set[int] = set()
-            q_hi = int(r.seq_len) if decoding else int(r.prefill_from + tq)
-            q_lo = q_hi - tq
-            if decoding:
-                # Chain query positions are [seq_len-1 .. seq_len-1+tq): the
-                # verify tick includes the W-1 draft queries, so a chain crossing
-                # a page boundary must allocate that next own page.
-                q_lo, q_hi = r.seq_len - 1, r.seq_len - 1 + tq
-                # own span = the trailing 8-page window the new token writes into
-                own_first = max(0, (q_lo // BLOCK_TOKENS) - (_WP - 1))
-                own_last = (q_hi - 1) // BLOCK_TOKENS
-                force_window = 0  # the window IS the own span
-            else:
-                q_hi = int(r.prefill_from + tq)
-                q_lo = q_hi - tq
-                own_first = q_lo // BLOCK_TOKENS
-                own_last = (q_hi - 1) // BLOCK_TOKENS
-                force_window = _WP  # force the 8 pre-chunk pages
-            own = list(range(own_first, own_last + 1))
-            own_len = q_hi - own_first * BLOCK_TOKENS
-            if tr.scorer == "bounds":
-                cand = [p for p in range(0, own_first) if tr.has_bounds(r.req_id, p)]
-            else:
-                cand = [p for p in range(0, own_first) if p in tr.keys[r.req_id]]
-
-            def resolve(p, r=r, reserved=reserved):
-                return self._sparse_resolve(r, p, reserved)
-
-            for p in own:
-                reserved.add(p)
-                resolve(p)
-            srows.append(
-                dict(
-                    req_id=r.req_id,
-                    own=own,
-                    own_len=own_len,
-                    q_hi=q_hi,
-                    tq=tq,
-                    decoding=decoding,
-                    cand=cand,
-                    force_window=force_window,
-                    resolve=resolve,
-                    reserved=reserved,
-                )
-            )
-        # Pure-decode ticks run the device (resident-only) path except every
-        # SPARSE_REFRESH_TICKS-th, which goes eager to re-score ALL candidates and
-        # promote the ones the resident hot set is missing. Prefill/mixed ticks are
-        # always eager (chunks force the window and grow the candidate set).
-        from .sparse_engine import SPARSE_REFRESH_TICKS
-
-        pure_decode = bool(decodes) and len(decodes) == len(rows)
-        if self._sparse_device_select and pure_decode:
-            self._sparse_ticks_since_refresh += 1
-            do_refresh = self._sparse_ticks_since_refresh >= SPARSE_REFRESH_TICKS
-        else:
-            do_refresh = False
-        device_select = self._sparse_device_select and pure_decode and not do_refresh
-        if do_refresh:
-            self._sparse_ticks_since_refresh = 0
-        return SparseForward(tr, srows, self._backend.device, device_select=device_select)
-
-    def _sparse_evict_victim(self, r: _Req, reserved: set[int]) -> None:
-        """Free one frame this tick does NOT need, so a promotion can allocate.
-
-        Cross-tick pin leaves last tick's selected pages resident; when this tick's
-        selection differs, a newly named page needs that frame. Demote any resident
-        page of this row outside the tick's reserved set (own span + this tick's
-        picks across groups). Raises if every resident page is reserved — that would
-        mean the pool was undersized below the pin ceiling, a build_engine bug."""
-        live = self._sparse.resident[r.req_id]
-        for p, phys in live.items():
-            if p in reserved:
-                continue
-            self._kv.demote_page(phys, key=(r.req_id, p))
-            r.cold_pages.append(p)
-            r.blocks.remove(phys)
-            self._sparse.map_evict(r.req_id, p)
-            del live[p]
-            return
-        raise RuntimeError(
-            "sparse: no unreserved resident page to evict for a "
-            "promotion; hot pool undersized below the pin ceiling"
-        )
-
-    def _sparse_resolve(self, r: _Req, page: int, reserved: set[int] | None = None) -> int:
-        """Physical block for a resident, private-cold, or shared-prefix logical
-        page, allocating a fresh block for a never-written own page or promoting
-        the host blob. A shared prefix page promotes its read-only host blob into
-        a fresh PRIVATE block (the store entry keeps the blob); promoting makes
-        the page private, so it is unlinked from the shared key. Under the
-        cross-tick pin the pool is full of last tick's pages, so evict one
-        unreserved frame first when no block is free."""
-        tr = self._sparse
-        live = tr.resident[r.req_id]
-        if page in live:
-            return live[page]
-        if self._kv.free_blocks == 0 and reserved is not None:
-            self._sparse_evict_victim(r, reserved)
-        # Automatic path: cold_pages are bare logical ints, blob keyed (req, page).
-        # A page the publisher itself dropped also has a shared key: prefer its
-        # private blob, fall back to the shared clone on byte-LRU eviction.
-        shared_keys = tr.shared.get(r.req_id, {})
-        if page in r.cold_pages and (r.req_id, page) in self._kv.cold:
-            new = self._kv.promote_keyed((r.req_id, page))
-            r.cold_pages.remove(page)
-            shared_keys.pop(page, None)
-        elif page in shared_keys:
-            blob = self._kv.cold.share_take(shared_keys[page])
-            if blob is None:
-                raise RuntimeError(f"sparse prefix page {page} missing its shared blob")
-            new = self._kv.shared_promote(blob)
-            shared_keys.pop(page)  # the store keeps its ref; this page is now private
-            if page in r.cold_pages:
-                r.cold_pages.remove(page)  # transfer moved the blob to the content key
-        else:
-            new = self._kv.alloc_block()
-        live[page] = new
-        r.blocks.append(new)
-        tr.map_resident(r.req_id, page, new)
-        return new
-
-    def _sparse_warm_draft(self, r: _Req, entry: dict, matched: int) -> None:
-        """Restore a WARM prefix into a spec follower's dense draft pool: copy the
-        publisher's per-page draft K/V into this row's reserved draft blocks,
-        zero the boundary slot, and prime draft state so the first tail draft
-        conditions on the saved boundary trunk hidden. Bit-equal to a cold
-        follower: cold zeroed position 0 in block 0; warm zeroes position
-        ``matched`` in block M, and every earlier draft slot is the publisher's
-        own value (already zero at its position 0)."""
-        dpool = self._draft.kv
-        dev = dpool.k_pool.device
-        keys = entry["keys"]
-        for p, key in enumerate(keys):
-            # field-only read: restore the draft planes without pinning the page's
-            # trunk K/V blob into host RAM
-            dk = self._kv.cold.share_take_field(key, "dk")
-            dv = self._kv.cold.share_take_field(key, "dv")
-            if dk is None or dv is None:
-                raise RuntimeError(
-                    f"warm prefix entry lost draft KV for page {p} (key {key})")
-            blk = r.draft_blocks[p]
-            dpool.k_pool[:, blk].copy_(dk.to(dev))
-            dpool.v_pool[:, blk].copy_(dv.to(dev))
-        # boundary slot: no draft attends past the matched prefix there
-        boundary_blk = r.draft_blocks[matched // BLOCK_TOKENS]
-        dpool.k_pool[:, boundary_blk, :, 0, :].zero_()
-        dpool.v_pool[:, boundary_blk, :, 0, :].zero_()
-        # condition the first tail draft (position matched) on hidden matched-1
-        r.hidden = entry["hidden"].to(dev).reshape(1, 1, -1)
-        r.hidden_prev = None
-        r.hidden_from = matched - 1
-        r.draft_pos = matched - 1
-        self._prefix_warm_adoptions += 1
-
-    def _sparse_offer_drop(self, r: _Req, page: int, draft_pages: dict | None = None) -> None:
-        """Page ``page`` just LEFT the resident union: offer it to the prefix index.
-        Drop-only — a stable pin never reaches here. No blob is copied or moved
-        yet: the index buffers out-of-order drops behind the contiguous frontier
-        and skips a page with no bound, so an entry never names a page it cannot
-        serve. When the frontier closes, :meth:`SparsePrefixCache.publish_dropped`
-        hands back the content keys and :meth:`_sparse_transfer_to_shared`
-        REHOMES each private blob to its content key (one copy, not two). A
-        newly published page's draft K/V is copied from the request's draft pool
-        (warm spec adoption)."""
-        tr = self._sparse
-        if tr.prefix is None or not tr.has_bounds(r.req_id, page):
-            return
-        keys = tr.prefix.publish_dropped(
-            r.req_id, r.tokens, tr.bounds_view(r.req_id), page, (r.req_id, page))
-        # The frontier can close over MANY pages though only ``page`` dropped
-        # this tick, so resolve each new page's draft block from the reserved
-        # draft span, not from the one dropped page.
-        written_page = ((r.draft_pos + 1) // BLOCK_TOKENS
-                        if self._draft is not None and r.draft_blocks else -1)
-        for p, content_key in keys.items():
-            draft_block = r.draft_blocks[p] if p <= written_page else None
-            self._sparse_transfer_to_shared(r, p, content_key, draft_block)
-        for content_key in tr.prefix.take_freeze_refs():
-            self._kv.cold.share_ref(content_key)
-
-    def _sparse_transfer_to_shared(self, r: _Req, page: int, content_key: int,
-                                   draft_block: int | None = None) -> None:
-        """Publish one page under its content key: attach bounds (+ draft K/V for
-        a warm spec entry) to the page's trunk K/V.
-
-        Three states the page can be in when its frontier closes:
-        - held on the host as the PRIVATE (rid,page) blob: transfer it (no copy);
-        - on the private SSD: share_hold_kv lifts it into the prefix spill file;
-        - still DEVICE-resident (in the own window, never dropped): build the host
-          blob from its live physical frame here.
-        Returning without a blob would leave a lookup entry naming a dead key."""
-        tr = self._sparse
-        extra = {"bounds": tr.bounds_view(r.req_id)[page].cpu()}
-        if draft_block is not None and self._draft is not None:
-            dpool = self._draft.kv
-            # clone: .cpu() is a no-op on the CPU cell, so without it the blob
-            # aliases a draft block that gets recycled and overwritten
-            extra["dk"] = dpool.k_pool[:, draft_block].detach().cpu().clone()
-            extra["dv"] = dpool.v_pool[:, draft_block].detach().cpu().clone()
-        tr.shared.setdefault(r.req_id, {})[page] = content_key
-        if (r.req_id, page) in self._kv.cold:
-            n = self._kv.cold.share_hold_kv(
-                (r.req_id, page), content_key, extra=extra)
-            if n:
-                return
-            # private blob was past the host budget and consumed into the prefix
-            # spill; future demotes re-home under the content key
-            r.cold_pages = [
-                content_key if (isinstance(p, tuple) and p == (r.req_id, page))
-                else p for p in r.cold_pages]
-            return
-        phys = tr.resident.get(r.req_id, {}).get(page)
-        if phys is None:
-            raise RuntimeError(
-                f"publish page {page}: neither a private host blob nor a resident "
-                f"frame exists (req {r.req_id}, content key {content_key})")
-        # Device-resident: snapshot the frame directly (it stays live; the page
-        # did not leave the union this tick). No pool block is freed.
-        blob, n = self._kv._page_blob(phys)
-        blob.update(extra)
-        n += sum(t.numel() * t.element_size() for t in extra.values()
-                 if torch.is_tensor(t))
-        self._kv.cold.share_hold(content_key, blob, n)
-
-    def _sparse_finalize(self, sf, rows: list[_Req], hidden=None) -> list:
-        """After the forward: store Quest bounds of every now-complete page, then
-        keep resident the pages selected THIS tick (the union of the source groups
-        plus the own span) and demote only resident pages that LEFT that set.
-
-        Returns (row, dropped pages) offers the caller processes LATER — after
-        ``draft.step`` — so a published blob can also carry the page's draft K/V
-        (this chunk's draft forward runs after the trunk forward). ``hidden`` is
-        the forward's per-row trunk hidden [1,q,H], used to save the boundary
-        vector a spec follower's first tail draft conditions on.
-
-        Cross-tick pin: a stable selection keeps the same physical frames pinned,
-        so the next tick promotes nothing; a changed selection demotes only the
-        dropped pages and promotes the newly named ones. The device pool is sized
-        n_groups*k + window + chunk per slot, i.e. exactly this pin ceiling.
-        Bounds stay device-resident regardless, so scoring a cold page needs no K.
-
-        Prefix publishing is DROP-ONLY (bounds scorer): a page is offered only
-        when it leaves the union, and AFTER the demotions() scope exits so its
-        private blob is already held (a batched implementation holds it at the
-        batch sync; peeking inside would clone nothing). The GDN boundary
-        snapshot is captured only on a finalize landing on a whole-page boundary.
-        """
-        tr = self._sparse
-        pool = self._kv
-        from .sparse_engine import page_bounds_one, project_index_page_keys
-
-        # One batched D2H for the tick's departing pages across every row: each
-        # demote launches non-blocking into pinned staging while its frame stays
-        # live; the context syncs once before the frames return to the pool.
-        # (row, dropped pages) collected in the scope, offered to the prefix index
-        # after it exits — the one point every demoted blob is guaranteed held.
-        dropped_offers: list[tuple[_Req, list[int]]] = []
-        with pool.demotions():
-            for bi, r in enumerate(rows):
-                rid = r.req_id
-                if rid not in tr.resident:
-                    continue  # request finished and dropped its tracker state this tick
-                live = tr.resident[rid]
-                q_hi = sf.rows[bi]["q_hi"]
-                complete = q_hi // BLOCK_TOKENS
-                n_stored = tr.bounds_count[rid] if tr.scorer == "bounds" else len(tr.keys[rid])
-                for p in range(n_stored, complete):
-                    if p not in live:
-                        # selected candidate promoted with its scorer state already
-                        continue
-                    phys = live[p]
-                    if pool.kv_fp8 is not None:
-                        raise NotImplementedError(
-                            f"sparse {tr.scorer} state over an fp8 pool: card PR"
-                        )
-                    if tr.scorer == "bounds":
-                        b = torch.stack(
-                            [
-                                page_bounds_one(pool.k_pool[plane, phys])
-                                for plane in range(pool.num_layers)
-                            ]
-                        )
-                        tr.set_bounds(rid, p, b)
-                    else:
-                        # mean K per source plane -> learned fp8 indexer keys
-                        kmean = torch.stack(
-                            [
-                                pool.k_pool[plane, phys].to(tr.ik.dtype).mean(dim=1)
-                                for plane in tr.src_planes
-                            ]
-                        )
-                        keys, scales = project_index_page_keys(kmean[None], tr.ik)
-                        keys, scales = keys[0], scales[0]
-                        tr.set_index_keys(
-                            rid, p, keys.to(pool.k_pool.device), scales.to(pool.k_pool.device)
-                        )
-                if tr.scorer == "bounds" and tr.prefix is not None and q_hi % BLOCK_TOKENS == 0:
-                    sp = self._states
-                    # vector at position q_hi-1; note_boundary moves it to host
-                    boundary_h = (None if hidden is None or self._draft is None
-                                 else hidden[bi, sf.rows[bi]["tq"] - 1])
-                    tr.prefix.note_boundary(
-                        rid, complete,
-                        (sp.states[r.state_slot].clone(),
-                         sp.window_snapshot(r.state_slot)),
-                        boundary_h)
-                kept = sf.selected_pages(bi)
-                dropped = [p for p in live if p not in kept]
-                for p in dropped:
-                    phys = live[p]
-                    pool.demote_page(phys, key=(rid, p))
-                    tr.map_evict(rid, p)
-                    r.blocks.remove(phys)
-                    r.cold_pages.append(p)
-                kept_live = {p: live[p] for p in kept if p in live}
-                # r.blocks mirrors the live frames in LOGICAL page order (paged_attention
-                # derives causal positions from the order), so sort the pinned set.
-                r.blocks = [kept_live[p] for p in sorted(kept_live)]
-                live.clear()
-                live.update(kept_live)
-                if dropped:
-                    dropped_offers.append((r, dropped))
-
-        return dropped_offers
+    def _sparse_finalize(self, sf, rows, hidden=None) -> list:
+        return self._sparse.finalize(sf, rows, hidden)
 
     def _sparse_process_offers(self, dropped_offers) -> None:
-        """Publish dropped pages AFTER ``draft.step``: this chunk's draft K/V now
-        exist in the request's draft pool for the transfer to copy."""
-        for r, pages in dropped_offers:
-            for p in pages:
-                self._sparse_offer_drop(r, p)
+        self._sparse.process_offers(dropped_offers)
 
-    def _sparse_decode_rows(self, decodes: list[_Req], q_dec: list[int]) -> list[dict]:
-        """Decode-only geometry for a captured sparse tick — the decode branch of
-        ``_sparse_rows`` without its refresh bookkeeping (the runner owns that).
-        Own pages resolve via the same closure; candidates are the complete
-        earlier pages with stored bounds."""
-        from .sparse_index import WINDOW_PAGES as _WP
+    def _sparse_decode_rows(self, decodes, q_dec):
+        return self._sparse.decode_rows(decodes, q_dec)
 
-        tr = self._sparse
-        srows = []
-        for r, tq in zip(decodes, q_dec):
-            reserved: set[int] = set()
-            q_lo, q_hi = r.seq_len - 1, r.seq_len - 1 + tq
-            own_first = max(0, (q_lo // BLOCK_TOKENS) - (_WP - 1))
-            own_last = (q_hi - 1) // BLOCK_TOKENS
-            own = list(range(own_first, own_last + 1))
-            cand = (
-                [p for p in range(0, own_first) if tr.has_bounds(r.req_id, p)]
-                if tr.scorer == "bounds"
-                else [p for p in range(0, own_first) if p in tr.keys[r.req_id]]
-            )
+    def _run_sparse_decode_graph(self, reqs, chains) -> bool:
+        return self._sparse.run_decode_graph(reqs, chains)
 
-            def resolve(p, r=r, reserved=reserved):
-                return self._sparse_resolve(r, p, reserved)
-
-            for p in own:
-                reserved.add(p)
-            srows.append(
-                dict(
-                    req=r,
-                    req_id=r.req_id,
-                    own=own,
-                    own_len=q_hi - own_first * BLOCK_TOKENS,
-                    q_hi=q_hi,
-                    tq=tq,
-                    decoding=True,
-                    cand=cand,
-                    force_window=0,
-                    resolve=resolve,
-                    reserved=reserved,
-                )
-            )
-        return srows
-
-    def _run_sparse_decode_graph(self, reqs: list[_Req], chains) -> bool:
-        """Capture/replay the sparse steady-state decode tick. Returns False (caller
-        runs eager) on a refresh tick (needed promotions), a bounds-scorer-only
-        configuration, or a failed capture. The refresh counter is advanced ONLY
-        on a captured tick; eager goes through ``_sparse_rows`` which owns it."""
-        from .sparse_engine import SPARSE_REFRESH_TICKS, SparseForward, cmax_bucket
-        from .sparse_index import WINDOW_PAGES as _WP
-
-        tr = self._sparse
-        if tr.scorer != "bounds":
-            return False
-        q_dec = [len(c) for c in chains] if chains else [1] * len(reqs)
-        # Read-only peek: let _sparse_rows do the reset when this tick is a refresh.
-        if self._sparse_ticks_since_refresh + 1 >= SPARSE_REFRESH_TICKS:
-            return False
-        rows = self._sparse_decode_rows(reqs, q_dec)
-        n = len(reqs)
-        B = self._graph_bucket(n)
-        W = max(q_dec)
-        own_w = _WP + (1 if W > 1 else 0)
-        cmax = max(len(r["cand"]) for r in rows)
-        key = (B, W, cmax_bucket(cmax), own_w)
-        g = self._sparse_graphs.get(key)
-        if g is None:
-            if n < B and not self._graph_capture.ensure_pad():
-                return False
-            sf = SparseForward(
-                tr,
-                None,
-                self._backend.device,
-                device_select=True,
-                reuse=True,
-                b=B,
-                cmax_cap=key[2],
-                own_w_cap=own_w,
-            )
-            g, self._graph_capture.pool, err = make_sparse_graph(
-                self._model, self._backend, self._kv, self._states, self._sparse,
-                sf, B, W, self._aux_layers, self._graph_capture.pool)
-            if g is None:
-                warnings.warn(f"sparse decode graph capture failed for {key}: {err}; eager fallback")
-                self._sparse_graph_on = False
-                return False
-            self._sparse_graphs[key] = g
-        logits = g.run(
-            rows,
-            chains or [(r.output[-1],) for r in reqs],
-            pad=self._graph_capture.pad,
-        )
-        self._sparse_ticks_since_refresh += 1
-        self._decode_forwards += 1
-        # Finalize residency immediately after the forward (same order as the
-        # eager path, engine _sparse_finalize before sample/verify): the pin reads
-        # this tick's selection out of the captured sf and demotes the rest.
-        self._sparse_finalize(g.sf, reqs)
-        if chains:
-            self._verify(reqs, chains, logits, g.hidden)
-        else:
-            if self._draft is not None and g.hidden is not None:
-                for i, r in enumerate(reqs):
-                    r.hidden_prev = None if r.hidden is None else r.hidden[:, -1:]
-                    r.hidden, r.hidden_from = g.hidden[i : i + 1], r.seq_len - 1
-            self._sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
-        if self._draft is not None:
-            end = self._width - 1
-            for r in reqs:
-                assert len(r.draft_blocks) * BLOCK_TOKENS > r.seq_len - 1 + end
-            self._draft_step(reqs)
-        return True
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0, sf=None) -> BatchKv:
         sparse = sf is not None
@@ -2566,7 +2099,7 @@ class Engine:
                                 else -1)
                 for p, content_key in keys.items():
                     draft_block = req.draft_blocks[p] if p <= written_page else None
-                    self._sparse_transfer_to_shared(req, p, content_key, draft_block)
+                    self._sparse.transfer_to_shared(req, p, content_key, draft_block)
                 for content_key in self._sparse.prefix.take_freeze_refs():
                     self._kv.cold.share_ref(content_key)
             # Sparse: drop this request's host-held cold blobs, keyed (req, logical
