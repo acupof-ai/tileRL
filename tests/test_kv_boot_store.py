@@ -141,7 +141,10 @@ def test_store_byte_count_matches_the_priced_cold_rows(tmp_path):
 
 
 def test_a_corrupted_page_file_fails_loudly(tmp_path):
-    """One flipped byte in k.bin must fail the page checksum, not load plausible KV."""
+    """One flipped byte in k.bin must fail the page checksum, not load plausible KV.
+
+    The store stays LOUD (raises); the engine admit path is the layer that turns
+    the failure into a miss (test_engine_admit_treats_a_corrupt_boot_entry_as_a_miss)."""
     from tilerl.config import tiny
     from tilerl.engine import SamplingParams
 
@@ -158,7 +161,7 @@ def test_a_corrupted_page_file_fails_loudly(tmp_path):
     b[0] ^= 0xFF  # page 0's K
     kf.write_bytes(b)
 
-    # direct store load raises (checksum), independent of the engine's admit handling
+    # Direct store load raises (checksum), independent of the engine's admit handling.
     store = KvBootStore(str(tmp_path), e._boot._fingerprint)
     fresh = _engine(cfg, tmp_path / "other", store=False)
     try:
@@ -195,3 +198,67 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def _save_boot_for_prompt(tmp_path, prompt):
+    from tilerl.config import tiny
+    from tilerl.engine import SamplingParams
+
+    cfg = tiny()
+    writer = _engine(cfg, tmp_path, store=True)
+    rid = writer.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+    writer.save_boot(_decode_req(writer, rid))
+    entry = next(p for p in (tmp_path / "tilerl_kvboot").iterdir() if p.is_dir())
+    return cfg, writer, entry
+
+
+def test_engine_admit_treats_a_corrupt_boot_entry_as_a_miss(tmp_path):
+    """F19a: the store raising on a corrupt entry must not escape admit (which fails
+    every running request). The engine admits the same prompt as a normal prefill
+    miss and serves it; the store-level raise is unchanged."""
+    import numpy as np
+
+    from tilerl.engine import SamplingParams
+
+    prompt = np.arange(3, 3 + 3 * BLOCK_TOKENS, dtype=np.int64)
+    cfg, writer, entry = _save_boot_for_prompt(tmp_path, prompt)
+    kf = entry / "k.bin"
+    b = bytearray(kf.read_bytes()); b[0] ^= 0xFF; kf.write_bytes(b)
+    writer.shutdown()
+
+    booter = _engine(cfg, tmp_path, store=True)
+    free_before = booter._kv.free_blocks
+    rid = booter.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+    out = _drain(booter, rid, 4)  # red here: RuntimeError escapes, drain times out
+    assert len(out) == 4
+    # corrupt boot admitted as a miss: full prefill ran, no blocks held after finish
+    assert booter.stats()["boot_hits"] == 0
+    assert booter._kv.free_blocks == free_before
+    booter.shutdown()
+
+
+def test_a_truncated_aux_file_frees_the_blocks_it_loaded(tmp_path):
+    """F19b: aux.pt is loaded AFTER the page-copy cleanup block, so a torch.load
+    failure used to leak all nblk copied blocks. The failure path must return
+    free_blocks to its pre-boot value."""
+    import numpy as np
+
+    prompt = np.arange(5, 5 + 2 * BLOCK_TOKENS, dtype=np.int64)
+    cfg, writer, entry = _save_boot_for_prompt(tmp_path, prompt)
+    writer.shutdown()
+    aux = entry / "aux.pt"
+    assert aux.exists(), "tiny has GDN layers; save_boot must write aux.pt"
+    aux.write_bytes(aux.read_bytes()[: len(aux.read_bytes()) // 2])
+
+    fresh = _engine(cfg, tmp_path, store=True)
+    store = KvBootStore(str(tmp_path), fresh._boot._fingerprint)
+    free_before = fresh._kv.free_blocks
+    try:
+        result = store.boot(list(prompt), fresh._kv)
+        # red here: RuntimeError leaks with nblk blocks still allocated
+        raise AssertionError(f"truncated aux.pt booted successfully: {result}")
+    except (RuntimeError, EOFError, OSError):
+        pass
+    assert fresh._kv.free_blocks == free_before, (
+        f"aux load failure leaked blocks: {free_before} -> {fresh._kv.free_blocks}")
+    fresh.shutdown()
