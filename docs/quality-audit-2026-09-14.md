@@ -211,7 +211,7 @@ unknown keys; existing node tests are the gate, no UI change.
 Body: `id` `resp_<rid>`, `object` "response", `created_at` float, `model`,
 `status` "completed"|"incomplete", `incomplete_details`: null|
 {`reason`:"max_output_tokens"}, `error`:null, `output` list,
-`parallel_tool_calls` bool, `tool_choice` str (echoed or "Auto"), `tools`
+`parallel_tool_calls` bool, `tool_choice` str (echoed or "auto"), `tools`
 list, `instructions`, `metadata` {}, `temperature`, `top_p`, `usage`
 {`input_tokens`,`output_tokens`,`total_tokens`,
 `input_tokens_details`:{`cached_tokens`:0},
