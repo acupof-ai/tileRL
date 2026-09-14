@@ -51,10 +51,24 @@ prompts the bounded path cannot hold, and admission that reserves the
 unbounded path's future pages. Wall-time fairness across ticks is necessary
 but not sufficient for tail latency when the two paths share one device queue.
 
+## Deploy verdict (2026-09-14)
+
+The hybrid shipped opt-in and misses the ≥50 tok/s single-request target on
+sm70: a think-off single request measured **48.1 tok/s**, with one bimodal
+run at **46.4 tok/s (39.5 vs 35.6 ms/fwd in its two phases)**, unexplained.
+Long-context concurrency stays fill-bound: a short request during a **unique
+128k** fill measured **5.59 tok/s, 3.2 s TTFT** vs ~52 tok/s solo; sparse
+ticks cost **~1 s median** on sm70, so a dense tick behind an in-flight
+sparse prefill waits on the device. A prefill cap of 96 relieves the wait but
+costs **+124%** prefill time (table below). Upgrade path is a sparse prefill
+kernel or chunking work that lets dense decode pass the fill.
+
 ## Results (V100 sm70, 27B NVFP4, MTP d1, --decode-graph, k=128 N=8192)
 
 | check | result |
 |---|---|
+| think-off single request | **48.1 tok/s**, below the ≥50 target; one bimodal run 46.4 (39.5 vs 35.6 ms/fwd), unexplained |
+| short dense DURING a unique 128k fill | **5.59 tok/s, 3.2 s TTFT** vs ~52 tok/s solo; sparse tick ~1 s median |
 | all-dense hybrid vs main (same flags) | within **0.9%** (53.2 → ~52.6-equivalent after the ledger memoize) |
 | 120k sparse fill with spill | answers (116,912 + 32 tok, TTFT 1270 s); **RSS peak 15.1 GiB**, GPU 32,448/32,768 MiB, spill file 8.24 GiB |
 | short dense DURING a 32k fill (real server) | delivered; **TTFT 2.5 s, 64 tokens at 9.9 tok/s** vs 52.6 solo (~20%) |
