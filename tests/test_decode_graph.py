@@ -116,11 +116,11 @@ def test_the_graphs_padding_row_is_not_taken_from_the_callers_capacity():
     on, off = engine(True), engine(False)
     # The pad row is engine overhead: the pool grows by it, the reported capacity does not.
     assert on._states.num_slots == n + 1 and on._kv.num_blocks == 16 + 1
-    assert on._pad_slot is not None and on._pad_block is not None
+    assert on._graph_capture.pad_slot is not None and on._graph_capture.pad_block is not None
     assert on.stats()["slots_total"] == n and on.stats()["blocks_total"] == 16
     # Negative control: with the graph off nothing is reserved and nothing is added.
     assert off._states.num_slots == n and off._kv.num_blocks == 16
-    assert off._pad_slot is None and off.stats()["slots_total"] == n
+    assert off._graph_capture.pad_slot is None and off.stats()["slots_total"] == n
 
     prompt = torch.randint(0, cfg.vocab_size, (8,),
                            generator=torch.Generator().manual_seed(5)).tolist()
@@ -368,13 +368,13 @@ def test_a_tick_with_no_pad_row_runs_eager_instead_of_capturing_mid_request():
     assert e._graph_bucket(3) == 4, "this test needs a row count that pads"
 
     # Control: the pad row is there, so the tick keys on the bucket precapture built.
-    assert e._pad_slot is not None
+    assert e._graph_capture.pad_slot is not None
     assert e._run_decode_graph(reqs) is False  # the spy returns None
     assert asked == [(4, 1)], f"a padded tick must key on its bucket, got {asked}"
 
     # The case: no pad row and no capacity to take one.
     asked.clear()
-    e._pad_slot = e._pad_block = None
+    e._graph_capture.pad_slot = e._graph_capture.pad_block = None
     e._states._free.clear()
     e._kv._free.clear()
     assert e._run_decode_graph(reqs) is False

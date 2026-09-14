@@ -45,7 +45,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .decode_graph import graph_bucket, make_decode_graph, make_sparse_graph
+from .decode_graph import GraphCapture, graph_bucket, make_decode_graph, make_sparse_graph
 from .kv_cache import BLOCK_TOKENS, BatchKv, NoPrefixStore
 from .kv_tiers import SpillWriteError
 from .memory import held_storage, measured_peak_bytes, memory_rows
@@ -411,15 +411,8 @@ class Engine:
         # ``build_engine`` sized the pools for this row, and taking it up front
         # keeps the capacity the caller asked for whole instead of removing one
         # request's worth of it partway through a run.
-        self._pad_slot: int | None = None
-        self._pad_block: int | None = None
-        if self._decode_graph_on:
-            try:
-                self._pad_slot = state_pool.alloc_slot()
-                self._pad_block = kv_pool.alloc_block()
-            except RuntimeError:
-                pass  # pools sized without the spare: fall back to exact-size graphs
-        self._graph_pool = None
+        self._graph_capture = GraphCapture(
+            state_pool.alloc_slot, kv_pool.alloc_block, reserve=self._decode_graph_on)
         # A slot is held from submit() to finish, so usable_slots -- not max_batch --
         # is the real concurrency ceiling, and _build_plan's max_batch is unreachable.
         # The excess QUEUES: `submit` has no slot check and `_admit` returns False on
@@ -432,7 +425,7 @@ class Engine:
             # pool instead is what made the old "+ 1 for the pad row" get applied to a
             # build_engine call that already adds it -- the misread this message caused.
             remedy = f"pass num_slots >= {limits.max_batch} to build_engine"
-            if self._pad_slot is not None:
+            if self._graph_capture.pad_slot is not None:
                 remedy += " (it adds the decode graph's pad row itself)"
             warnings.warn(
                 f"{self.usable_slots} usable state slots against max_batch="
@@ -441,7 +434,7 @@ class Engine:
                 f"into later ticks rather than raising -- twice the ticks at half the "
                 f"width, not an error. To run {limits.max_batch} rows at once, "
                 f"{remedy}, or size a LinearStatePool for "
-                f"{limits.max_batch + (self._pad_slot is not None)} directly "
+                f"{limits.max_batch + (self._graph_capture.pad_slot is not None)} directly "
                 f"(this one holds {self._states.num_slots})",
                 stacklevel=2,
             )
@@ -564,7 +557,7 @@ class Engine:
         caller asked for when the captured tick is on, and that row is the
         engine's — every capacity answer is net of it, or a request sized to the
         whole pool passes the guard and fails on the allocation behind it."""
-        return self._kv.num_blocks - (self._pad_block is not None)
+        return self._kv.num_blocks - (self._graph_capture.pad_block is not None)
 
     @property
     def _logical_capacity_blocks(self) -> int:
@@ -583,7 +576,7 @@ class Engine:
 
     @property
     def usable_slots(self) -> int:
-        return self._states.num_slots - (self._pad_slot is not None)
+        return self._states.num_slots - (self._graph_capture.pad_slot is not None)
 
     @property
     def config(self) -> dict[str, Any]:
@@ -672,7 +665,7 @@ class Engine:
             if (not sparse_on and self._sparse is not None and params.max_new_tokens > 0
                     and self._kv.blocks_for_tokens(
                         total + self._width - 1)
-                    > self._kv.num_blocks - (self._pad_block is not None)):
+                    > self._kv.num_blocks - (self._graph_capture.pad_block is not None)):
                 # A dense row cannot use the sparse cold tier: its pin has to fit
                 # the DEVICE pool (usable_blocks counts cold for sparse rows), so a
                 # prompt that would head-of-line block on a permanent _admit False
@@ -1780,12 +1773,8 @@ class Engine:
         key = (B, W, cmax_bucket(cmax), own_w)
         g = self._sparse_graphs.get(key)
         if g is None:
-            if n < B and self._pad_slot is None:
-                try:
-                    self._pad_slot = self._states.alloc_slot()
-                    self._pad_block = self._kv.alloc_block()
-                except RuntimeError:
-                    return False
+            if n < B and not self._graph_capture.ensure_pad():
+                return False
             sf = SparseForward(
                 tr,
                 None,
@@ -1796,9 +1785,9 @@ class Engine:
                 cmax_cap=key[2],
                 own_w_cap=own_w,
             )
-            g, self._graph_pool, err = make_sparse_graph(
+            g, self._graph_capture.pool, err = make_sparse_graph(
                 self._model, self._backend, self._kv, self._states, self._sparse,
-                sf, B, W, self._aux_layers, self._graph_pool)
+                sf, B, W, self._aux_layers, self._graph_capture.pool)
             if g is None:
                 warnings.warn(f"sparse decode graph capture failed for {key}: {err}; eager fallback")
                 self._sparse_graph_on = False
@@ -1807,7 +1796,7 @@ class Engine:
         logits = g.run(
             rows,
             chains or [(r.output[-1],) for r in reqs],
-            pad=None if self._pad_slot is None else (self._pad_slot, self._pad_block),
+            pad=self._graph_capture.pad,
         )
         self._sparse_ticks_since_refresh += 1
         self._decode_forwards += 1
@@ -1827,10 +1816,7 @@ class Engine:
             end = self._width - 1
             for r in reqs:
                 assert len(r.draft_blocks) * BLOCK_TOKENS > r.seq_len - 1 + end
-            if self._draft_ms is None:
-                self._draft.step(reqs)
-            else:
-                self._draft_step_timed(reqs)
+            self._draft_step(reqs)
         return True
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0, sf=None) -> BatchKv:
@@ -2060,10 +2046,7 @@ class Engine:
                     r.blocks.append(self._kv.alloc_block())
                     r.own_blocks += 1
                     self._blocks_used += 1
-            if self._draft_ms is None:
-                self._draft.step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
-            else:
-                self._draft_step_timed(rows)
+            self._draft_step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
             if sparse:
                 # draft K/V for this tick's dropped pages now exist: publish them
                 self._sparse_process_offers(sparse_offers)
@@ -2215,9 +2198,9 @@ class Engine:
         g = self._decode_graphs.get((B, W))
         if g is not None:
             return g
-        g, self._graph_pool, err = make_decode_graph(
+        g, self._graph_capture.pool, err = make_decode_graph(
             self._model, self._backend, self._kv, self._states, B, W, keep,
-            self._aux_layers, self._graph_pool)
+            self._aux_layers, self._graph_capture.pool)
         if g is None:
             warnings.warn(err)
             self._decode_graph_on = False
@@ -2331,18 +2314,14 @@ class Engine:
         need a graph outside the `graph_keys` grid."""
         n, W = len(reqs), len(chains[0]) if chains else 1
         B = self._graph_bucket(n)
-        if n < B and self._pad_slot is None:
-            try:
-                self._pad_slot = self._states.alloc_slot()
-                self._pad_block = self._kv.alloc_block()
-            except RuntimeError:
-                # no pad row: an exact-size graph is off the graph_keys grid and would
-                # capture mid-request
-                return False
+        if n < B and not self._graph_capture.ensure_pad():
+            # no pad row: an exact-size graph is off the graph_keys grid and would
+            # capture mid-request
+            return False
         g = self._graph_for(B, W, keep=bool(chains))
         if g is None:
             return False
-        pad = None if self._pad_slot is None else (self._pad_slot, self._pad_block)
+        pad = self._graph_capture.pad
         logits = g.run(reqs, chains, pad=pad)
         self._decode_forwards += 1
         if g.aux is not None:  # _verify sets hidden_from, which is aux's base position too
@@ -2359,11 +2338,17 @@ class Engine:
         if self._draft is not None:
             # No block-growth loop needed here: this path runs only with `not prefills`, so
             # the pre-fork `seq_len - 1 + q` loop already covers the draft's furthest write.
-            if self._draft_ms is None:
-                self._draft.step(reqs)
-            else:
-                self._draft_step_timed(reqs)
+            self._draft_step(reqs)
         return True
+
+    def _draft_step(self, rows: list[_Req]) -> None:
+        """One named tick-step binding for the draft head: timed when the engine
+        was built with draft timing on, plain otherwise. Every forward path calls
+        this so the graph and eager ticks stay one call site."""
+        if self._draft_ms is None:
+            self._draft.step(rows)
+        else:
+            self._draft_step_timed(rows)
 
     def _draft_step_timed(self, rows: list[_Req]) -> None:
         """``_draft.step`` with CUDA events around it, recording (forwards, ms).

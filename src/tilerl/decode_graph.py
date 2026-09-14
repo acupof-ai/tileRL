@@ -306,6 +306,43 @@ class CpuSparseGraph:
         return logits
 
 
+class GraphCapture:
+    """Shared capture infrastructure for dense and sparse decode graphs:
+
+    - one CUDA graph memory ``pool`` across every bucket (a private pool per
+      graph is never returned to the allocator);
+    - the padding row's ``(slot, block)``: a replay's pad rows write to both
+      pools, so they must never land on a slot a live request owns.
+
+    The pad row is reserved up front when ``reserve`` is set (dense capture is
+    on and build_engine sized the pools one larger), or lazily on the first
+    bucket that pads. ``ensure_pad`` returns False only when the pools were
+    sized without the spare row, so the caller runs an exact-size eager tick.
+    """
+
+    def __init__(self, alloc_slot, alloc_block, reserve: bool = False):
+        self._alloc_slot = alloc_slot
+        self._alloc_block = alloc_block
+        self.pool: Any = None
+        self.pad_slot: int | None = None
+        self.pad_block: int | None = None
+        if reserve:
+            self.ensure_pad()
+
+    def ensure_pad(self) -> bool:
+        if self.pad_slot is None:
+            try:
+                self.pad_slot = self._alloc_slot()
+                self.pad_block = self._alloc_block()
+            except RuntimeError:
+                return False
+        return True
+
+    @property
+    def pad(self) -> tuple[int, int] | None:
+        return None if self.pad_slot is None else (self.pad_slot, self.pad_block)
+
+
 def make_decode_graph(model, backend, kv_pool, state_pool, B, W, keep,
                       aux_layers, pool) -> tuple[DecodeGraph | None, Any, str | None]:
     """Capture one dense (B, W) decode graph. Returns (graph, pool, error).
