@@ -42,6 +42,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .prompt import (
     await_completion,
     blocks_to_text,
+    choice_name,
     cut_at_stop,
     refuse_unsupported,
     render_prompt,
@@ -50,6 +51,7 @@ from .prompt import (
     sampling,
     split_think,
     strip_think,
+    tools_for_render,
     unknown_fields,
     unsupported_choice,
 )
@@ -182,7 +184,9 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
     engine_limit = getattr(getattr(engine, "limits", None), "max_total_tokens", 0)
 
     def _render(req: MessagesRequest) -> str:
-        return render_prompt(req.messages, req.system, req.tools, _thinking(req), _effort(req))
+        return render_prompt(req.messages, req.system,
+                             tools_for_render(req.tools, req.tool_choice),
+                             _thinking(req), _effort(req))
 
     def _record(row: dict[str, Any]) -> None:
         path = record_path()
@@ -213,7 +217,10 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         scores = engine.logprobs(rid)  # single reader; a second one raises
         reasoning, text = split_think(tokenizer.decode(out), opened=_thinking(req))
         stopped = engine.stop_text(rid)
-        prose, calls = _parse_tool_calls(cut_at_stop(text, stopped), req.tools)
+        prose, calls = _parse_tool_calls(cut_at_stop(text, stopped),
+                                           tools_for_render(req.tools, req.tool_choice))
+        if choice_name(req.tool_choice) == "none":
+            calls = []
         content: list[dict[str, Any]] = []
         # Anthropic's native shape for reasoning is its own block, ahead of the
         # text, and it must come first: a client renders content in order. We

@@ -229,6 +229,21 @@ def cut_at_stop(text: str, stop: str | None) -> str:
     return text if not stop else text.split(stop)[0]
 
 
+#: Tool types that are the provider's to run, not ours. Declaring one means the
+#: client expects the SERVER to perform the search or execution. Shared by the
+#: chat and responses routes: accepting one silently renders a null-name tool
+#: on chat while responses refuses the same request.
+HOSTED_TOOL_TYPES = ("file_search", "web_search", "web_search_preview", "computer",
+                     "computer_use_preview", "code_interpreter", "image_generation",
+                     "local_shell", "mcp", "custom", "apply_patch", "shell")
+
+
+def hosted_tool_fields(tools: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """The hosted tool types present in a request, as refusal kwargs."""
+    kinds = {t.get("type") for t in tools or []} & set(HOSTED_TOOL_TYPES)
+    return {f"tools[type={k}]": True for k in sorted(kinds)}
+
+
 def unknown_fields(req: Any) -> dict[str, str] | None:
     """A request's undeclared fields, as name -> shape. Values are never recorded.
 
@@ -270,6 +285,24 @@ def _shape(v: Any) -> str:
     return type(v).__name__
 
 
+def choice_name(choice: Any) -> str | None:
+    """A ``tool_choice`` value's type name, either route's spelling.
+
+    Both APIs accept a bare str or a ``{"type": ...}`` object.
+    """
+    if choice is None:
+        return None
+    return choice if isinstance(choice, str) else (choice or {}).get("type")
+
+
+def tools_for_render(tools: list[dict[str, Any]] | None,
+                     choice: Any) -> list[dict[str, Any]] | None:
+    """The tools to render for a tool_choice: ``none`` forbids the call, so
+    the tools block must not reach the prompt -- accepting ``none`` while
+    still rendering the tools made the field a lie."""
+    return None if choice_name(choice) == "none" else tools
+
+
 def unsupported_choice(choice: Any) -> bool | None:
     """`tool_choice` beyond auto/none, for either route's spelling.
 
@@ -278,10 +311,8 @@ def unsupported_choice(choice: Any) -> bool | None:
     prompt and cannot force or forbid one, so anything stronger than a hint is
     unimplementable and is refused rather than dropped.
     """
-    if choice is None:
-        return None
-    name = choice if isinstance(choice, str) else (choice or {}).get("type")
-    return name not in ("auto", "none", None)
+    name = choice_name(choice)
+    return None if name is None else name not in ("auto", "none")
 
 
 def refuse_unsupported(*fields: str, **flagged: Any) -> None:

@@ -33,14 +33,17 @@ from pydantic import BaseModel, ConfigDict, Field
 from .messages import _COMPLETION_TIMEOUT_S, _parse_tool_calls, mount_messages
 from .prompt import (
     await_completion,
+    choice_name,
     cut_at_stop,
     flatten_tools,
+    hosted_tool_fields,
     refuse_unsupported,
     render_prompt,
     sampling,
     split_think,
     stop_texts,
     thinking_enabled,
+    tools_for_render,
     unknown_fields,
 )
 from .responses import mount_responses
@@ -239,13 +242,10 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         # We render tools into the prompt and cannot force or forbid a call, so a
         # tool_choice stronger than a hint is refused rather than echoed.
         unknown_fields(req)  # warns; this route has no recorder, so the warn is all there is
-        # `auto`/`none` are honourable as given; anything stronger is refused. Both the
-        # str form and the `{"type": ...}` form reach here, and an absent field lands on
-        # `None`, which is in the honourable set -- so no separate guard for it.
-        choice = req.tool_choice
-        named = choice if isinstance(choice, str) else (choice or {}).get("type")
-        refuse_unsupported(tool_choice=named not in ("auto", "none", None))
-        tools = flatten_tools(req.tools)
+        named = choice_name(req.tool_choice)
+        refuse_unsupported(tool_choice=named not in ("auto", "none", None),
+                          **hosted_tool_fields(req.tools))
+        tools = tools_for_render(flatten_tools(req.tools), req.tool_choice)
         input_ids = tokenizer.encode(_render_chat(
             req.messages, thinking, kw.get("reasoning_effort") or req.reasoning_effort, tools
         ))
@@ -318,7 +318,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             return StreamingResponse(
                 _stream(request_id, max_new, prompt_tokens, opened, bool(
                     (req.stream_options or {}).get("include_usage")
-                ), stop_texts(req.stop)),
+                ), stop_texts(req.stop), tools,
+                choice_name(req.tool_choice) != "none"),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -362,6 +363,10 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         # depending on which API asked. The prose before the first call is the
         # model's own explanation and stays as content.
         text, calls = _parse_tool_calls(text, tools)
+        # choice:"none" must also discard a call the model emits anyway: the
+        # tools block was hidden, but the parser still matches free-form XML.
+        if choice_name(req.tool_choice) == "none":
+            calls = []
         tool_calls = [
             {"id": f"call_{request_id}_{i}", "type": "function",
              "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}}
@@ -407,10 +412,12 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             "system_fingerprint": SYSTEM_FINGERPRINT,
         }
 
-    def _deltas(request_id: int, max_new: int, opened: bool, stops: tuple[str, ...] = ()):
+    def _deltas(request_id: int, max_new: int, opened: bool, stops: tuple[str, ...] = (),
+                tools: list | None = None, allow_tool_calls: bool = True):
         """One request's reply, as ``(kind, payload, completion_tokens)`` triples.
 
         ``kind`` is ``delta`` (payload is a ``reasoning_content``/``content`` dict),
+        ``tool_calls`` (payload is the non-stream route's (name, args) pairs),
         ``error`` (an OpenAI error body) or ``done`` (payload is the finish_reason,
         and it is the last item). Shared by the SSE route and ``/ws/chat``: the two
         transports differ only in how they frame these, so they cannot disagree about
@@ -419,12 +426,16 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
         Blocking, by design -- it is driven from a thread on both routes.
         """
+        # The checkpoint opens a tool call with this literal; once any suffix of it
+        # reaches the wire it can never be un-sent, so a forming call is held back.
+        call_open = "<tool_call>"
+
         deadline = time.monotonic() + _COMPLETION_TIMEOUT_S
-        sent = 0  # characters of the STRIPPED reply already emitted
+        sent = 0  # safe content characters already emitted (absolute index)
         sent_r = 0  # characters of the reasoning already emitted
         seen = 0  # tokens already decoded, so a quiet poll costs nothing
         # the most of a stop sequence that can still turn out to be a prefix
-        hold = max((len(x) for x in stops), default=1) - 1
+        stop_hold = max((len(x) for x in stops), default=1) - 1
         try:
             while True:
                 # peek() is lock-free; take() blocks on the engine lock for a whole
@@ -452,16 +463,36 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                     if len(reasoning) > sent_r:
                         yield "delta", {"reasoning_content": reasoning[sent_r:]}, seen
                         sent_r = len(reasoning)
-                    # Two cases, and a holdback alone gets the first one wrong: once a
-                    # match is COMPLETE cut there; while one may still be forming, hold
-                    # back `hold` chars. Measured: holding only, the frame before the
-                    # final one carried "The answer " -- the leading space of " is".
+                    # A COMPLETE stop match ends the text; otherwise hold the
+                    # stop-prefix chars. With calls allowed, also hold a complete
+                    # <tool_call> opener and any forming opener suffix, so the XML
+                    # leaks in neither chunks nor a single frame at a time.
+                    safe = text
                     if stops:
-                        done = [text.index(x) for x in stops if x in text]
-                        text = text[:min(done)] if done else text[:max(0, len(text) - hold)]
-                    if len(text) > sent:
-                        yield "delta", {"content": text[sent:]}, seen
-                        sent = len(text)
+                        done = [safe.index(x) for x in stops if x in safe]
+                        safe = (safe[:min(done)] if done
+                                else safe[:max(0, len(safe) - stop_hold)])
+                    # The opener hold runs UNCONDITIONALLY: even when
+                    # tool_choice:"none" discards the structured calls
+                    # (allow_tool_calls False), the raw XML bytes must not
+                    # reach a content delta. allow_tool_calls only decides
+                    # whether the held call is emitted as a tool_calls frame.
+                    cut = safe.find(call_open)
+                    if cut >= 0:
+                        safe = safe[:cut]
+                    else:
+                        for n in range(1, len(call_open)):
+                            if safe.endswith(call_open[:n]):
+                                safe = safe[:-n]
+                                break
+                    # Hold trailing whitespace unconditionally too: a call
+                    # follows its prose after "\n", and the parser strips that
+                    # prose, so the separator cannot reach a content delta on
+                    # the choice:none path either.
+                    upto = len(safe.rstrip())
+                    if upto > sent:
+                        yield "delta", {"content": safe[sent:upto]}, seen
+                        sent = upto
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         f"request {request_id} did not finish within {_COMPLETION_TIMEOUT_S}s")
@@ -488,27 +519,55 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         reasoning, text = split_think(tokenizer.decode(output_ids), opened)
         stopped = engine.stop_text(request_id)
         text = cut_at_stop(text, stopped)
+        prose, calls = _parse_tool_calls(text, tools)
+        if not allow_tool_calls:
+            calls = []
         if len(reasoning) > sent_r:
             yield "delta", {"reasoning_content": reasoning[sent_r:]}, len(output_ids)
-        # The held-back tail lands here, minus the stop sequence: `sent` counts what
-        # actually went out, so this is the remainder either way.
-        if len(text) > sent:
-            yield "delta", {"content": text[sent:]}, len(output_ids)
-        yield ("done", "stop" if stopped else "length" if len(output_ids) >= max_new
-               else "stop", len(output_ids))
+        # Tool-call XML never reached the content deltas (the opener was held).
+        # _parse_tool_calls strips it for both paths; choice:"none" keeps the
+        # parse but discards the calls, so the terminal tail is the prose only.
+        tail = prose
+        if calls:
+            # The non-stream parser strips the prose around the call; the
+            # separating newline rides with the XML, not the content delta.
+            tail = tail.rstrip()
+        if len(tail) > sent:
+            yield "delta", {"content": tail[sent:]}, len(output_ids)
+        if calls:
+            yield "tool_calls", calls, len(output_ids)
+        finish = ("tool_calls" if calls else "stop" if stopped
+                   else "length" if len(output_ids) >= max_new else "stop")
+        yield ("done", finish, len(output_ids))
 
     def _stream(request_id: int, max_new: int, prompt_tokens: int, opened: bool,
-                include_usage: bool, stops: tuple[str, ...] = ()):
+                include_usage: bool, stops: tuple[str, ...] = (),
+                tools: list | None = None, allow_tool_calls: bool = True):
         created = int(time.time())
         chunk_id = f"chatcmpl-{request_id}"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {"role": "assistant"}))
         completion = 0
         try:
-            for kind, payload, completion in _deltas(request_id, max_new, opened, stops):
+            for kind, payload, completion in _deltas(request_id, max_new, opened, stops,
+                                                      tools, allow_tool_calls):
                 if kind == "error":
                     yield _sse({"error": payload})
                     yield "data: [DONE]\n\n"
                     return
+                if kind == "tool_calls":
+                    for i, (name, args) in enumerate(payload):
+                        # One full-arguments delta per call: the SDK appends, and
+                        # index/id/function are byte-identical to the non-stream
+                        # message.tool_calls element.
+                        yield _sse(_chat_chunk(chunk_id, created, model_name, {
+                            "tool_calls": [{"index": i,
+                                            "id": f"call_{request_id}_{i}",
+                                            "type": "function",
+                                            "function": {
+                                                "name": name,
+                                                "arguments": json.dumps(args,
+                                                                       ensure_ascii=False)}}]}))
+                    continue
                 if kind == "delta":
                     # Cumulative tokens on every content frame, vLLM's
                     # continuous_usage_stats shape. Without it a live rate gauge can only
@@ -565,7 +624,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         try:
             # A picked constructor hides every other field from extra="allow".
             req = ChatCompletionRequest.model_validate(_ws_body(ask))
-            request_id, prompt_tokens, max_new, opened, _ = await asyncio.to_thread(_submit, req)
+            request_id, prompt_tokens, max_new, opened, tools = (
+                await asyncio.to_thread(_submit, req))
         except Exception as exc:
             await ws.send_json({"t": "error", "message": f"{type(exc).__name__}: {exc}"})
             await ws.close()
@@ -573,17 +633,25 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
         # _deltas blocks on the engine; stepping it in a thread keeps the event loop free
         # to serve the other routes while one page streams.
-        gen, end = _deltas(request_id, max_new, opened, stop_texts(req.stop)), object()
+        gen, end = _deltas(request_id, max_new, opened, stop_texts(req.stop),
+                           tools, choice_name(req.tool_choice) != "none"), object()
+        calls = None
         try:
             while (item := await asyncio.to_thread(next, gen, end)) is not end:
                 kind, payload, completion = item
                 if kind == "delta":
                     await ws.send_json({"t": "delta", **payload})
+                elif kind == "tool_calls":
+                    calls = [{"id": f"call_{request_id}_{i}", "type": "function",
+                              "name": n, "arguments": json.dumps(a, ensure_ascii=False)}
+                             for i, (n, a) in enumerate(payload)]
+                    await ws.send_json({"t": "tool_calls", "tool_calls": calls})
                 elif kind == "error":
                     await ws.send_json({"t": "error", "message": payload["message"]})
                     break
                 else:
                     await ws.send_json({"t": "done", "finish_reason": payload,
+                                        **({"tool_calls": calls} if payload == "tool_calls" else {}),
                                         "usage": _usage(prompt_tokens, completion)})
         except WebSocketDisconnect:
             # gen.close() stops this poll loop; the cancel is what stops the engine,
