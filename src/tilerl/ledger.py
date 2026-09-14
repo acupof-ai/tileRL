@@ -4,6 +4,7 @@ input is a new run. Gates are data here and exit codes in the CLI. Stdlib only."
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -390,6 +391,80 @@ def format_run(m: dict) -> str:
     if verdict == "FAIL" and verdict_of(m, "verdict") is True:
         verdict = "novalid"
     return f"{m['id']}  {m['command']:<6} {m['finished'] or 'running':<25} {verdict:<7} {mt}"
+
+
+
+@functools.lru_cache(maxsize=1)
+def _benchrec():
+    """The ruler's validator/store, loaded from scripts/benchrec.py."""
+    # ponytail: scripts/ bridge, package benchrec after the scripts sweep
+    import importlib.util
+
+    p = Path(__file__).resolve().parents[2] / "scripts" / "benchrec.py"
+    spec = importlib.util.spec_from_file_location("benchrec", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def residency_row(
+    device_name: str,
+    card: int | None,
+    peak_bytes: int,
+    static_bytes: int,
+    transient_bytes: int,
+    target: str,
+    model: str,
+    build: str = "eager",
+    uuid: str | None = None,
+) -> dict:
+    """One measured row: steady-state device residency with its static/transient
+    split, so occupancy lives in the same measurements.jsonl as the kernel
+    roofline (peak = static + transient). A card-less sm* row is benchrec-
+    rejected, so the CLI refuses --record-residency off cuda."""
+    br = _benchrec()
+    device = {"name": device_name, "card": card}
+    if uuid is not None:
+        device["uuid"] = uuid
+    return {
+        "metric": "device_resident_bytes",
+        "value": int(peak_bytes),
+        "unit": "bytes",
+        "target": target,
+        "build": build,
+        "model": model,
+        "shape": {
+            "card": card,
+            "static": int(static_bytes),
+            "transient": int(transient_bytes),
+        },
+        "warm": {"state": "warm", "compiles": None},
+        "n": 1,
+        "spread": 0,
+        "device": device,
+        "commit": br.git_commit(),
+        "dirty": br.git_dirty(),
+        "cmd": "tilerl serve --dry-run --record-residency",
+        "floor": {
+            "value": int(peak_bytes),
+            "unit": "bytes",
+            "kind": "reference",
+            "derivation": f"measured resident peak = static {int(static_bytes)} + "
+            f"transient {int(transient_bytes)}",
+        },
+    }
+
+
+def append_residency(row: dict, path: str | None = None) -> str:
+    """Validate + append through benchrec, the one schema-writer."""
+    br = _benchrec()
+    old = br.STORE
+    if path is not None:
+        br.STORE = Path(path)
+    try:
+        return br.append(row)
+    finally:
+        br.STORE = old
 
 
 if __name__ == "__main__":  # runnable check

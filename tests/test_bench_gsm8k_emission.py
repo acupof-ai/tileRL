@@ -8,7 +8,7 @@ import json
 import pytest
 import torch
 
-from tilerl import cli
+from tilerl import cli, ledger
 
 
 class _Backend:
@@ -28,7 +28,7 @@ class _CPUBackend:
 
 @pytest.fixture
 def tmp_store(tmp_path, monkeypatch):
-    benchrec = cli._benchrec()
+    benchrec = ledger._benchrec()
     monkeypatch.setattr(benchrec, "STORE", tmp_path / "measurements.jsonl")
     return benchrec
 

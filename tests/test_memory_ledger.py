@@ -377,7 +377,7 @@ def test_residency_row_roundtrips_through_benchrec(tmp_path):
     through the one schema writer (a malformed row is rejected)."""
     import json
 
-    from tilerl.memory import append_residency, residency_row
+    from tilerl.ledger import append_residency, residency_row
 
     p = tmp_path / "measurements.jsonl"
     row = residency_row("tiny-cpu", None, 500, static_bytes=450,

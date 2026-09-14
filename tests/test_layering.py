@@ -18,7 +18,7 @@ LAYERS: dict[str, frozenset[str]] = {
     "L0": frozenset({"precision", "config", "tokenizer", "testing"}),
     "L1": frozenset({"model", "tensor_parallel", "autograd"}),
     "L2": frozenset({"kv_cache", "kv_tiers", "sparse_index"}),
-    "L3": frozenset({"engine", "decode_graph", "sparse_engine", "spec", "dflash2", "memory"}),
+    "L3": frozenset({"engine", "decode_graph", "sparse_engine", "spec", "memory"}),
     "L4": frozenset({"build"}),
     "L5": frozenset(
         {
@@ -49,13 +49,7 @@ _RANK = {m: i for i, mods in enumerate(LAYERS.values()) for m in mods}
 _SKIP = frozenset({"__init__", "__main__"})
 
 # Every upward edge observed at fa2ae898. May only shrink.
-ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("autograd", "sparse_index"),
-        ("calibration", "cli"),
-        ("memory", "cli"),
-    }
-)
+ALLOWLIST: frozenset[tuple[str, str]] = frozenset()
 
 
 def read_sources(root: Path = SRC) -> dict[str, str]:

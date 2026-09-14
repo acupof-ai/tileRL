@@ -34,7 +34,7 @@ def store_path() -> Path:
 def load_rows(path: str | os.PathLike | None = None) -> list[dict]:
     """The ledger's rows via scripts/benchrec (the one reader/writer); a torn tail is
     skipped there. ``path`` swaps benchrec.STORE for the read, so a test store works."""
-    from .cli import _benchrec
+    from .ledger import _benchrec
 
     br = _benchrec()
     old = br.STORE
@@ -276,7 +276,7 @@ def measure_fp8_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> flo
 
 def _row(metric: str, value: float, unit: str, device_name: str, card: int,
          derivation: str, uuid: str | None = None, target: str = "sm90"):
-    from .cli import _benchrec
+    from .ledger import _benchrec
 
     br = _benchrec()
     device = {"name": device_name, "card": card}
@@ -392,10 +392,10 @@ def calibrate_rows(card: int) -> list[dict]:
 
 
 def append_rows(rows: list[dict], path: str | os.PathLike | None = None) -> list[str]:
-    """Validate and append through scripts/benchrec via cli._benchrec, the tree's one
+    """Validate and append through scripts/benchrec via ledger._benchrec, the tree's one
     schema-writer loader. A row failing REQUIRED/unit/target/device/floor checks is
     rejected before the file is opened — calibration is not a second writer. Returns ids."""
-    from .cli import _benchrec
+    from .ledger import _benchrec
 
     br = _benchrec()
     old = br.STORE

@@ -32,7 +32,7 @@ from torch import Tensor
 
 from . import kv_cache
 from .kv_cache import BLOCK_TOKENS
-from .sparse_index import WINDOW_PAGES, group_map, index_source_groups
+from .sparse_index import WINDOW_PAGES, group_map
 
 #: block-table ids are logical+1 so selected logical page 0 is not the 0 pad.
 _SENTINEL = 1

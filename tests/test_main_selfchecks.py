@@ -32,11 +32,12 @@ import pytest
 _SRC = Path(__file__).resolve().parents[1] / "src" / "tilerl"
 _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 
-# A ratchet, not a constant. Ten modules carry an asserting block today
-# (origin/main @ 44f2573f, 2026-09-09); if one
+# A ratchet, not a constant. Eight modules carry an asserting block today
+# (tensor_parallel's moved to tests/test_tensor_parallel.py on 2026-09-14 to
+# break the model<->tensor_parallel import cycle); if one
 # legitimately loses its block, lower this deliberately and let that edit be the
 # review point. A gate whose coverage can shrink in silence is the hole this closes.
-_MIN_MODULES = 9
+_MIN_MODULES = 8
 
 # Same ratchet for scripts/. Three are hermetic today; the rest import torch or a
 # backend and belong to the card, not to CI.

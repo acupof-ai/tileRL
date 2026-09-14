@@ -275,7 +275,9 @@ def indexer_warmup_loss(h: Tensor, k_pages: Tensor, iq_weight: Tensor,
     iq = project_indexer_queries(h, iq_weight)
     ik = project_page_keys(k_pages, ik_weight)
     loss = indexer_kl(iq, ik, target_page_mass, n_pages, n_win_pages)
-    maybe_record("indexer_warmup", loss, iq_weight, ik_weight, h=h, k_pages=k_pages,
+    # bwd= passed as a callable so autograd (L1) never imports sparse_index (L2).
+    maybe_record("indexer_warmup", loss, iq_weight, ik_weight,
+                 bwd=indexer_warmup_bwd, h=h, k_pages=k_pages,
                  target_page_mass=target_page_mass, n_pages=n_pages,
                  n_win_pages=n_win_pages)
     return loss
