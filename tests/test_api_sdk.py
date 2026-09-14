@@ -405,6 +405,37 @@ def test_responses_tool_call_and_replay(oa, engine):
     assert second.output_text == REPLY
 
 
+def test_chat_tool_call_and_tool_message_replay(oa, engine):
+    """Finding 11 through the real OpenAI SDK: the assistant.tool_calls and
+    the following role:"tool" message must replay in the checkpoint's XML,
+    not render empty or a bare <|im_start|>tool turn."""
+    tools = [{"type": "function", "function": {
+        "name": "Bash", "description": "run a command",
+        "parameters": {"type": "object",
+                       "properties": {"command": {"type": "string"}}}}}]
+    first = oa.chat.completions.create(
+        model="tilerl", messages=[{"role": "user", "content": "run ls"}],
+        tools=tools, extra_body=THINKING_ON)
+    tc = first.choices[0].message.tool_calls[0]
+    assert tc.function.name == "Bash"
+    before = len(engine.prompts)
+    second = oa.chat.completions.create(model="tilerl", tools=tools, extra_body=THINKING_ON,
+        messages=[
+            {"role": "user", "content": "run ls"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name,
+                              "arguments": tc.function.arguments}}]},
+            {"role": "tool", "content": "a.txt", "tool_call_id": tc.id},
+            {"role": "user", "content": "what happened?"},
+        ])
+    prompt = engine.prompts[before]
+    assert "<|im_start|>tool" not in prompt
+    assert "<tool_call>" in prompt and "Bash" in prompt
+    assert "<tool_response>\na.txt\n</tool_response>" in prompt
+    assert second.choices[0].finish_reason == "stop"
+
+
 def test_responses_max_output_tokens_reports_incomplete(oa):
     r = oa.responses.create(model="tilerl", input="hi", max_output_tokens=4,
                             extra_body=THINKING_ON)

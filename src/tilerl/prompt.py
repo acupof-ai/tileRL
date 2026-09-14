@@ -36,8 +36,29 @@ def render_prompt(messages: list[dict[str, Any]], system: Any = None,
     if sys_text or tools_text:
         turns.append(("system", "\n\n".join(x for x in (tools_text, sys_text) if x)))
     for m in messages:
-        turns.append((str(m.get("role", "user")), blocks_to_text(m.get("content"))))
+        turns.append(_turn(m))
     return render_chat(turns, thinking)
+
+
+def _turn(m: dict[str, Any]) -> tuple[str, str]:
+    """One chat message as a ``(role, text)`` turn.
+
+    ``role:"tool"`` re-enters as a USER turn carrying the same
+    ``<tool_response>`` wrapper blocks_to_text gives an Anthropic
+    tool_result block: the checkpoint template has no ``tool`` role, and the
+    bare ``<|im_start|>tool`` would be off-distribution. An assistant turn
+    carrying OpenAI ``tool_calls`` replays the calls' XML verbatim.
+    """
+    role = str(m.get("role", "user"))
+    if role == "tool":
+        return "user", f"<tool_response>\n{blocks_to_text(m.get('content'))}\n</tool_response>"
+    text = blocks_to_text(m.get("content"))
+    calls = m.get("tool_calls")
+    if role == "assistant" and calls:
+        parts = [text] if text else []
+        parts += [render_tool_call_dict(tc) for tc in calls if isinstance(tc, dict)]
+        text = "\n".join(parts)
+    return role, text
 
 
 def sampling(tok: Any, thinking: bool | None, max_new_tokens: int, *,
@@ -80,7 +101,7 @@ def blocks_to_text(content: Any) -> str:
         if not isinstance(b, dict):
             continue
         kind = b.get("type")
-        if kind == "text":
+        if kind in ("text", "input_text", "output_text"):
             out.append(strip_think(b.get("text", "")))
         elif kind == "tool_use":
             out.append(render_tool_call(b.get("name") or "", b.get("input") or {}))
@@ -155,6 +176,19 @@ def render_tool_call(name: str, args: dict[str, Any]) -> str:
         lines.append(f"<parameter={k}>\n{val}\n</parameter>")
     lines.append("</function>\n</tool_call>")
     return "\n".join(lines)
+
+
+def render_tool_call_dict(tc: dict[str, Any]) -> str:
+    """One replayed tool call item, either OpenAI chat's nested
+    ``{function:{name,arguments}}`` shape or a flat ``{name,arguments}``
+    item (Responses ``function_call``). ``arguments`` is a JSON string on
+    both wire shapes; an unparseable value renders empty args."""
+    fn = tc.get("function") or tc
+    try:
+        args = json.loads(fn.get("arguments") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        args = {}
+    return render_tool_call(fn.get("name") or "", args)
 
 
 def render_tools(tools: list[dict[str, Any]] | None, effort: str | None = None) -> str:

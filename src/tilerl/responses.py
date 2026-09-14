@@ -42,6 +42,7 @@ from .prompt import (
     flatten_tools,
     refuse_unsupported,
     render_prompt,
+    render_tool_call_dict,
     sampling,
     split_think,
     thinking_enabled,
@@ -104,20 +105,12 @@ def _to_messages(inp: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
                                      "content": item.get("output", "")}]})
         elif kind == "function_call":
             out.append({"role": "assistant",
-                        "content": _render_call(item.get("name", ""),
-                                                item.get("arguments", "{}"))})
+                        "content": render_tool_call_dict(
+                            {"name": item.get("name", ""),
+                             "arguments": item.get("arguments", "{}")})})
         else:
             out.append({"role": item.get("role", "user"), "content": item.get("content")})
     return out
-
-
-def _render_call(name: str, arguments: str) -> str:
-    from .prompt import render_tool_call
-    try:
-        args = json.loads(arguments) if isinstance(arguments, str) else (arguments or {})
-    except json.JSONDecodeError:
-        args = {}
-    return render_tool_call(name, args)
 
 
 #: Tool types that are the provider's to run, not ours. Declaring one means the
