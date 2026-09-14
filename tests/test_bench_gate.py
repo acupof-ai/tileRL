@@ -58,12 +58,12 @@ def test_a_training_run_never_edits_the_tracked_baseline(tmp_path, monkeypatch):
     the copy it executes -- the first version of this test patched `bh._BASELINE`, passed
     with the guard removed, and proved nothing.
     """
-    from tilerl import cli
+    from tilerl import ledger
 
     before = bh._BASELINE.read_text()
     monkeypatch.setattr("tilerl.ledger.runs_root", lambda: str(tmp_path))
     (tmp_path / "r1").mkdir()
-    cli._timing_snapshot({
+    ledger._timing_snapshot({
         "id": "r1", "inputs": {"model": "tiny", "algo": "grpo", "group": 6,
                                "max_new_tokens": 8},
         "metrics": {"secs_per_step_median": 0.25}})

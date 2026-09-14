@@ -100,7 +100,7 @@ def test_the_rollout_cap_must_clear_the_measured_completion_length():
     """
     import pytest
 
-    from tilerl.cli import _ROLLOUT_HEADROOM, _refuse_short_rollouts
+    from tilerl.train import _ROLLOUT_HEADROOM, _refuse_short_rollouts
 
     _refuse_short_rollouts(1038, 2048)  # the fix: headroom, no raise
     _refuse_short_rollouts(None, 512)  # no before-arm measured: nothing to compare
@@ -127,7 +127,8 @@ def test_eval_gsm8k_must_be_held_out_from_training(tmp_path, monkeypatch):
     """
     import pytest
 
-    from tilerl.cli import _build_parser, cmd_train
+    from tilerl.cli import _build_parser
+    from tilerl.train import cmd_train
 
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
     data = tmp_path / "d.jsonl"
@@ -159,7 +160,8 @@ def test_training_stops_on_a_cap_the_policy_cannot_answer_in(tmp_path, monkeypat
     """
     import pytest
 
-    from tilerl.cli import _build_parser, cmd_train
+    from tilerl.cli import _build_parser
+    from tilerl.train import cmd_train
 
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
     data = tmp_path / "d.jsonl"
@@ -186,7 +188,7 @@ def test_eval_rows_are_written_before_the_manifest_exists(tmp_path, monkeypatch)
     `if not is_dir(): return` in the row writer silently wrote nothing -- which is
     what it did on the first MATH run: 500 before-arm rows measured, zero on disk.
     """
-    from tilerl.cli import _write_eval_rows
+    from tilerl.train import _write_eval_rows
 
     monkeypatch.setattr("tilerl.ledger.runs_root", lambda: tmp_path)
     rows = [{"i": 0, "correct": True, "tokens": 10, "answer": "1"},
@@ -266,19 +268,20 @@ def test_before_eval_cache_tracks_checkpoint_file_mtime(tmp_path, monkeypatch):
     import os
     from types import SimpleNamespace
 
-    from tilerl import cli
+    from tilerl import cli, train
     from tilerl.config import tiny
+    from tilerl.train import _before_eval_key
 
-    monkeypatch.setattr(cli, "_QWEN38_SOURCE", str(tmp_path))
+    monkeypatch.setattr(train, "_QWEN38_SOURCE", str(tmp_path))
     weights = tmp_path / "model.safetensors"
     weights.write_bytes(b"a")
     args = cli._build_parser().parse_args(["train", "--model", "qwen38-27b"])
     backend = SimpleNamespace(target="cpu", precision="bf16")
-    key = cli._before_eval_key(args, tiny(), backend, SamplingParams(), None)
+    key = _before_eval_key(args, tiny(), backend, SamplingParams(), None)
     stat = weights.stat()
     weights.write_bytes(b"b")
     os.utime(weights, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
-    assert cli._before_eval_key(args, tiny(), backend, SamplingParams(), None) != key
+    assert _before_eval_key(args, tiny(), backend, SamplingParams(), None) != key
 
 
 def test_before_eval_cache_keys_on_weights_or_refuses(tmp_path, monkeypatch):
@@ -297,6 +300,7 @@ def test_before_eval_cache_keys_on_weights_or_refuses(tmp_path, monkeypatch):
     from tilerl.prompt import sampling
     from tilerl.tensor_parallel import tp_config
     from tilerl.tokenizer import get_tokenizer
+    from tilerl.train import _before_eval_key
 
     backend = SimpleNamespace(target="cpu", precision="bf16")
     tok = get_tokenizer(None)
@@ -308,7 +312,7 @@ def test_before_eval_cache_keys_on_weights_or_refuses(tmp_path, monkeypatch):
         a = cli._build_parser().parse_args(argv)
         p = sampling(tok, None, a.eval_max_new_tokens, temperature=a.temperature,
                      max_think_tokens=a.max_think_tokens, seed=a.seed)
-        return cli._before_eval_key(a, cfg or tiny_cfg(), backend, p, None)
+        return _before_eval_key(a, cfg or tiny_cfg(), backend, p, None)
 
     base = key()
     assert base is not None and len(base) == 64
@@ -327,7 +331,7 @@ def test_before_eval_cache_keys_on_weights_or_refuses(tmp_path, monkeypatch):
     a = cli._build_parser().parse_args(["train", "--model", "tiny"])
     a.model = "some-new-checkpoint"
     p = sampling(tok, None, a.eval_max_new_tokens, seed=a.seed)
-    assert cli._before_eval_key(a, tiny_cfg(), backend, p, None) is None, (
+    assert _before_eval_key(a, tiny_cfg(), backend, p, None) is None, (
         "a model with no weights branch must get no cache, not a key without weights")
 
 

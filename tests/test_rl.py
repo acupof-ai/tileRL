@@ -34,7 +34,7 @@ def test_the_within_group_r_removes_the_prompt_confound():
     reward, so pooling over steps measures difficulty. Centering per group is what
     removes it, and the gate is that the two disagree on the SAME rows.
     """
-    from tilerl.cli import _within_group_r
+    from tilerl.train import _within_group_r
 
     def rows(spec):
         return [{"step": s, "g": i, "tokens": t, "reward": r}
@@ -119,7 +119,7 @@ def test_an_all_wrong_group_is_silent_not_length_ranked():
     only lam=0 turned it off. That gradient was the 2026-09-10 P1 collapse (length
     term 1.3x the correctness term at step 1, 2.1x+ after): a group with no
     correctness signal carries no information, so its advantages are zero."""
-    from tilerl.cli import _length_aware
+    from tilerl.train import _length_aware
 
     class Tok:
         def decode(self, ids):
@@ -826,12 +826,13 @@ def test_a_loaded_adapter_actually_changes_the_output(tmp_path, monkeypatch):
         from tilerl.build import build_model, build_serving_engine
         from tilerl.engine import SamplingParams
         from tilerl.model import add_lora
+        from tilerl.train import _load_adapter
 
         cfg, model = build_model("tiny", seed=0, keep_master=False)
         engine = build_serving_engine(cfg, model, get_backend())
         trainable = add_lora(model, rank=2)
         if load:
-            cli._load_adapter(trainable, load, lambda *a, **k: None)
+            _load_adapter(trainable, load, lambda *a, **k: None)
         rid = engine.submit([1, 2, 3, 4], SamplingParams(max_new_tokens=8, temperature=0.0))
         for _ in range(64):
             engine.step()
@@ -960,8 +961,8 @@ def test_the_rl_reward_closure_carries_the_length_term_and_the_matcher_does_not(
     `gsm8k_accuracy`, whose count becomes `manifest["metrics"]["gsm8k_*"]` -- the number P1's
     exit criterion reads. This drives the real closure rather than a copy of its arithmetic.
     """
-    from tilerl.cli import _length_aware
     from tilerl.eval import MATCHERS
+    from tilerl.train import _length_aware
 
     class Tok:
         def decode(self, ids):

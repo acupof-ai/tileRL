@@ -18,10 +18,10 @@ from tilerl.recipes import RECIPES, flags
     ["--recipe", "grpo-tiny-smoke", "--model", "qwen38-27b"],
 ])
 def test_rl_opd_recipe_requires_data(argv, monkeypatch):
-    from tilerl import cli
+    from tilerl import cli, train
 
     monkeypatch.setattr("sys.argv", ["tilerl", "train", *argv])
-    monkeypatch.setattr(cli, "_train_adapters", lambda args: None)
+    monkeypatch.setattr(train, "_train_adapters", lambda args: None)
     with pytest.raises(SystemExit, match="^error: --data is required for RL/OPD training$"):
         cli.main()
 
