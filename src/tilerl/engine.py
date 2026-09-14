@@ -65,6 +65,14 @@ def _last_prefill_boundary(n: int) -> int:
     return end - BLOCK_TOKENS if tail == 1 else end
 
 
+def _decode_extra_blocks(seq_len: int, q: int, held: int) -> int:
+    """New blocks a decode tick must grow. The verify forward rewrites position
+    seq_len-1 (the anchor), so its last PHYSICAL write is seq_len+q-2; covering
+    seq_len+q-1 demanded one block that is never written and killed saturated
+    final ticks (~1/16, trigger (prompt+max_new)%16==1)."""
+    return max(0, (seq_len + q - 2 + BLOCK_TOKENS) // BLOCK_TOKENS - held)
+
+
 #: Set after the one-time sm70 graph warning, so the three _graph_on callers
 #: (Engine init, build_engine pad sizing, the CLI slot fit) do not repeat it.
 _sm70_graph_warned = False
@@ -2364,7 +2372,7 @@ class Engine:
                 c.extend([c[-1]] * (w - len(c)))
         q_dec = [len(c) for c in chains] if chains else [1] * len(decodes)
         growth = sum(
-            max(0, (r.seq_len + q - 1 + BLOCK_TOKENS) // BLOCK_TOKENS - len(r.blocks))
+            _decode_extra_blocks(r.seq_len, q, len(r.blocks))
             for r, q in zip(decodes, q_dec)
         )
         if growth:
@@ -2377,7 +2385,7 @@ class Engine:
             # raise: `_admit` does the same for the same reason -- its comment says an
             # exception out of here reaches step()'s handler and fails EVERY running
             # request. A row that does not fit fails alone and leaves the batch.
-            need = max(0, (r.seq_len + q - 1 + BLOCK_TOKENS) // BLOCK_TOKENS - len(r.blocks))
+            need = _decode_extra_blocks(r.seq_len, q, len(r.blocks))
             if need > self._kv.free_blocks:
                 self._finish(
                     r,
@@ -2387,7 +2395,7 @@ class Engine:
                 )
                 dead.add(i)
                 continue
-            while len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 1 + q:
+            while len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 2 + q:
                 r.blocks.append(self._kv.alloc_block())
                 r.own_blocks += 1
                 self._blocks_used += 1

@@ -2923,3 +2923,71 @@ def test_an_unknown_model_name_is_refused_not_silently_tiny():
     # Not built here -- it needs the checkpoint -- but it must be ADMITTED, or the guard
     # would refuse the only name the pod runs.
     assert "qwen38-27b" in MODEL_NAMES
+
+
+def test_dense_final_tick_at_a_block_crossing_does_not_demand_a_phantom_block():
+    """(prompt+max_new)%16==1: the final decode's last write is the ANCHOR rewrite
+    at seq_len-1, so that tick needs zero new blocks. The old growth formula
+    covered through seq_len, demanded one never-written block, and on a saturated
+    pool finished the row with RequestFailed one tick early.
+
+    Saturated pool: prompt 15 + 2 = 17; its two ticks are prefill-write to
+    position 16 then the final decode at S=16. The pool is 4 with three blocks
+    held by other residents (one free), the exact crossing.
+    """
+    cfg = tiny()
+    eng = build_engine(cfg, build_random(cfg, seed=41), get_backend(),
+                       num_blocks=4, num_slots=1, max_batch=1,
+                       max_total_tokens=512, max_num_batched_tokens=512,
+                       sparse_k=0)
+    held = [eng._kv.alloc_block() for _ in range(3)]
+    try:
+        rid = eng.submit(list(range(15)),
+                         SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+        out = _drain(eng, [rid], 2)
+        for b in held:
+            eng._kv.free_block(b)
+    finally:
+        eng.shutdown()
+    assert len(out[rid]) == 2, "the row was killed one tick before completion"
+
+
+def test_decode_extra_blocks_covers_the_last_written_position():
+    """Unit bound for both q=1 and a verify width q>1: the anchor at seq_len-1
+    is a rewrite, so blocks cover through seq_len+q-2 only. Tables pin the
+    exact crossing the saturated-pool e2e above hits and the q=4 analogue.
+    """
+    from tilerl.engine import _decode_extra_blocks
+
+    # (seq_len, q, held blocks), 16-token blocks: anchor rewrite crossing
+    # needs 0, then +1 per block.
+    table = [
+        (16, 1, 1, 0),  # the e2e trigger: last write 15 in held block 1
+        (17, 1, 1, 1),  # genuine growth: last write 16 needs block 2
+        (18, 1, 1, 1),  # last write 17 still block 2
+        (31, 1, 1, 1),  # last write 30 spans into block 2
+        (16, 4, 1, 1),  # verify q=4: last write 18, block 2
+        (32, 4, 2, 1),  # last write 34, block 3
+        (32, 1, 2, 0),  # q=1 at a 2-block crossing
+        (32, 1, 1, 1),  # under-held: last write 31 needs the missing block 2
+    ]
+    for seq_len, q, held, want in table:
+        assert _decode_extra_blocks(seq_len, q, held) == want, (seq_len, q, held)
+    # Never negative once all positions are already covered.
+    assert _decode_extra_blocks(16, 1, 8) == 0
+    # Independent model over the engine's real held count: entering a decode
+    # tick at seq_len S the last written position is the prior anchor S-2, so
+    # held = ceil((S-1)/16). Required blocks must cover through the last write
+    # S+q-2; new == that model, and differs from old by exactly 1 only when the
+    # last write S+q-2 ends a block (S+q ≡ 1 mod 16) — the phantom case.
+    import math
+
+    for seq_len in range(16, 80):
+        for q in (1, 4, 8, 16):
+            held = math.ceil((seq_len - 1) / 16)
+            true_need = max(0, math.ceil((seq_len + q - 1) / 16) - held)
+            old_need = max(0, (seq_len + q - 1 + 16) // 16 - held)
+            new_need = _decode_extra_blocks(seq_len, q, held)
+            assert new_need == true_need, (seq_len, q, held)
+            assert new_need <= old_need, (seq_len, q)
+            assert (old_need - new_need) == (1 if (seq_len + q) % 16 == 1 else 0)
