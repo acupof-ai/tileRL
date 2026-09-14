@@ -35,7 +35,8 @@ L5  apps       server messages responses prompt ui_assets   (serving front end)
 L4  build.py                    config + checkpoint -> Model, Engine (the only assembler)
 L3  schedule   engine.py        submit/poll/StepLimits, admit, plan, commit, release, loop
                decode_graph.py  captured dense and sparse decode graphs, buckets, precapture
-               sparse_engine.py SparseTracker, SparseForward, SparsePrefixCache, sparse runtime
+               sparse_engine.py SparseTracker, SparseForward, SparsePrefixCache
+               sparse_runtime.py SparseRuntime: residency, promotion, sparse decode graph
                spec.py          draft + verify (dflash2.py merged in at step 6)
                memory.py        byte plan + measured ledger rows (engine stats call it)
 L2  storage    kv_cache.py      PagedKvPool, LinearStatePool, PrefixStore, BatchKv
@@ -54,7 +55,7 @@ same model and backend.
 
 What changes is placement only:
 - `build.py` becomes the single assembler.
-- The sparse runtime leaves `Engine` for `sparse_engine.py`.
+- The sparse runtime leaves `Engine` for `sparse_runtime.py`.
 - Graphs leave for `decode_graph.py`.
 - Ledger rows move to `memory.py`.
 - Host and SSD tiers move to `kv_tiers.py`.
@@ -64,10 +65,16 @@ What changes is placement only:
 ### The hybrid seam
 
 After #586 the engine serves two regimes: a dense captured graph below `--sparse-min-tokens`
-and eager sparse above it. The target makes that a named object instead of `sparse_*`
-methods and `if r.sparse_on` branches spread across `Engine`. `Engine` holds an optional
-`SparseRuntime` (in `sparse_engine.py`). The runtime owns the 17 `_sparse_*` methods and
-`_hybrid_charge`, and it exposes the few calls the loop needs:
+and eager sparse above it. The realized seam (step 11) is `SparseRuntime` in
+`sparse_runtime.py`: Engine holds it as `engine._sparse` (None on a dense engine), and it
+owns the sparse-tick methods — selection geometry, residency resolve/evict,
+promotion/demotion, prefix offers, warm-draft restore, and the sparse capture/replay.
+Engine keeps scheduling (`route`/sparse_on predicates, `_hybrid_charge`, the
+`_sparse_prefill_cap` decision), the #500 `sparse_retier` page walk, and
+`_sparse_live_stats`/`_sparse_hot_headroom`. Pools, model, backend and the
+verify/sample/draft-step callbacks cross the seam on a frozen `SparseCtx`; the runtime
+never imports Engine. The tracker attributes the tree reads are proxied through the same
+`engine._sparse` facade, so callers below kept their spellings. The planned calls:
 
 | Call | Replaces | When the loop calls it |
 |---|---|---|
@@ -89,12 +96,13 @@ largest move and runs last, behind a device gate.
 
 | Module | Now | Target |
 |---|---|---|
-| engine.py | 3,633 | ~1,500 (core loop + request types) |
-| decode_graph.py | – | ~450 |
-| sparse_engine.py | 1,189 | ~1,800 (absorbs the sparse runtime) |
+| engine.py | 2,305 (step 11) | ~1,500 (core loop + request types) |
+| decode_graph.py | 382 | ~450 |
+| sparse_engine.py | 1,174 | tracker/forward/index only |
+| sparse_runtime.py | 688 (step 11) | the absorbed sparse runtime |
 | build.py | – | ~350 (replaces `build_engine` + `cli._build_*`) |
 | cli.py | 2,820 | ≤ 900 |
-| kv_cache.py / kv_tiers.py | 1,919 | ~950 / ~950 |
+| kv_cache.py / kv_tiers.py | 962 / 991 (step 9) | ~950 / ~950 |
 
 The net reduction comes from deleting dead code, the duplicate builder and removed-feature
 residue, not from the moves. A move PR is judged by "no behaviour change". A deletion PR is
@@ -131,7 +139,7 @@ of 52 on the same question set; MMLU n=200 against the same gold-question list (
 | 9 | `kv_tiers.py`: HostKvPages, ColdSsdFile, DramSnapshots, KvBootStore move together with `_shared_ssd_path`/`_blob_spec`/`assert_spill_writable`/`_nbytes`/`_to_device` and SpillWriteError (engine import edited, no shim); ~12 import edits across engine, 4 test files, trace_256k_spill_time.py | fixkv | CI + device (mmap spill is device-only) |
 | 10a | `decode_graph.py`: _DecodeGraph/_SparseDecodeGraph/_CpuSparseGraph + bucket/for/precapture. Functions take the ~12 Engine values they read as explicit arguments — signature construction, not a literal move. Boundary vs 11: decode_graph owns capture/replay keyed by (B,W); SparseRuntime owns when to call. ~1,300 mechanical test rewrites excluded from the cap | fixkv | CI + device |
 | 10b | Ledger rows `_memory_rows`/`_measured_peak_bytes` → `memory.py`, taking primitives; `memory.py` must not import `engine` (same-layer legal but entrenching the coupling the split ends). `_sparse_live_stats` stays for 11 | fixkv | CI + device |
-| 11 | `SparseRuntime` seam in `sparse_engine.py`, including construction (SparseTracker + SparsePrefixCache wiring), the 7 `_sparse_*` config/counter fields, the two prefill SparseForward sites, and the BatchKv.sf data contract. Tests reach attributes through an `engine.sparse` facade with preserved names (delegations), not a 3,700-line rewrite | fixkv | CI + device (+ one unique 128k request) |
+| 11 | `SparseRuntime` seam in `sparse_runtime.py` (12 sparse-tick methods; the 7 config/counter fields; frozen SparseCtx of pools/model/backend + named verify/sample/draft-step callbacks; zero Engine references). Tracker attributes stay reachable through the preserved `engine._sparse` facade (proxies + `__getattr__`); Engine retains scheduling predicates, `_hybrid_charge`, `sparse_retier`, live stats. Boundary prep shared the graph pad/pool holder (`GraphCapture`) with the dense path | fixkv | CI + device (+ one unique 128k request) |
 
 The serving core has no dead code: a grep inventory of engine, sparse_engine and kv_cache found a caller for every symbol, so its gains come only from the moves. Order reason: deletions (4–5) shrink what the moves have to carry. Cycle breaks (6) make the
 moves mechanical. The engine seam (11) goes last because it touches the hot path of both

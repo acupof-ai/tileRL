@@ -2105,37 +2105,38 @@ def _full_context_draft(cfg, model, draft, backend, toks: list[int]) -> torch.Te
 def test_every_draft_call_site_is_covered_by_the_timer():
     """`_draft_ms` must see EVERY draft step, not just the ones on one code path.
 
-    The engine calls `_draft.step` from two places — `_run_forward` (eager) and
-    `_run_decode_graph`. Instrumenting only the eager one produced a number 31x too
-    large on the V100: the graph path took 212 of 218 ticks, so the timer sampled the
-    6 warm/mixed ticks, which carry prefill work, and reported 165.97 ms/forward
-    against a subtracted 4.80-5.30. A mean over an unrepresentative subset looks
-    exactly like a mean, which is why this is a gate and not a comment.
-
-    Asserted by source, because the failure is a MISSING call and no CPU run reaches
-    the graph path: every `_draft.step(` in engine.py must sit in a `_draft_ms is
-    None` branch or inside the timing helper itself. Counting recorded entries at
-    runtime cannot see a site that was never wired.
+    The engine calls draft.step from three tick paths — eager `_run_forward`,
+    the dense `_run_decode_graph`, and the sparse graph (SparseRuntime);
+    instrumenting only one produced a number 31x too large on the V100. All
+    three go through the single Engine._draft_step binding, which routes to the
+    timed helper whenever the timer is on. Asserted by source: a MISSING wiring
+    never executes on CPU, so counting recorded entries cannot see it.
     """
     import re
     from pathlib import Path
 
     import tilerl.engine as eng_mod
+    import tilerl.sparse_runtime as rt_mod
 
-    src = Path(eng_mod.__file__).read_text().split("\n")
-    sites = [i for i, ln in enumerate(src) if re.search(r"self\._draft\.step\(", ln)]
-    assert len(sites) >= 2, f"expected both draft call sites, found {len(sites)}"
-    helper = next(i for i, ln in enumerate(src) if "def _draft_step_timed" in ln)
-    for i in sites:
-        if i > helper:
-            continue  # the call inside the timing helper is the timed one
-        # the three lines above a plain call must gate it on the timer being off
-        window = "\n".join(src[max(0, i - 3):i])
-        assert "_draft_ms is None" in window, (
-            f"engine.py:{i + 1} calls _draft.step outside the timer's reach:\n{window}")
-    # and the timed twin must exist beside it
-    assert sum("_draft_step_timed(" in ln for ln in src) >= 3, (
-        "each gated call site needs a _draft_step_timed twin plus the definition")
+    eng_src = Path(eng_mod.__file__).read_text().split("\n")
+    rt_src = Path(rt_mod.__file__).read_text().split("\n")
+
+    # The one binding: plain step in the timer-off branch, _draft_step_timed else.
+    bind = next(i for i, ln in enumerate(eng_src) if "def _draft_step(" in ln)
+    body = "\n".join(eng_src[bind : bind + 8])
+    assert "_draft_ms is None" in body and "_draft_step_timed" in body, body
+    # Exactly one raw draft.step call in engine.py — inside the binding. The timed
+    # helper's own call is the second raw occurrence.
+    raw = [i for i, ln in enumerate(eng_src) if re.search(r"self\._draft\.step\(", ln)]
+    assert all(i > bind for i in raw), "a raw draft.step sits outside _draft_step"
+    # Every tick path calls the binding, not draft.step directly: two in engine,
+    # and the sparse graph path's ctx.draft_step (the same bound method).
+    engine_sites = [ln for ln in eng_src if "self._draft_step(" in ln]
+    rt_sites = [ln for ln in rt_src if "ctx.draft_step(" in ln]
+    assert len(engine_sites) >= 2, engine_sites
+    assert len(rt_sites) >= 1, rt_sites
+    assert not any(re.search(r"\._draft\.step\(", ln) for ln in rt_src), (
+        "SparseRuntime bypasses the timed draft-step binding")
 
 
 def test_the_draft_forward_counter_counts_forwards_not_ticks():
