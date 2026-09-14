@@ -264,3 +264,57 @@ def refuse_unsupported(*fields: str, **flagged: Any) -> None:
         raise ValueError(
             f"{', '.join(sorted(named))}{plural} not supported by this server: the "
             f"request is refused rather than answered as if the field had been applied")
+
+
+def await_completion(engine: Any, request_id: int, timeout_s: float,
+                     poll_s: float = 0.02) -> list[int]:
+    """Block until ``engine.take`` returns the row, or raise TimeoutError.
+
+    The single wait body every non-stream route runs (inside asyncio.to_thread
+    via server.await_or_cancel, which owns disconnect polling and cancellation).
+    take() pops only this request — poll() would steal another row's completion.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        out = engine.take(request_id)
+        if out is not None:
+            return out
+        time.sleep(poll_s)
+    raise TimeoutError(f"request {request_id} did not finish within {timeout_s}s")
+
+
+def flatten_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """OpenAI/Responses tool dicts as the flat {name, description, input_schema}
+    vocabulary the template renders and messages._parse_tool_calls reads, so a
+    call parses identically whichever API declared it.
+
+    Accepts OpenAI's ``{type, function: {name, description, parameters}}`` and
+    Responses' top-level ``{name, description, parameters|input_schema}``.
+    """
+    if not tools:
+        return None
+    out = []
+    for t in tools:
+        fn = t.get("function") or t
+        out.append({"name": fn.get("name"),
+                    "description": fn.get("description", ""),
+                    "input_schema": fn.get("parameters") or fn.get("input_schema") or {}})
+    return out
+
+
+def thinking_enabled(tokenizer: Any, explicit: bool | None, effort_none: bool) -> bool | None:
+    """Common tail of the three routes' thinking adapters.
+
+    An explicit caller override wins; an effort of "none" switches thinking off;
+    otherwise the template's own default, which needs a tokenizer that HAS the
+    ``<think>`` tag (ByteTokenizer makes one token per byte, and its bare turn is
+    the dev path with no such tag). The per-API input adapters (raw dict /
+    MessagesRequest / ResponsesRequest) stay in the routes and feed this.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    if effort_none:
+        return False
+    return len(tokenizer.encode("<think>")) == 1 or None
