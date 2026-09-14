@@ -1,8 +1,9 @@
 # Layered architecture refactor lands — CPU + V100 sm70, 2026-09-15
 
-> Status: pending-remote — 343 CPU gates green across the final PR, reviewer
-> verified body identity; V100 128k sparse smoke after deploy of 2e8612c1 is
-> the remote confirmation.
+> Status: pending-remote — full CPU suite green on the final PR's CI
+> (822 passed / 21 skipped / 1 xfailed ubuntu, 816 / 27 / 1 macos) and the
+> reviewer verified body identity; V100 128k sparse smoke after deploy of
+> 2e8612c1 is the remote confirmation.
 
 ## Context
 
