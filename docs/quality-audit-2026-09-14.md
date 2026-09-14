@@ -155,3 +155,141 @@ CONFIRMED with minimal repros and owner modules. Fix queue for the route owner
     responses refuses them; port the shared _hosted_tools refusal.
 17. submit() _waiting is unbounded (engine.py); add a limit + typed exception
     mapped to 429/503.
+
+## Wire shape table for findings 11–16 (2026-09-15, read off b916c50b)
+
+The implementation contract for the two fix PRs (A: 11+12 transcript/parts;
+B: 13+16+15 choice/hosted/streaming). Keys/types dumped from the emitting code,
+not from client docs. Arguments on every OpenAI-shaped route are a JSON STRING
+via `json.dumps(args, ensure_ascii=False)` — space after colon
+(`'{"command": "ls"}'`), locked by
+`test_chat_tools_come_back_as_tool_calls`; the new streaming delta must be
+byte-identical to the non-stream message for the same reply (shared fixture).
+
+### (a) non-stream chat — `POST /v1/chat/completions`
+
+Top: `id` `chatcmpl-<rid>`, `object` "chat.completion", `created` int,
+`model`, `choices[1]`, `usage`
+{`prompt_tokens`,`completion_tokens`,`total_tokens`}, `system_fingerprint`.
+
+`choices[0]` = {`index`:0, `message`, `logprobs`: null |
+{`content`:[{`token`:str,`logprob`:float|null}]}, `finish_reason`:str}.
+
+`message` = {`role`:"assistant", `content`: str|null,
+`reasoning_content`: str|null (always present), `tool_calls`: array|null}.
+
+- `content` is null only when tool_calls exist and prose is empty.
+- tool_calls[i] = {`id`:`call_<rid>_<i>`, `type`:"function",
+  `function`:{`name`:str, `arguments`: JSON str}}.
+- finish_reason precedence: "tool_calls" → "stop" (stop text matched) →
+  "length" (n_out >= max_new) → "stop".
+
+### (b) chat SSE — `stream=true`
+
+Frame: `data: {id, object:"chat.completion.chunk", created, model,
+choices:[{index:0, delta, logprobs:null, finish_reason}], usage:null|obj,
+system_fingerprint}\n\n`; ends `data: [DONE]\n\n`.
+
+Current order: delta {`role`:"assistant"}; zero+ {`reasoning_content`} /
+{`content`} incremental slices; terminal chunk delta {} +
+finish_reason "stop"|"length". `include_usage` adds cumulative `usage` per
+frame plus a final choices:[] usage-only chunk.
+
+Target under finding 15 (parity with (a), same ids/arguments): after the
+prose content deltas, a chunk with delta {`tool_calls`:[{`index`:int,
+`id`:`call_<rid>_<i>`, `type`:"function",
+`function`:{`name`,`arguments`: same JSON str}}]}; then the empty-delta
+chunk with finish_reason "tool_calls". The call XML is stripped from the
+content tail — no `<tool_call>` substring may occur in a content delta.
+WS `/ws/chat` done frame ({`t`:"done",`finish_reason`,`usage`}) gains an
+additive `tool_calls` key in the same PR; `web/README.md` documents that
+frame and must be updated in the same commit. The playground ignores
+unknown keys; existing node tests are the gate, no UI change.
+
+### (c) responses — `POST /v1/responses`
+
+Body: `id` `resp_<rid>`, `object` "response", `created_at` float, `model`,
+`status` "completed"|"incomplete", `incomplete_details`: null|
+{`reason`:"max_output_tokens"}, `error`:null, `output` list,
+`parallel_tool_calls` bool, `tool_choice` str (echoed or "Auto"), `tools`
+list, `instructions`, `metadata` {}, `temperature`, `top_p`, `usage`
+{`input_tokens`,`output_tokens`,`total_tokens`,
+`input_tokens_details`:{`cached_tokens`:0},
+`output_tokens_details`:{`reasoning_tokens`:0}}.
+
+Call output item: {`id`:`fc_<rid>_<i>`, `type`:"function_call",
+`call_id`:`call_<rid>_<i>`, `name`:str, `arguments`: JSON str,
+`status`:"completed"}. Message parts use type "output_text".
+
+SSE (every event carries top-level `sequence_number`):
+`response.created` / `.in_progress`; per output index
+`response.output_item.added`; for a message:
+`response.content_part.added` → `response.output_text.delta` (full text,
+`logprobs`:[]) → `.done` → `content_part.done`; for a call:
+`response.function_call_arguments.delta` → `.done`; then
+`response.output_item.done`; final `response.completed`. Stream replays the
+parsed body, so calls are already structured — finding 15 needs a gate here,
+no code.
+
+### (d) messages — `POST /v1/messages`
+
+Body: `id` `msg_<rid>`, `type` "message", `role` "assistant", `model`,
+`content` blocks, `stop_reason`
+"tool_use"|"stop_sequence"|"max_tokens"|"end_turn", `stop_sequence`:
+str|null, `usage`
+{`input_tokens`,`output_tokens`,`cache_creation_input_tokens`:0,
+`cache_read_input_tokens`:0}.
+
+Blocks in order: {`type`:"thinking",`thinking`:str,`signature`:""} if
+reasoning; {`type`:"text",`text`:str}; one per call
+{`type`:"tool_use",`id`:`toolu_<rid>_<i>`,`name`:str,`input`: OBJECT} —
+`input` is the coerced dict, not a JSON string (differs from the OpenAI
+routes).
+
+SSE: `message_start` (content:[]) then per block
+`content_block_start` (tool_use opening has `input`:{}) →
+`content_block_delta` (`input_json_delta.partial_json` = json.dumps(input)
+for tool_use; `thinking_delta` / `text_delta` otherwise) →
+`content_block_stop`; then `message_delta`
+{`delta`:{stop_reason,stop_sequence},`usage`}; `message_stop`.
+
+### Incoming shapes (additive only)
+
+- chat `ChatMessage` today: {`role`:str,
+  `content`:str|list[dict]|null}. PR A adds optional
+  `tool_calls`:[{`id`?,`type`:"function",
+  `function`:{`name`,`arguments`: JSON str}}] and `tool_call_id`:str;
+  `role`:"tool" turns carry string content and render with the existing
+  `blocks_to_text` `<tool_response>` wrapper byte-for-byte.
+- responses input items already supported: message items with block
+  `content`, `function_call` {name,arguments}, `function_call_output`
+  {output}. PR A aliases part types `input_text`/`output_text` to text.
+- messages incoming `tool_use`/`tool_result` blocks already render via
+  `blocks_to_text`.
+
+### Reusable test fixtures
+
+`tests/test_server.py` (tiny engine + TestClient): fixtures `client`,
+`model_id`; `_ByteTokenizer` (1 token/byte, leading id 1),
+`_TextTokenizer` (fixed-pattern prefix decode), `_text_blocks`;
+`_ScriptedEngine(tokenizer, replies[])` — submit-order canned replies,
+two-stage `peek`, stop_text emulation, logprobs/stats/room_for. Relevant
+gates: `test_messages_tool_use_round_trip`,
+`test_parallel_tool_calls_become_separate_blocks`,
+`test_the_sse_stream_keeps_the_shape_a_reader_has_to_handle`,
+`test_sse_frames_survive_a_separator_splitlines_cuts_on`,
+`test_messages_stream_is_anthropic_sse`.
+
+`tests/test_api_sdk.py` (official openai + anthropic SDKs over uvicorn):
+`_PromptKeyedEngine(_ScriptedEngine)` returns the canned TOOL_CALL reply
+keyed on prompt content and records `engine.prompts[]`; one module-scoped
+server already serves stream and non-stream, so it is the shared fixture
+for stream/non-stream parity. Fixtures `oa`, `an`, `base_url`, `engine`;
+consts `TOOL_CALL` (Bash/ls), `PLAIN`, `THINKING_ON`. Gates:
+`test_chat_tools_come_back_as_tool_calls` (locks arguments spacing),
+`test_chat_stream_reconstructs_the_same_text`,
+`test_responses_tool_call_and_replay`,
+`test_responses_stream_events_and_order`,
+`test_messages_tool_use_round_trip`,
+`test_chat_refuses_a_tool_choice_it_cannot_force`,
+`test_responses_refuses_a_field_it_cannot_honour`.
