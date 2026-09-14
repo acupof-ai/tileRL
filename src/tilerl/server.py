@@ -273,6 +273,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
         req = ChatCompletionRequest.model_validate(_normalize_thinking(req.model_dump()))
+        request_id = -1
         try:
             # to_thread: engine.submit takes step()'s lock; on the loop a request arriving
             # during a long prefill freezes every route, /health included.
@@ -299,6 +300,10 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
         try:
             output_ids = await asyncio.to_thread(_await_completion, request_id)
+        except asyncio.CancelledError:
+            # Client hung up before the non-stream reply; stop generating for nobody.
+            engine.cancel(request_id)
+            raise
         except TimeoutError as exc:
             return JSONResponse(
                 status_code=504,

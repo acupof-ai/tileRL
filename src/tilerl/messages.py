@@ -189,7 +189,8 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def _run(req: MessagesRequest, rollout: str | None = None) -> tuple[dict[str, Any], int]:
+    def _run(req: MessagesRequest, rollout: str | None = None, rid_box: list | None = None
+             ) -> tuple[dict[str, Any], int]:
         refuse_unsupported(*_unsatisfied_edits(req.context_management),
                            tool_choice=unsupported_choice(req.tool_choice))
         input_ids = tokenizer.encode(_render(req))
@@ -205,6 +206,8 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
                           temperature=req.temperature, top_p=req.top_p, logprobs=True,
                           stop=req.stop_sequences)
         rid = engine.submit(input_ids, params)
+        if rid_box is not None:
+            rid_box[0] = rid
         deadline = time.monotonic() + _COMPLETION_TIMEOUT_S
         out: list[int] | None = None
         while time.monotonic() < deadline:
@@ -286,9 +289,13 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         # ANTHROPIC_CUSTOM_HEADERS carries it: measured 2026-09-02, the CLI
         # passes it through verbatim, which metadata.user_id would not survive.
         rollout = request.headers.get(_ROLLOUT_HEADER)
+        rid_box: list = [-1]
         try:
             # to_thread: `_run` polls take() with sleep, which on the loop starves every route.
-            body, rid = await asyncio.to_thread(_run, req, rollout)
+            body, rid = await asyncio.to_thread(_run, req, rollout, rid_box)
+        except asyncio.CancelledError:
+            engine.cancel(rid_box[0])
+            raise
         except ValueError as exc:
             return JSONResponse(status_code=400,
                                 content={"type": "error",

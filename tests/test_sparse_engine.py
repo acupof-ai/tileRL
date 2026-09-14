@@ -2899,3 +2899,35 @@ def test_hybrid_dense_spec_row_finishes_with_exactly_n_during_sparse_fill():
         assert not any(r.req_id == rid for r in e._running), "row still running at cap"
     finally:
         e.shutdown()
+
+
+def test_a_cancelled_sparse_row_publishes_no_prefix_and_returns_every_page():
+    """A disconnected sparse reader releases like a #587 cold-spill failure row.
+
+    cancel() used to leave failed=False, so _release ran close_request: it closed
+    the prompt-end frontier and transferred the row's own pages into shared cold
+    blobs for a reader already gone, and on a spill-capable build even wrote SSD.
+    A cancelled row must publish nothing and give back blocks, cold blobs and slot.
+    """
+    engine = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
+    # Same 24-page prompt the publishing test uses: early pages demote in decode,
+    # so a prompt-end close WOULD publish 24 keys if cancel skipped the failed flag.
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    rid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    for _ in range(30):
+        engine.step()
+        r = next((x for x in engine._running if x.req_id == rid), None)
+        if r is not None and r.decoding:
+            break
+    assert engine._kv.used_blocks > 0, "vacuous: the row holds no hot pages"
+    assert engine.cancel(rid) is True
+
+    assert engine._sparse.prefix.published == 0, engine._sparse.prefix.published
+    assert engine._sparse.prefix.lookup(prompt) is None
+    assert engine._slots_used == 0
+    assert not engine._kv.used_blocks, engine._kv.used_blocks
+    assert not engine._kv.cold.stats()["kv_cold_pages"], engine._kv.cold.stats()
+    engine.shutdown()

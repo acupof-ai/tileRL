@@ -1753,21 +1753,31 @@ def test_the_routes_cancel_when_the_client_hangs_up():
 
     A gate on `Engine.cancel` alone passes while both call sites are missing, which
     is the state this shipped in: the WS branch closed the generator and the SSE
-    generator did nothing at all.
+    generator did nothing at all. The three non-stream routes joined later: a
+    client disconnect cancels the awaited task, and each route catches
+    CancelledError.
     """
     import inspect
 
+    import tilerl.messages as messages
+    import tilerl.responses as responses
     from tilerl import server
 
     src = inspect.getsource(server)
-    assert src.count("engine.cancel(request_id)") == 2, (
-        "expected the WebSocketDisconnect branch and the SSE generator's GeneratorExit "
-        f"to cancel; found {src.count('engine.cancel(request_id)')}"
+    assert src.count("engine.cancel(request_id)") == 3, (
+        "expected the WebSocketDisconnect branch, the SSE generator's GeneratorExit "
+        f"and the non-stream chat route's CancelledError; found "
+        f"{src.count('engine.cancel(request_id)')}"
     )
     assert "except GeneratorExit:" in src, (
         "the SSE route needs GeneratorExit: starlette closes the generator when the "
         "client hangs up, and without it an abandoned SSE stream runs to its cap"
     )
+    for mod in (messages, responses):
+        msrc = inspect.getsource(mod)
+        assert "except asyncio.CancelledError:" in msrc and "engine.cancel(" in msrc, (
+            f"{mod.__name__}'s non-stream route must cancel on a client disconnect"
+        )
 
 
 @pytest.mark.parametrize("state_bytes", [0, 12345678])
@@ -1799,3 +1809,64 @@ def test_serve_state_bytes_reaches_health(state_bytes, monkeypatch, capsys):
         assert got == state_bytes, f"--state-bytes {state_bytes} did not reach the store: {got}"
     else:
         assert got and got != 12345678, f"the default budget is the flag's value: {got}"
+
+
+def test_a_nonstream_client_disconnect_cancels_its_request():
+    """A non-stream reader that hangs up frees the row the stream paths already do.
+
+    stream=True and /ws/chat cancel from GeneratorExit; the three non-stream routes
+    (chat, messages, responses) awaited take() in a worker thread and never told the
+    engine, so a disconnected client kept generating to max_new and held its slot.
+    The disconnect reaches the route as asyncio.CancelledError.
+    """
+    import asyncio
+
+    import httpx
+
+    engine = _build_engine(seed=71)
+    engine.run()
+    app = create_app(engine, _ByteTokenizer())
+
+    async def scenario(path: str, body: dict) -> None:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t",
+                                     timeout=30.0) as ac:
+            req = ac.build_request("POST", path, json=body)
+            task = asyncio.ensure_future(ac.send(req))
+            # Wait until the engine owns the row, then emulate the reader leaving.
+            deadline = time.monotonic() + 5.0
+            while not engine.stats()["running"] and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
+            assert engine.stats()["running"], f"{path}: request never reached the engine"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            # cancel() drops the row under the lock; two loop polls is the bound the
+            # route contract claims.
+            deadline = time.monotonic() + 0.5
+            while engine.stats()["running"] and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
+            assert not engine.stats()["running"], f"{path}: the row stayed running"
+            assert engine.stats()["slots_used"] == 0, f"{path}: slot not released"
+
+            # The freed slot serves another request at the same max_batch.
+            follow_up = await ac.post(path, json=body)
+            assert follow_up.status_code == 200, follow_up.text
+
+    async def main():
+        await scenario("/v1/chat/completions",
+                       {"model": "m", "max_tokens": 512,
+                        "messages": [{"role": "user", "content": "x" * 64}]})
+        await scenario("/v1/messages",
+                       {"model": "m", "max_tokens": 512,
+                        "messages": [{"role": "user", "content": "x" * 64}]})
+        await scenario("/v1/responses",
+                       {"model": "m", "max_output_tokens": 512,
+                        "input": [{"role": "user", "content": [{"type": "input_text",
+                                                                 "text": "x" * 64}]}]})
+
+    try:
+        asyncio.run(main())
+    finally:
+        engine.shutdown()
