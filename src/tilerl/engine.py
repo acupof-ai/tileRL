@@ -65,6 +65,14 @@ def _last_prefill_boundary(n: int) -> int:
     return end - BLOCK_TOKENS if tail == 1 else end
 
 
+def _decode_extra_blocks(seq_len: int, q: int, held: int) -> int:
+    """New blocks a decode tick must grow. The verify forward rewrites position
+    seq_len-1 (the anchor), so its last PHYSICAL write is seq_len+q-2; covering
+    seq_len+q-1 demanded one block that is never written and killed saturated
+    final ticks (~1/16, trigger (prompt+max_new)%16==1)."""
+    return max(0, (seq_len + q - 2 + BLOCK_TOKENS) // BLOCK_TOKENS - held)
+
+
 #: Set after the one-time sm70 graph warning, so the three _graph_on callers
 #: (Engine init, build_engine pad sizing, the CLI slot fit) do not repeat it.
 _sm70_graph_warned = False
@@ -1215,14 +1223,15 @@ class Engine:
             if entry is not None:
                 matched = len(entry["tokens"])
                 req.seq_len = matched
-                if (self._draft is not None and matched == len(req.tokens)
+                if (matched == len(req.tokens)
                         and matched % BLOCK_TOKENS == 0):
-                    # A warm spec follower whose prompt matches a page-aligned
-                    # prefix in WHOLE has zero residual tokens, so no chunk would
-                    # forward and the row stuck in PREFILL with no first-token
-                    # logits. Re-forward the last adopted page (its promote is a
-                    # fresh private copy): the boundary hidden conditions the
-                    # first draft and logits at matched-1 appear.
+                    # A follower whose prompt matches a page-aligned prefix in
+                    # WHOLE has zero residual tokens, so no chunk would forward
+                    # and the row stuck in PREFILL with no first-token logits.
+                    # Re-forward the last adopted page (its promote is a fresh
+                    # private copy): the boundary hidden conditions the next
+                    # step and logits at matched-1 appear. Runs with or without
+                    # a draft — the no-draft follower needs those logits too.
                     req.prefill_from = matched - BLOCK_TOKENS
                 else:
                     req.prefill_from = matched
@@ -2363,7 +2372,7 @@ class Engine:
                 c.extend([c[-1]] * (w - len(c)))
         q_dec = [len(c) for c in chains] if chains else [1] * len(decodes)
         growth = sum(
-            max(0, (r.seq_len + q - 1 + BLOCK_TOKENS) // BLOCK_TOKENS - len(r.blocks))
+            _decode_extra_blocks(r.seq_len, q, len(r.blocks))
             for r, q in zip(decodes, q_dec)
         )
         if growth:
@@ -2376,7 +2385,7 @@ class Engine:
             # raise: `_admit` does the same for the same reason -- its comment says an
             # exception out of here reaches step()'s handler and fails EVERY running
             # request. A row that does not fit fails alone and leaves the batch.
-            need = max(0, (r.seq_len + q - 1 + BLOCK_TOKENS) // BLOCK_TOKENS - len(r.blocks))
+            need = _decode_extra_blocks(r.seq_len, q, len(r.blocks))
             if need > self._kv.free_blocks:
                 self._finish(
                     r,
@@ -2386,7 +2395,7 @@ class Engine:
                 )
                 dead.add(i)
                 continue
-            while len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 1 + q:
+            while len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 2 + q:
                 r.blocks.append(self._kv.alloc_block())
                 r.own_blocks += 1
                 self._blocks_used += 1

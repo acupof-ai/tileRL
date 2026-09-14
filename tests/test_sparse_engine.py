@@ -2932,3 +2932,39 @@ def test_a_cancelled_sparse_row_publishes_no_prefix_and_returns_every_page():
     assert not engine._kv.used_blocks, engine._kv.used_blocks
     assert not engine._kv.cold.stats()["kv_cold_pages"], engine._kv.cold.stats()
     engine.shutdown()
+
+
+def test_sparse_nodraft_full_prefix_resend_re_forwards_the_last_page():
+    """No-draft sparse follower whose prompt matches a published prefix in WHOLE
+    pages must not stall: prefill_from == len(tokens) with zero residual meant
+    no chunk ever forwarded, so the row spun until the 1800 s timeout. The
+    re-forward-last-page escape was gated on _draft; it must run without one.
+    The re-forwared follower emits the same tokens as a prefix-MISS engine.
+    """
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    # Prefix-miss oracle: fresh engine, no shared prefix.
+    miss = _sparse_engine(2, draft=False)
+    ts_miss = _drain(miss, miss.submit(prompt, params), 8)
+    miss.shutdown()
+
+    sparse = _sparse_engine(2, draft=False)
+    r1 = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    _drain(sparse, r1, 200)
+    assert sparse._sparse.prefix.lookup(prompt) is not None
+
+    r2 = sparse.submit(prompt, params)
+    # 60 ticks must move the row out of PREFILL: pre-fix it never forwards.
+    left_prefill = False
+    for _ in range(60):
+        sparse.step()
+        req = next((x for x in sparse._running if x.req_id == r2), None)
+        if req is not None and req.decoding:
+            left_prefill = True
+            break
+    assert left_prefill, "no-draft full-prefix follower never left PREFILL"
+    assert req.sparse_matched == 24 * BLOCK_TOKENS
+    ts = _drain(sparse, r2, 8)
+    sparse.shutdown()
+    assert ts == ts_miss, f"re-forwared follower {ts} != prefix-miss {ts_miss}"
