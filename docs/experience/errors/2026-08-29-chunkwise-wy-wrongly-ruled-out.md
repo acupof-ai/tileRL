@@ -76,3 +76,5 @@ occupancy one. Whatever attacks it next has to shorten that chain without the
 six-stage split, the bf16 intermediates, or the block explosion that sank the
 first two — and without being slower than a kernel that has now beaten three
 challengers.
+
+> **Provenance (2026-09-14 cleanup):** the six-row upstream↔ours `(W,U)` convention mapping, its negative controls (a deliberately wrong convention 3.0e-08→6.5e-01 / 0.0→2.6e+00), and the A==M solve-boundary caveat came from `TILERL_TARGET=cpu uv run python scripts/derive_wy_fast_mapping.py` (CPU torch, no card). **Standing question** — the `wy_fast` backward port is still a listed opportunity (wins/2026-09-07-inside-the-gdn-backward.md); rerun the mapping when that lands.

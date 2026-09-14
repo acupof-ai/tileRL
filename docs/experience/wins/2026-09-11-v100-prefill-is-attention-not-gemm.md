@@ -101,3 +101,5 @@ M-ladder) and flat per token; the quadratic attention phase carried the gap.
 | 2026-09-11 | V100-SXM2-32GB | cuda sm70 | prefill attn 74%@32k / 86%@64k; linear 4.3 ms/tok flat; 593 s / 2144 s total |
 | 2026-09-12 | V100-SXM2-32GB | cuda sm70 | f16 block GEMM 0.0093→0.0048 ms/row at M256 (1.94x); end-to-end rel 1.8e-3 |
 | 2026-09-12 | V100-SXM2-32GB | cuda sm70 | whole 8k prefill 95.3→35.7 s (2.67x); 11.64→4.36 ms/tok; decode unchanged |
+
+> **Provenance (2026-09-14 cleanup):** the standalone w4a16 block-GEMM parity (3.2e-4/1.9e-4 at M=32..256; the 0.0093→0.0048 ms/row table) came from `TILERL_TARGET=cuda PYTHONPATH=src:packages/tilerl-kernels/src /usr/bin/python3 scripts/probe_sm70_fp4_f16_mma.py`. The surviving `probe_sm70_linear_fp4_dispatch.py` covers M=64/256 end-to-end and skips M≤8, so this standalone rung is not otherwise carried.

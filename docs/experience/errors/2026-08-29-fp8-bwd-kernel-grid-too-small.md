@@ -64,3 +64,5 @@ split-N variant — the same trick `linear_fp4_fp8_decode` already uses with
 gradient, a residual — anything that sums signed terms — needs a norm-relative
 bound. Both of my error numbers here were artifacts of the denominator, and one
 of them nearly condemned a correct kernel.
+
+> **Provenance (2026-09-14 cleanup):** the 0.0034 norm-relative error and the weight-cast-vs-gradient-cast split (0.0021-0.0024 each, no indexing bug) came from `CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src TILERL_TARGET=cuda python3 scripts/probe_fp8_bwd_err.py`. Ongoing correctness is covered by `test_frozen_bwd_fp8_parity` / its gradcheck.

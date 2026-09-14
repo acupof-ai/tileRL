@@ -175,3 +175,5 @@ pod round trip and saved a four-point bisect that would have found nothing.
 A red set is not one bug. These three shared a symptom class (CUDA-only,
 training path) and had nothing else in common — a shared cause was the
 tempting story and it was wrong.
+
+> **Provenance (2026-09-14 cleanup):** the tape-gradient half of this (the CUDA gradcheck red is bf16 finite-difference noise, not a wrong tape gradient; FD steps 0.1/0.05/0.025, spread over four keys) came from `TILERL_TARGET=cpu uv run python scripts/tape_grad_targets.py` (and `TILERL_TARGET=cuda` on a card), which compares the same tape gradient against two targets.

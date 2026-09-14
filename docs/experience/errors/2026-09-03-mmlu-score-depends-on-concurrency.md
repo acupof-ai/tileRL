@@ -97,3 +97,5 @@ parameter had a default, and two callers took different ones.
 
 A batch-size knob is a numerics knob on this backend, not just a throughput
 knob. `M` selects the kernel, so anything that moves `M` can move an answer.
+
+> **Provenance (2026-09-14 cleanup):** the rung-isolation result (the W=3↔W=4 rung fixes the fp4 linears+attention tile yet sits at 0.000 median / 7-of-8 bit-identical, while linears-only rungs sit ~0.153) came from `TILERL_TARGET=cuda python3 scripts/probe_width_ladder.py --source <27b> --draft <mtp> --gsm8k <jsonl> --widths 1,2,3,4,8`, one process, seeded per engine build.

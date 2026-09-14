@@ -106,3 +106,5 @@ registration for sm70 changed, and `make_gdn_prep_bf16`'s default stays `bfloat1
 
 Raw artifacts: `torch.profiler` self-CUDA tables before and after at T=2048;
 parity and A/B script output; `~/serve70c.log` boot at `2026-09-05T11:38:33+08:00`.
+
+> **Provenance (2026-09-14 cleanup):** the sm70 parity/speed rows above came from `scripts/v100.sh '/usr/bin/python3 scripts/check_gdn_prep_sm70.py'` (rerun shape): worst `max|delta|` 1.192e-07 against `reference.gdn_prep`, 1.907e-06 against the old serial kernel, 66.49→0.17 ms (397.9x). Ongoing full-scale parity is the permanent `test_gdn_chunk_fused_parity_full_scale`.
