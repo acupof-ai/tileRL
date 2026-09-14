@@ -1,9 +1,8 @@
 # Layered architecture refactor lands — CPU + V100 sm70, 2026-09-15
 
-> Status: pending-remote — full CPU suite green on the final PR's CI
-> (822 passed / 21 skipped / 1 xfailed ubuntu, 816 / 27 / 1 macos) and the
-> reviewer verified body identity; V100 128k sparse smoke after deploy of
-> 2e8612c1 is the remote confirmation.
+> Status: Shipped — full CPU suite green on the final PR's CI
+> (822 passed / 21 skipped / 1 xfailed ubuntu, 816 / 27 / 1 macos), reviewer
+> verified body identity, and V100 128k sparse smoke passed on 2e8612c1.
 
 ## Context
 
@@ -40,6 +39,15 @@ pre-mortem split decisions for steps 8b/9/10/11. Every moved body was reviewed
 normalized for binding only (`self.` → `ctx.`); any boundary-forcing logic
 change had to be a separate commit, and the one such change (GraphCapture /
 named `_draft_step`) was the first commit of the final PR.
+
+## Results
+
+V100 (sm70) 128k single-request sparse smoke on 2e8612c1: HTTP 200,
+prompt_tokens 125452, 655 sparse ticks, prefill wall 1877.6 s (~67 tok/s),
+clean block/slot release. The run exceeded the 1800 s production completion
+timeout (the probe raised it to 5400 s remotely; the production constant is
+unchanged), so 128k sparse prefill stays outside the default-served window —
+the smoke confirmed behavior identity of the move, not a serving default.
 
 ## Rule
 
