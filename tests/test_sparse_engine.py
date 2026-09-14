@@ -2543,3 +2543,359 @@ def test_a_private_spill_failure_fails_the_request_and_frees_its_slot(tmp_path):
     out2 = _drain(e, rid2, 3)
     e.shutdown()
     assert len(out2) == 3
+
+
+# ------------------------------------------------- hybrid --sparse-min-tokens
+
+def _hybrid_engine():
+    return build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=128, num_slots=4, max_batch=4, max_total_tokens=8192,
+        max_num_batched_tokens=512, sparse_k=64, scorer="bounds",
+        kv_cold_bytes=1 << 30, sparse_min_tokens=128)
+
+
+def _drain_two(engine, rids, n, ticks=8000):
+    # poll() pops ALL finished rows, so a per-rid drain would discard the other's
+    # output; accumulate each poll dict by rid in one loop.
+    outs = {r: [] for r in rids}
+    for _ in range(ticks):
+        engine.step()
+        if engine._failed:
+            raise AssertionError(engine._failed)
+        for k, v in engine.poll().items():
+            if k in outs:
+                outs[k] += v
+        if all(len(v) >= n for v in outs.values()):
+            return outs
+    raise AssertionError(f"stalled: {[(k, len(v)) for k, v in outs.items()]}")
+
+
+def test_hybrid_short_runs_dense_long_runs_sparse_token_exact_to_pure_modes():
+    """One hybrid engine: the short prompt must equal the pure-dense engine's
+    output, the long prompt the pure-sparse engine's output."""
+    rng = np.random.default_rng(3)
+    short = rng.integers(3, 300, 64).astype(np.int64)
+    long = rng.integers(3, 300, 20 * BLOCK_TOKENS).astype(np.int64)
+    p = lambda: SamplingParams(temperature=0.0, max_new_tokens=6, seed=0)
+
+    e = _hybrid_engine()
+    rs = e.submit(short, p())
+    rl = e.submit(long, p())
+    out = _drain_two(e, (rs, rl), 6)
+    hs, hl = out[rs], out[rl]
+    e.shutdown()
+
+    dense = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=128, num_slots=4, max_batch=4, max_total_tokens=8192,
+        max_num_batched_tokens=512)
+    rd = dense.submit(short, p())
+    want_d = _drain_two(dense, (rd,), 6)[rd]
+    dense.shutdown()
+
+    sp = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=128, num_slots=4, max_batch=4, max_total_tokens=8192,
+        max_num_batched_tokens=512, sparse_k=64, scorer="bounds",
+        kv_cold_bytes=1 << 30)
+    rsp = sp.submit(long, p())
+    want_s = _drain_two(sp, (rsp,), 6)[rsp]
+    sp.shutdown()
+    assert hs == want_d, f"dense-mode short {hs} != pure dense {want_d}"
+    assert hl == want_s, f"sparse-mode long {hl} != pure sparse {want_s}"
+
+
+def test_hybrid_tick_is_never_mixed_and_short_ticks_use_the_dense_graph():
+    """Round-robin: every tick carries one mode; all-short decode ticks run the
+    dense captured graph (forced on the CPU seam), and per-mode counters record
+    the path."""
+    rng = np.random.default_rng(3)
+    short = rng.integers(3, 300, 64).astype(np.int64)
+    long = rng.integers(3, 300, 20 * BLOCK_TOKENS).astype(np.int64)
+    p = lambda: SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    e = _hybrid_engine()
+    # Hybrid never captures the sparse graph: sparse ticks run eager (token-exact),
+    # only the dense graph is used -- and it is precaptured before traffic.
+    assert e._sparse_graph_on is False
+    sparse_graph_calls = {"n": 0}
+    real_sp = e._run_sparse_decode_graph
+    e._run_sparse_decode_graph = (lambda reqs, chains:
+        sparse_graph_calls.__setitem__("n", sparse_graph_calls["n"] + 1)
+        or real_sp(reqs, chains))
+    e._decode_graph_on = True
+    seen = {"dense": [], "sparse": [], "mixed": []}
+    orig_fwd = e._run_forward
+
+    def watch(decodes, prefills, chunks):
+        rows = decodes + prefills
+        if rows:
+            modes = {r.sparse_on for r in rows}
+            assert modes <= {True, False} and len(modes) == 1, "mixed-mode tick"
+            seen["mixed"].append(len(modes) == 2)
+        return orig_fwd(decodes, prefills, chunks)
+
+    e._run_forward = watch
+    dense_graph = {"n": 0}
+    real = e._run_decode_graph
+
+    def counting_dense(reqs, chains=None):
+        dense_graph["n"] += 1
+        return real(reqs, chains)  # CPU: capture fails -> caller runs eager, tokens still commit
+
+    e._run_decode_graph = counting_dense
+    rs = e.submit(short, p())
+    rl = e.submit(long, p())
+    _drain_two(e, (rs, rl), 8)
+    st = e.stats()
+    e.shutdown()
+    assert not any(seen["mixed"]), "a tick carried both modes"
+    assert dense_graph["n"] >= 1, "an all-short decode tick never used the dense graph"
+    assert sparse_graph_calls["n"] == 0, "a hybrid sparse tick entered the sparse graph"
+    assert st["dense_mode_ticks"] >= 1 and st["sparse_mode_ticks"] >= 1, st
+    assert st["dense_mode_ticks"] + st["sparse_mode_ticks"] >= dense_graph["n"]
+
+
+def test_hybrid_a_dense_prompt_over_the_device_pool_routes_sparse_at_submit():
+    """A dense row pins its WHOLE context in the device pool (the sparse cold tier
+    is not available to it); a prompt that cannot fit that pin routes sparse at
+    submit rather than blocking _admit forever."""
+    # 128 blocks x 16 tokens is the whole device pool; a prompt claiming that much
+    # plus decode cannot be dense even with the pool empty.
+    too_long = np.arange(7, 7 + 120 * BLOCK_TOKENS, dtype=np.int64) % 297 + 3
+    e = _hybrid_engine()
+    rid = e.submit(too_long, SamplingParams(temperature=0.0, max_new_tokens=16, seed=0))
+    req = e._waiting[0]
+    assert req.sparse_on is True, "an un-pinnable prompt must route sparse, not dense"
+    _drain_two(e, (rid,), 16)
+    e.shutdown()
+
+
+def test_hybrid_wall_time_fairness_gives_dense_dozens_of_ticks_per_sparse_tick():
+    """Measured V100 ratio: a sparse prefill tick is ~1023 ms, a dense decode
+    tick ~37 ms, so while both modes are runnable wall-time fairness must give
+    ~28 dense ticks per sparse tick (1000/37). A fake clock pins sparse tick at
+    1000 and dense at 37; a long-lived dense decode row coexists with the sparse
+    prefill, and the steady-state mode sequence averages >=25 dense ticks
+    between consecutive sparse ticks, and a dense row arriving after sparse ticks
+    ran solo is served on the next tick (it owes no solo-history debt, and a tie
+    at a freshly opened window goes to dense).
+
+    Note: this gate CANNOT be red on the prior global-debt scheduler under a
+    deterministic fake clock -- that scheduler also yields ~27:1 here. The V100
+    regression (5.95:1, 9.7 tok/s) comes from real tick-duration spread and
+    request-arrival timing, which a uniform fake clock does not model; it is
+    caught by the device A-B, not this gate. The change here pins the intended
+    rolling-window/tie semantics so a future edit cannot silently regress them."""
+    e = _fair_engine()
+    e._hybrid_fake_dt = (1000.0, 37.0)
+    rng = np.random.default_rng(5)
+    long = rng.integers(3, 300, 120 * 192).astype(np.int64)
+    e.submit(long, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+    # three solo sparse ticks before any dense row exists
+    for _ in range(3):
+        e.step()
+    e.submit(rng.integers(3, 300, 64).astype(np.int64),
+             SamplingParams(temperature=0.0, max_new_tokens=2000, seed=1))
+    seq = []
+    orig = e._run_forward
+
+    def watch(decodes, prefills, chunks):
+        rows = decodes + prefills
+        seq.append(rows[0].sparse_on if rows else None)
+        return orig(decodes, prefills, chunks)
+
+    e._run_forward = watch
+    # drive until >=6 sparse ticks have run WITH the dense row present
+    n_with_dense = 0
+    for _ in range(4000):
+        e.step()
+        e.poll()
+        if any(not r.sparse_on for r in e._running):
+            n_with_dense = sum(1 for m in seq if m is True)
+        if n_with_dense >= 6:
+            break
+    e.shutdown()
+    s = [m for m in seq if m is not None]
+    # the arriving dense row is served immediately (first tick after arrival is
+    # dense; the solo sparse history is not a debt it inherits)
+    assert s[0] is False, f"newly arrived dense row first tick was {s[0]}"
+    idx = [i for i, m in enumerate(s) if m is True]
+    assert len(idx) >= 2, f"need a steady window, got sparse ticks {len(idx)}"
+    gaps = [idx[i + 1] - idx[i] - 1 for i in range(len(idx) - 1)]
+    dense_per_sparse = sum(gaps) / len(gaps)
+    assert dense_per_sparse >= 25, (
+        f"{dense_per_sparse:.1f} dense ticks per sparse tick in steady state; "
+        "1000/37 wall-time fairness requires >= 25")
+
+
+def _fair_engine():
+    cfg = tiny()
+    return build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+        num_blocks=512, num_slots=8, max_batch=8, max_total_tokens=65536,
+        max_num_batched_tokens=512, sparse_k=64, scorer="bounds",
+        kv_cold_bytes=1 << 30, sparse_min_tokens=8192)
+
+
+def test_hybrid_dense_admit_reserves_live_sparse_rows_hot_headroom():
+    """CHANGE-REQ (rev-30, #586): a dense admit pins from the one pool sparse
+    rows grow into lazily. Free blocks alone overstate what dense may take -- a
+    live sparse row is entitled to grow to its per-slot hot ceiling. A dense
+    admit that fits free_blocks but starves that headroom must be refused;
+    otherwise the sparse row raises 'hot pool undersized' inside a live tick and
+    the step handler fails EVERY running row. Red on the head that admitted on
+    free_blocks alone."""
+    from tilerl.memory import sparse_hot_pages_per_slot
+
+    cfg = tiny()
+    ceil_ = sparse_hot_pages_per_slot(cfg, 64, 512)
+    # sparse pool fits num_slots x ceiling + 1. Fabricate one live sparse row
+    # holding ceiling-6 REAL pages: free = pool-held = 322, its headroom = 6.
+    # A dense 320-block pin fits free (old code: 320 <= 322, admits) but must be
+    # refused once the headroom is reserved (320 + 6 > 322).
+    e = build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+        num_blocks=0, num_slots=4, max_batch=4, max_total_tokens=16384,
+        max_num_batched_tokens=512, sparse_k=64, scorer="bounds",
+        kv_cold_bytes=1 << 30, sparse_min_tokens=8192)
+    try:
+        rng = np.random.default_rng(9)
+        long = rng.integers(3, 300, 20 * BLOCK_TOKENS).astype(np.int64)
+        srid = e.submit(long, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+        srow0 = e._waiting[0]
+        srow0.sparse_on = True  # fabricate the live sparse mode for this row
+        assert e._admit(srow0), "sparse row must admit with needed=0"
+        e._running.append(e._waiting.popleft())
+        srow = next(r for r in e._running if r.req_id == srid)
+        held = ceil_ - 6
+        for _ in range(held):
+            srow.blocks.append(e._kv.alloc_block())
+        e._sparse.attach(srid)
+        e._sparse.resident[srid] = {p: srow.blocks[p] for p in range(held)}
+        assert e._sparse_hot_headroom() == 6
+        free = e._kv.free_blocks
+        assert free >= 320, f"test setup: free {free} cannot place the 320-block pin"
+
+        # 320 whole-context blocks: dense under N=8192, fits free but not free+headroom.
+        short = rng.integers(3, 300, 320 * BLOCK_TOKENS).astype(np.int64)
+        e.submit(short, SamplingParams(temperature=0.0, max_new_tokens=8, seed=1))
+        drow = e._waiting[0]
+        assert drow.sparse_on is False
+        admitted = e._admit(drow)
+        assert not admitted, (
+            f"dense admitted with {free} free against a 6-page sparse headroom: "
+            "the sparse row's next own page raises inside a live tick")
+    finally:
+        e.shutdown()
+
+
+def test_hybrid_stats_carries_live_sparse_residency():
+    """rev-30 item 4: hybrid reconciles the DENSE memory ledger, so the sparse
+    live occupancy must still be visible flat in stats() (page_bounds/kv_hot),
+    or the concurrent device run cannot see residency vs cold."""
+    cfg = tiny()
+    e = build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+        num_blocks=0, num_slots=4, max_batch=4, max_total_tokens=16384,
+        sparse_k=64, scorer="bounds", kv_cold_bytes=1 << 30,
+        sparse_min_tokens=8192)
+    try:
+        rng = np.random.default_rng(4)
+        long = rng.integers(3, 300, 20 * BLOCK_TOKENS).astype(np.int64)
+        rid = e.submit(long, SamplingParams(max_new_tokens=4, seed=0))
+        r0 = e._waiting[0]
+        r0.sparse_on = True
+        assert e._admit(r0)
+        e._running.append(e._waiting.popleft())
+        for _ in range(3):
+            e._running[0].blocks.append(e._kv.alloc_block())
+        e._sparse.attach(rid)
+        e._sparse.resident[rid] = {p: e._running[0].blocks[p] for p in range(3)}
+        st = e.stats()
+        assert st["sparse_hot_pages"] == 3, st.get("sparse_hot_pages")
+        assert st["sparse_hot_bytes"] > 0 and st["page_bounds_bytes"] >= 0
+        assert "kv_cold_bytes" in st
+    finally:
+        e.shutdown()
+
+
+def test_hybrid_dense_ledger_is_memoized_but_pure_sparse_stays_live():
+    """#586 all-dense A-B: a hybrid engine must not re-walk memory.plan every
+    stats call (the memoize #581 added for plain dense engines must also cover
+    the hybrid dense whole-pool view). A PURE sparse engine keeps the live ledger
+    (kv_hot moves with residency)."""
+    import tilerl.memory as memory_mod
+
+    cfg = tiny()
+    h = build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+        num_blocks=0, num_slots=4, max_batch=4, max_total_tokens=16384,
+        sparse_k=64, scorer="bounds", kv_cold_bytes=1 << 30,
+        sparse_min_tokens=8192)
+    orig = memory_mod.plan
+    calls = {"n": 0}
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    memory_mod.plan = counting
+    try:
+        h._build_stats()
+        h._build_stats()
+        h._build_stats()
+    finally:
+        memory_mod.plan = orig
+    h.shutdown()
+    assert calls["n"] == 1, f"hybrid ledger not memoized: plan ran {calls['n']}x"
+
+    p = build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+        num_blocks=0, num_slots=1, max_batch=1, max_total_tokens=1024,
+        sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
+    calls["n"] = 0
+    memory_mod.plan = counting
+    try:
+        p._build_stats()
+        p._build_stats()
+    finally:
+        memory_mod.plan = orig
+    p.shutdown()
+    assert calls["n"] == 2, "pure sparse ledger must stay live per stats call"
+
+
+def test_hybrid_dense_spec_row_finishes_with_exactly_n_during_sparse_fill():
+    """Device regression (#586 trace): dense rows kept decoding (1,449 observed
+    output tokens against a 40-token cap) and never finished during a concurrent
+    long sparse fill. A dense spec (draft d1) short row must stop at EXACTLY
+    max_new_tokens even while the sparse prefill owns alternating ticks."""
+    from tilerl_kernels.backend import get_backend
+
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    e = build_engine(
+        cfg=cfg, model=model, backend=get_backend(),
+        num_blocks=0, num_slots=4, max_batch=4, max_total_tokens=300000,
+        max_num_batched_tokens=512, sparse_k=128, scorer="bounds",
+        kv_cold_bytes=1 << 30, sparse_min_tokens=8192,
+        draft=_draft(cfg, model), spec_depth=1)
+    try:
+        rng = np.random.default_rng(3)
+        e.submit(rng.integers(3, 300, 200 * 192).astype(np.int64),
+                 SamplingParams(max_new_tokens=2, seed=0))
+        N = 10
+        rid = e.submit(rng.integers(3, 300, 64).astype(np.int64),
+                       SamplingParams(temperature=0.0, max_new_tokens=N, seed=100))
+        out = []
+        for _ in range(6000):
+            e.step()
+            out += e.poll().get(rid, [])
+            if len(out) >= N:
+                break
+        assert len(out) == N, f"dense spec row produced {len(out)} tokens, cap {N}"
+        # it must be DONE and gone from running, not still decoding
+        assert not any(r.req_id == rid for r in e._running), "row still running at cap"
+    finally:
+        e.shutdown()
