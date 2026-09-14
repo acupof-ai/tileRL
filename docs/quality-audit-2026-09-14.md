@@ -134,3 +134,24 @@ dead; and two review-process meta findings.
 - Next: API surface 11–16 (client-visible correctness), gates 6–10.
 - Fold-ins: 20/23/24 ride the architecture steps; 25 and 33 ride the scripts
   cleanup; 26–30 one docs PR; 35 rides step 8b.
+
+## Reproduction pack (2026-09-14 late, re-verified on 3026d507)
+
+API-surface findings 11-13/15-17 re-derived after #598/#608/#614 — all six
+CONFIRMED with minimal repros and owner modules. Fix queue for the route owner
+(fixmisc) after step 11; finding 17 is engine:
+
+11. tool transcript: ChatMessage carries only role/content; assistant.tool_calls
+    and role:'tool' render empty / leak `<|im_start|>tool`. Fix ChatMessage +
+    blocks_to_text (tool_calls→render_tool_call, tool→tool_response).
+12. Responses `input_text` part: blocks_to_text returns "" → 400 empty prompt.
+    Map input_text→text in responses._to_messages or blocks_to_text.
+13. `tool_choice:'none'` accepted but tools still rendered. Set tools=None for
+    render when named none (chat + responses/messages share _render).
+15. Streaming never parses tool calls: raw XML in content, finish_reason
+    length, vs structured tool_calls non-stream. Parse at terminal delta;
+    check responses SSE too.
+16. Chat accepts web_search-style hosted tools (null-name render) while
+    responses refuses them; port the shared _hosted_tools refusal.
+17. submit() _waiting is unbounded (engine.py); add a limit + typed exception
+    mapped to 429/503.
