@@ -178,3 +178,29 @@ boundary-crossing block the anchor math (`seq_len+q-2`) misses. CPU: e2e 81,
 sparse 62, rl 33 (on-policy graph/recapture), server 73, decode-graph/dflash
 29, all green. Device forced-graph smoke (the 4x2k warmup shape) runs on the
 V100 after merge by ops.
+
+## Status: fixed and device-verified (2026-09-15)
+
+Fix landed as #628 (8d56cf20) — `Engine.ensure_draft_write_blocks` above.
+Verified on V100 sm70 against 8d56cf20 with the forced-graph regression gate
+`scripts/smoke_dense_d1_boundary.py` (reads :8000; no deploy):
+
+- serve reports `decode_graph=true`; 8 rounds × 4 concurrent dense d1 rows,
+  distinct-nonce prompts of 250 words (~1k prompt tokens, dense), max_new=16,
+  all rows decoding on captured graphs in one (B=4) batch.
+- **32/32 HTTP 200, every row exactly 16 tokens `finish_reason=length`**;
+  running/waiting/slots drained to 0 between rounds and at the end; free-block
+  count stable; the boot log has zero `draft would write position` assertions.
+- sm90 parity stays deferred (H20 unavailable by decision 2026-09-14).
+
+Two probe incidents during gating, neither a fix gap:
+
+1. The first probe used `word ×2000`, which tokenizes to ~8k tokens; four
+   such fills OOMed the 31.7 GiB card (136 MiB short) and tripped the liveness
+   restart. The two `torch.OutOfMemoryError` tracebacks in that boot's log are
+   this probe-sizing error, not the boundary race and not #628. Corrected to
+   250 words.
+2. An intermediate run had one 13/16 row. The probe was tightened to capture
+   `finish_reason` and accept an early row only on a clean `stop`/`eos`; the
+   clean 8-round rerun was all 16/`length`, so the 13 was a non-length natural
+   end, not a dropped write.
