@@ -366,18 +366,6 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--tp',
         '--train-seq-len',
     }),
-    'pretrain': frozenset({
-        '--ckpt-dir',
-        '--ckpt-every',
-        '--data',
-        '--help',
-        '--lr',
-        '--model',
-        '--seed',
-        '--seq-len',
-        '--steps',
-        '--warmup',
-    }),
     'bench': frozenset({
         '--batches',
         '--calibrate',

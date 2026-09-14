@@ -505,7 +505,9 @@ def _train_indexer_recall(args: argparse.Namespace, backend, model, log) -> dict
     held = load("held", getattr(args, "held_spans", 0))
     train_groups = load("train")
     # cycle training prompts across lengths in an interleaved order
-    train_batches = [b for grp in zip_longest_flat(train_groups) for b in [grp] if b is not None]
+    import itertools
+    train_batches = [b for row in itertools.zip_longest(*train_groups.values())
+                     for b in row if b is not None]
     t0 = time.perf_counter()
     out = train_mod.indexer_warmup_run(
         model, backend, train_batches, held, args.k_pages, args.steps, args.lr,
@@ -527,11 +529,6 @@ def _train_indexer_recall(args: argparse.Namespace, backend, model, log) -> dict
         if (i + 1) % max(1, args.steps // 20) == 0 or i == 0:
             log(f"step {i + 1:4d}/{args.steps}  kl {v:.4f}")
     return out
-
-
-def zip_longest_flat(groups: dict) -> list:
-    import itertools
-    return [b for row in itertools.zip_longest(*groups.values()) for b in row if b is not None]
 
 
 def _train_indexer_warmup(args: argparse.Namespace) -> None:
@@ -998,14 +995,6 @@ def _length_aware(match, gold, tok, lam: float, cap: int):
     return reward
 
 
-def _correctness(match, gold, tok):
-    """Binary correctness before the length term — the tied_correctness input."""
-    def fn(prompt, completion):
-        text = tok.decode([int(t) for t in completion])
-        return float(match(text, gold[tuple(int(t) for t in prompt)]))
-    return fn
-
-
 def _within_group_r(rows: list) -> float | None:
     """Pearson r of (tokens, reward) POOLED over within-group deviations.
 
@@ -1443,7 +1432,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
             match = MATCHERS[args.reward]
             reward = _length_aware(match, gold, tok, args.length_penalty,
                                    max(int(args.max_new_tokens), 1))
-            correctness = _correctness(match, gold, tok)
+
+            # binary correctness before the length term — the tied_correctness input
+            def correctness(prompt, completion):
+                text = tok.decode([int(t) for t in completion])
+                return float(match(text, gold[tuple(int(t) for t in prompt)]))
         else:
             # No length term: this reward is a RATE, so its expectation does not grow with
             # length and the defect above is absent by construction -- a longer completion
@@ -1912,57 +1905,19 @@ def _finish(m: dict, as_json: bool) -> None:
         sys.exit(1)
 
 
-def cmd_pretrain(args: argparse.Namespace) -> None:
-    from tilerl_kernels.backend import get_backend
-
-    from . import train as train_mod
-    from .autograd import AdamW
-    from .server import get_tokenizer
-
-    backend = get_backend()
-    cfg, model = _build_model(args.model, seed=args.seed, keep_master=True)
-    from .model import drop_quantized
-
-    drop_quantized(model)
-    dataset = train_mod.JsonlDataset(args.data, get_tokenizer(None), args.seq_len)
-    optimizer = AdamW(lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
-
-    print(
-        f"tilerl pretrain: model={cfg.name} data={args.data} "
-        f"seq_len={args.seq_len} steps={args.steps}"
-    )
-    train_mod.pretrain(
-        model,
-        dataset,
-        backend,
-        optimizer,
-        args.steps,
-        lr=args.lr,
-        warmup=args.warmup,
-        ckpt_dir=args.ckpt_dir,
-        ckpt_every=args.ckpt_every,
-        seed=args.seed,
-    )
-
-
-def _devices(spec: str) -> list[int]:
-    """``0-7`` or ``0,1,2`` or ``0-3,6``."""
-    out: list[int] = []
-    for part in spec.split(","):
-        if "-" in part:
-            lo, hi = part.split("-")
-            out.extend(range(int(lo), int(hi) + 1))
-        else:
-            out.append(int(part))
-    return out
-
-
 def cmd_generate(args: argparse.Namespace) -> None:
     # One process per device: an in-process wrapper serialises every tick on the GIL.
     from .generate import generate
 
+    devices: list[int] = []
+    for part in args.devices.split(","):  # "0-7" or "0,1,2" or "0-3,6"
+        if "-" in part:
+            lo, hi = part.split("-")
+            devices.extend(range(int(lo), int(hi) + 1))
+        else:
+            devices.append(int(part))
     stats = generate(
-        prompts=args.prompts, out=args.out, devices=_devices(args.devices),
+        prompts=args.prompts, out=args.out, devices=devices,
         source=args.source, max_new_tokens=args.max_new_tokens,
         temperature=args.temperature, top_p=args.top_p, seed=args.seed,
         max_batch=args.max_batch,
@@ -2702,18 +2657,6 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "(default: --max-new-tokens)")
     # The recipe is the subparser's defaults, so anything typed still wins.
     p_train.set_defaults(func=cmd_train, **(flags(recipe) if recipe else {}))
-
-    p_pretrain = sub.add_parser("pretrain", help="pretrain on a JSONL text corpus")
-    p_pretrain.add_argument("--model", choices=["tiny"], default="tiny")
-    p_pretrain.add_argument("--data", required=True, help="JSONL file with 'text' fields")
-    p_pretrain.add_argument("--steps", type=int, default=20)
-    p_pretrain.add_argument("--seq-len", type=int, default=512)
-    p_pretrain.add_argument("--ckpt-dir", default=None)
-    p_pretrain.add_argument("--ckpt-every", type=int, default=0)
-    p_pretrain.add_argument("--lr", type=float, default=1e-3)
-    p_pretrain.add_argument("--warmup", type=int, default=0)
-    p_pretrain.add_argument("--seed", type=int, default=0)
-    p_pretrain.set_defaults(func=cmd_pretrain)
 
     p_bench = sub.add_parser("bench", help="benchmark prefill/decode throughput")
     p_bench.add_argument("--model", choices=MODEL_NAMES, default="tiny")
