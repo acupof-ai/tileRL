@@ -186,6 +186,48 @@ def test_render_chat_is_chatml():
     )
 
 
+def test_replayed_tool_transcript_renders_the_call_and_a_user_tool_response():
+    """OpenAI replays a call as assistant.tool_calls and its result as role:"tool"
+    (#617 finding 11). Both must reach the model in the checkpoint's own tags:
+    the call via render_tool_call, the result via the SAME <tool_response>
+    wrapper blocks_to_text uses for Anthropic tool_result — no invented
+    dialect, no bare <|im_start|>tool turn."""
+    from tilerl.prompt import render_tool_call
+    from tilerl.server import ChatMessage, _render_chat
+
+    call = {"id": "call_1_0", "type": "function",
+            "function": {"name": "Bash", "arguments": '{"command": "ls"}'}}
+    out = _render_chat([
+        ChatMessage(role="user", content="run ls"),
+        ChatMessage(role="assistant", content=None, tool_calls=[call]),
+        ChatMessage(role="tool", content="a.txt", tool_call_id="call_1_0"),
+    ])
+    expect_call = render_tool_call("Bash", {"command": "ls"})
+    assert expect_call in out
+    assert "<|im_start|>assistant\n" + expect_call + "<|im_end|>\n" in out
+    # role:"tool" re-enters as a USER turn in the existing tool_result wrapper
+    assert "<|im_start|>user\n<tool_response>\na.txt\n</tool_response><|im_end|>\n" in out
+    assert "<|im_start|>tool" not in out
+    # A plain assistant turn with no tool_calls is byte-identical to before:
+    # this render runs on every request.
+    plain = _render_chat([ChatMessage(role="assistant", content="hello")])
+    assert plain == "<|im_start|>assistant\nhello<|im_end|>\n<|im_start|>assistant\n"
+
+
+def test_responses_input_text_part_reaches_the_prompt(tmp_path):
+    """A Responses message item whose part type is input_text used to flatten to
+    "" and 400 as an empty prompt (#617 finding 12)."""
+    tok = _ByteTokenizer()
+    app = create_app(_ScriptedEngine(tok, ["ok"]), tok)
+    with TestClient(app) as c:
+        r = c.post("/v1/responses", json={
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": "hello"}]}],
+        })
+    assert r.status_code == 200, r.text
+    assert r.json()["output"][0]["content"][0]["text"] == "ok"
+
+
 def test_top_level_enable_thinking_reaches_the_rendered_prompt():
     """OpenAI/sglang clients send enable_thinking top-level. The HTTP route's
     pydantic model has extra=allow, so without a normalization step the field

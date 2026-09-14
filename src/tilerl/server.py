@@ -60,6 +60,12 @@ SYSTEM_FINGERPRINT = "tilerl_fp_1"
 class ChatMessage(BaseModel):
     role: str
     content: str | list[dict[str, Any]] | None = None
+    #: OpenAI replays a prior assistant call in the next request as
+    #: ``tool_calls`` on the assistant message (nested
+    #: ``{function:{name,arguments}}``); the matching result arrives as a
+    #: later ``role:"tool"`` message carrying ``tool_call_id``.
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
