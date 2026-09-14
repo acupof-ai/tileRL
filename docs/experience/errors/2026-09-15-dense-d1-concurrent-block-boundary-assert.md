@@ -46,53 +46,114 @@ the serve runs without `--kv-store`, so it is not on this path either. The
 race is older than both PRs; the small per-boot sample just hid it until a
 repeat-run gate happened to count it.
 
-## Root cause (bisection hypothesis — UNVERIFIED)
 
-`DraftHead.step` (`spec.py`, the assertion around line 407) plans each row's
-draft write against the blocks it currently owns:
+## Root cause
+
+A growth-TIMING divergence between the eager and the captured-graph decode
+paths, verified against `engine.py` (2026-09-15). `DraftHead.step`
+(`spec.py`) plans its writes against the blocks each row currently owns:
 
 ```python
 dblocks = r.draft_blocks if r.draft_blocks else r.blocks
-assert len(dblocks) * BLOCK_TOKENS > hi   # hi = r.seq_len - 1
+assert len(dblocks) * BLOCK_TOKENS > hi   # hi = r.seq_len - 1 post-commit
 ```
 
-At `seq_len=929` the trunk needs 59 blocks for position 928, but the row still
-holds 58 (58×16 = 928, and the check is strict), while `draft_pos=926` puts
-the planned write exactly at that position. The hypothesis: when four dense
-rows decode in one tick and several cross a 16-token boundary together, the
-block that grows the row is allocated (or expected to already exist) on a
-path that assumes it was added before the draft step — under one-row-per-tick
-or non-concurrent timing the trunk growth lands first, but a multi-row tick
-reaches `_draft.step` with a row whose trunk block for the new boundary has
-not been attached to the set the draft plans against. The trunk and the draft
-disagree by one block at the crossing, and only when the rows align.
+Within one decode tick the trunk commits a token (`_sample_commit` →
+`_commit` → `r.seq_len += 1`) and then the draft step runs. After a commit
+that accepts exactly onto a 16-token boundary, `seq_len` becomes `k*16 + 1`,
+so the draft's `hi = seq_len - 1 = k*16` needs the `(k+1)`th block (the check
+is strict). The two paths disagree on whether that block exists yet:
 
-This is a hypothesis from the assertion numbers and the concurrency needed to
-reproduce; the exact ordering between trunk growth and `r.blocks`/
-`r.draft_blocks` visible to `step` has not been traced. A correct fix must
-reason about draft position versus the blocks the row will own AFTER the
-tick's growth, not the ones it entered with, and should cover the dense
-trunk-reuse path (`r.blocks`) and any draft-owned path (`r.draft_blocks`)
-symmetrically.
+- **Eager** — after the forward it runs an explicit post-commit growth loop in
+  `_run_forward` (`while len(r.blocks)*16 <= r.seq_len-1: r.blocks.append(
+  alloc_block())`, immediately before `_draft.step`). The row grows to `k+1`
+  blocks, then drafts. Structurally it cannot see the shortfall.
+- **Captured graph** — `_run_decode_graph` calls `_draft.step(reqs)` right
+  after commit with only the PRE-FORK growth, which is sized by
+  `_decode_extra_blocks(seq_len, q, …)` covering `seq_len + q - 2` (the #605
+  anchor-rewrite bound). Its comment claims the pre-fork loop "already covers
+  the draft's furthest write" — true for the verifier chain, false for the
+  post-commit `hi` on an accepted-token boundary. The row is one block short,
+  `spec.py` asserts, and the whole batched tick fails.
+
+4x2k warmup runs dense rows under `--decode-graph`, so it takes the graph
+path; it surfaces only when four rows accept onto the same boundary in one
+tick (single rows usually cross on a verifier-covered or eager tick). Not a
+capacity bug and not the #616 extraction — both paths are identical before
+and after that move; the divergence is older.
 
 ## Fix (named, not landed)
 
-`src/tilerl/spec.py` `DraftHead.step` block planning together with the dense
-decode growth in `src/tilerl/engine.py`: reconcile draft-position with
-row-owned-block accounting so four dense d1 rows crossing a 16-token boundary
-in the same tick either grow before the plan is built or plan against the
-post-growth block count. Queued for the dense-engine owner after step 11
-(`spec.py` may overlap the sparse `SparseRuntime` work, so it is sequenced
-after to avoid editing the file twice).
-
-A gate needs a deterministic CPU/tiny reproduction, not another ~1/3
-real-card warmup: build four dense rows with d1 and drive one `step()` that
-lands all four at the `(58×16 → 59×16)` boundary, asserting the tick
-completes and the writes land on owned pages. Red today on the alignment,
-green after.
+Pull the invariant "every decode row's `r.blocks` covers the post-commit
+draft position `seq_len - 1` (plus the verifier tail)" out of the eager loop
+into one shared planning helper — e.g. `ensure_draft_write_blocks(rows)` that
+grows what is needed and finishes a row that does not fit, with the existing
+growth semantics — and call it from BOTH `_run_forward` (eager) and
+`_run_decode_graph` (captured) immediately before `_draft.step`. The graph
+path drops its "pre-fork growth is enough" assumption, the two paths
+converge, and `spec.py`'s strict check can never see a one-block-short dense
+row. Queued for fixkv after step 11.
 
 ## Rule
 
 An off-by-one block check that only fires when N rows align at a boundary in
-one tick is a concurrency-ordering defect, not a capacity defect: size-based
-single-row probes pass forever. The repro must force the multi-row alignment.
+one tick is a growth-timing divergence between two paths, not a capacity
+defect. If one path grows inline and the other assumes earlier growth was
+enough, the fix is a shared "blocks cover the post-commit write" helper
+called from both; single-row probes never expose the missing call.
+
+## Deterministic gate
+
+Two layers: a pure planning unit test (the acceptance gate) plus a
+device-level forced-graph smoke. The old `L = k*16+1` prefill construction is
+**wrong** — a `k*16+1` prompt already holds `k+1` blocks from prefill, which
+cover `hi = k*16`; there is no shortfall at admission. The defect is about
+growth AFTER commit on the graph path, so the unit gate targets the shared
+planner directly, not prompt arithmetic.
+
+**1. Unit gate (CPU/tiny, no forward, no graph)** — in `tests/test_e2e.py`
+beside the dense spec suite (reuse `tiny()`, `_random_draft`, RefBackend):
+
+```python
+# four dense+d1 rows frozen in the PRE-growth state at an accepted boundary:
+# each row has committed onto k*16 (seq_len = k*16+1) but still owns only k
+# blocks; the planner must grow every row to k+1.
+rows = make_rows(n=4, blocks_per_row=k, seq_len=k*16+1, sparse_on=False)
+kept = engine.ensure_draft_write_blocks(rows)          # the extracted helper
+assert len(kept) == 4
+for r in kept:
+    assert len(r.blocks) * BLOCK_TOKENS > r.seq_len - 1
+# a row the pool cannot fit is finished, not raised; pool bookkeeping restored
+```
+
+Red today: the graph path has no such helper (the precondition only holds on
+the eager inline loop), so exercising the equivalent logic on aligned rows
+raises the `spec.py` assertion. Green after the helper is extracted and both
+paths call it. Build knobs for the engine used here:
+
+```python
+cfg = tiny()  # BLOCK_TOKENS = 16
+build_engine(cfg, build_random(cfg, seed=7), get_backend(),
+    num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096,
+    draft=_random_draft(cfg, 7, model), spec_depth=1, sparse_k=0)
+```
+
+Fixed-state assertions are deterministic because the rows are constructed at
+the boundary explicitly — equal block count, `seq_len = k*16+1`, dense — not
+scheduled into alignment. Submit four equal rows only when asserting the
+call-site wiring; the core guarantee is the planner's, which takes rows
+directly.
+
+**2. Device smoke (forced graph)** — V100 sm70 (pre-authorized), run the
+server with `--decode-graph` and drive four concurrent dense d1 rows that all
+accept onto a 16-boundary in one tick (the 4x2k warmup shape), deterministically
+by equal-length prompts submitted together; assert all four complete (no 500),
+each drained to `max_new_tokens`, and `free_blocks` returns to its pre-tick
+value. This is the end-to-end confirmation that both paths now share the
+helper. sm90/H20 parity is **deferred (H20 unavailable by decision
+2026-09-14)**.
+
+**Sparse symmetry:** the same plan function has a `r.draft_blocks` branch
+(sparse rows own a separate dense draft pool, reserved at admit). When that
+code moves post-step-11, give the planner a sparse-row unit case (admit
+reservation vs post-commit end) rather than assuming the dense gate covers it.
