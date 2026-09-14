@@ -250,6 +250,38 @@ def test_tool_choice_none_suppresses_render_and_output(tmp_path):
     assert ch["message"]["content"] == "I will run it."
 
 
+def test_tool_choice_none_streaming_never_emits_call_xml(tmp_path):
+    """CHANGE-REQ regression: with choice none the structured call is dropped,
+    but the opener hold used to be gated on the same flag, so the raw XML
+    still rode the content deltas (finish stop, content contained the whole
+    <tool_call> block)."""
+    tok = _ByteTokenizer()
+    from tilerl.prompt import render_tool_call
+    reply = "I will run it.\n" + render_tool_call("Bash", {"command": "ls"})
+    app = create_app(_ScriptedEngine(tok, [reply]), tok)
+    with TestClient(app) as c:
+        r = c.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "run ls"}],
+            "tools": [{"type": "function", "function": {
+                "name": "Bash", "description": "run",
+                "parameters": {"type": "object",
+                               "properties": {"command": {"type": "string"}}}}}],
+            "tool_choice": "none", "stream": True, "max_tokens": 256,
+        })
+    assert r.status_code == 200, r.text
+    frames = [json.loads(ln[6:]) for ln in r.text.splitlines()
+              if ln.startswith("data: ") and ln[6:] != "[DONE]"]
+    content = "".join(
+        f["choices"][0].get("delta", {}).get("content") or "" for f in frames)
+    assert "<tool_call>" not in content
+    assert "<function=Bash>" not in content
+    assert "ls" not in content
+    assert content == "I will run it.", repr(content)
+    assert not [f for f in frames
+                if f["choices"][0].get("delta", {}).get("tool_calls")]
+    assert frames[-1]["choices"][0]["finish_reason"] == "stop"
+
+
 def test_chat_refuses_hosted_tools(tmp_path):
     """Finding 16: chat used to accept web_search-style hosted tools with a
     null name while responses already refused them."""

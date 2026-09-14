@@ -472,21 +472,24 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                         done = [safe.index(x) for x in stops if x in safe]
                         safe = (safe[:min(done)] if done
                                 else safe[:max(0, len(safe) - stop_hold)])
-                    if allow_tool_calls:
-                        cut = safe.find(call_open)
-                        if cut >= 0:
-                            safe = safe[:cut]
-                        else:
-                            for n in range(1, len(call_open)):
-                                if safe.endswith(call_open[:n]):
-                                    safe = safe[:-n]
-                                    break
-                    # When calls are possible, hold trailing whitespace: a call
-                    # follows its prose after "\n", and the non-stream parser
-                    # strips that prose, so the separator cannot reach a content
-                    # delta. A later non-ws char flushes it; a no-call reply
-                    # flushes the held tail in the terminal section.
-                    upto = len(safe.rstrip()) if allow_tool_calls else len(safe)
+                    # The opener hold runs UNCONDITIONALLY: even when
+                    # tool_choice:"none" discards the structured calls
+                    # (allow_tool_calls False), the raw XML bytes must not
+                    # reach a content delta. allow_tool_calls only decides
+                    # whether the held call is emitted as a tool_calls frame.
+                    cut = safe.find(call_open)
+                    if cut >= 0:
+                        safe = safe[:cut]
+                    else:
+                        for n in range(1, len(call_open)):
+                            if safe.endswith(call_open[:n]):
+                                safe = safe[:-n]
+                                break
+                    # Hold trailing whitespace unconditionally too: a call
+                    # follows its prose after "\n", and the parser strips that
+                    # prose, so the separator cannot reach a content delta on
+                    # the choice:none path either.
+                    upto = len(safe.rstrip())
                     if upto > sent:
                         yield "delta", {"content": safe[sent:upto]}, seen
                         sent = upto
@@ -632,6 +635,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         # to serve the other routes while one page streams.
         gen, end = _deltas(request_id, max_new, opened, stop_texts(req.stop),
                            tools, choice_name(req.tool_choice) != "none"), object()
+        calls = None
         try:
             while (item := await asyncio.to_thread(next, gen, end)) is not end:
                 kind, payload, completion = item

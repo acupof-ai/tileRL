@@ -452,6 +452,8 @@ def test_chat_stream_tool_calls_match_non_stream(oa, engine):
     assert none_non.choices[0].finish_reason == "stop"
     assert not [c for c in none_chunks
                 if c.choices[0].delta.tool_calls]
+    none_content = "".join(c.choices[0].delta.content or "" for c in none_chunks)
+    assert "<tool_call>" not in none_content and "Bash" not in none_content
     assert none_chunks[-1].choices[0].finish_reason == "stop"
 
 
