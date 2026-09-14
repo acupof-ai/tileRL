@@ -22,14 +22,12 @@ from .engine import (
 )
 from .kv_cache import (
     BLOCK_TOKENS,
-    DramSnapshots,
-    HostKvPages,
-    KvBootStore,
     LinearStatePool,
     NoPrefixStore,
     PagedKvPool,
     PrefixStore,
 )
+from .kv_tiers import DramSnapshots, HostKvPages, KvBootStore
 from .sparse_index import DEFAULT_SPARSE_K
 
 QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")

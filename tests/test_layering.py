@@ -12,8 +12,8 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "tilerl"
 
-# Lower rank = lower layer. Pre-placed future modules (build, decode_graph,
-# kv_tiers, bench) are absent from disk today and must not error while absent.
+# Lower rank = lower layer. Pre-placed future modules (decode_graph,
+# bench) are absent from disk today and must not error while absent.
 LAYERS: dict[str, frozenset[str]] = {
     "L0": frozenset({"precision", "config", "tokenizer", "testing"}),
     "L1": frozenset({"model", "tensor_parallel", "autograd"}),
@@ -128,7 +128,7 @@ def test_unlisted_module_is_flagged() -> None:
 
 
 def test_preplaced_absent_future_modules_do_not_error() -> None:
-    for future in ("decode_graph", "kv_tiers", "bench"):
+    for future in ("decode_graph", "bench"):
         assert future in _RANK and not (SRC / f"{future}.py").exists()
     # violations() over the real tree (which lacks them) is already green above.
 

@@ -24,7 +24,7 @@ from tilerl_kernels.backend import get_backend
 
 from tilerl.build import build_engine, build_model
 from tilerl.engine import SamplingParams
-from tilerl.kv_cache import ColdSsdFile
+from tilerl.kv_tiers import ColdSsdFile
 
 GIB = 1 << 30
 MIB = 1 << 20

@@ -29,12 +29,8 @@ from tilerl.engine import (
     _restrict,
     _step_seed,
 )
-from tilerl.kv_cache import (
-    DramSnapshots,
-    NoPrefixStore,
-    PagedKvPool,
-    PrefixStore,
-)
+from tilerl.kv_cache import NoPrefixStore, PagedKvPool, PrefixStore
+from tilerl.kv_tiers import DramSnapshots
 from tilerl.model import add_lora, build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
 from tilerl.testing import RefBackend

@@ -16,7 +16,8 @@ import os
 
 import torch
 
-from tilerl.kv_cache import BLOCK_TOKENS, HostKvPages, PagedKvPool
+from tilerl.kv_cache import BLOCK_TOKENS, PagedKvPool
+from tilerl.kv_tiers import HostKvPages
 from tilerl.testing import RefBackend
 
 
@@ -719,7 +720,7 @@ def test_an_unwritable_spill_path_refuses_to_construct(tmp_path):
     mid-decode. Red on main: the constructor never probed the path."""
     import pytest
 
-    from tilerl.kv_cache import SpillWriteError
+    from tilerl.kv_tiers import SpillWriteError
 
     ro = tmp_path / "ro"
     ro.mkdir()
@@ -735,7 +736,7 @@ def test_a_shared_spill_failure_stays_in_ram_and_disables_spill(tmp_path):
     """Shared prefix spill is a cache. If the sibling write raises, the page
     stays in RAM, shared SSD spill turns off for the process, and the caller
     never sees — private spill is untouched. Red on main: the OSError escaped."""
-    from tilerl.kv_cache import ColdSsdFile
+    from tilerl.kv_tiers import ColdSsdFile
 
     per = 2 * 2 * BLOCK_TOKENS
     cold = HostKvPages(budget_bytes=per * 2, ssd_path=str(tmp_path / "c.bin"))
@@ -758,7 +759,7 @@ def test_a_shared_spill_failure_stays_in_ram_and_disables_spill(tmp_path):
         # a PRIVATE page past the tiny budget still fails loudly (live row needs it)
         import pytest
 
-        from tilerl.kv_cache import SpillWriteError
+        from tilerl.kv_tiers import SpillWriteError
         big = {f"k{i}": torch.zeros(per) for i in range(4)}
         with pytest.raises(SpillWriteError):
             cold.hold(("r", 9), big, per * 3)
