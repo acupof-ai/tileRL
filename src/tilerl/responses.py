@@ -38,6 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .messages import _COMPLETION_TIMEOUT_S, _parse_tool_calls
 from .prompt import (
     await_completion,
+    bad_effort,
     choice_name,
     cut_at_stop,
     flatten_tools,
@@ -47,6 +48,7 @@ from .prompt import (
     render_tool_call_dict,
     sampling,
     split_think,
+    think_cap,
     thinking_enabled,
     tools_for_render,
     unknown_fields,
@@ -128,6 +130,7 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         return thinking_enabled(tokenizer, explicit, effort_none)
 
     def _run(req: ResponsesRequest, rid_box: list | None = None) -> dict[str, Any]:
+        effort_raw = (req.reasoning or {}).get("effort")
         unknown_fields(req)  # warns; no recorder on this route either
         refuse_unsupported(
             previous_response_id=req.previous_response_id,
@@ -135,6 +138,7 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
             # "disabled" is our behaviour already, so only "auto" is a lie.
             truncation=req.truncation not in (None, "disabled"),
             store=req.store,
+            reasoning_effort=bad_effort(effort_raw),
             tool_choice=unsupported_choice(req.tool_choice),
             **hosted_tool_fields(req.tools))
         thinking = _thinking(req)
@@ -148,7 +152,8 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         # route. `or` rather than `is not None`: 0 is not a usable cap here either.
         max_new = req.max_output_tokens or engine.room_for(len(input_ids))
         params = sampling(tokenizer, thinking, max_new,
-                          temperature=req.temperature, top_p=req.top_p, stop=req.stop)
+                          temperature=req.temperature, top_p=req.top_p,
+                          max_think_tokens=think_cap(effort_raw), stop=req.stop)
         rid = engine.submit(input_ids, params)
         if rid_box is not None:
             rid_box[0] = rid

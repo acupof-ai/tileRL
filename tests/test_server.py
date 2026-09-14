@@ -2387,3 +2387,95 @@ def test_a_successful_completion_never_cancels(path, body):
     r = client.post(path, json=body)
     assert r.status_code == 200, (path, r.status_code, r.text)
     assert engine.cancelled == [], "success must not cancel"
+
+
+EFFORT_PATHS = [
+    ("/v1/chat/completions",
+     {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "low"}),
+    ("/v1/messages",
+     {"max_tokens": 64, "messages": [{"role": "user", "content": "hi"}],
+      "output_config": {"effort": "high"}}),
+    ("/v1/responses",
+     {"input": "hi", "reasoning": {"effort": "none"}}),
+]
+
+
+@pytest.mark.parametrize(("path", "body", "cap"), [
+    ("/v1/chat/completions",
+     {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "low"}, 512),
+    ("/v1/messages",
+     {"max_tokens": 64, "messages": [{"role": "user", "content": "hi"}],
+      "output_config": {"effort": "high"}}, 8192),
+    # effort:"none" closes the think block in the prompt; sampling then
+    # carries no cap (sampling drops max_think_tokens when thinking is off),
+    # so the engine sees None on that route too.
+    ("/v1/responses",
+     {"input": "hi", "reasoning": {"effort": "none"}}, None),
+])
+def test_reasoning_effort_caps_the_engine_on_every_route(tmp_path, monkeypatch,
+                                                          path, body, cap):
+    """Finding 14: only chat mapped effort to the engine cap; messages/responses
+    wrote effort into prompt text and sampled with no max_think_tokens. All three
+    now use the shared prompt.think_cap mapping."""
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "r.jsonl"))
+    tok = _ByteTokenizer()
+    eng = _ScriptedEngine(tok, ["ok"])
+    post = dict(body)
+    if cap:
+        # A positive cap presupposes thinking is on; without an explicit switch
+        # the ByteTokenizer dev path leaves thinking bare and the cap off.
+        post["chat_template_kwargs"] = {"enable_thinking": True}
+    with TestClient(create_app(eng, tok)) as c:
+        r = c.post(path, json=post)
+    assert r.status_code == 200, (path, r.text)
+    assert eng.params[-1].max_think_tokens == cap, (path, eng.params[-1])
+
+
+@pytest.mark.parametrize(("path", "body"), EFFORT_PATHS)
+def test_no_effort_input_means_no_engine_cap(tmp_path, monkeypatch, path, body):
+    """An absent effort must reach sampling as max_think_tokens=None on every
+    route, not default to some budget."""
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "r.jsonl"))
+    body = {k: v for k, v in body.items()
+            if k not in ("reasoning_effort", "output_config", "reasoning")}
+    tok = _ByteTokenizer()
+    eng = _ScriptedEngine(tok, ["ok"])
+    with TestClient(create_app(eng, tok)) as c:
+        r = c.post(path, json=body)
+    assert r.status_code == 200, (path, r.text)
+    assert eng.params[-1].max_think_tokens is None, path
+
+
+@pytest.mark.parametrize(("path", "body"), EFFORT_PATHS)
+def test_unknown_effort_is_refused_on_every_route(tmp_path, monkeypatch, path, body):
+    """Same refusal everywhere: accepting an effort the engine does not cap
+    silently answered the request as if it applied."""
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "r.jsonl"))
+    body = dict(body)
+    if "reasoning_effort" in body:
+        body["reasoning_effort"] = "turbo"
+    elif "output_config" in body:
+        body["output_config"] = {"effort": "turbo"}
+    else:
+        body["reasoning"] = {"effort": "turbo"}
+    tok = _ByteTokenizer()
+    eng = _ScriptedEngine(tok, ["ok"])
+    with TestClient(create_app(eng, tok)) as c:
+        r = c.post(path, json=body)
+    assert r.status_code == 400, (path, r.status_code, r.text)
+    assert "reasoning_effort" in r.text, (path, r.text)
+    assert not eng.params, "a refused effort must never submit"
+
+
+def test_chat_effort_render_is_byte_identical():
+    """Finding 14 changes the chat CAP, not its prompt text: the chat
+    vocabulary (high) never matched the template's xhigh sentence, and low
+    always did. The shared mapping must not start rendering new prose."""
+    from tilerl.server import ChatMessage, _render_chat
+
+    high = _render_chat([ChatMessage(role="user", content="hi")],
+                         reasoning_effort="high")
+    assert "Reasoning effort is set to" not in high
+    low = _render_chat([ChatMessage(role="user", content="hi")],
+                        reasoning_effort="low")
+    assert "Reasoning effort is set to low." in low

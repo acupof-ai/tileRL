@@ -285,6 +285,34 @@ def _shape(v: Any) -> str:
     return type(v).__name__
 
 
+#: reasoning_effort -> engine cap on <think> tokens. "none" (0) switches
+#: thinking off in the prompt. The prompt TEXT vocabulary only knows
+#: xhigh/medium/low; xhigh and max share the top cap with high -- the engine
+#: budget has no higher step, and the template sentence is the route's job.
+EFFORT_CAPS = {"none": 0, "minimal": 128, "low": 512, "medium": 2048,
+               "high": 8192, "xhigh": 8192, "max": 8192}
+
+
+def think_cap(effort: str | None) -> int | None:
+    """The engine's <think> token cap for an effort value; None when absent."""
+    if not effort:
+        return None
+    return EFFORT_CAPS.get(effort.lower())
+
+
+def bad_effort(effort: str | None) -> bool:
+    """An effort string outside every route's shared vocabulary."""
+    return bool(effort) and effort.lower() not in EFFORT_CAPS
+
+
+def effort_text(effort: str | None) -> str | None:
+    """The prompt-text effort name: high/max are aliases of xhigh, which is
+    the only instruction sentence the template has beyond low."""
+    if not effort:
+        return None
+    return "xhigh" if effort.lower() in ("high", "max", "xhigh") else effort.lower()
+
+
 def choice_name(choice: Any) -> str | None:
     """A ``tool_choice`` value's type name, either route's spelling.
 
