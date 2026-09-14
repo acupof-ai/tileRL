@@ -2438,9 +2438,9 @@ def test_a_padded_decode_tick_needs_a_spare_state_slot():
     Pure bookkeeping, so it runs on the CPU target where no graph is ever captured."""
     from pathlib import Path
 
-    from tilerl.engine import _GRAPH_BUCKETS
+    from tilerl.decode_graph import GRAPH_BUCKETS
     def bucket(rows: int, max_batch: int) -> int:
-        b = next((c for c in _GRAPH_BUCKETS if c >= rows), None)
+        b = next((c for c in GRAPH_BUCKETS if c >= rows), None)
         return rows if b is None or max_batch < b else b
 
     # A batch draining one request at a time hits n = max_batch-1, which pads at 4.
