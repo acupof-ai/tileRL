@@ -166,6 +166,148 @@ def test_models(client, model_id):
     assert isinstance(model_id, str) and model_id
 
 
+def test_streaming_tool_call_is_structured_at_the_terminal_frame(tmp_path):
+    """Finding 15: the stream used to carry raw <tool_call> XML in content and
+    finish "length" while the non-stream route structured the same reply. The
+    XML is held across every content frame, then emitted as tool_calls deltas
+    byte-identical to the non-stream message, with finish tool_calls."""
+    tok = _ByteTokenizer()
+    from tilerl.prompt import render_tool_call
+    reply = "I will run it.\n" + render_tool_call("Bash", {"command": "ls"})
+    app = create_app(_ScriptedEngine(tok, [reply]), tok)
+    with TestClient(app) as c:
+        r = c.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "run ls"}],
+            "tools": [{"type": "function", "function": {
+                "name": "Bash", "description": "run",
+                "parameters": {"type": "object",
+                               "properties": {"command": {"type": "string"}}}}}],
+            "stream": True, "max_tokens": 256,
+        })
+    assert r.status_code == 200, r.text
+    frames = [json.loads(ln[6:]) for ln in r.text.splitlines()
+              if ln.startswith("data: ") and ln[6:] != "[DONE]"]
+    content = "".join(
+        (f["choices"][0].get("delta", {}).get("content") or "") for f in frames)
+    assert "<tool_call>" not in content and "Bash" not in content, content
+    assert content == "I will run it.", repr(content)
+    tc_frames = [f for f in frames
+                 if f["choices"][0].get("delta", {}).get("tool_calls")]
+    assert len(tc_frames) == 1, [f["choices"][0]["delta"] for f in frames]
+    tc = tc_frames[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert tc == {"index": 0, "id": "call_1_0", "type": "function",
+                 "function": {"name": "Bash", "arguments": '{"command": "ls"}'}}, tc
+    terminal = frames[-1]["choices"][0]
+    assert terminal["delta"] == {} and terminal["finish_reason"] == "tool_calls"
+    # The non-stream reply for the SAME canned text must equal the stream frame.
+    app2 = create_app(_ScriptedEngine(tok, [reply]), tok)
+    with TestClient(app2) as c:
+        body = c.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "run ls"}],
+            "tools": [{"type": "function", "function": {
+                "name": "Bash", "description": "run",
+                "parameters": {"type": "object",
+                               "properties": {"command": {"type": "string"}}}}}],
+            "max_tokens": 256,
+        }).json()
+    nonstream = body["choices"][0]["message"]["tool_calls"][0]
+    assert tc["id"] == nonstream["id"]
+    assert tc["function"] == nonstream["function"]
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_tool_choice_none_suppresses_render_and_output(tmp_path):
+    """Finding 13 on chat: choice none must remove the tools block from the
+    prompt AND discard calls parsed from a reply that calls anyway."""
+    tok = _ByteTokenizer()
+    seen = {}
+    from tilerl.prompt import render_tool_call
+    reply = "I will run it.\n" + render_tool_call("Bash", {"command": "ls"})
+
+    class _Cap(_ScriptedEngine):
+        def submit(self, input_ids, params=None):
+            seen["prompt"] = self._tok.decode(list(input_ids))
+            return super().submit(input_ids, params)
+
+    app = create_app(_Cap(tok, [reply]), tok)
+    with TestClient(app) as c:
+        r = c.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "run ls"}],
+            "tools": [{"type": "function", "function": {"name": "Bash",
+                       "description": "run",
+                       "parameters": {"type": "object",
+                                      "properties": {"command": {"type": "string"}}}}}],
+            "tool_choice": "none", "max_tokens": 256,
+        })
+    assert "<tools>" not in seen["prompt"] and "Bash" not in seen["prompt"]
+    ch = r.json()["choices"][0]
+    assert ch["finish_reason"] == "stop"
+    assert ch["message"]["tool_calls"] is None
+    # The shared parser strips the recognized XML; suppressing the calls
+    # leaves the prose before the call as ordinary content (the stream keeps
+    # the separating newline, the non-stream reply trims it).
+    assert "<tool_call>" not in ch["message"]["content"]
+    assert ch["message"]["content"] == "I will run it."
+
+
+def test_chat_refuses_hosted_tools(tmp_path):
+    """Finding 16: chat used to accept web_search-style hosted tools with a
+    null name while responses already refused them."""
+    tok = _ByteTokenizer()
+    app = create_app(_ScriptedEngine(tok, ["ok"]), tok)
+    with TestClient(app) as c:
+        r = c.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "web_search"}],
+        })
+    assert r.status_code == 400, r.text
+    assert "web_search" in r.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(("path", "body_extra"), [
+    ("/v1/messages", {"max_tokens": 256,
+                       "messages": [{"role": "user", "content": "run ls"}],
+                       "tools": [{"name": "Bash", "description": "run",
+                                  "input_schema": {"properties": {
+                                      "command": {"type": "string"}}}}]}),
+    ("/v1/responses", {"max_output_tokens": 256, "input": [{"type": "message", "role": "user",
+                                 "content": [{"type": "input_text",
+                                              "text": "run ls"}]}],
+                       "tools": [{"type": "function", "name": "Bash",
+                                  "description": "run",
+                                  "parameters": {"properties": {
+                                      "command": {"type": "string"}}}}]}),
+])
+def test_tool_choice_none_suppresses_each_route(tmp_path, monkeypatch, path, body_extra):
+    """Refinement 4: choice none suppresses calls at output on messages and
+    responses too, not only chat (render suppression covered by the chat
+    gate)."""
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "r.jsonl"))
+    tok = _ByteTokenizer()
+    from tilerl.prompt import render_tool_call
+    reply = "</think>\n\n" + render_tool_call("Bash", {"command": "ls"})
+
+    class _BigRoom(_ScriptedEngine):
+        # The messages route clamps max_tokens to room_for (64 by default); the
+        # reply plus request exceeds it and would end "max_tokens" for the
+        # wrong reason.
+        def room_for(self, prompt_tokens):
+            return 1024
+
+    app = create_app(_BigRoom(tok, [reply, reply]), tok)
+    with TestClient(app) as c:
+        r = c.post(path, json={**body_extra, "tool_choice": "none"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    blocks = body.get("content") or body.get("output")
+    kinds = [b.get("type") for b in blocks]
+    assert "tool_use" not in kinds and "function_call" not in kinds, kinds
+    assert body.get("stop_reason") in (None, "end_turn") and body.get("stop_reason") != "tool_use"
+    # responses keeps a message item; messages may return an empty content list.
+    if "output" in body:
+        assert any(b.get("type") == "message" for b in blocks)
+
+
 def test_render_chat_is_chatml():
     """The render half must agree with the stop half: _HfTokenizerAdapter
     stops on <|im_end|>, so the prompt must be ChatML (the old plain-text

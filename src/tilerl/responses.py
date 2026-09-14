@@ -38,14 +38,17 @@ from pydantic import BaseModel, ConfigDict, Field
 from .messages import _COMPLETION_TIMEOUT_S, _parse_tool_calls
 from .prompt import (
     await_completion,
+    choice_name,
     cut_at_stop,
     flatten_tools,
+    hosted_tool_fields,
     refuse_unsupported,
     render_prompt,
     render_tool_call_dict,
     sampling,
     split_think,
     thinking_enabled,
+    tools_for_render,
     unknown_fields,
     unsupported_choice,
 )
@@ -113,21 +116,6 @@ def _to_messages(inp: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-#: Tool types that are the provider's to run, not ours. Declaring one means the
-#: client expects the SERVER to perform the search or execution.
-_HOSTED = ("file_search", "web_search", "web_search_preview", "computer",
-           "computer_use_preview", "code_interpreter", "image_generation",
-           "local_shell", "mcp", "custom", "apply_patch", "shell")
-
-
-def _hosted_tools(tools: list[dict[str, Any]] | None) -> dict[str, Any]:
-    """The hosted tool types present in a request, as refusal kwargs."""
-    kinds = {t.get("type") for t in tools or []} & set(_HOSTED)
-    return {f"tools[type={k}]": True for k in sorted(kinds)}
-
-
-
-
 def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
                     model_name: str) -> FastAPI:
     """Add POST /v1/responses to an existing app, sharing its engine."""
@@ -148,9 +136,9 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
             truncation=req.truncation not in (None, "disabled"),
             store=req.store,
             tool_choice=unsupported_choice(req.tool_choice),
-            **_hosted_tools(req.tools))
+            **hosted_tool_fields(req.tools))
         thinking = _thinking(req)
-        tools = flatten_tools(req.tools)
+        tools = flatten_tools(tools_for_render(req.tools, req.tool_choice))
         prompt = render_prompt(_to_messages(req.input), req.instructions, tools,
                                thinking, (req.reasoning or {}).get("effort"))
         input_ids = tokenizer.encode(prompt)
@@ -168,6 +156,8 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         reasoning, text = split_think(tokenizer.decode(out), bool(thinking))
         stopped = engine.stop_text(rid)
         text, calls = _parse_tool_calls(cut_at_stop(text, stopped), tools)
+        if choice_name(req.tool_choice) == "none":
+            calls = []
         return _body(rid, req, model_name, reasoning, text, calls,
                      len(input_ids), len(out), params.max_new_tokens, stopped=stopped)
 

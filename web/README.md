@@ -14,8 +14,10 @@ one terminal frame last.
 
 - `{"t":"delta","reasoning_content"?:string,"content"?:string}` — 0..N; reasoning frames all
   precede content frames.
-- `{"t":"done","finish_reason":string,"usage":{prompt_tokens,completion_tokens}}` — success
-  terminal.
+- `{"t":"tool_calls","tool_calls":Array<{id,type:"function",name,arguments:string}>}` — 0..1,
+  emitted before the terminal frame; 1 entry per call, additive to the contract.
+- `{"t":"done","finish_reason":string,"tool_calls"?:Array<…>,"usage":{prompt_tokens,completion_tokens}}`
+  — success terminal; `tool_calls` present only when finish_reason is "tool_calls".
 - `{"t":"error","message":string}` — failure terminal.
 
 A frame that fails shape validation is dropped (`console.warn`), never fatal.

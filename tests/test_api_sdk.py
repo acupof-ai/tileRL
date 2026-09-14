@@ -405,6 +405,56 @@ def test_responses_tool_call_and_replay(oa, engine):
     assert second.output_text == REPLY
 
 
+def test_chat_stream_tool_calls_match_non_stream(oa, engine):
+    """Finding 15 through the official SDK: a streamed call accumulates into the
+    same tool_calls the non-stream route returns for the same canned reply, with
+    no raw XML in a content delta and finish_reason tool_calls."""
+    tools = [{"type": "function", "function": {
+        "name": "Bash", "description": "run a command",
+        "parameters": {"type": "object",
+                       "properties": {"command": {"type": "string"}}}}}]
+    common = dict(model="tilerl", messages=[{"role": "user", "content": "run ls"}],
+                  tools=tools, extra_body=THINKING_ON)
+    non = oa.chat.completions.create(**common)
+    ns_calls = non.choices[0].message.tool_calls
+    chunks = list(oa.chat.completions.create(**common, stream=True))
+    streamed = []
+    contents = []
+    for ch in chunks:
+        d = ch.choices[0].delta
+        contents.append(d.content or "")
+        if d.tool_calls:
+            streamed += d.tool_calls
+    assert "".join(contents) == "I will run it.", contents
+    finish = chunks[-1].choices[0].finish_reason
+    assert finish == "tool_calls", finish
+    assert len(streamed) == len(ns_calls) == 1
+    st, ns = streamed[0], ns_calls[0]
+    import re as _re
+    # The id carries the per-request rid, so two separate requests necessarily
+    # differ there; the shared contract is index/id shape/name/arguments.
+    assert st.index == 0 and _re.fullmatch(r"call_\d+_0", st.id)
+    assert st.function.name == ns.function.name == "Bash"
+    # Byte-identical arguments, including json.dumps' space after the colon.
+    assert st.function.arguments == ns.function.arguments == '{"command": "ls"}'
+    # The same turn twice with choice none: render suppressed and no call out
+    # on EITHER path, so the field cannot be honored on one and lie on the other.
+    # max_tokens 256: _ScriptedEngine.room_for is 64, shorter than the canned call.
+    before = len(engine.prompts)
+    none_non = oa.chat.completions.create(**common, tool_choice="none",
+                                          max_tokens=256)
+    none_chunks = list(oa.chat.completions.create(**common, stream=True,
+                                                   tool_choice="none",
+                                                   max_tokens=256))
+    prompt = engine.prompts[before]
+    assert "<tools>" not in prompt and "Bash" not in prompt
+    assert none_non.choices[0].message.tool_calls is None
+    assert none_non.choices[0].finish_reason == "stop"
+    assert not [c for c in none_chunks
+                if c.choices[0].delta.tool_calls]
+    assert none_chunks[-1].choices[0].finish_reason == "stop"
+
+
 def test_chat_tool_call_and_tool_message_replay(oa, engine):
     """Finding 11 through the real OpenAI SDK: the assistant.tool_calls and
     the following role:"tool" message must replay in the checkpoint's XML,
