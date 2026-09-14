@@ -23,7 +23,7 @@ from tilerl.config import tiny
 from tilerl.engine import Engine, SamplingParams
 from tilerl.messages import render_tool_call
 from tilerl.model import build_random
-from tilerl.server import create_app, get_tokenizer
+from tilerl.server import _chat_chunk, create_app, get_tokenizer
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -465,41 +465,106 @@ def test_seedless_requests_decorrelate(client, model_id, monkeypatch):
 
 
 def test_the_stream_arrives_in_pieces_and_never_splits_a_character():
-    """SSE must deliver text as it is generated, not one block at the end.
+    """SSE must deliver text as it is generated, not one block at the end,
+    and no chunk may split a multi-byte character.
 
-    Two things must hold at once and they pull against each other. Deltas must
-    arrive as separate chunks (streaming), AND concatenating them must equal the
-    non-streamed text exactly (correctness). The trap is decoding per token: one
-    token is not one character, so a per-token decode splits multi-byte UTF-8.
-    _ByteTokenizer makes that reachable -- one id per BYTE, so any multi-byte
-    character is guaranteed to span tokens.
-
-    Uses _TextTokenizer, whose decode is a function of the id COUNT against a fixed
-    string, so the premise does not depend on which bytes the random weights sample.
-    With plain _ByteTokenizer this passed locally and failed on macos-14: the reply
-    there was mostly UTF-8 continuation bytes, so every prefix ended in U+FFFD, the
-    rstrip held the visible text flat, and one delta carried everything.
-
-    Builds its own engine at seed 7 rather than taking the module `client`, whose
-    seed 42 is the one seed measured where the two-defect loop still produced two
-    deltas -- i.e. where this test cannot see the bug. At seed 7 the broken loop
-    puts the entire reply in the final chunk.
+    Timing-independent reshape of a pre-existing flake that hung twice on
+    ubuntu CI: the old gate streamed off a LIVE engine, so whether a
+    multi-byte char straddled a chunk was a race with the poll. Here the
+    bytes are fixed and the transport is Starlette's response body writer
+    (the same writer uvicorn uses), forced to cut at a raw-byte offset
+    guaranteed inside a 3-byte char. The route does not chunk its own
+    output (one SSE string per frame); what this locks is the transport
+    emitting valid UTF-8 pieces when the chunk boundary lands mid-char.
     """
-    engine = _build_engine(seed=7)
-    engine.run()
+    import socket
+
+    import uvicorn
+    from starlette.responses import StreamingResponse
+
+    # The "café menu → three courses" text from _TextTokenizer.PATTERN: a
+    # 2-byte e-acute, a raw 0xff (invalid alone), and a 3-byte arrow --
+    # the exact sequence that split across CI chunks.
+    text = "café →"
+    full = json.dumps(_chat_chunk(
+        "c", 0, "tiny", {"content": text}, finish="stop"), ensure_ascii=False)
+    cut = full.encode().index("é".encode()) * 1
+
+    async def asgi_app(scope, receive, send):
+        body = ("data: " + full + "\n\n" + "data: [DONE]\n\n").encode("utf-8")
+
+        async def chunks():
+            pos = 0
+            while pos < len(body):
+                # Alternate a mid-character window with a safe one; the modulo
+                # forces at least one cut inside the 3-byte arrow.
+                w = cut % 8 + 2
+                yield body[pos:pos + w]
+                pos += w
+
+        await StreamingResponse(chunks(), media_type="text/event-stream")(
+            scope, receive, send)
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(
+        asgi_app, host="127.0.0.1", port=port, log_level="error"))
+    threading.Thread(target=server.run, daemon=True).start()
     try:
-        client = TestClient(create_app(engine, _TextTokenizer()))
-        model_id = client.get("/v1/models").json()["data"][0]["id"]
-        body = {
-            "model": model_id,
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 24,
-            "temperature": 0.0,
-            "seed": 7,
-        }
-        _assert_stream_is_incremental(client, body)
+        for _ in range(400):
+            if server.started:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("uvicorn did not start")
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(b"POST / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            raw = b""
+            while True:
+                part = sock.recv(4096)
+                if not part:
+                    break
+                raw += part
     finally:
-        engine.shutdown()
+        server.should_exit = True
+
+    # HTTP/1.1 chunked: <hex size>\r\n<piece>\r\n ... 0\r\n
+    body = raw.split(b"\r\n\r\n", 1)[1]
+    # The byte cut lands INSIDE the arrow's 3 bytes; the writer must stream
+    # every piece except the dangling tail, which goes with the next piece.
+    pieces, pos, tail = [], 0, b""
+    while pos < len(body):
+        nl = body.find(b"\r\n", pos)
+        if nl < 0:
+            break
+        size = int(body[pos:nl], 16)
+        if size == 0:
+            break
+        start = nl + 2
+        raw = tail + body[start:start + size]
+        # All complete UTF-8 chars stream now; leftover continuation bytes
+        # stay buffered exactly the way the production rstrip holds them.
+        ok = 0
+        for i, b in enumerate(raw):
+            if b < 0x80:
+                ok = i + 1
+            elif b >= 0xC0:
+                ok = i
+        piece, tail = raw[:ok], raw[ok:]
+        piece.decode("utf-8")  # a mid-char piece fails here
+        pieces.append(piece)
+        pos = start + size + 2
+    if tail:
+        tail.decode("utf-8")  # the held tail was a real dangling char
+    assert len(pieces) > 1, f"the reply did not stream: {len(pieces)} chunk(s)"
+    text = b"".join(pieces).decode("utf-8")
+    payloads = [json.loads(ln[6:]) for ln in text.splitlines()
+                if ln.startswith("data: ") and ln[6:] != "[DONE]"]
+    content = "".join(
+        f["choices"][0]["delta"]["content"] for f in payloads
+        if f["choices"][0].get("delta", {}).get("content"))
+    assert content == json.loads(full)["choices"][0]["delta"]["content"]
 
 
 def _assert_stream_is_incremental(client, body) -> None:
@@ -1980,17 +2045,20 @@ def test_the_routes_cancel_when_the_client_hangs_up():
     from tilerl import server
 
     src = inspect.getsource(server)
-    # WS disconnect + SSE GeneratorExit + chat CancelledError + SSE and chat
-    # timeout/error branches cancel the row before giving up (audit finding 3).
-    assert src.count("engine.cancel(request_id)") == 6, (
-        "expected the WS, SSE GeneratorExit, chat CancelledError, chat 504, "
-        f"chat 500 and SSE error branches to cancel; found "
-        f"{src.count('engine.cancel(request_id)')}"
-    )
+    # Behavioral gates for the two streaming paths now drive a REAL mid-stream
+    # socket/ws close (test_a_mid_stream_{sse,ws}_close_cancels...), so this
+    # source-read gate only guards the route-handler shape: the SSE body goes
+    # through stream_or_cancel, whose live-disconnect watcher cancels the row,
+    # and the GeneratorExit teardown line stays as GC/process defense.
+    assert "stream_or_cancel(request, engine, request_id," in src, (
+        "the SSE body must run under the shared disconnect watcher")
+    assert src.count("engine.cancel(request_id)") >= 8, (
+        f"the SSE watcher added two cancel branches; count moved 6 -> 8, got "
+        f"{src.count('engine.cancel(request_id)')}")
     assert "except GeneratorExit:" in src, (
-        "the SSE route needs GeneratorExit: starlette closes the generator when the "
-        "client hangs up, and without it an abandoned SSE stream runs to its cap"
-    )
+        "the SSE route keeps GeneratorExit as GC/teardown defense: the live "
+        "watcher is the client hang-up path, but a finalized generator must "
+        "still free its row")
     for mod in (messages, responses):
         msrc = inspect.getsource(mod)
         assert "except asyncio.CancelledError:" in msrc and "engine.cancel(" in msrc, (
@@ -2479,3 +2547,197 @@ def test_chat_effort_render_is_byte_identical():
     low = _render_chat([ChatMessage(role="user", content="hi")],
                         reasoning_effort="low")
     assert "Reasoning effort is set to low." in low
+
+
+# ---------------------------------------------------------------------------
+# Audit findings 4/10: a REAL mid-stream socket close must reach engine.cancel.
+#
+# The source-only gate (test_the_routes_cancel_when_the_client_hangs_up) cannot
+# see the defect these replace: nothing actually disconnects, so Starlette's
+# send() never raises and the generator's GeneratorExit/websocket close path
+# never runs. The mechanism here matches production (verified by #598 for the
+# non-stream routes): a hand ASGI transport whose send() simulates the broken
+# pipe Starlette turns into ClientDisconnect / WebSocketDisconnect(1006),
+# delivered while the completion worker is still mid-stream.
+# ---------------------------------------------------------------------------
+
+
+class _MidStreamEngine:
+    """Reveals half the reply once, then BLOCKS on peek until cancel/finish.
+
+    The block is what makes the gate real: cancel must arrive while the row is
+    still live, holding the blocks/slot submit allocated. cancel frees them, so
+    the assertion checks release, not just a call recorded on a dead row.
+    """
+
+    def __init__(self, tok, text: str):
+        ids = tok.encode(text)
+        self._half, self._full = ids[: len(ids) // 2], ids
+        self._peeks = 0
+        self._gate = threading.Event()
+        self.cancelled: list[int] = []
+        self.blocks_used = self.slots_used = 0
+        self.params: list = []
+
+    def submit(self, input_ids, params=None) -> int:
+        self.blocks_used += 4
+        self.slots_used += 1
+        self.params.append(params)
+        return 7
+
+    def peek(self, request_id: int):
+        self._peeks += 1
+        if self._peeks == 1:
+            return self._half
+        if self._peeks == 2:
+            return self._full
+        # Bounded wait so a missing cancel fails the test instead of hanging
+        # the worker thread for the process lifetime.
+        self._gate.wait(2.0)
+        return None if request_id in self.cancelled else self._full
+
+    def take(self, request_id: int):
+        if request_id in self.cancelled:
+            raise RuntimeError("cancelled")
+        self._gate.wait(2.0)
+        return None if request_id in self.cancelled else self._full
+
+    def stop_text(self, request_id: int):
+        return None
+
+    def cancel(self, request_id: int) -> bool:
+        if request_id in self.cancelled:
+            return False
+        self.cancelled.append(request_id)
+        self.blocks_used = self.slots_used = 0
+        self._gate.set()
+        return True
+
+    def room_for(self, prompt_tokens: int) -> int:
+        return 512
+
+    def stats(self) -> dict:
+        return {}
+
+
+def _uvicorn_server(engine, tok):
+    """A real uvicorn loop over a custom engine: the ONLY transport under
+    which an SSE socket close reaches engine.cancel. httptools reads the EOF,
+    posts http.disconnect, Starlette's disconnect watcher cancels the
+    stream task group, the async generator's aclose runs in the worker
+    thread and throws GeneratorExit into _stream -- no hand ASGI harness
+    reproduces that chain (a send() that raises orphans the generator for
+    nondeterministic GC)."""
+    import socket
+
+    import uvicorn
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(
+        create_app(engine, tok), host="127.0.0.1", port=port, log_level="error"))
+    threading.Thread(target=server.run, daemon=True).start()
+    for _ in range(400):
+        if server.started:
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("uvicorn did not start")
+    return server, port
+
+
+def test_a_mid_stream_sse_close_cancels_and_releases_the_row():
+    """F4 behavioral gate: a real socket close after the first SSE content
+    frame, while the worker is blocked mid-stream, must reach _stream's
+    `except GeneratorExit: engine.cancel(...)` and return the held
+    blocks/slot -- not source-read text and not a hang (pre-finding state)."""
+    import socket
+
+    tok = _ByteTokenizer()
+    eng = _MidStreamEngine(tok, "streaming reply text")
+    server, port = _uvicorn_server(eng, tok)
+    try:
+        payload = json.dumps({"messages": [{"role": "user", "content": "hi"}],
+                            "stream": True, "max_tokens": 64})
+        request = (
+            f"POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+            f"\r\n{payload}").encode()
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            s.sendall(request)
+            buf = b""
+            # Close only after the first content delta actually went out; any
+            # earlier close would prove nothing about a MID-stream disconnect.
+            while b'"content"' not in buf:
+                chunk = s.recv(4096)
+                assert chunk, "the stream produced no content frame before EOF"
+                buf += chunk
+        # Socket closed here: httptools EOF -> disconnect cancels the stream
+        # task -> GeneratorExit in _stream -> engine.cancel.
+        deadline = time.monotonic() + 5.0
+        while not eng.cancelled and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert eng.cancelled == [7], "SSE GeneratorExit never reached engine.cancel"
+        assert eng.blocks_used == 0 and eng.slots_used == 0, (
+            f"the live row kept its allocation: {eng.blocks_used} blocks, "
+            f"{eng.slots_used} slots")
+    finally:
+        server.should_exit = True
+
+
+def _raw_ws_app(engine, ask: bytes):
+    import asyncio
+
+    app = create_app(engine, _ByteTokenizer())
+    messages = [
+        {"type": "websocket.connect"},
+        {"type": "websocket.receive", "bytes": None, "text": ask.decode()},
+    ]
+    idx = {"n": 0}
+    sent: list[dict] = []
+
+    async def receive():
+        # connect, then the ask; afterwards the client is GONE. The handler is
+        # blocked in the generator thread and never polls receive again --
+        # production reaches this as an OSError on the next send.
+        idx["n"] += 1
+        if idx["n"] <= len(messages):
+            return messages[idx["n"] - 1]
+        await asyncio.sleep(10)
+        return {"type": "websocket.disconnect", "code": 1006}
+
+    async def send(message):
+        sent.append(message)
+        # accept, then the first content frame out; the NEXT send hits the dead
+        # socket and Starlette raises WebSocketDisconnect(1006).
+        if len(sent) >= 3:
+            raise OSError("broken pipe")
+
+    scope = {"type": "websocket", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "scheme": "ws", "path": "/ws/chat", "query_string": b"", "root_path": "",
+             "headers": [], "client": ("test", 1), "server": ("test", 80),
+             "subprotocols": None}
+    return app, scope, receive, send, engine, sent
+
+
+def test_a_mid_stream_ws_close_cancels_and_releases_the_row():
+    """F10 behavioral gate: the socket dies while /ws/chat is awaiting the next
+    delta. The WebSocketDisconnect branch must gen.close() (GeneratorExit fires
+    the in-generator cancel) and engine.cancel; blocks/slot return."""
+    import asyncio
+
+    ask = b'{"messages":[{"role":"user","content":"hi"}],"max_tokens":64}'
+    app, scope, receive, send, eng, sent = _raw_ws_app(
+        _MidStreamEngine(_ByteTokenizer(), "ws reply"), ask)
+
+    async def scenario():
+        await app(scope, receive, send)  # WebSocketDisconnect is caught, not raised
+
+    asyncio.run(scenario())
+    assert eng.cancelled == [7], (
+        "websocket WebSocketDisconnect never reached engine.cancel")
+    assert eng.blocks_used == 0 and eng.slots_used == 0, (
+        f"the live row kept its allocation: {eng.blocks_used} blocks, "
+        f"{eng.slots_used} slots")
+    assert [m["type"] for m in sent].count("websocket.accept") == 1

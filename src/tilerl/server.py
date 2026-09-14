@@ -188,6 +188,45 @@ async def await_or_cancel(request: Request, engine: Any, rid_box: list,
             worker.add_done_callback(lambda t: t.exception())
 
 
+_STREAM_END = object()
+
+
+async def stream_or_cancel(request: Request, engine: Any, request_id: int,
+                            body: Any):
+    """The SSE body under the same disconnect watch as the non-stream routes.
+
+    Iterating the sync generator through ``to_thread(next, ...)`` leaves an
+    in-flight worker anyio cannot interrupt: a sync call already running in the
+    worker thread is not cancelled, and iterate_in_threadpool never acloses the
+    sync generator, so a socket hang-up used to leave the row generating -- the
+    _stream GeneratorExit branch only fires at GC/teardown. Each chunk is fetched
+    one at a time; a fresh is_disconnected() poll runs while the fetch blocks,
+    and disconnect cancels the row and stops the body. A normal completion wins
+    the race: it returns before a disconnect tick can cancel the finished row,
+    and cancel() on a finished id is a no-op."""
+    worker = asyncio.ensure_future(asyncio.to_thread(next, body, _STREAM_END))
+    worker.add_done_callback(lambda t: t.exception())
+    while True:
+        try:
+            done, _ = await asyncio.wait({worker}, timeout=_DISCONNECT_POLL_S)
+        except asyncio.CancelledError:
+            # Response teardown while a fetch is in flight: same outcome as a
+            # client hang-up.
+            engine.cancel(request_id)
+            raise
+        if worker in done:
+            item = worker.result()
+            if item is _STREAM_END:
+                return
+            yield item
+            worker = asyncio.ensure_future(
+                asyncio.to_thread(next, body, _STREAM_END))
+            worker.add_done_callback(lambda t: t.exception())
+        elif await request.is_disconnected():
+            engine.cancel(request_id)
+            return
+
+
 # ---------------------------------------------------------------------------
 # App factory.
 # ---------------------------------------------------------------------------
@@ -316,10 +355,11 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
         if req.stream:
             return StreamingResponse(
-                _stream(request_id, max_new, prompt_tokens, opened, bool(
-                    (req.stream_options or {}).get("include_usage")
-                ), stop_texts(req.stop), tools,
-                choice_name(req.tool_choice) != "none"),
+                stream_or_cancel(request, engine, request_id,
+                                 _stream(request_id, max_new, prompt_tokens, opened, bool(
+                                     (req.stream_options or {}).get("include_usage")
+                                 ), stop_texts(req.stop), tools,
+                                 choice_name(req.tool_choice) != "none")),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -584,7 +624,10 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                     yield _sse(_chat_chunk(chunk_id, created, model_name, {},
                                            finish=payload))
         except GeneratorExit:
-            # GeneratorExit = the client hung up; engine.cancel, as in ws_chat.
+            # Defense-in-depth only: the live disconnect path is stream_or_cancel
+            # above. This fires when the abandoned sync generator is finalized at
+            # GC/process teardown (anyio cannot interrupt the in-flight thread
+            # call itself), and still must free the row then.
             engine.cancel(request_id)
             raise
         # A final usage-only chunk, OpenAI's include_usage shape. Without it a client can
