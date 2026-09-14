@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import functools
 import hashlib
 import json
 import os
@@ -245,7 +244,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                     "error: --record-residency is cuda-only (device residency belongs to "
                     "the card; the CPU tiny cell has no measured peak). Run on the card: "
                     "TILERL_TARGET=cuda tilerl serve --dry-run --record-residency")
-            from .memory import append_residency, residency_row
+            from .ledger import append_residency, residency_row
 
             by = {r["owner"]: r["derived"] for r in table if r["kind"] == "allocation"}
             static = sum(v for k, v in by.items() if k != "transient")
@@ -892,18 +891,6 @@ def _refuse_short_rollouts(mean_len: float | None, cap: int, allow: bool = False
     )
 
 
-@functools.lru_cache(maxsize=1)
-def _benchrec():
-    """The ruler's validator/store, loaded from scripts/ (same bridge as cmd_bench)."""
-    import importlib.util
-
-    p = Path(__file__).resolve().parents[2] / "scripts" / "benchrec.py"
-    spec = importlib.util.spec_from_file_location("benchrec", p)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def _emit_eval_records(correct: int, total: int, ntok: int, token_lens: list,
                        steps: int, backend) -> None:
     """Append the arm's two operands to the bench store. A training run with
@@ -913,6 +900,7 @@ def _emit_eval_records(correct: int, total: int, ntok: int, token_lens: list,
     stored ratio gets one chance to drift from its operands."""
     import math
 
+    from .ledger import _benchrec
     benchrec = _benchrec()
     p = correct / total
     vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")

@@ -32,7 +32,7 @@ from torch import Tensor
 
 from . import kv_cache
 from .kv_cache import BLOCK_TOKENS
-from .sparse_index import WINDOW_PAGES, index_source_groups
+from .sparse_index import WINDOW_PAGES, group_map
 
 #: block-table ids are logical+1 so selected logical page 0 is not the 0 pad.
 _SENTINEL = 1
@@ -51,21 +51,6 @@ _SCORE_PAGE_CHUNK = 64
 SPARSE_REFRESH_TICKS = 8
 
 
-def group_map(cfg) -> tuple[list[int], dict[int, int]]:
-    """Full-attn PLANE indices -> (source planes, plane -> group). A group's
-    layers reuse the source layer's selection. Tiny (<4 full-attn): each layer
-    is its own source/group."""
-    n = len(cfg.full_attn_layers)
-    if n >= 4:
-        _, groups = index_source_groups(n)
-    else:
-        groups = [[j] for j in range(n)]
-    src, of = [], {}
-    for g, idxs in enumerate(groups):
-        src.append(idxs[0])
-        for j in idxs:
-            of[j] = g
-    return src, of
 
 
 def page_bounds_one(k_page: Tensor) -> Tensor:

@@ -22,9 +22,8 @@ from safetensors.torch import save_file
 from tilerl_kernels.backend import get_backend
 
 from tilerl.config import tiny
-from tilerl.dflash2 import load_dflash2
 from tilerl.model import build_random
-from tilerl.spec import _DRAFT_TOP, read_head_params
+from tilerl.spec import _DRAFT_TOP, load_dflash2, read_head_params
 
 _NORM = 0.25
 #: The tiny trunk's random readout leaves ~10 logits between its top two tokens.
@@ -332,7 +331,7 @@ def test_unmapped_tensors_raise_instead_of_vanishing(tmp_path):
     head_file = tmp_path / "model.safetensors"
 
     # Negative control: the correct reader takes the same file with nothing dropped.
-    from tilerl.dflash2 import _DFLASH2_TOP
+    from tilerl.spec import _DFLASH2_TOP
 
     ok = read_head_params(head_file, _DFLASH2_TOP)
     assert any(k.endswith("attn_conv.proj") for k in ok), sorted(ok)[:5]

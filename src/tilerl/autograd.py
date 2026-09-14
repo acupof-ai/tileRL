@@ -264,12 +264,10 @@ def _frozen(fp8: bool) -> _Handler:
 
 
 def _indexer_warmup(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
-    # Pure f32 torch reverse living beside the scorer (sparse_index), not a
-    # backend kernel op; only the two projection weights learn. H, page-K and
-    # the dense-mass target are frozen inputs, so they get no slots.
-    from .sparse_index import indexer_warmup_bwd
-
-    d_iq, d_ik = indexer_warmup_bwd(g, *args, **kw)
+    # The backward is a pure-f32 torch fn living in sparse_index (L2), which may
+    # not import this L1 module; the forward passes the callable in kwargs, the
+    # same dependency-inversion checkpoint uses with its fn.
+    d_iq, d_ik = kw["bwd"](g, *args, **{k: v for k, v in kw.items() if k != "bwd"})
     yield 0, d_iq
     yield 1, d_ik
 

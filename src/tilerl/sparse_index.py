@@ -29,6 +29,24 @@ from torch import Tensor
 
 from .kv_cache import BLOCK_TOKENS
 
+
+def group_map(cfg) -> tuple[list[int], dict[int, int]]:
+    """Full-attn PLANE indices -> (source planes, plane -> group). A group's
+    layers reuse the source layer's selection. Tiny (<4 full-attn): each layer
+    is its own source/group."""
+    n = len(cfg.full_attn_layers)
+    if n >= 4:
+        _, groups = index_source_groups(n)
+    else:
+        groups = [[j] for j in range(n)]
+    src, of = [], {}
+    for g, idxs in enumerate(groups):
+        src.append(idxs[0])
+        for j in idxs:
+            of[j] = g
+    return src, of
+
+
 #: Index query heads and per-head dim (V4.1-Flash releases 32/128; one H20
 #: holds 4/128 per the sparse-KV design). Kept as module constants for the
 #: derived byte rows; tiny gates use small values.
@@ -257,7 +275,9 @@ def indexer_warmup_loss(h: Tensor, k_pages: Tensor, iq_weight: Tensor,
     iq = project_indexer_queries(h, iq_weight)
     ik = project_page_keys(k_pages, ik_weight)
     loss = indexer_kl(iq, ik, target_page_mass, n_pages, n_win_pages)
-    maybe_record("indexer_warmup", loss, iq_weight, ik_weight, h=h, k_pages=k_pages,
+    # bwd= passed as a callable so autograd (L1) never imports sparse_index (L2).
+    maybe_record("indexer_warmup", loss, iq_weight, ik_weight,
+                 bwd=indexer_warmup_bwd, h=h, k_pages=k_pages,
                  target_page_mass=target_page_mass, n_pages=n_pages,
                  n_win_pages=n_win_pages)
     return loss
