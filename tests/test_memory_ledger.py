@@ -647,3 +647,22 @@ def test_dense_memory_rows_computed_once_and_stable(monkeypatch):
     assert eng._memory_rows() != first
     assert calls == 3
     assert eng._memory_rows() == eng._memory_rows()
+
+
+def test_cpu_measured_peak_falls_back_to_held_storage_not_cuda_hwm():
+    """On the CPU target measured_peak_bytes returns None (torch.cuda unavailable),
+    and the Engine's peak is the held-storage sum - never torch's small cuda
+    context bytes (step-10b regression: a pure peak call returned below static).
+    The returned peak must be >= the ledger's static held total."""
+    import torch
+
+    from tilerl.memory import measured_peak_bytes
+
+    assert not torch.cuda.is_available(), "this gate is the CPU fallback branch"
+    cfg, model, eng = _engine()
+    assert measured_peak_bytes(eng._backend) is None
+    # engine.stats() already reconciles: device_total equals the peak on CPU.
+    rows = eng.stats()["memory"]
+    peak = eng._measured_peak_bytes()
+    device_total = next(r["derived"] for r in rows if r["owner"] == "device_total")
+    assert peak is not None and peak == device_total, (peak, device_total)

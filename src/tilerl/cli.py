@@ -190,7 +190,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     # never bind the HTTP port. --json prints the rows for the cost-model tooling. The budget
     # rows need device_free: the card's free on CUDA, else --device-free (bytes) is required.
     if args.dry_run:
-        from .memory import format_memory_table, memory_table, plan
+        from .memory import format_memory_table, measured_peak_bytes, memory_table, plan
 
         if getattr(args, "sparse_k", 0) and getattr(args, "checkpoint", ""):
             # Header-only --checkpoint prices the derived ledger; a built sparse engine
@@ -213,7 +213,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
             # Same table (incl. transient + totals) /health serves from engine.stats()["memory"].
             measured = {r["owner"]: r.get("measured") for r in engine.stats()["memory"]
                         if r.get("measured") is not None and r["kind"] == "allocation"}
-            peak = engine._measured_peak_bytes()
+            peak = measured_peak_bytes(backend)
             table = memory_table(rows, measured, peak)
         if args.json:
             print(json.dumps(table, indent=1))
