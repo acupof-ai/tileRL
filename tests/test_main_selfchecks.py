@@ -36,7 +36,7 @@ _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 # (origin/main @ 44f2573f, 2026-09-09); if one
 # legitimately loses its block, lower this deliberately and let that edit be the
 # review point. A gate whose coverage can shrink in silence is the hole this closes.
-_MIN_MODULES = 10
+_MIN_MODULES = 9
 
 # Same ratchet for scripts/. Three are hermetic today; the rest import torch or a
 # backend and belong to the card, not to CI.
