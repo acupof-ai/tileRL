@@ -14,6 +14,7 @@ the weights, KV pool and state rows are exact (tests/test_memory_ledger.py).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .kv_cache import BLOCK_TOKENS
@@ -538,3 +539,224 @@ def format_memory_table(rows: list[dict]) -> str:
         d = f"{r['delta']:7d}" if r["delta"] is not None else f"{'-':>7}"
         lines.append(f"  {r['owner']:<24} {r['derived'] / 2**20:12.2f} {m} {d}  {r['note']}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Measured ledger builders (moved out of Engine, step 10b). Pure: every value
+# they read is an argument - no Engine import, no live-counter aggregation.
+# _build_stats stays on Engine and passes explicit values/callables.
+# ---------------------------------------------------------------------------
+
+
+def held_storage(*, cfg, model_params, kv, states, sparse=None, sparse_min_tokens=0,
+                 draft_kv=None, running=(),
+                 sparse_graph_bytes: Callable[[], int] = lambda: 0) -> dict[str, int]:
+    """Measured bytes of each static owner from materialized tensor storage. The
+    ledger's measured column and the CPU peak (off cuda there is no torch
+    allocator high-water). Pool sums include both fp8 scale grids: dropping them
+    makes derived != measured on the fp8 27B path by two planes."""
+
+    def pool(p) -> int:
+        return sum(
+            t.numel() * t.element_size()
+            for t in (p.k_pool, p.v_pool, p.k_scale, p.v_scale)
+            if t is not None
+        )
+
+    measured = {
+        "weights": sum(t.numel() * t.element_size() for t in model_params.values()),
+        "kv_pool": pool(kv),
+        "state_slots": sum(
+            t.numel() * t.element_size()
+            for t in (
+                states.states,
+                states.conv_windows,
+                states.step_states,
+                states.step_windows,
+                states.win_parity,
+            )
+            if t is not None
+        ),
+    }
+    # Hybrid mode reconciles the DENSE ledger (the pool is sized for dense rows
+    # pinning their whole context); sparse-only measured owners (kv_hot/bounds/
+    # cold) are omitted - the pool is one container for both modes.
+    if sparse is not None and sparse_min_tokens == 0:
+        block_n = per_kv_block_bytes(cfg, kv.dtype, kv.kv_fp8)
+        hot = sum(len(sparse.resident.get(r.req_id, ())) for r in running) * block_n
+        measured.pop("kv_pool")
+        measured["index_keys" if sparse.scorer == "index" else "page_bounds"] = (
+            sparse.bounds_bytes()
+        )
+        measured["kv_hot"] = hot
+        if getattr(kv, "cold", None) is not None:
+            shared_n = kv.cold.shared_bytes()
+            if kv.cold.bytes_held - shared_n:
+                measured["kv_cold"] = kv.cold.bytes_held - shared_n
+            if shared_n:
+                measured["kv_prefix"] = shared_n
+        graph_n = sparse_graph_bytes()
+        if graph_n:
+            measured["sparse_graph"] = graph_n
+    if draft_kv is not None:
+        measured["draft_pool"] = pool(draft_kv)
+    return measured
+
+
+def measured_peak_bytes(backend) -> int | None:
+    """The resident-device byte peak the table closes against. On cuda this is
+    the torch allocator's high-water mark; off cuda None - the Engine sums the
+    held-storage dict itself for its CPU peak (it already holds that dict)."""
+    import torch
+
+    if torch.cuda.is_available():
+        return int(torch.cuda.max_memory_allocated(backend.device))
+    return None
+
+
+def memory_rows(*, cfg, model_params, kv, states, held: dict[str, int],
+                peak_bytes: int | None, sparse=None, sparse_min_tokens=0,
+                running=(), draft_kv=None, draft_layers: int = 0, boot=None,
+                sparse_graph_bytes: Callable[[], int] = lambda: 0,
+                sparse_graph_count: Callable[[], int] = lambda: 0) -> list[dict]:
+    """The unified device ledger rows (memory_table input): every held allocation
+    plus the transient residual, so ``measured peak = sum static + transient``.
+    Pure: per-call plan/table; the Engine owns any static-ledger memoization."""
+    if sparse is None or sparse_min_tokens:
+        derived = plan(
+            cfg,
+            model_params,
+            0,
+            num_slots=states.num_slots,
+            num_blocks=kv.num_blocks,
+            spec_steps=0,
+            state_dtype=states.states.dtype,
+            kv_io=kv.dtype,
+            kv_fp8=kv.kv_fp8,
+            draft_layers=draft_layers,
+        )
+    else:
+        # Live sparse ledger from ACTUAL per-row state (post-tick every private
+        # page is demoted, so kv_hot counts the blocks currently in r.blocks).
+        derived = plan(
+            cfg,
+            model_params,
+            0,
+            num_slots=states.num_slots,
+            num_blocks=kv.num_blocks,
+            spec_steps=0,
+            state_dtype=states.states.dtype,
+            kv_io=kv.dtype,
+            kv_fp8=kv.kv_fp8,
+            draft_layers=0,
+            sparse=None,
+        )
+        derived = [r for r in derived if r.owner != "kv_pool"]
+        block_n = per_kv_block_bytes(cfg, kv.dtype, kv.kv_fp8)
+        # Sparse draft pool is dense-sized (a whole context per slot), unlike the
+        # hot trunk pool, so its row is computed from the draft pool's blocks.
+        if draft_kv is not None:
+            derived.append(
+                Row(
+                    "device",
+                    "draft_pool",
+                    draft_per_block_bytes(cfg, kv.dtype, draft_layers) * draft_kv.num_blocks,
+                    f"{draft_layers} draft layers x {draft_kv.num_blocks} dense blocks",
+                )
+            )
+        pages_total = 0
+        hot_n = 0
+        for r in running:
+            complete = r.seq_len // BLOCK_TOKENS
+            pages_total += complete
+            hot_n += len(r.blocks) * block_n
+        if sparse.scorer == "index":
+            scorer_n = index_keys_bytes(cfg, pages_total, sparse.di)
+            owner = "index_keys"
+            note = f"{pages_total} complete pages, learned index scorer"
+        else:
+            # Actual stored bounds, not complete-page count: the newest complete
+            # page's bound is written in finalize, so a snapshot between forwards
+            # sees one fewer bound than seq_len//16.
+            scorer_n = sparse.bounds_bytes()
+            owner = "page_bounds"
+            note = f"{pages_total} complete pages, bounds scorer"
+        cold_n = ssd_n = ssd_cap = prefix_n = 0
+        if getattr(kv, "cold", None) is not None:
+            prefix_n = kv.cold.shared_bytes()
+            cold_n = kv.cold.bytes_held - prefix_n
+            ssd_n = kv.cold.ssd_bytes
+            ssd_cap = kv.cold.ssd_capacity_bytes
+        derived.append(Row("device", owner, scorer_n, note))
+        derived.append(Row("device", "kv_hot", hot_n, "resident private blocks this tick"))
+        if cold_n:
+            derived.append(Row("host", "kv_cold", cold_n, "demoted pages in pinned host RAM"))
+        if prefix_n:
+            derived.append(Row("host", "kv_prefix", prefix_n,
+                               "shared published-prefix pages in pinned host RAM"))
+        if ssd_n:
+            derived.append(Row("ssd", "kv_cold_ssd", ssd_n,
+                               "demoted pages spilled past the host budget"))
+        if ssd_cap:
+            derived.append(Row("ssd", "kv_cold_ssd_capacity", ssd_cap,
+                               "countable spill budget used by admission"))
+        graph_n = sparse_graph_bytes()
+        if graph_n:
+            derived.append(
+                Row(
+                    "device",
+                    "sparse_graph",
+                    graph_n,
+                    f"captured sparse decode tick staging, {sparse_graph_count()} bucket(s)",
+                )
+            )
+    rows = memory_table(derived, held, peak_bytes)
+    # Dense engine with a cold tier driven by the manual sparse_retier seam (#500):
+    # its host pages are not in plan(), so append the held allocation explicitly.
+    cold = getattr(kv, "cold", None)
+    if sparse is None and cold is not None and (cold.bytes_held or cold.ssd_bytes):
+        per = per_cold_kv_block_bytes(cfg, kv.dtype, kv.kv_fp8, kv.cold_dtype)
+        st = cold.stats()
+        if cold.bytes_held:
+            pages = st["kv_cold_pages"]
+            rows.append(
+                {
+                    "tier": "host",
+                    "owner": "kv_cold",
+                    "kind": "allocation",
+                    "derived": pages * per,
+                    "note": f"{pages} demoted pages in host RAM",
+                    "measured": cold.bytes_held,
+                    "delta": pages * per - cold.bytes_held,
+                }
+            )
+        if cold.ssd_bytes:
+            pages = st["kv_cold_ssd_pages"]
+            rows.append(
+                {
+                    "tier": "ssd",
+                    "owner": "kv_cold_ssd",
+                    "kind": "allocation",
+                    "derived": pages * per,
+                    "note": f"{pages} demoted pages spilled to SSD",
+                    "measured": cold.ssd_bytes,
+                    "delta": pages * per - cold.ssd_bytes,
+                }
+            )
+    # The cold-start boot store on disk: derived == measured bytes (one
+    # kv_cold(ssd) allocation per saved entry), so plan and filesystem agree.
+    if boot is not None:
+        ssd_bytes = boot.bytes_total()
+        if ssd_bytes:
+            rows.append(
+                {
+                    "tier": "ssd",
+                    "owner": "kv_cold",
+                    "kind": "allocation",
+                    "derived": ssd_bytes,
+                    "note": f"{boot.entries()} saved boot entries",
+                    "measured": ssd_bytes,
+                    "delta": 0,
+                }
+            )
+    return rows
