@@ -44,12 +44,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from .kv_cache import (
-    BLOCK_TOKENS,
-    BatchKv,
-    NoPrefixStore,
-    SpillWriteError,
-)
+from .kv_cache import BLOCK_TOKENS, BatchKv, NoPrefixStore
+from .kv_tiers import SpillWriteError
 from .spec import _PREFILL_BUCKET, LADDER_WIDTHS
 
 

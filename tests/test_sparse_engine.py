@@ -425,7 +425,7 @@ def test_sparse_prefix_out_of_order_drops_never_publish_a_hole():
     missing blobs, so a follower silently never attended those pages)."""
     import torch
 
-    from tilerl.kv_cache import HostKvPages
+    from tilerl.kv_tiers import HostKvPages
     from tilerl.sparse_engine import SparsePrefixCache
 
     cold = HostKvPages(budget_bytes=1 << 30)
@@ -473,7 +473,7 @@ def test_sparse_prefill_retains_at_most_two_boundary_snapshots_per_request():
     snapshots accumulated in a bare dict OUTSIDE HostKvPages' pinned budget:
     one per chunk for the whole prefill. Only the next-closure (lowest) and the
     prompt-end (newest) boundaries can still be consumed, so cap at two."""
-    from tilerl.kv_cache import HostKvPages
+    from tilerl.kv_tiers import HostKvPages
     from tilerl.sparse_engine import SparsePrefixCache
 
     cold = HostKvPages(budget_bytes=1 << 30)
@@ -558,7 +558,7 @@ def test_sparse_prefix_republished_after_repin_keeps_the_first_blob():
     blob — the clone is independent of the private frame across a pin boundary."""
     import torch
 
-    from tilerl.kv_cache import HostKvPages
+    from tilerl.kv_tiers import HostKvPages
     from tilerl.sparse_engine import SparsePrefixCache
 
     cold = HostKvPages(budget_bytes=1 << 30)
@@ -589,7 +589,8 @@ def test_prefix_clone_reads_blob_only_after_demotions_scope_exits():
     together they pin the offer to after the scope for both implementations."""
     import contextlib
 
-    from tilerl.kv_cache import HostKvPages, PagedKvPool
+    from tilerl.kv_cache import PagedKvPool
+    from tilerl.kv_tiers import HostKvPages
 
     pool = PagedKvPool(8, 1, 16, device=torch.device("cpu"), layer_map=(0,))
     pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
@@ -1896,7 +1897,7 @@ def test_prefix_publish_consumes_boundary_snapshots_no_second_copy():
     must be popped (the entry now owns it); only unconsumed snapshots remain."""
     import torch as _torch
 
-    from tilerl.kv_cache import HostKvPages
+    from tilerl.kv_tiers import HostKvPages
     from tilerl.sparse_engine import SparsePrefixCache
 
     cold = HostKvPages(budget_bytes=1 << 30)
@@ -1929,7 +1930,7 @@ def test_published_content_keys_are_bit_identical_to_page_key():
     them, so a recurrence change silently corrupts the shared index."""
     import torch as _torch
 
-    from tilerl.kv_cache import HostKvPages
+    from tilerl.kv_tiers import HostKvPages
     from tilerl.sparse_engine import SparsePrefixCache, page_key
 
     rng = np.random.default_rng(0)
@@ -1962,7 +1963,7 @@ def test_publish_hash_steps_stay_linear_not_quadratic_in_context():
     times — not sum_p 16*(p+1)."""
     import torch as _torch
 
-    from tilerl.kv_cache import HostKvPages
+    from tilerl.kv_tiers import HostKvPages
     from tilerl.sparse_engine import SparsePrefixCache
 
     P = 128
@@ -2447,7 +2448,7 @@ def test_a_shared_spill_failure_lets_requests_finish_token_exact(tmp_path):
     wedging the request with a leaked slot. Shared spill is a cache, so on
     failure it disables for the process and the page stays in RAM; both
     requests must finish token-identically to a spill-succeeding run."""
-    import tilerl.kv_cache as kvmod
+    import tilerl.kv_tiers as kvmod
 
     cfg = tiny()
     per = __import__("tilerl.memory", fromlist=["per_kv_block_bytes"]).per_kv_block_bytes(
@@ -2498,7 +2499,7 @@ def test_a_private_spill_failure_fails_the_request_and_frees_its_slot(tmp_path):
     request with a client-visible error, free its slot/blocks, and leave a second
     request able to run. Red on main: the error escaped step and the loop retried
     forever with a leaked slot."""
-    import tilerl.kv_cache as kvmod
+    import tilerl.kv_tiers as kvmod
 
     cfg = tiny()
     per = __import__("tilerl.memory", fromlist=["per_kv_block_bytes"]).per_kv_block_bytes(

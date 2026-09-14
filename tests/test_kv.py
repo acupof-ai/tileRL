@@ -377,7 +377,7 @@ def test_entries_capacity_counts_the_host_tier():
     while the store held 3 entries a lookup could match -- an operator sizing against it
     would see a store that cannot hold anything.
     """
-    from tilerl.kv_cache import DramSnapshots
+    from tilerl.kv_tiers import DramSnapshots
 
     state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
     one = _nbytes(state)

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import torch
 
-from tilerl.kv_cache import BLOCK_TOKENS, KvBootStore, NoPrefixStore
+from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
+from tilerl.kv_tiers import KvBootStore
 from tilerl.testing import RefBackend
 
 
