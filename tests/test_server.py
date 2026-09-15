@@ -2054,9 +2054,10 @@ def test_the_routes_cancel_when_the_client_hangs_up():
     # and the GeneratorExit teardown line stays as GC/process defense.
     assert "stream_or_cancel(request, engine, request_id," in src, (
         "the SSE body must run under the shared disconnect watcher")
-    assert src.count("engine.cancel(request_id)") >= 8, (
-        f"the SSE watcher added two cancel branches; count moved 6 -> 8, got "
-        f"{src.count('engine.cancel(request_id)')}")
+    assert src.count("asyncio.to_thread(engine.cancel, request_id)") == 2, (
+        "both stream_or_cancel cancel branches (disconnect and task "
+        "cancellation) must run engine.cancel off the event loop, or a slow "
+        "step tick holding engine._lock freezes /health")
     assert "except GeneratorExit:" in src, (
         "the SSE route keeps GeneratorExit as GC/teardown defense: the live "
         "watcher is the client hang-up path, but a finalized generator must "
@@ -2839,3 +2840,91 @@ def test_a_plain_runtime_error_stays_api_error(tmp_path, monkeypatch, path, body
         path, json=body)
     assert r.status_code in (500, 503), r.text
     assert r.json()["error"]["type"] == "api_error", r.text
+
+
+class _LockParkEngine(_MidStreamEngine):
+    """cancel() parks on an engine-held lock: models a slow step tick holding
+    engine._lock for seconds while a late-stream disconnect arrives."""
+
+    def __init__(self, tok, text, *, cancel_park_s: float = 2.0):
+        super().__init__(tok, text)
+        import threading as _t
+        self.cancel_lock = _t.Lock()
+        self._cancel_park_s = cancel_park_s
+        self.cancel_started = _t.Event()
+
+    def cancel(self, request_id: int) -> bool:
+        if request_id in self.cancelled:
+            return False
+        self.cancel_started.set()
+        with self.cancel_lock:  # held by the test across the disconnect window
+            time.sleep(self._cancel_park_s)
+        self.cancelled.append(request_id)
+        self.blocks_used = self.slots_used = 0
+        self._gate.set()
+        return True
+
+
+def test_a_late_sse_disconnect_does_not_freeze_the_event_loop():
+    """F4 device-verification follow-up: engine.cancel takes engine._lock; a
+    late disconnect landing on a slow step tick (lock held seconds) used to
+    call cancel synchronously ON the event loop, freezing /health for every
+    other connection. cancel must run off the loop (to_thread), so the loop
+    stays responsive while the cancel is waiting for the lock.
+
+    The resource row is NOT asserted released within a wall-clock bound: the
+    tick owns the lock and the engine cannot release faster than the next
+    tick -- only (1) cancel was recorded/attempted, (2) the loop answered
+    /health while cancel blocked, (3) blocks/slot hit zero once the parked
+    critical section ended (the next-tick flag)."""
+    import socket
+
+    tok = _ByteTokenizer()
+    eng = _LockParkEngine(tok, "late disconnect reply", cancel_park_s=2.0)
+    eng.cancel_lock.acquire()  # the "slow step tick": held until the probe ends
+    server, port = _uvicorn_server(eng, tok)
+    try:
+        payload = json.dumps({"messages": [{"role": "user", "content": "hi"}],
+                            "stream": True, "max_tokens": 64})
+        request = (
+            f"POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+            f"\r\n{payload}").encode()
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            s.sendall(request)
+            buf = b""
+            while b'"content"' not in buf:
+                chunk = s.recv(4096)
+                assert chunk, "no content frame before the close"
+                buf += chunk
+        # Disconnect delivered; stream_or_cancel must dispatch cancel to a
+        # worker thread, leaving the event loop free.
+        assert eng.cancel_started.wait(2.0), "cancel was never attempted"
+        # A probe ON the same uvicorn event loop must answer while cancel is
+        # still parked behind the held lock. 0.5 s bound, not the 2 s park.
+        probe = socket.create_connection(("127.0.0.1", port), timeout=5)
+        probe.sendall(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        t0 = time.monotonic()
+        answer = b""
+        while b"\r\n\r\n" not in answer:
+            part = probe.recv(4096)
+            assert part, "/health never answered"
+            answer += part
+        elapsed = time.monotonic() - t0
+        probe.close()
+        assert b" 200 " in answer.split(b"\r\n", 1)[0], answer[:80]
+        assert elapsed < 0.5, (
+            f"event loop froze {elapsed:.2f}s waiting for engine.cancel's lock")
+        # Release the parked critical section: the queued cancel completes and
+        # the next-tick cleanup flag drains the allocation.
+        eng.cancel_lock.release()
+        deadline = time.monotonic() + 3.0
+        while (not eng.cancelled or eng.blocks_used or eng.slots_used) \
+                and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert eng.cancelled == [7] and eng.blocks_used == 0 \
+            and eng.slots_used == 0
+    finally:
+        if eng.cancel_lock.locked():
+            eng.cancel_lock.release()
+        server.should_exit = True

@@ -231,8 +231,10 @@ async def stream_or_cancel(request: Request, engine: Any, request_id: int,
             done, _ = await asyncio.wait({worker}, timeout=_DISCONNECT_POLL_S)
         except asyncio.CancelledError:
             # Response teardown while a fetch is in flight: same outcome as a
-            # client hang-up.
-            engine.cancel(request_id)
+            # client hang-up. Off the loop: cancel takes engine._lock, which a
+            # slow step tick can hold for seconds; a synchronous call would
+            # block the event loop and freeze /health for every connection.
+            await asyncio.to_thread(engine.cancel, request_id)
             raise
         if worker in done:
             item = worker.result()
@@ -243,7 +245,7 @@ async def stream_or_cancel(request: Request, engine: Any, request_id: int,
                 asyncio.to_thread(next, body, _STREAM_END))
             worker.add_done_callback(lambda t: t.exception())
         elif await request.is_disconnected():
-            engine.cancel(request_id)
+            await asyncio.to_thread(engine.cancel, request_id)
             return
 
 

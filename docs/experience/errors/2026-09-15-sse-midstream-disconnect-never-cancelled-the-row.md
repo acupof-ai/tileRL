@@ -82,3 +82,33 @@ sync iterator fetched one `next` at a time is never aclosed mid-flight. A
 disconnect that must stop work needs its OWN event-loop-side
 `is_disconnected()` poll running concurrently with each blocking fetch —
 do not assume task cancellation or generator finalization will reach it.
+
+## Device verification and the follow-up fix (2026-09-15)
+
+ops verified the fix on the V100 sm70 endpoint (36 repetitions): every
+mid-stream close cancelled the row with zero slot/block leaks. The first SSE
+content frame reached the client in 0.001–0.22 s; ~12% of disconnects landed
+during a slow late step tick 1–2.94 s long.
+
+That late-disconnect population exposed a SECOND defect in the same watcher:
+`stream_or_cancel` called `engine.cancel(rid)` synchronously ON the event loop.
+`Engine.cancel` takes `engine._lock`, which a step tick holds for the whole
+forward — independently measured on this box at 1–5.6 s on dense+d1 when free
+VRAM is near ~350 MiB. A disconnect arriving in that window parked the event
+loop thread behind the tick, and `/health` for EVERY other connection stalled
+up to a measured 5.57 s. Both watcher branches now run
+`await asyncio.to_thread(engine.cancel, rid)` (the same off-loop placement as
+`_submit`); cancel takes its own lock and is thread-safe. GeneratorExit and
+499 semantics are unchanged.
+
+Two separate indicators, and the gate reflects the split:
+
+1. **Event-loop responsiveness**: `/health` on the same loop answers <0.5 s
+   while cancel is parked behind a held lock (`test_a_late_sse_disconnect_does_not_freeze_the_event_loop`,
+   red against the synchronous call). This is fully under the server's control.
+2. **Row release**: blocks/state slot return only after the tick that owns the
+   lock ends — the engine cannot release faster than its next tick, so the gate
+   asserts "cancel recorded + loop stays responsive + allocation zero once the
+   parked critical section ends", never a wall-clock release bound.
+
+The long tick itself is a separate, unowned defect — see OPEN.md.
