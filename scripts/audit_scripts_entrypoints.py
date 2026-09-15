@@ -29,6 +29,53 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPTS = sorted((ROOT / "scripts").glob("*.py"))
 STEMS = {p.stem for p in SCRIPTS}
 
+#: Hand-run tools the seven reachability sets structurally cannot see: no test,
+#: doc, CI job, import or glob names them, but a person invokes them by hand on
+#: a card, a deploy box or in an ad-hoc review. Deleting one makes the next
+#: person rewrite it -- proven for repo_hotspots (#595 shipped it explicitly as
+#: "dev-only tooling"). Each line is a review point: the reason must say WHO
+#: runs it and ON WHICH WORK LINE, never "useful script". A name here is kept
+#: only while the reason holds; the closure gate fails if a name is added
+#: without a reason or a script this reaches is deleted without dropping the
+#: name. May only shrink by intent.
+MANUAL_KEEP: dict[str, str] = {
+    "compile_gate_sm70": "ops runs on V100 sm70: JIT-compiles every kernel the "
+                         "sm70 fp4 cell dispatches to catch a deleted CUDA extern "
+                         "(CUDA externs are Python string constants, invisible to "
+                         "grep). Card gate, no CPU twin.",
+    "parity_dequant_fp4": "kernel parity probe for the fused frozen-base backward "
+                          "(dequant+gemm_nn block16); run by hand on the GPU box "
+                          "(scripts header: CUDA_VISIBLE_DEVICES=7). Card only.",
+    "quantize_nvfp4": "deploy path: stream-quantizes a bf16 HF checkpoint to "
+                      "tilerl NVFP4 one shard at a time to fit the 31GB V100 "
+                      "box; output is what load_hf(fp4=True) reads. Run per "
+                      "checkpoint by hand.",
+    "pod_portcheck": "pre-port gate ops runs on a card: compiles the upstream "
+                     "tilelang corpus we copy kernels from against our pinned "
+                     "tilelang (scripts/_portcheck_corpus is gitignored, a local "
+                     "clone). 15/15 on 0.1.13/sm90.",
+    "tp_parity": "tensor-parallel correctness gate, CPU+gloo via "
+                 "`torchrun --nproc_per_node=2`; hand-run TP check (no pytest "
+                 "wrapper), deliberately not a single-process test.",
+    "pod_sync_check": "ops hand check that a non-git V100 pod tree matches the "
+                      "push checkout before trusting a run (the pod is fed by "
+                      "scp, so it converges to a mix of commits).",
+    "repo_hotspots": "ad-hoc review tool: churn x fan-in x LOC for src/tilerl "
+                     "modules over a git window. Shipped #595 expressly as "
+                     "dev-only tooling, read-only, zero deps.",
+    "floor_diff": "P1 eval analysis tool (#356): gross/net flips between two "
+                  "same-weights eval arms paired by row index. Hand-run on "
+                  "eval jsonl by the eval work line; sibling of probe_math_boxed.",
+    "paired_2x2": "P1 eval analysis tool (#356): kept/lost/fixed/untouched + "
+                  "at_cap transitions for before/after eval arms. Hand-run on "
+                  "eval jsonl; sibling of probe_math_boxed.",
+    "gate_margin_report": "P1 observational margin report (#381): how close "
+                          "each gate's operand came to its threshold across "
+                          "recorded runs, to tell a live gate from a decorative "
+                          "one. Hand-run over the measurements store.",
+}
+
+
 
 def _read(p: pathlib.Path) -> str:
     try:
@@ -179,7 +226,37 @@ def set6_readmes() -> set[str]:
     return hits
 
 
-def main() -> int:
+def set7_selfcheck() -> set[str]:
+    """Scripts tests/test_main_selfchecks.py executes: a hermetic (no torch/
+    backend/build_engine) script whose ``__main__`` block carries an assert.
+
+    The architecture keep-rule names this glob explicitly ("... or
+    test_main_selfchecks glob reaches"), but the original six sets did not model
+    it, so a script reached ONLY by that glob read DEAD. The reachability test is
+    content-derived (same filter as the test), not a name list.
+    """
+    import ast as _ast
+
+    hits = set()
+    for p in SCRIPTS:
+        src = _read(p)
+        if any(k in src for k in ("import torch", "get_backend", "build_engine")):
+            continue
+        try:
+            tree = _ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if (isinstance(node, _ast.If) and "__main__" in _ast.unparse(node.test)
+                    and any(isinstance(n, _ast.Assert) for n in _ast.walk(node))):
+                hits.add(p.stem)
+                break
+    return hits
+
+
+def audit() -> dict:
+    """Classify every script. Same data whether printed to JSON or imported by
+    the closure gate (tests/test_scripts_closure.py)."""
     # A wrong ROOT globs nothing and every bucket reads 0 -- silently, since an empty
     # enumeration is indistinguishable from "nothing is reachable".
     if len(SCRIPTS) < 50:
@@ -192,6 +269,7 @@ def main() -> int:
         "4b_other_docs": set4b_other_docs(),
         "5_invocation": set5_invocation(),
         "6_readmes": set6_readmes(),
+        "7_selfcheck": set7_selfcheck(),
     }
 
     rows = []
@@ -204,29 +282,42 @@ def main() -> int:
         where = {k: (stem in v) for k, v in sets.items()}
         where["3_imports"] = bool(importers)
         prov = where["4_experience"]
-        live = any(where[k] for k in ("1_pyproject", "2_ci", "3_imports", "5_invocation",
-                                      "6_readmes", "4b_other_docs"))
+        reached = any(where[k] for k in ("1_pyproject", "2_ci", "3_imports",
+                                         "5_invocation", "6_readmes",
+                                         "4b_other_docs", "7_selfcheck"))
+        if reached:
+            bucket = "LIVE"
+        elif prov:
+            bucket = "PROVENANCE"
+        elif stem in MANUAL_KEEP:
+            bucket = "MANUAL_KEEP"
+        else:
+            bucket = "DEAD"
         rows.append({
             "file": f"scripts/{p.name}",
+            "stem": stem,
             "lines": len(_read(p).splitlines()),
             "sets": sorted(k for k, v in where.items() if v),
             "importers": importers[:4],
-            "bucket": "LIVE" if live else ("PROVENANCE" if prov else "DEAD"),
+            "bucket": bucket,
         })
 
-    out = {
+    return {
         "head": "origin/main",
         "total_files": len(SCRIPTS),
         "total_lines": sum(r["lines"] for r in rows),
         "set_sizes": {k: len(v & STEMS) for k, v in sets.items()}
         | {"3_imports": sum(1 for r in rows if "3_imports" in r["sets"])},
         "buckets": {b: sum(1 for r in rows if r["bucket"] == b)
-                    for b in ("LIVE", "PROVENANCE", "DEAD")},
+                    for b in ("LIVE", "PROVENANCE", "MANUAL_KEEP", "DEAD")},
         "dead_lines": sum(r["lines"] for r in rows if r["bucket"] == "DEAD"),
         "provenance_lines": sum(r["lines"] for r in rows if r["bucket"] == "PROVENANCE"),
         "rows": rows,
     }
-    json.dump(out, sys.stdout, indent=1)
+
+
+def main() -> int:
+    json.dump(audit(), sys.stdout, indent=1)
     return 0
 
 
