@@ -36,36 +36,57 @@ def _framework_files():
 _PRIVATES = ("_MAX_VERIFY_W", "_dp_pg")
 
 
+def _violations(src: str) -> list[str]:
+    """All backend-private / bare-distributed references in one source string."""
+    bad: list[str] = []
+    for node in ast.walk(ast.parse(src)):
+        # bare name: a direct import-then-use of the constant
+        if isinstance(node, ast.Name) and node.id in _PRIVATES:
+            bad.append(f"references {node.id}")
+        # attribute on ANY receiver: backend._dp_pg, x._MAX_VERIFY_W, ...
+        if isinstance(node, ast.Attribute) and node.attr in _PRIVATES:
+            bad.append(f"references .{node.attr}")
+        # `from ... import _MAX_VERIFY_W` or `... as W`: either binds the
+        # private name, and the as-bound name is then untraceable, so the
+        # import is the only choke point -- match a.name regardless of alias.
+        if isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name in _PRIVATES:
+                    bad.append(f"imports {a.name}")
+        # import torch.distributed / from torch.distributed import ...
+        if isinstance(node, ast.Import) and any(
+                a.name == "torch.distributed" for a in node.names):
+            bad.append("imports torch.distributed")
+        if isinstance(node, ast.ImportFrom) and node.module == "torch.distributed":
+            bad.append("imports from torch.distributed")
+        # an explicit torch.distributed.<collective> attribute path
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "distributed"
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "torch"):
+            bad.append(f"calls torch.distributed.{node.attr}")
+    return bad
+
+
 def test_framework_does_not_touch_backend_privates_or_distributed():
     bad: list[str] = []
     for p in _framework_files():
-        tree = ast.parse(p.read_text())
-        for node in ast.walk(tree):
-            # bare name: a direct import-then-use of the constant
-            if isinstance(node, ast.Name) and node.id in _PRIVATES:
-                bad.append(f"{p.name}:{node.lineno} references {node.id}")
-            # attribute on ANY receiver: backend._dp_pg, x._MAX_VERIFY_W, ...
-            if isinstance(node, ast.Attribute) and node.attr in _PRIVATES:
-                bad.append(f"{p.name}:{node.lineno} references .{node.attr}")
-            # `from ... import _MAX_VERIFY_W` binds an alias, not a Name node
-            if isinstance(node, ast.ImportFrom):
-                for a in node.names:
-                    if a.asname is None and a.name in _PRIVATES:
-                        bad.append(f"{p.name}:{node.lineno} imports {a.name}")
-            # import torch.distributed / from torch.distributed import ...
-            if isinstance(node, ast.Import) and any(
-                    a.name == "torch.distributed" for a in node.names):
-                bad.append(f"{p.name}:{node.lineno} imports torch.distributed")
-            if isinstance(node, ast.ImportFrom) and node.module == "torch.distributed":
-                bad.append(f"{p.name}:{node.lineno} imports from torch.distributed")
-            # an explicit torch.distributed.<collective> attribute path
-            if (isinstance(node, ast.Attribute)
-                    and isinstance(node.value, ast.Attribute)
-                    and node.value.attr == "distributed"
-                    and isinstance(node.value.value, ast.Name)
-                    and node.value.value.id == "torch"):
-                bad.append(f"{p.name}:{node.lineno} calls torch.distributed.{node.attr}")
+        for v in _violations(p.read_text()):
+            bad.append(f"{p.name}: {v}")
     assert not bad, "framework must use the Backend seam, not:\n" + "\n".join(sorted(bad))
+
+
+@pytest.mark.parametrize("mutant", [
+    "from tilerl_kernels.backend import _MAX_VERIFY_W\n",       # bare from-import
+    "from tilerl_kernels.backend import _MAX_VERIFY_W as W\n",  # import-as alias
+    "def f(b):\n    return b._dp_pg\n",                         # obj._private attribute
+])
+def test_every_private_access_shape_is_red(mutant):
+    """The gate must catch all three binding shapes: a bare name, an as-bound
+    alias (untraceable after import), and an attribute on any receiver. Each
+    is the exact form this seam deletes; a scanner missing one reads green."""
+    assert _violations(mutant), f"gate missed private access shape:\n{mutant}"
 
 
 def test_both_backends_expose_the_seam():
