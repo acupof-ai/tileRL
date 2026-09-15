@@ -47,6 +47,24 @@ Stop: `pkill -f serve_v100_dense.sh` (the supervisor trap releases the GPU).
 `scripts/serve_v100.sh` is a different, older launcher (single session,
 spec-on, 32k context); do not use it for this serve.
 
+### Hybrid sparse+d1 supervisor
+
+The sparse k=128 + MTP d1 + decode-graph serve (128k context, cold SSD tier)
+runs under
+[`scripts/serve_hybrid_v100.sh`](../scripts/serve_hybrid_v100.sh), launched the
+same detached way. It warms dense, sparse and B=4 paths
+([`serve_warmup_hybrid.py`](../scripts/serve_warmup_hybrid.py)) and runs
+[`serve_liveness.py`](../scripts/serve_liveness.py): two consecutive
+non-200 `/health` polls (503, refused connection or timeout, 5s each) or a fatal
+CUDA log marker kills the child by PID and restarts it; a real short completion
+stays as the slot-leak fallback. A rolling fuse stops the supervisor
+(`RESTART_FUSE_MAX`, default 5, within `RESTART_FUSE_WINDOW_S`, default 600s;
+exit 2) instead of crash-looping through a burst — delete the fuse-state file
+to re-arm. All host paths are env-overridable (`SERVE_ROOT`, `SERVE_REPO`,
+`SERVE_PYTHON`, `SERVE_CKPT_DIR`, `SERVE_DRAFT`, `SERVE_COLD_SSD`, …), so the
+script carries no user-specific path.
+
+
 ## Measured 2026-09-13 (stable config)
 
 - **Concurrent-prefill burst:** four simultaneous ~7,400-token prompts on the
