@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .messages import _COMPLETION_TIMEOUT_S, _parse_tool_calls, mount_messages
 from .prompt import (
+    POLL_INTERVAL_S,
     await_completion,
     bad_effort,
     choice_name,
@@ -563,7 +564,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         f"request {request_id} did not finish within {_COMPLETION_TIMEOUT_S}s")
-                time.sleep(0.02)
+                time.sleep(POLL_INTERVAL_S)
             output_ids = _await_completion(request_id)
         except (TimeoutError, RuntimeError) as exc:
             # Sync generator: already in a to_thread worker, off the loop.

@@ -359,8 +359,13 @@ def refuse_unsupported(*fields: str, **flagged: Any) -> None:
             f"request is refused rather than answered as if the field had been applied")
 
 
+#: Idle gap between take/peek polls of a blocked row. One value for the
+#: non-stream waiter and the SSE peek loop, not two copies of the same 0.02.
+POLL_INTERVAL_S = 0.02
+
+
 def await_completion(engine: Any, request_id: int, timeout_s: float,
-                     poll_s: float = 0.02) -> list[int]:
+                     poll_s: float = POLL_INTERVAL_S) -> list[int]:
     """Block until ``engine.take`` returns the row, or raise TimeoutError.
 
     The single wait body every non-stream route runs (inside asyncio.to_thread
