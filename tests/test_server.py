@@ -2743,3 +2743,99 @@ def test_a_mid_stream_ws_close_cancels_and_releases_the_row():
         f"the live row kept its allocation: {eng.blocks_used} blocks, "
         f"{eng.slots_used} slots")
     assert [m["type"] for m in sent].count("websocket.accept") == 1
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("path,body,envelope", [
+    ("/v1/chat/completions",
+     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4},
+     ("error",)),
+    ("/v1/messages",
+     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4},
+     ("error",)),
+    ("/v1/responses",
+     {"input": [{"role": "user", "content": [{"type": "input_text",
+                                               "text": "hi"}]}],
+      "max_output_tokens": 4},
+     ("error",)),
+])
+def test_engine_overloaded_is_a_503_overloaded_body(tmp_path, monkeypatch,
+                                                      path, body, envelope,
+                                                      stream):
+    """Finding 17 route half (#633): submit raises EngineOverloaded
+    synchronously at queue capacity. Every route answers 503 with the
+    overloaded type and cap/inflight ints, stream and non-stream alike
+    (the rejection happens before any SSE header), and never 429."""
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "r.jsonl"))
+    from tilerl.engine import EngineOverloaded
+
+    class _Saturated:
+        def submit(self, input_ids, params=None) -> int:
+            raise EngineOverloaded(
+                "engine is saturated: 8 in-flight requests and the cap is 8 "
+                "(running + waiting); retry later")
+
+        def room_for(self, prompt_tokens: int) -> int:
+            return 64
+
+        def cancel(self, request_id: int) -> bool:
+            return False  # nothing was enqueued; cancel must be a no-op
+
+        def stats(self) -> dict:
+            return {}
+
+    payload = dict(body)
+    if stream:
+        payload["stream"] = True
+    r = TestClient(create_app(_Saturated(), _ByteTokenizer())).post(path,
+                                                                     json=payload)
+    assert r.status_code == 503, (path, stream, r.status_code, r.text)
+    assert r.headers.get("retry-after") is None
+    err = r.json()[envelope[0]]
+    assert err["type"] == "overloaded_error", (path, stream, err)
+    assert err["inflight"] == 8 and err["cap"] == 8, (path, stream, err)
+    assert "cap is 8" in err["message"], err
+    assert all(k not in err for k in ("retry_after", "retryAfter")), err
+
+
+@pytest.mark.parametrize("path,body", [
+    ("/v1/chat/completions",
+     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}),
+    ("/v1/messages",
+     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}),
+    ("/v1/responses",
+     {"input": [{"role": "user", "content": [{"type": "input_text",
+                                              "text": "hi"}]}],
+      "max_output_tokens": 4}),
+])
+def test_a_plain_runtime_error_stays_api_error(tmp_path, monkeypatch, path, body):
+    """Only EngineOverloaded maps to overloaded_error; a RequestFailed or
+    other RuntimeError keeps the generic api_error 503 body."""
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "r.jsonl"))
+
+    class _OtherFailure:
+        def submit(self, input_ids, params=None) -> int:
+            return 3
+
+        def room_for(self, prompt_tokens: int) -> int:
+            return 64
+
+        def take(self, request_id: int):
+            raise RuntimeError(f"request {request_id} failed: pool exhausted")
+
+        def cancel(self, request_id: int) -> bool:
+            return True
+
+        def stop_text(self, request_id: int):
+            return None
+
+        def logprobs(self, request_id: int):
+            return []
+
+        def stats(self) -> dict:
+            return {}
+
+    r = TestClient(create_app(_OtherFailure(), _ByteTokenizer())).post(
+        path, json=body)
+    assert r.status_code in (500, 503), r.text
+    assert r.json()["error"]["type"] == "api_error", r.text

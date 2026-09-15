@@ -316,12 +316,11 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             # a no-op. EngineOverloaded never submitted, so no cancel applies.
             engine.cancel(rid_box[0])
             from .server import overloaded_body
-            err = (overloaded_body(exc)
+            overloaded = overloaded_body(exc)
+            err = (overloaded and {**overloaded, "type": "overloaded_error"}
                    or {"type": "api_error", "message": str(exc)})
             return JSONResponse(status_code=503,
-                                content={"type": "error",
-                                         "error": {"type": err["type"],
-                                                   "message": err["message"]}})
+                                content={"type": "error", "error": err})
         headers = {"x-tilerl-request-id": str(rid)}
         if not req.stream:
             return JSONResponse(content=body, headers=headers)
