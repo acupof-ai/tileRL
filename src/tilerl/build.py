@@ -239,6 +239,7 @@ def build_engine(
     #: to override, or None for unbounded. Over-capacity submit raises
     #: EngineOverloaded.
     max_inflight=_INFLIGHT_AUTO,
+    device_reserve_bytes: int = 0,
 ) -> Engine:
     """Wire a model + backend into an Engine; pool shapes come from ``cfg``.
     ``decode_graph`` None auto-enables the captured decode tick on CUDA.
@@ -366,6 +367,53 @@ def build_engine(
             draft_layers=0 if draft is None else draft.cfg.num_layers,
             kv_fp8=kv_fp8,
         )
+    # Device reserve: decide the KV pool size NOW, before its tensor exists, from
+    # one post-state measured-free snapshot. The pool is built ONCE at the result
+    # — never full-then-resized (that needs both tensors live and OOMs at the edge
+    # this guards), and before GraphCapture grabs the pad block (it reserves a
+    # block from the already-sized pool, so there is no held-block collision). The
+    # draft fit and prefix-store budget are frozen on the BASE layout here (same
+    # 2/3 and 1/4 rules, on the same snapshot) and passed into the cut; after the
+    # cut there is more free, so frozen-but-slightly-small sizing errs toward
+    # leaving the floor with margin, never under it. Only trimmable KV blocks
+    # shrink. reserve_dropped>0 here means a peak-live reduction, not a held
+    # reservation — nothing pins free against the allocator reclaiming it.
+    reserve_dropped = 0
+    reserve_store_bytes = 0
+    if device_reserve_bytes and backend.device.type == "cuda":
+        from .memory import draft_per_block_bytes, layout_with_reserve, per_kv_block_bytes
+
+        torch.cuda.empty_cache()  # state pool was just allocated; read true free
+        free0 = torch.cuda.mem_get_info()[0]
+        kv_per = per_kv_block_bytes(cfg, kv_io, kv_fp8)
+        post_kv_free = free0 - (num_blocks + pad) * kv_per
+        d_blocks, d_per = 0, 0
+        if draft is not None:
+            d_per = draft_per_block_bytes(cfg, kv_io, draft.cfg.num_layers)
+            if sparse_k:
+                d_cap = num_slots * (max_total_tokens // BLOCK_TOKENS + 1)
+                d_blocks = min(d_cap, max(1, int(post_kv_free * 2 / 3) // d_per))
+                draft_num_blocks = d_blocks
+            else:
+                # Dense draft attaches a mirror of the whole trunk pool, pad block
+                # included (Engine passes kv_pool.num_blocks when no count is set).
+                d_blocks = num_blocks + pad
+        # The store budget exists only when a PrefixStore is built below: pure
+        # sparse (sparse_k set, sparse_min_tokens 0) takes NoPrefixStore and never
+        # allocates that HBM, so charging it would cut extra KV blocks for nothing.
+        store_built = (not sparse_k) or bool(sparse_min_tokens)
+        if not state_bytes and store_built:
+            reserve_store_bytes = max(0, post_kv_free - d_blocks * d_per) // 4
+        num_blocks, reserve_dropped = layout_with_reserve(
+            free0_bytes=free0,
+            reserve_bytes=device_reserve_bytes,
+            base_kv_blocks=num_blocks,
+            kv_per_block=kv_per,
+            pad_blocks=pad,
+            draft_blocks=d_blocks,
+            draft_per_block=d_per,
+            other_static_bytes=reserve_store_bytes,
+        )
     # The narrow host-copy dtype. Auto ("") narrows an f32 pool (sm70) to f16 and
     # leaves every other pool native; --cold-format forces it. "native" explicitly
     # keeps the pool dtype even on sm70.
@@ -392,11 +440,13 @@ def build_engine(
         kv_fp8=kv_fp8,
         cold_dtype=cold_dtype,
     )
-    if sparse_k and draft is not None:
+    if sparse_k and draft is not None and not (device_reserve_bytes
+                                              and backend.device.type == "cuda"):
         # The draft head stays DENSE under sparse, so its pool is independent of the
         # hot set: on a card, fit it to the memory left after weights/state/hot pool
         # (one draft layer is 1/16 of the trunk planes at 27B), capped at a whole
         # context per slot; off cuda the tests are tiny, take the full ceiling.
+        # (With a device reserve the block count was frozen pre-pool above.)
         from .memory import POOL_FRACTION, draft_per_block_bytes
 
         cap = num_slots * (max_total_tokens // BLOCK_TOKENS + 1)
@@ -415,6 +465,8 @@ def build_engine(
     kw = {}
     if state_bytes:
         kw["state_bytes"] = state_bytes
+    elif reserve_store_bytes:
+        kw["state_bytes"] = reserve_store_bytes
     elif backend.device.type == "cuda":
         kw["state_bytes"] = int(torch.cuda.mem_get_info()[0] // 4)
     # Host tier for snapshots the card cannot keep resident. Measured on the live V100: 43
@@ -486,6 +538,8 @@ def build_engine(
         draft_num_blocks=draft_num_blocks,
         sparse_min_tokens=sparse_min_tokens,
         sparse_prefill_tokens=sparse_prefill_tokens,
+        device_reserve_bytes=device_reserve_bytes,
+        reserve_dropped_blocks=reserve_dropped,
     )
 
 
@@ -514,6 +568,7 @@ def build_serving_engine(
     decode_graph=None,
     sparse_min_tokens=0,
     sparse_prefill_tokens=0,
+    device_reserve_mib=0,
 ):
     """Serving-size engine on one card. Multi-card serving is one process per card
     under CUDA_VISIBLE_DEVICES (see generate.py for the process-per-device pattern);
@@ -566,6 +621,8 @@ def build_serving_engine(
     kw["decode_graph"] = decode_graph
     kw["sparse_min_tokens"] = sparse_min_tokens
     kw["sparse_prefill_tokens"] = sparse_prefill_tokens
+    if device_reserve_mib:
+        kw["device_reserve_bytes"] = int(device_reserve_mib) * 1024 * 1024
     if sparse_k:
         # Cold pages need somewhere to demote: default the pinned host tier to the whole
         # written context at its per-block bytes if the caller gave no budget.

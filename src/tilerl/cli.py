@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -172,7 +173,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            kv_cold_bytes=getattr(args, "kv_cold_bytes", 0),
                            decode_graph=getattr(args, "decode_graph", None),
                            sparse_min_tokens=getattr(args, "sparse_min_tokens", 0),
-                           sparse_prefill_tokens=getattr(args, "sparse_prefill_tokens", 0))
+                           sparse_prefill_tokens=getattr(args, "sparse_prefill_tokens", 0),
+                           device_reserve_mib=getattr(args, "device_reserve_mib", 0))
     app = create_app(engine, tokenizer, model_name=cfg.name)
     # --dry-run: build (which materializes and fits) then print the memory ledger and stop,
     # never bind the HTTP port. --json prints the rows for the cost-model tooling. The budget
@@ -468,6 +470,12 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.add_argument("--kv-cold-bytes", type=int, default=0,
                          help="pinned-host budget for sparse-KV cold pages. Auto-sized to the "
                               "whole context when --sparse-k is set and this is 0")
+    p_serve.add_argument("--device-reserve-mib", type=int,
+                         default=int(os.environ.get("TILERL_DEVICE_RESERVE_MIB", "0")),
+                         metavar="MIB",
+                         help="build-time free-device-VRAM floor in MiB; the KV pool is trimmed "
+                              "once at startup if idle free would be below it (sm70 edge-memory "
+                              "wedge headroom). 0 (default) changes nothing.")
     p_serve.add_argument("--kv-fp8", choices=["e4m3", "e5m2"], default="",
                          help="store the KV planes in fp8: 65536 -> 33280 bytes per token at the "
                               "27B's 16 planes x 4 heads x 256, a 1.969x saving, the 0.031 being "

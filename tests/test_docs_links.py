@@ -290,6 +290,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--decode-graph',
         '--depth',
         '--device-free',
+        '--device-reserve-mib',
         '--draft',
         '--dram-bytes',
         '--dry-run',
