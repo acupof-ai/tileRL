@@ -32,13 +32,26 @@ def _framework_files():
     return [p for p in _SRC.rglob("*.py") if p.name not in _ALLOWED]
 
 
+#: Backend-private names the framework must only reach through the public seam.
+_PRIVATES = ("_MAX_VERIFY_W", "_dp_pg")
+
+
 def test_framework_does_not_touch_backend_privates_or_distributed():
     bad: list[str] = []
     for p in _framework_files():
         tree = ast.parse(p.read_text())
         for node in ast.walk(tree):
-            if isinstance(node, ast.Name) and node.id in ("_MAX_VERIFY_W", "_dp_pg"):
+            # bare name: a direct import-then-use of the constant
+            if isinstance(node, ast.Name) and node.id in _PRIVATES:
                 bad.append(f"{p.name}:{node.lineno} references {node.id}")
+            # attribute on ANY receiver: backend._dp_pg, x._MAX_VERIFY_W, ...
+            if isinstance(node, ast.Attribute) and node.attr in _PRIVATES:
+                bad.append(f"{p.name}:{node.lineno} references .{node.attr}")
+            # `from ... import _MAX_VERIFY_W` binds an alias, not a Name node
+            if isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    if a.asname is None and a.name in _PRIVATES:
+                        bad.append(f"{p.name}:{node.lineno} imports {a.name}")
             # import torch.distributed / from torch.distributed import ...
             if isinstance(node, ast.Import) and any(
                     a.name == "torch.distributed" for a in node.names):
