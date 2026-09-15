@@ -43,7 +43,9 @@ def _dp_step(rank: int, no_dp: bool, out: dict, streams: bool = False,
     # Set, not setdefault: the two arms have different world sizes, and a port
     # inherited from the world=2 arm puts four ranks on a store built for two
     # (measured: gloo aborts the process with EnforceNotMet, not an error).
-    os.environ["MASTER_PORT"] = "29523"
+    # Honor an injected base so parallel harness runs get a unique port; default
+    # keeps the historical fixed port.
+    os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29523")
     os.environ["TILERL_TARGET"] = "cpu"
     os.environ["WORLD_SIZE"], os.environ["RANK"] = str(WORLD), str(rank)
 
@@ -90,7 +92,10 @@ def _dp_step(rank: int, no_dp: bool, out: dict, streams: bool = False,
 def _dp_ref_rank(r: int, out: dict, streams: bool = False) -> None:
     """One rank of the dp=1 tp=2 reference step (module level: spawn pickles it)."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29525"
+    # Second arm of the pair, a different world size so a distinct store. Honor an
+    # injected MASTER_PORT_2 for parallel harness runs; otherwise base+1.
+    _base = int(os.environ.get("MASTER_PORT", "29523"))
+    os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT_2", str(_base + 1))
     os.environ["TILERL_TARGET"] = "cpu"
     os.environ["WORLD_SIZE"], os.environ["RANK"] = str(TP), str(r)
 

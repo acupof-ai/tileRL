@@ -52,6 +52,10 @@ jobs:
         # test_ function and `pytest` collects ZERO items from them -- measured.
         # Until this step existed they ran only when someone typed them, which
         # is the same as not having them. Each exits non-zero on failure.
+        # Their NEGATIVE CONTROLS (the --flag mutation arms) run in the CPU
+        # pytest step above, via tests/test_world_negative_controls.py, which
+        # subprocesses every control and asserts each one correctly fails (a
+        # vacuous control that passes turns that test red).
         run: |
           set -e
           # globbed: a hand-maintained list omitted three gates
