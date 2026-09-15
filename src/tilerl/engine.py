@@ -418,6 +418,8 @@ class Engine:
         draft_num_blocks: int | None = None,
         sparse_min_tokens: int = 0,
         sparse_prefill_tokens: int = 0,
+        device_reserve_bytes: int = 0,
+        reserve_dropped_blocks: int = 0,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -563,6 +565,12 @@ class Engine:
                 draft_num_blocks if draft_num_blocks is not None else kv_pool.num_blocks,
                 dtype=kv_pool.dtype,
             )
+
+        # Device reserve was applied in build_engine: the KV tensor was sized once
+        # (smaller) before it existed, so here we only record what build cut. It is
+        # a peak-live reduction, not a held reservation.
+        self._device_reserve_bytes = int(device_reserve_bytes)
+        self._reserve_dropped_blocks = int(reserve_dropped_blocks)
 
         self._pin = backend.device.type == "cuda"
         self._lock = threading.RLock()
@@ -1337,6 +1345,10 @@ class Engine:
                 "blocks_used": self._blocks_used,
                 "blocks_total": self.usable_blocks,
                 "pool_used_blocks": self._kv.used_blocks,
+                # Build-time device headroom floor (--device-reserve-mib) and how
+                # many KV blocks it trimmed; 0/0 means the reserve did not bind.
+                "device_reserve_bytes": self._device_reserve_bytes,
+                "reserve_dropped_blocks": self._reserve_dropped_blocks,
                 "slots_used": self._slots_used,
                 "slots_total": self.usable_slots,
                 "prefix_hits": self._prefix_hits,
@@ -1463,6 +1475,18 @@ class Engine:
             sparse_graph_count=lambda: len(self._sparse_graphs),
         )
         hybrid = self._sparse is not None and self._sparse_min_tokens
+        if self._device_reserve_bytes:
+            # A target free floor, not a held allocation: kind budget keeps it out
+            # of the peak = Σstatic + transient invariant. Peak-LIVE reduction —
+            # the build sizes the KV pool smaller so the floor is left free; it
+            # does not pin that free against the caching allocator reclaiming it.
+            rows.append({
+                "tier": "device", "owner": "device_reserve", "kind": "budget",
+                "derived": self._device_reserve_bytes,
+                "note": f"peak-live free floor (not held); KV pool cut by "
+                        f"{self._reserve_dropped_blocks} blocks at build",
+                "measured": None, "delta": None,
+            })
         if hybrid or (
             self._sparse is None
             and self._boot is None

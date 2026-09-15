@@ -14,6 +14,7 @@ the weights, KV pool and state rows are exact (tests/test_memory_ledger.py).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -196,6 +197,73 @@ def fit_num_blocks(
     )
     n = max(floor, int(device_free * POOL_FRACTION) // per_block)
     return min(n, cap) if cap else n
+
+
+def reserve_kv_blocks(
+    *, base_kv_blocks: int, kv_per_block: int, idle_free_bytes: int, reserve_bytes: int
+) -> tuple[int, int]:
+    """KV blocks to cut so the build leaves at least ``reserve_bytes`` free.
+
+    Pure arithmetic over ONE pre-pool snapshot: ``idle_free_bytes`` is the free
+    the finished layout is PROJECTED to have (measured free after weights/state,
+    minus the KV, draft and prefix-store bytes about to be allocated), not a
+    post-allocation measurement. The pool is then built once at the returned
+    count — never allocated full and resized (that needs new+old to coexist and
+    OOMs in the exact low-free condition this guards). The graph pad block is
+    already counted by the caller in the projected KV bytes. A floor already met
+    cuts 0 blocks. Returns ``(final_kv_blocks, dropped_blocks)``.
+
+    Raises when even an empty KV pool cannot leave the floor — the card is too
+    small for the fixed weights/state plus the reserve asked for.
+
+    This is a PEAK-LIVE reduction, not a held reservation: nothing pins the free
+    bytes against the caching allocator reclaiming them after a large transient.
+    """
+    if reserve_bytes < 0:
+        raise ValueError(f"device reserve must be >= 0, got {reserve_bytes}")
+    shortfall = reserve_bytes - idle_free_bytes
+    if shortfall <= 0:
+        return base_kv_blocks, 0
+    kv_total = base_kv_blocks * kv_per_block
+    if reserve_bytes > idle_free_bytes + kv_total:
+        raise ValueError(
+            f"device reserve {reserve_bytes} bytes cannot be met: projected idle free is "
+            f"{idle_free_bytes} and the whole KV pool is only {kv_total} bytes; "
+            f"{reserve_bytes - idle_free_bytes - kv_total} bytes short even with 0 KV blocks"
+        )
+    drop = min(base_kv_blocks, math.ceil(shortfall / kv_per_block))
+    return base_kv_blocks - drop, drop
+
+
+def layout_with_reserve(
+    *, free0_bytes: int, reserve_bytes: int, base_kv_blocks: int, kv_per_block: int,
+    pad_blocks: int = 0, draft_blocks: int = 0, draft_per_block: int = 0,
+    other_static_bytes: int = 0,
+) -> tuple[int, int]:
+    """Size the KV pool ONCE from a pre-pool free snapshot with a reserve floor.
+
+    ``free0_bytes`` is measured after the fixed weights + GDN state pool exist but
+    BEFORE any KV/draft/prefix tensor; the caller has already frozen the draft
+    block count and the prefix-store byte budget, passed here as already-known
+    bytes. Projected idle free at the BASE sizing is
+    ``free0 - (base+pad)*kv_per - draft*per - other_static``. Only the trimmable
+    KV blocks shrink to meet the floor (the pad and the frozen draft/store sizing
+    do not), so the returned pool is allocated directly — never built full and
+    resized. Returns ``(final_kv_blocks, dropped_blocks)``. reserve_bytes 0 is a
+    no-op and returns the base unchanged, which is why build keeps its old path
+    when the reserve is off.
+    """
+    if reserve_bytes <= 0:
+        return base_kv_blocks, 0
+    kv_bytes = (base_kv_blocks + pad_blocks) * kv_per_block
+    draft_bytes = draft_blocks * draft_per_block
+    idle = free0_bytes - kv_bytes - draft_bytes - other_static_bytes
+    return reserve_kv_blocks(
+        base_kv_blocks=base_kv_blocks,
+        kv_per_block=kv_per_block,
+        idle_free_bytes=idle,
+        reserve_bytes=reserve_bytes,
+    )
 
 
 def state_shapes(cfg, num_slots: int, spec_steps: int = 0) -> list[tuple[tuple, object]]:
