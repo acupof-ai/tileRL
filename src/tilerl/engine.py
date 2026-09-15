@@ -188,9 +188,13 @@ class _StepTiming:
     exit prints per-segment averages. perf_counter reads stay unconditional at
     the call sites (tens of ns against a 100+ ms tick); with the env off no
     instance exists and the marks themselves are skipped.
+
+    "forward" is an ENVELOPE: on the eager path it equals prep + model + sample +
+    draft_offers (+ sparse_select/sparse_finalize on sparse ticks); a graph tick
+    carries "graph" alone. Do not sum it together with its inner segments.
     """
 
-    __slots__ = ("slow_s", "tot", "count", "cur", "t0", "n")
+    __slots__ = ("slow_s", "tot", "count", "cur", "t0", "n", "last_total")
 
     def __init__(self) -> None:
         self.slow_s = float(os.environ.get("TILERL_STEP_TIMING_SLOW_MS", "1000")) / 1000.0
@@ -199,6 +203,7 @@ class _StepTiming:
         self.cur: dict[str, float] = {}
         self.t0 = 0.0
         self.n = 0
+        self.last_total = 0.0
 
     def tick_start(self) -> None:
         self.cur.clear()
@@ -208,8 +213,9 @@ class _StepTiming:
         self.cur[seg] = self.cur.get(seg, 0.0) + time.perf_counter() - t
 
     def tick_end(self) -> None:
-        dt = time.perf_counter() - self.t0
+        self.last_total = time.perf_counter() - self.t0
         self.n += 1
+        dt = self.last_total
         for k, v in self.cur.items():
             self.tot[k] = self.tot.get(k, 0.0) + v
             self.count[k] = self.count.get(k, 0) + 1
@@ -1505,6 +1511,10 @@ class Engine:
             assert r.state_slot is not None, (
                 f"request {r.req_id} reached the forward unadmitted (no state slot)"
             )
+        _tm = self._step_timing
+        _t = 0.0
+        if _tm is not None:
+            _t = time.perf_counter()
         # Speculate on pure-decode ticks only: the step-state buffers cannot
         # cover a bucketed prefill width.
         chains = (
@@ -1558,9 +1568,6 @@ class Engine:
             if not decodes and not prefills:
                 return
         tick_sparse = bool(decodes or prefills) and (decodes + prefills)[0].sparse_on
-        _tm = self._step_timing
-        if _tm is not None:
-            _t = time.perf_counter()
         if (
             not prefills
             and decodes
