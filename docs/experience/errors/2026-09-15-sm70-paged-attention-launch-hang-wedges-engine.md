@@ -89,3 +89,33 @@ must not sink the server):
 Related: [2026-09-15-sm70-long-step-tick-holds-engine-lock.md](2026-09-15-sm70-long-step-tick-holds-engine-lock.md)
 (the self-limiting 1–5.6 s sibling tick — that one returns, this one does not),
 [2026-09-15-sse-midstream-disconnect-never-cancelled-the-row.md](2026-09-15-sse-midstream-disconnect-never-cancelled-the-row.md).
+
+## Addendum 2026-09-15 (second trigger, post-#650) — ops device run
+
+A second re-run of the 20-rep SSE-disconnect churn on the V100 at **29e767de**
+(#650 `/health` step-progress watchdog deployed) re-triggered the wedge at
+**disconnect rep 14** (the first incident was ~rep 16). Data points added by
+ops; conclusions above unchanged:
+
+- The stuck leaf this time was **`Model._mlp` (model.py:566) → `forward`
+  (model.py:646)** — NOT `paged_attention`. GPU 0 %, and **free VRAM was only
+  28 MiB** (tighter than the first incident's ~114 MiB). The blocking point
+  moving from `paged_attention_split` to `_mlp` as free memory shrank is the
+  strongest evidence yet that this is an **op-agnostic memory-edge CUDA launch
+  / caching-allocator host-side stall**, not one kernel.
+- #650 behaved as designed: while wedged `/health` returned **503
+  `{"status":"unhealthy","stuck_secs":82.0}` in ~54 ms** instead of the old
+  false 200.
+- SSE reps 0–13 all released rows (0.11–1.65 s) and the non-stream arm passed
+  with in-flight `/health` under 0.5 s, so the #649 cancel path is clean; the
+  failure is only the underlying wedge.
+- Supervisor recovery was verified end to end on the EXISTING (pre-fast-503)
+  liveness: 3 consecutive chat failures over ~3 min → liveness exit 10 →
+  wedged child killed (rc=137) → GPU back to 0 → launcher boot 1 → 29e767de
+  health 200 after warmup, zero tracebacks. The in-flight #2 change shortens
+  this to two 503s; this run is the slow-path baseline.
+
+Evidence on the V100: `~/wedge_evidence_2026-09-15/verify649b.log` and
+`health_649b.log` (independent-subprocess `/health` samples and the rep-by-rep
+release trace for this second trigger).
+
