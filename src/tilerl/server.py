@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -177,6 +178,11 @@ def overloaded_body(exc: Exception) -> dict[str, Any] | None:
 
 
 _DISCONNECT_POLL_S = 0.05
+
+#: /health reports unhealthy when active requests make no step progress for this
+#: long. A long but RETURNING prefill (up to a few s) must stay healthy; a
+#: wedged device forward (never returns) must not. Overridable for tests/ops.
+HEALTH_STUCK_AFTER_S = float(os.environ.get("TILERL_HEALTH_STUCK_S", "60"))
 
 
 async def await_or_cancel(request: Request, engine: Any, rid_box: list,
@@ -365,15 +371,30 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         return await_completion(engine, request_id, timeout_s)
 
     @app.get("/health")
-    def health() -> dict:
+    def health():
         # "ok" was a literal, so an engine whose stats() raises answered the same as a
         # healthy one. Loop liveness is deliberately NOT checked via engine._thread:
         # that wants a liveness method on the engine, not a private attribute read.
         try:
             stats = engine.stats()
         except Exception as exc:
-            return {"status": "degraded", "model": model_name, "stats": None,
-                    "error": f"{type(exc).__name__}: {exc}"}
+            return JSONResponse(
+                status_code=503,
+                content={"status": "degraded", "model": model_name, "stats": None,
+                         "error": f"{type(exc).__name__}: {exc}"})
+        # Step-loop progress: stats() is a lock-free SNAPSHOT, so it keeps
+        # returning the last tick while the loop is frozen inside a device
+        # forward -- a wedged server answered 200. liveness() reads the last
+        # non-idle tick timestamp (idle/quiet engines stay healthy) and flags a
+        # stall so LB/ops can detect and restart it.
+        liveness = getattr(engine, "liveness", None)
+        if liveness is not None:
+            live, stuck_s = liveness(HEALTH_STUCK_AFTER_S)
+            if not live:
+                return JSONResponse(
+                    status_code=503,
+                    content={"status": "unhealthy", "model": model_name, "stats": stats,
+                             "stuck_secs": round(stuck_s, 3)})
         return {"status": "ok", "model": model_name, "stats": stats}
 
     @app.get("/v1/models")

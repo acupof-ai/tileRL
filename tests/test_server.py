@@ -3201,3 +3201,67 @@ def test_sse_body_generator_exit_cancel_runs_off_the_event_loop():
     assert all(t != loop_id for t in gen_threads), (
         f"GeneratorExit ran on the event loop thread ({loop_id}), threads {gen_threads}")
     assert responsive, "event loop stalled while GeneratorExit cancel parked"
+
+
+class _LivenessEngine:
+    """Minimal engine for the /health stall gate: stats plus a scripted
+    (live, stuck_secs) liveness answer."""
+
+    def __init__(self, verdict):
+        self._verdict = verdict
+
+    def stats(self):
+        return {"running": 1, "waiting": 0, "finished": 0}
+
+    def liveness(self, stuck_after_s):
+        return self._verdict
+
+
+def test_health_returns_503_when_the_step_loop_is_stalled():
+    """A wedged device forward freezes the step loop but stats() keeps serving
+    the last snapshot, so /health used to answer 200 on a dead server. A
+    liveness() verdict of (False, stuck_secs) must produce 503 + stuck_secs."""
+    with TestClient(create_app(_LivenessEngine((False, 91.25)), _ByteTokenizer())) as c:
+        r = c.get("/health")
+    assert r.status_code == 503, r.text
+    body = r.json()
+    assert body["status"] == "unhealthy"
+    assert body["stuck_secs"] == 91.25
+    assert body["stats"]["running"] == 1
+
+
+def test_health_stays_ok_when_the_step_loop_is_live_or_idle():
+    # live even with active requests
+    with TestClient(create_app(_LivenessEngine((True, 0.2)), _ByteTokenizer())) as c:
+        r = c.get("/health")
+    assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+
+
+def test_engine_liveness_idle_is_live_and_active_stall_is_not(monkeypatch):
+    """Direct on the real Engine: idle (no running/waiting) is always live even
+    if the clock is ancient; with an active request a stale last-progress
+    timestamp reports stuck, and a fresh one is live."""
+    import time as _time
+
+
+    cfg = tiny()
+    eng = build_engine(cfg, build_random(cfg, seed=71), get_backend(),
+                       num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096)
+    try:
+        # idle: no requests, ancient timestamp must still be live (quiet server)
+        eng._last_progress_ts = _time.perf_counter() - 9999.0
+        live, stuck = eng.liveness(60.0)
+        assert live is True and stuck == 0.0
+
+        # active request: ancient timestamp -> stuck by roughly that much
+        eng._running.append(object())
+        live, stuck = eng.liveness(60.0)
+        assert live is False and stuck > 60.0
+
+        # active request, just progressed -> live
+        eng._last_progress_ts = _time.perf_counter()
+        live, stuck = eng.liveness(60.0)
+        assert live is True and 0.0 <= stuck <= 60.0
+    finally:
+        eng._running.clear()
+        eng.shutdown()
