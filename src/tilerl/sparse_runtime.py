@@ -295,7 +295,8 @@ class SparseRuntime:
         device_select = self.device_select and pure_decode and not do_refresh
         if do_refresh:
             self.ticks_since_refresh = 0
-        return SparseForward(tr, srows, ctx.backend.device, device_select=device_select)
+        return SparseForward(tr, srows, ctx.backend.device, ctx.backend,
+                             device_select=device_select)
 
     def evict_victim(self, r, reserved: set[int]) -> None:
         """Free one frame this tick does NOT need, so a promotion can allocate.
@@ -648,6 +649,7 @@ class SparseRuntime:
                 tr,
                 None,
                 ctx.backend.device,
+                ctx.backend,
                 device_select=True,
                 reuse=True,
                 b=B,

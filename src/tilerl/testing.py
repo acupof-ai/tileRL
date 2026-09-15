@@ -289,7 +289,8 @@ class RefBackend:
 
         return reference.page_bound_scores(q, bounds)
 
-    def select_pages(self, block_table, n_pages, scores, k_pages):
+    def select_pages(self, block_table, n_pages, scores, k_pages, n_window=0):
         from tilerl_kernels import reference
 
-        return reference.select_pages(block_table, n_pages, scores, k_pages)
+        return reference.select_pages(
+            block_table, n_pages, scores, k_pages, n_window=n_window)

@@ -120,14 +120,13 @@ def test_sparse_pins_selected_pages_across_ticks_and_demotes_what_leaves():
 def test_sparse_a_stable_selection_promotes_nothing_after_the_first_tick():
     """Strong half of the pin gate: force the SAME selection on successive decode
     ticks and assert zero promotions/demotions — the kept frames are reused. The
-    selection is pinned by monkeypatching the CONSUMER
-    (sparse_engine.select_pages) to a fixed top-k once the rows are in decode."""
+    selection is pinned by monkeypatching the CONSUMER (the engine backend's
+    select_pages) to a fixed top-k once the rows are in decode."""
     import tilerl_kernels.reference as ref
-
-    import tilerl.sparse_engine as se
 
     prompt = np.arange(7, 7 + 12 * BLOCK_TOKENS, dtype=np.int64)
     sparse = _engine(True, 2)
+    backend = sparse._backend
     orig_select = ref.select_pages
     fixed: dict[tuple, object] = {}
 
@@ -143,7 +142,7 @@ def test_sparse_a_stable_selection_promotes_nothing_after_the_first_tick():
         return out
 
     rid = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
-    se.select_pages = stable_select
+    backend.select_pages = stable_select  # instance attr shadows the seam method
     cycles = []
     try:
         for _ in range(256):
@@ -159,7 +158,7 @@ def test_sparse_a_stable_selection_promotes_nothing_after_the_first_tick():
             sparse.step()
             cycles.append((cold.demotions - d0, cold.promotions - p0))
     finally:
-        se.select_pages = orig_select
+        del backend.select_pages
     sparse.shutdown()
     assert len(cycles) >= 3, cycles
     # from the second stable tick on, nothing moves between device and host
@@ -1269,7 +1268,7 @@ def test_select_tensor_op_count_is_constant_in_candidate_count():
             decoding=True,
             tq=1,
         )
-        sf = SparseForward(tr, [row], torch.device("cpu"))
+        sf = SparseForward(tr, [row], torch.device("cpu"), RefBackend())
         q = torch.randn(1, cfg.num_attention_heads, cfg.head_dim)
         with _Count() as c:
             sf._select(0, 0, q, None)
@@ -1380,7 +1379,8 @@ def _resident_forward(B, device_select, n_pages=20, k=4):
                 reserved=set(),
             )
         )
-    sf = SparseForward(tr, rows, torch.device("cpu"), device_select=device_select)
+    sf = SparseForward(tr, rows, torch.device("cpu"), RefBackend(),
+                        device_select=device_select)
     return cfg, sf
 
 
@@ -1522,7 +1522,8 @@ def _forward_one_cold(B, device_select, cold_pages):
                 reserved=set(),
             )
         )
-    return SparseForward(tr, rows, torch.device("cpu"), device_select=device_select), cfg
+    return SparseForward(tr, rows, torch.device("cpu"), RefBackend(),
+                        device_select=device_select), cfg
 
 
 def test_device_select_excludes_a_cold_candidate_and_eager_promotes_it():

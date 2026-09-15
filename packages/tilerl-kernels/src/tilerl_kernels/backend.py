@@ -1011,6 +1011,16 @@ class Backend:
             threads=_THREADS,
         )
 
+    def select_pages(
+        self, block_table, n_pages, scores, k_pages, n_window=0,
+    ):
+        """Selected pages per row/layer in sequence order; see
+        ``reference.select_pages`` for the union/order contract."""
+        # ponytail: torch reference until a real select kernel lands -- it is
+        # the CPU twin on every arch; upgrade path is a tiled top-k+union kernel.
+        return reference.select_pages(
+            block_table, n_pages, scores, k_pages, n_window=n_window)
+
     def paged_attention(
         self, q, k_cache, v_cache, block_table, seq_lens, scale, gate=None, seq_q_lens=None,
         k_scale=None, v_scale=None
