@@ -281,20 +281,6 @@ class HostKvPages:
         except OSError:
             return 0
 
-    def _evict_to_ssd(self, victim: int) -> bool:
-        """Move one host-resident page to the spill file. False (drop) when no file."""
-        blob = self._blobs.pop(victim, None)
-        n = self._held.pop(victim, 0)
-        if not self._ssd_path:
-            self.drops += 1
-            return False
-        if self._ssd is None:
-            self._ssd = ColdSsdFile(self._ssd_path, _blob_spec(blob))  # first spill fixes layout
-        self._ssd.write(victim, blob)
-        self._ssd_bytes += n
-        self._used -= n
-        return True
-
     def __contains__(self, key) -> bool:
         return key in self._held or (self._ssd is not None and key in self._ssd)
 
