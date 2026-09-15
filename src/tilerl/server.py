@@ -155,6 +155,26 @@ class ClientDisconnected(Exception):
     """A real http.disconnect arrived while the completion worker still runs."""
 
 
+def overloaded_body(exc: Exception) -> dict[str, Any] | None:
+    """The 503 error body for an EngineOverloaded submit refusal, or None.
+
+    Capacity is the server's responsibility, not the client's: no 429, no
+    retry_after. The exception message already carries the cap and the
+    in-flight count (running + waiting); the body exposes the same fact in
+    machine-readable fields so a caller can choose whether to queue.
+    """
+    from .engine import EngineOverloaded
+
+    if not isinstance(exc, EngineOverloaded):
+        return None
+    import re
+
+    m = re.search(r"(\d+) in-flight requests and the cap is (\d+)", str(exc))
+    inflight, cap = (int(m.group(1)), int(m.group(2))) if m else (None, None)
+    return {"message": str(exc), "type": "overloaded_error",
+            "inflight": inflight, "cap": cap}
+
+
 _DISCONNECT_POLL_S = 0.05
 
 
@@ -350,7 +370,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         except RuntimeError as exc:
             return JSONResponse(
                 status_code=503,
-                content={"error": {"message": str(exc), "type": "api_error"}},
+                content={"error": overloaded_body(exc) or {
+                    "message": str(exc), "type": "api_error"}},
             )
 
         if req.stream:

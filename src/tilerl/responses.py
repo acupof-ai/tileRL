@@ -245,11 +245,14 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
                                                    "type": "invalid_request_error"}})
         except (TimeoutError, RuntimeError) as exc:
             # Timeout: the row keeps generating until the server cancels it;
-            # RuntimeError (RequestFailed) makes cancel a no-op.
+            # RuntimeError (RequestFailed) makes cancel a no-op. An
+            # EngineOverloaded submit never created a row.
             engine.cancel(rid_box[0])
+            from .server import overloaded_body
+            err = (overloaded_body(exc)
+                   or {"message": str(exc), "type": "api_error"})
             return JSONResponse(status_code=503,
-                                content={"error": {"message": str(exc),
-                                                   "type": "api_error"}})
+                                content={"error": err})
         if not req.stream:
             return JSONResponse(content=body)
 
