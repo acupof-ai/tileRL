@@ -3450,3 +3450,20 @@ def test_forward_oom_is_fatal_but_a_normal_error_finishes_the_row():
     finally:
         eng2.shutdown()
 
+
+
+def test_health_stats_carry_in_process_device_free_and_limit():
+    """The long-term observability for a memory-fraction reserve: stats expose the
+    process allocator's free/limit (mem_get_info), distinct from nvidia-smi. Off
+    cuda both are 0 (no device); the fields always exist so readers need no
+    device branch. The cuda values are pending-remote."""
+    cfg = tiny()
+    eng = build_engine(cfg, build_random(cfg, seed=7), get_backend(),
+                       num_blocks=8, num_slots=4, max_batch=4,
+                       max_total_tokens=2048, sparse_k=0)
+    try:
+        s = eng.stats()
+        assert s["device_free_bytes"] == 0
+        assert s["device_limit_bytes"] == 0
+    finally:
+        eng.shutdown()

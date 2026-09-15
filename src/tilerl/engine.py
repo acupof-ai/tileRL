@@ -1373,6 +1373,16 @@ class Engine:
             return self._build_stats()
         return snap
 
+    def _device_free_limit(self) -> dict[str, int]:
+        """This process's allocator free/total in bytes (torch.cuda.mem_get_info).
+        Under set_per_process_memory_fraction the total is the capped process limit
+        and free is the held reserve headroom; off cuda both are 0 (no device).
+        Pure read; never takes the model lock path."""
+        if self._backend.device.type != "cuda":
+            return {"device_free_bytes": 0, "device_limit_bytes": 0}
+        free, total = torch.cuda.mem_get_info(self._backend.device)
+        return {"device_free_bytes": int(free), "device_limit_bytes": int(total)}
+
     def _build_stats(self) -> dict[str, Any]:
         with self._lock:
             store = self._prefix.stats()
@@ -1390,6 +1400,11 @@ class Engine:
                 # many KV blocks it trimmed; 0/0 means the reserve did not bind.
                 "device_reserve_bytes": self._device_reserve_bytes,
                 "reserve_dropped_blocks": self._reserve_dropped_blocks,
+                # In-process allocator view, NOT nvidia-smi: under a memory
+                # fraction these are capped to the process limit, so free is the
+                # reserve headroom the process actually has (physical card free
+                # always differs by driver/context bytes outside the fraction).
+                **self._device_free_limit(),
                 "slots_used": self._slots_used,
                 "slots_total": self.usable_slots,
                 "prefix_hits": self._prefix_hits,
