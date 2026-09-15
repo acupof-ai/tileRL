@@ -157,13 +157,16 @@ JSON 503. The pool then drained to zero and a normal short chat returned 200
 before and after. Waiting rows hold no KV, so inflight 8 costs no more device
 memory than 4 running rows.
 
-**Known follow-up (CPU-gateable, no device run).** The non-stream arm logged
-two `Task exception was never retrieved` (`RequestFailed: ... cancelled: the
-reader disconnected`). In `await_or_cancel`, the orphaned completion worker's
-retrieving callback is attached only `if not worker.done()` in `finally`; the
-new `await asyncio.to_thread(engine.cancel)` opens a window in which the worker
-finishes with `RequestFailed` first, so the callback is skipped. Benign log
-noise (the row is already released); the fix is to attach the done callback
-**unconditionally** — a callback on an already-done task is scheduled
-immediately and still retrieves the exception. A CPU disconnect gate covers it.
-
+**Follow-up closed.** The non-stream arm logged two `Task exception was never
+retrieved` (`RequestFailed: ... cancelled: the reader disconnected`): in
+`await_or_cancel` the orphaned completion worker's retrieving callback was
+attached only `if not worker.done()` in `finally`, and the
+`await asyncio.to_thread(engine.cancel)` window let the worker finish with
+`RequestFailed` first, skipping the callback. Fixed by attaching the callback
+unconditionally before the worker can finish (a callback on an already-done
+task is scheduled immediately and still retrieves). Gate: a scripted engine
+whose `cancel()` signals entry then sleeps while `take()` raises inside that
+window; a custom loop exception handler plus GC asserts no
+`Task exception was never retrieved` — red on the conditional attachment with
+exactly that message, green after. Pure CPU, no device run. `stream_or_cancel`
+already attached both callbacks unconditionally (#637).
