@@ -125,3 +125,45 @@ Two separate indicators, and the gate reflects the split:
    parked critical section ends", never a wall-clock release bound.
 
 The long tick itself is a separate, unowned defect — see OPEN.md.
+
+## Device verification after #637 — V100 sm70, e751b27e, 2026-09-15
+
+ops re-ran the real-curl gate `scripts/probe_sse_overload.py` against the
+merged fix (e751b27e; warmup green, no liveness restart). The probe holds
+inflight at the cap with a self-healing pool and times every disconnect
+against a ~20 Hz `/health` sampler. Hard gates: in-flight `/health` < 0.5 s,
+and running/slots/blocks end at zero (no wall-clock release bound).
+
+| arm | reps | close→zero release (s) | worst in-flight /health (s) | zero leak |
+|---|---:|---|---:|:--:|
+| SSE (1 first-frame + 5 at frame ~45) | 6 | 0.052 – 0.574 | **0.273** | yes |
+| non-stream in-flight disconnect | 3 | 0.154 – 0.206 | **0.002** | yes |
+| `/ws/chat` (manual, third-party `websockets`) | 4 | 0.155 – 1.540 | **0.005** | yes |
+
+Pre-fix the same disconnects left `/health` unresponsive up to **5.57 s**
+(measured from an independent curl process); post-fix worst across all arms is
+**0.273 s**, and no release exceeded 2 s in this run (the slow-tick OPEN row
+stays open — a parked cancel can still wait for a long tick, but the loop no
+longer freezes).
+
+**Over-capacity backpressure.** The separate #630/#633/#634 chain gave
+`submit` an `max_inflight` ceiling (serve derives `2 * usable_slots` = 8),
+refused pre-enqueue as `EngineOverloaded` → HTTP 503 `overloaded_error` on all
+three routes, stream included. On an exact `/health` reading of running=4
+waiting=4, six ninth submits — chat/messages/responses × stream and non-stream,
+fired through one barrier — all returned **503** with integer `inflight=8
+cap=8`, no 429 and no `retry_after`; streamed submits got the same pre-submit
+JSON 503. The pool then drained to zero and a normal short chat returned 200
+before and after. Waiting rows hold no KV, so inflight 8 costs no more device
+memory than 4 running rows.
+
+**Known follow-up (CPU-gateable, no device run).** The non-stream arm logged
+two `Task exception was never retrieved` (`RequestFailed: ... cancelled: the
+reader disconnected`). In `await_or_cancel`, the orphaned completion worker's
+retrieving callback is attached only `if not worker.done()` in `finally`; the
+new `await asyncio.to_thread(engine.cancel)` opens a window in which the worker
+finishes with `RequestFailed` first, so the callback is skipped. Benign log
+noise (the row is already released); the fix is to attach the done callback
+**unconditionally** — a callback on an already-done task is scheduled
+immediately and still retrieves the exception. A CPU disconnect gate covers it.
+
