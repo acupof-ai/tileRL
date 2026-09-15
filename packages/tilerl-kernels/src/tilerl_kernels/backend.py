@@ -31,6 +31,9 @@ _WY_CHUNK = 64
 # ponytail: the DFlash2 verify block; wider runs take the M-tiled kernel until
 # the crossover between the two is measured
 _MAX_VERIFY_W = 8
+#: Public read-only face of the verify-tile width; the framework reads it via
+#: ``Backend.max_verify_width`` rather than the underscore constant.
+MAX_VERIFY_W = _MAX_VERIFY_W
 # a whole-chunk verify width would reach _full_rows' host sync, illegal under graph capture
 assert _MAX_VERIFY_W < _WY_CHUNK
 # getattr: an older torch build may have neither, and this is only ever a membership test
@@ -222,6 +225,26 @@ class Backend:
 
         dist.all_reduce(x, group=self._dp_pg)
         return x.div_(self.dp_world)
+
+    @property
+    def max_verify_width(self) -> int:
+        """Widest verify tick the paged-attention tile routes on the decode
+        path; above it every verify tick falls onto the M-tiled prefill kernel.
+        Read-only: the bound is a kernel constant, not a runtime choice."""
+        return MAX_VERIFY_W
+
+    def dp_all_gather(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Gather one tensor from every dp replica, in dp rank order. The order
+        check hashes a per-rank list and compares it across replicas -- it needs
+        the rows, not a concat, and it must run on the dp group the reduces ran
+        on. dp_world 1 returns ``[x]``."""
+        if self.dp_world == 1:
+            return [x]
+        import torch.distributed as dist
+
+        parts = [torch.empty_like(x) for _ in range(self.dp_world)]
+        dist.all_gather(parts, x, group=self._dp_pg)
+        return parts
 
     def tp_fork(self, x: torch.Tensor) -> torch.Tensor:
         """Identity forward, all-reduce backward: the dual of ``all_reduce``.

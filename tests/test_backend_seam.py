@@ -1,0 +1,119 @@
+"""Backend-isolation gate for the dp/verify seam (finding 23).
+
+The framework (src/tilerl, outside the kernels package) must reach torch
+distributed and kernel tile constants only through a Backend method or
+read-only property, never by importing torch.distributed or a backend private:
+
+* ``_MAX_VERIFY_W``  -> ``Backend.max_verify_width``
+* ``backend._dp_pg`` + bare ``torch.distributed.all_gather`` ->
+  ``Backend.dp_all_gather``
+
+RefBackend (src/tilerl/testing.py) is the one ALLOWED point: it is itself a
+backend implementation, the CPU mirror of the tilelang Backend, so its private
+process groups and torch.distributed calls are the seam's other half, not a
+leak around it.
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+import pytest
+import torch
+
+_SRC = Path(__file__).resolve().parent.parent / "src" / "tilerl"
+
+#: The reference backend implements the same seam; it is allowed torch.
+_ALLOWED = {"testing.py"}
+
+
+def _framework_files():
+    return [p for p in _SRC.rglob("*.py") if p.name not in _ALLOWED]
+
+
+#: Backend-private names the framework must only reach through the public seam.
+_PRIVATES = ("_MAX_VERIFY_W", "_dp_pg")
+
+
+def _violations(src: str) -> list[str]:
+    """All backend-private / bare-distributed references in one source string."""
+    bad: list[str] = []
+    for node in ast.walk(ast.parse(src)):
+        # bare name: a direct import-then-use of the constant
+        if isinstance(node, ast.Name) and node.id in _PRIVATES:
+            bad.append(f"references {node.id}")
+        # attribute on ANY receiver: backend._dp_pg, x._MAX_VERIFY_W, ...
+        if isinstance(node, ast.Attribute) and node.attr in _PRIVATES:
+            bad.append(f"references .{node.attr}")
+        # `from ... import _MAX_VERIFY_W` or `... as W`: either binds the
+        # private name, and the as-bound name is then untraceable, so the
+        # import is the only choke point -- match a.name regardless of alias.
+        if isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name in _PRIVATES:
+                    bad.append(f"imports {a.name}")
+        # import torch.distributed / from torch.distributed import ...
+        if isinstance(node, ast.Import) and any(
+                a.name == "torch.distributed" for a in node.names):
+            bad.append("imports torch.distributed")
+        if isinstance(node, ast.ImportFrom) and node.module == "torch.distributed":
+            bad.append("imports from torch.distributed")
+        # an explicit torch.distributed.<collective> attribute path
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "distributed"
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "torch"):
+            bad.append(f"calls torch.distributed.{node.attr}")
+    return bad
+
+
+def test_framework_does_not_touch_backend_privates_or_distributed():
+    bad: list[str] = []
+    for p in _framework_files():
+        for v in _violations(p.read_text()):
+            bad.append(f"{p.name}: {v}")
+    assert not bad, "framework must use the Backend seam, not:\n" + "\n".join(sorted(bad))
+
+
+@pytest.mark.parametrize("mutant", [
+    "from tilerl_kernels.backend import _MAX_VERIFY_W\n",       # bare from-import
+    "from tilerl_kernels.backend import _MAX_VERIFY_W as W\n",  # import-as alias
+    "def f(b):\n    return b._dp_pg\n",                         # obj._private attribute
+])
+def test_every_private_access_shape_is_red(mutant):
+    """The gate must catch all three binding shapes: a bare name, an as-bound
+    alias (untraceable after import), and an attribute on any receiver. Each
+    is the exact form this seam deletes; a scanner missing one reads green."""
+    assert _violations(mutant), f"gate missed private access shape:\n{mutant}"
+
+
+def test_both_backends_expose_the_seam():
+    from tilerl_kernels.backend import MAX_VERIFY_W, Backend
+
+    from tilerl.testing import RefBackend
+
+    assert isinstance(MAX_VERIFY_W, int) and MAX_VERIFY_W == 8
+    for cls in (Backend, RefBackend):
+        assert isinstance(getattr(cls, "max_verify_width"), property)
+        assert callable(getattr(cls, "dp_all_gather"))
+
+    ref = RefBackend()
+    assert ref.max_verify_width == MAX_VERIFY_W
+    assert ref.dp_world == 1  # the CPU test default
+    t = torch.arange(4.0)
+    out = ref.dp_all_gather(t)
+    assert len(out) == 1 and out[0] is t  # world-1 fast path: the same tensor
+
+
+def test_engine_reads_verify_width_off_the_backend():
+    """The width error message must source its bound from the backend, proving
+    the private constant is gone from the engine call site."""
+    engine_py = (_SRC / "engine.py").read_text()
+    assert "_MAX_VERIFY_W" not in engine_py
+    assert "backend.max_verify_width" in engine_py
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

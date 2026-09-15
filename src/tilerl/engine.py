@@ -523,8 +523,6 @@ class Engine:
         self._aux_layers = draft.aux_layers if draft is not None else ()
         self._width = 1  # verify tick width: 1 committed token + width-1 drafts
         if draft is not None:
-            from tilerl_kernels.backend import _MAX_VERIFY_W
-
             if not hasattr(draft, "step"):
                 raise TypeError(
                     f"draft head {type(draft).__name__} is not a drafter: it has no "
@@ -534,9 +532,10 @@ class Engine:
             self._width = draft.width
             if not 1 < self._width <= BLOCK_TOKENS:
                 raise ValueError(f"verify width must be in (1, {BLOCK_TOKENS}], got {self._width}")
-            if self._width > _MAX_VERIFY_W:
+            if self._width > backend.max_verify_width:
                 raise ValueError(
-                    f"verify width {self._width} exceeds the verify tile's {_MAX_VERIFY_W}: "
+                    f"verify width {self._width} exceeds the verify tile's "
+                    f"{backend.max_verify_width}: "
                     f"paged_attention would route every verify tick off the decode path onto "
                     f"the M-tiled prefill kernel, which costs more than the drafts save"
                 )
