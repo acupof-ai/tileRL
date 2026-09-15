@@ -97,11 +97,22 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
     done
     [ "$gone" != 1 ] && { kill -9 "$child" 2>/dev/null; sleep 3; }
     st=$(ps -o stat= -p "$child" 2>/dev/null) && echo "servehybrid: WARN pid $child still present: $st" >> "$LOG"
+    # Record held MiB after the pid is gone; informational only -- NOT a gate on
+    # the GPU reading 0 (another process or a slow release is for ops to see).
     gpu=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d " ")
     echo "servehybrid: post-kill GPU ${gpu}MiB at $(date -Is)" >> "$LOG"
     exit 12 ) &
   guard=$!
   wait "$child"; rc=$?; child=
+  # A crash after readiness leaves this boot's guard blocked in liveness's 60s
+  # sleep; kill its python children then the subshell before the next boot, or
+  # the old liveness loop survives and two guards poll one new child.
+  if [ -n "$guard" ]; then
+    pkill -TERM -P "$guard" 2>/dev/null
+    kill -TERM "$guard" 2>/dev/null
+    wait "$guard" 2>/dev/null
+  fi
+  guard=
   ran=$((SECONDS - started))
   echo "=== exit rc=$rc after ${ran}s at $(date -Is) ===" >> "$LOG"
   [ -n "$stopping" ] && exit 0
