@@ -69,6 +69,21 @@ exceed the stock executor's `min(32, cpu+4)` (=8 on 4-vCPU CI), a harness-only
 constraint since the real sync body polls in short slices rather than parking
 solid.
 
+Review added two more requirements to the detached drain, both about its
+failure/exit edges:
+
+- a drain that times out or whose worker raises no longer skips `body.close()`
+  silently — it logs a warning with the rid, timeout-vs-exception, and
+  "close skipped"; the slot is already free from the first cancel, but an
+  unclosed generator on the wedge box must be visible;
+- graceful shutdown (SIGTERM) joins in-flight drains via the app lifespan with
+  the same bounded `asyncio.wait(_draining, timeout=_DRAIN_WAIT_S)` (it does
+  NOT cancel them — each is already self-bounded — and logs pending count).
+  The supervisor's SIGKILL-on-wedge path needs no join; ordinary restarts do,
+  since an unclosed sync generator on that path is a real leak. A gate starts a
+  drain with a blocking stub `close()` and asserts the join stays pending until
+  close returns.
+
 ## The VRAM/allocator hypothesis — refuted as the cause
 
 Two candidate preventions were built and measured before the GIL root was found;

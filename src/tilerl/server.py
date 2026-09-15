@@ -18,6 +18,7 @@ This module never imports torch or tilelang: prompts cross the boundary as
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -233,9 +234,42 @@ async def _drain_body(engine: Any, request_id: int, worker: Any, body: Any) -> N
     await asyncio.to_thread(engine.cancel, request_id)
     try:
         await asyncio.wait_for(asyncio.shield(worker), timeout=_DRAIN_WAIT_S)
+    except TimeoutError:
+        # The row is already cancelled/slot-free, but the sync generator is not
+        # closed: closing a still-executing generator raises ValueError. This is
+        # the exact event the wedge box must see, so never skip it silently.
+        logging.warning(
+            "sse drain rid=%s: in-flight worker did not finish in %.0fs; "
+            "body.close() skipped (row cancelled, generator unclosed)",
+            request_id, _DRAIN_WAIT_S)
+        return
     except Exception:
-        return  # timeout or the worker itself raised; the body is not safe to close
+        logging.warning(
+            "sse drain rid=%s: in-flight worker raised; body.close() skipped "
+            "(row cancelled, generator unclosed)", request_id, exc_info=True)
+        return
     await asyncio.to_thread(body.close)
+
+
+async def _await_drains() -> None:
+    """Bounded join of in-flight detached drains at graceful shutdown (SIGTERM).
+    asyncio.wait (not gather): the timeout does NOT cancel the drains — each is
+    already self-bounded by _DRAIN_WAIT_S — so a late one still closes its body
+    after shutdown returns. The supervisor's SIGKILL-on-wedge path needs no join;
+    this covers an ordinary restart leaving no unclosed sync generator."""
+    if not _draining:
+        return
+    _, pending = await asyncio.wait(tuple(_draining), timeout=_DRAIN_WAIT_S)
+    if pending:
+        logging.warning(
+            "sse shutdown: %d body drain(s) unfinished after %.0fs; their "
+            "generators close late or unclosed", len(pending), _DRAIN_WAIT_S)
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(app: Any):
+    yield
+    await _await_drains()
 
 #: /health reports unhealthy when active requests make no step progress for this
 #: long. A long but RETURNING prefill (up to a few s) must stay healthy; a
@@ -349,7 +383,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     ``stats``. The engine loop is expected to run in its own thread (the CLI
     starts it); request handlers only submit and poll.
     """
-    app = FastAPI(title="tilerl", version="0.1.0")
+    app = FastAPI(title="tilerl", version="0.1.0", lifespan=_lifespan)
     app_started = int(time.time())
 
     @app.exception_handler(RequestValidationError)

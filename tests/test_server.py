@@ -3712,3 +3712,71 @@ def test_stream_or_cancel_final_drain_is_detached_not_awaited_in_cancel_scope():
     # release is not best-effort); the drain's cancel is only the backstop
     fsrc = src
     assert fsrc.count("to_thread(engine.cancel, request_id)") >= 2
+    # a skipped body.close (worker timeout or raise) must be logged, not silent
+    assert dsrc.count("logging.warning") == 2 and "body.close() skipped" in dsrc
+    # graceful shutdown joins in-flight drains through the app lifespan, bounded
+    assert "lifespan=_lifespan" in full
+    jsrc = inspect.getsource(srv_mod._await_drains)
+    assert "asyncio.wait(tuple(_draining), timeout=_DRAIN_WAIT_S)" in jsrc
+
+
+def test_detached_drains_are_awaited_at_shutdown_while_a_close_is_still_running():
+    """Graceful stop (SIGTERM) must JOIN an in-flight detached drain within the
+    bound: an SSE task torn down just before exit leaves _drain_body running
+    body.close() on a worker thread; shutdown has to wait for it instead of
+    letting an unclosed sync generator outlive the server. Event-synced: the
+    join future must be pending while close() blocks, and must complete once
+    close returns. Red on a no-op shutdown helper (join would be done early) and
+    on a missing helper (attribute error). The 30s bound itself is pinned
+    structurally in the AST gate; a 30s wall test is not worth it."""
+
+    class _SlowClose:
+        def __init__(self):
+            self.close_started = threading.Event()
+            self.released = threading.Event()
+            self.closed = False
+
+        def close(self):
+            self.close_started.set()
+            self.released.wait(5.0)
+            self.closed = True
+
+    class _QuickCancel:
+        def __init__(self):
+            self.cancelled = threading.Event()
+
+        def cancel(self, rid):
+            self.cancelled.set()
+            return True
+
+    import tilerl.server as srv_mod
+
+    async def main():
+        body, eng = _SlowClose(), _QuickCancel()
+        worker = asyncio.ensure_future(asyncio.sleep(0))
+        await worker  # the in-flight next() has already returned; close() blocks
+        srv_mod._detach_drain(eng, 1, worker, body)
+        for _ in range(25):  # let the drain task start on the loop
+            await asyncio.sleep(0.02)
+            if eng.cancelled.is_set():
+                break
+        assert eng.cancelled.wait(2.0)
+        assert body.close_started.wait(2.0)
+        assert srv_mod._draining
+
+        join = asyncio.ensure_future(srv_mod._await_drains())
+        for _ in range(20):  # let the join reach its wait
+            await asyncio.sleep(0.02)
+            if not join.done():
+                break
+        assert not join.done(), "shutdown returned while body.close() was running"
+        body.released.set()
+        await asyncio.wait_for(join, timeout=2.0)
+        assert body.closed
+        for _ in range(50):  # done callback discards the strong ref
+            if not srv_mod._draining:
+                break
+            await asyncio.sleep(0.02)
+        assert not srv_mod._draining
+
+    asyncio.run(main())
