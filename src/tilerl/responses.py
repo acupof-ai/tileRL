@@ -235,7 +235,8 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         try:
             body = await await_or_cancel(request, engine, rid_box, _run, req, rid_box)
         except asyncio.CancelledError:
-            engine.cancel(rid_box[0])
+            # Off the event loop: cancel takes engine._lock across _release.
+            await asyncio.to_thread(engine.cancel, rid_box[0])
             raise
         except ClientDisconnected:
             return Response(status_code=499)
@@ -247,7 +248,7 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
             # Timeout: the row keeps generating until the server cancels it;
             # RuntimeError (RequestFailed) makes cancel a no-op. An
             # EngineOverloaded submit never created a row.
-            engine.cancel(rid_box[0])
+            await asyncio.to_thread(engine.cancel, rid_box[0])
             from .server import overloaded_body
             err = (overloaded_body(exc)
                    or {"message": str(exc), "type": "api_error"})
