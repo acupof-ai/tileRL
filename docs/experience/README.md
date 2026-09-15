@@ -1,6 +1,6 @@
 # The experience archive
 
-591 dated entries — 274 wins, 317 errors. One measurement each, written the day it was taken, kept
+595 dated entries — 275 wins, 320 errors. One measurement each, written the day it was taken, kept
 whether it shipped or was rejected. This page is not the listing — it is the
 ~16 entries that carry findings the rest of the repo rests on. Everything else
 is the archive, and `git log` or `grep` is the way into it.

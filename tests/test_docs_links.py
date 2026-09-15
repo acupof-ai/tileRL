@@ -493,5 +493,53 @@ def test_no_readme_number_is_absent_from_every_dated_entry():
         "missing or the number was never measured:\n  " + "\n  ".join(missing))
 
 
+def _dated_counts() -> tuple[int, int, int]:
+    """(wins, errors, total) dated entries git actually tracks, TEMPLATE excluded."""
+    dated = {p for p in _tracked()
+             if p.endswith(".md")
+             and re.search(r"docs/experience/(wins|errors)/20\d\d-\d\d-\d\d-", p)}
+    wins = sum("/wins/" in p for p in dated)
+    errors = sum("/errors/" in p for p in dated)
+    return wins, errors, len(dated)
+
+
+def test_experience_counts_in_prose_match_the_tree():
+    """The archive counts in the three README prose lines drift every few PRs (591 vs
+    a tree that already held 595). They stay literal prose, not generated text, so a
+    hand edit can desync them -- this gate fails on the mismatch instead of letting a
+    reader trust a stale number."""
+    wins, errors, total = _dated_counts()
+    assert wins > 100 and errors > 100 and total == wins + errors, (
+        f"the count scan is broken: {wins=} {errors=} {total=}")
+
+    arch = (DOCS / "experience" / "README.md").read_text()
+    m = re.search(r"(\d+) dated entries — (\d+) wins, (\d+) errors", arch)
+    assert m, "docs/experience/README.md lost its '<n> dated entries — <w> wins, <e> errors' line"
+    assert (int(m.group(1)), int(m.group(2)), int(m.group(3))) == (total, wins, errors), (
+        f"docs/experience/README.md says {m.groups()}, tree has total={total} "
+        f"wins={wins} errors={errors}")
+
+    docs_readme = (DOCS / "README.md").read_text()
+    m = re.search(r"(\d+) dated entries", docs_readme)
+    assert m, "docs/README.md lost its '<n> dated entries' line"
+    assert int(m.group(1)) == total, (
+        f"docs/README.md says {m.group(1)} dated entries, tree has {total}")
+
+
+def test_root_readme_open_defect_count_matches_open_md():
+    """README's '<n> open defects' must equal the live rows in OPEN.md's table, not the
+    'Closed by triage' appendix below it."""
+    open_md = (DOCS / "experience" / "OPEN.md").read_text()
+    table = open_md.split("## Closed by triage")[0]
+    rows = [ln for ln in table.splitlines()
+            if ln.startswith("|") and not ln.startswith("| entry")
+            and not set(ln) <= set("|-: ")]
+    readme = (ROOT / "README.md").read_text()
+    m = re.search(r"(\d+) open defects", readme)
+    assert m, "README.md lost its '<n> open defects' phrase"
+    assert int(m.group(1)) == len(rows), (
+        f"README.md says {m.group(1)} open defects, OPEN.md has {len(rows)} live rows")
+
+
 if __name__ == "__main__":
     print(f"{len(_dead())} dead references across {len(_tracked())} tracked docs")

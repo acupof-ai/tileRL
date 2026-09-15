@@ -53,7 +53,7 @@ What runs today (H20 unless noted; every number links its entry):
   full-27B training rollout tick is measured **2.64x the serving tick** and never closed
   ([errors/2026-09-08-the-training-rollout-tick-is-2.6x-serving.md](docs/experience/errors/2026-09-08-the-training-rollout-tick-is-2.6x-serving.md)).
 
-Unfinished (owners in [OPEN.md](docs/experience/OPEN.md), **8 open defects**): the sparse 256k
+Unfinished (owners in [OPEN.md](docs/experience/OPEN.md), **10 open defects**): the sparse 256k
 decode number still waits on a named card lend — its 32k row shipped in
 [#571](https://github.com/acupof-ai/tileRL/pull/571) (88.23 ms/tick vs ~13 ms dense graph); 32k
 teacher-forced sparse NLL closed partial at **5 of 8 windows** (k128 gap −0.1402 nats/token,

@@ -70,6 +70,20 @@ jobs:
           echo "distributed gates run: $ran"
         env:
           TILERL_TARGET: cpu
+      - name: Pod script selftests
+        # Local, hermetic bash selftests (card_claim/nvidia-smi mocked) for the
+        # path composition and runner guards the pod scripts rely on. Until this
+        # step existed they ran only when someone typed them, which is the same
+        # as not having them. Each prints PASS and exits non-zero on failure.
+        run: |
+          set -e
+          ran=0
+          for t in scripts/pod_*_selftest.sh; do
+            echo "== $t"
+            bash "$t"
+            ran=$((ran + 1))
+          done
+          [ "$ran" -ge 3 ] || { echo "only $ran pod selftests ran, expected >= 3" >&2; exit 1; }
       - name: Both distributions build
         # The workspace ships two wheels; a release that cannot build one of
         # them is found at publish time otherwise.
