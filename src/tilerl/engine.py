@@ -29,6 +29,7 @@ sequences: ``decode=`` is the one place ids become text, for ``stop_texts``.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import pickle
@@ -175,6 +176,54 @@ def _serve_draft(draft: Any, backend: Any) -> None:
 def _step_seed(seed: int, generated: int) -> int:
     # Full-width hashes: a shift-then-mask collapsed seeds 1/2049/16385 to one stream.
     return ((int(seed) * 2_654_435_761) ^ (generated * 2_246_822_519)) & _HASH_MASK
+
+
+class _StepTiming:
+    """Env-gated wall-clock timing of the segments step() holds _lock across
+    (the slow-tick investigation: 1-5.6 s). TILERL_STEP_TIMING=1 enables,
+    TILERL_STEP_TIMING_SLOW_MS sets the per-tick print threshold (1000).
+
+    Wall-clock, not CUDA-event time: the question is where lock-held time goes,
+    host stalls included. Every slow tick prints its segments to stderr at once;
+    exit prints per-segment averages. perf_counter reads stay unconditional at
+    the call sites (tens of ns against a 100+ ms tick); with the env off no
+    instance exists and the marks themselves are skipped.
+    """
+
+    __slots__ = ("slow_s", "tot", "count", "cur", "t0", "n")
+
+    def __init__(self) -> None:
+        self.slow_s = float(os.environ.get("TILERL_STEP_TIMING_SLOW_MS", "1000")) / 1000.0
+        self.tot: dict[str, float] = {}
+        self.count: dict[str, int] = {}
+        self.cur: dict[str, float] = {}
+        self.t0 = 0.0
+        self.n = 0
+
+    def tick_start(self) -> None:
+        self.cur.clear()
+        self.t0 = time.perf_counter()
+
+    def mark(self, seg: str, t: float) -> None:
+        self.cur[seg] = self.cur.get(seg, 0.0) + time.perf_counter() - t
+
+    def tick_end(self) -> None:
+        dt = time.perf_counter() - self.t0
+        self.n += 1
+        for k, v in self.cur.items():
+            self.tot[k] = self.tot.get(k, 0.0) + v
+            self.count[k] = self.count.get(k, 0) + 1
+        if dt > self.slow_s:
+            parts = " ".join(f"{k}={v * 1000:.0f}ms" for k, v in self.cur.items())
+            print(f"[step-timing] tick {self.n} total={dt * 1000:.0f}ms {parts}",
+                  file=sys.stderr, flush=True)
+
+    def report(self) -> None:
+        if not self.n:
+            return
+        parts = " ".join(
+            f"{k}={self.tot[k] / self.count[k] * 1000:.1f}ms" for k in sorted(self.tot))
+        print(f"[step-timing] {self.n} ticks avg: {parts}", file=sys.stderr, flush=True)
 
 
 class RequestFailed(RuntimeError):
@@ -512,6 +561,9 @@ class Engine:
 
         self._pin = backend.device.type == "cuda"
         self._lock = threading.RLock()
+        self._step_timing = _StepTiming() if os.environ.get("TILERL_STEP_TIMING") else None
+        if self._step_timing is not None:
+            atexit.register(self._step_timing.report)
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         #: Published by the loop so `stats()` never takes the lock a forward holds.
@@ -839,15 +891,25 @@ class Engine:
         """Run one tick: one forward over the planned rows."""
         idle = False
         with self._lock:
+            _tm = self._step_timing
+            if _tm is not None:
+                _tm.tick_start()
+                _t = time.perf_counter()
             decodes, prefills, chunks = self._build_plan()
             if not decodes and not prefills:
                 idle = True
             else:
+                if _tm is not None:
+                    _tm.mark("plan", _t)
+                    _t = time.perf_counter()
                 # Before the forward too: without this the FIRST forward has no snapshot and
                 # `stats()` falls back to the locking path.
                 self._stats_snapshot = self._build_stats()
                 tick_sparse = bool(
                     (decodes + prefills) and (decodes + prefills)[0].sparse_on)
+                if _tm is not None:
+                    _tm.mark("stats", _t)
+                    _t = time.perf_counter()
                 try:
                     self._hybrid_t0 = time.perf_counter()
                     self._run_forward(decodes, prefills, chunks)
@@ -856,10 +918,19 @@ class Engine:
                         self._finish(req, error=str(exc))
                     raise
                 finally:
+                    if _tm is not None:
+                        _tm.mark("forward", _t)
+                        _t = time.perf_counter()
                     # `_loop` stops calling `step` once nothing runs, so this carries the last
                     # tick's state -- including a failed forward's, hence `finally`.
                     self._stats_snapshot = self._build_stats()
+                if _tm is not None:
+                    _tm.mark("stats", _t)
+                    _t = time.perf_counter()
                 self._hybrid_charge(tick_sparse)
+                if _tm is not None:
+                    _tm.mark("charge", _t)
+                    _tm.tick_end()
         if idle:
             return
 
@@ -1487,6 +1558,9 @@ class Engine:
             if not decodes and not prefills:
                 return
         tick_sparse = bool(decodes or prefills) and (decodes + prefills)[0].sparse_on
+        _tm = self._step_timing
+        if _tm is not None:
+            _t = time.perf_counter()
         if (
             not prefills
             and decodes
@@ -1494,6 +1568,8 @@ class Engine:
             and self._decode_graph_on
             and self._run_decode_graph(decodes, chains)
         ):
+            if _tm is not None:
+                _tm.mark("graph", _t)
             self._hybrid_charge(False)
             return
         if (
@@ -1503,6 +1579,8 @@ class Engine:
             and self._sparse_graph_on
             and self._run_sparse_decode_graph(decodes, chains)
         ):
+            if _tm is not None:
+                _tm.mark("graph", _t)
             self._hybrid_charge(True)
             return
         rows = decodes + prefills
@@ -1517,6 +1595,9 @@ class Engine:
             promote_ctx = self._kv.promotions()
             sf = self._sparse_rows(rows, seq_q, decodes)
             promote_ctx.__enter__()
+            if _tm is not None:
+                _tm.mark("sparse_select", _t)
+                _t = time.perf_counter()
         # Bucket a prefill width: kernels specialize per shape (MMLU compiled
         # 662 variants). A verify width is exact, at most 1+depth.
         chunk = max(chunks, default=0)
@@ -1534,6 +1615,9 @@ class Engine:
             positions[j, :c] = np.arange(start, start + c)
         hid: list | None = [] if self._draft else None
         t_fwd = time.perf_counter()
+        if _tm is not None:
+            _tm.mark("prep", _t)
+            _t = time.perf_counter()
         logits = self._model.forward(
             input_ids,
             positions,
@@ -1543,6 +1627,9 @@ class Engine:
             aux_layers=self._aux_layers,
             last_only=False if chains else seq_q,  # a verify tick needs every chain position
         )
+        if _tm is not None:
+            _tm.mark("model", _t)
+            _t = time.perf_counter()
         if sparse:
             promote_ctx.__exit__(None, None, None)
             try:
@@ -1569,6 +1656,9 @@ class Engine:
                 }
                 for i, r in enumerate(rows)
             }
+            if _tm is not None:
+                _tm.mark("sparse_finalize", _t)
+                _t = time.perf_counter()
         if hid is not None:
             n_aux = len(self._aux_layers)
             for i, r in enumerate(rows):  # hidden_out is full width, appended before last_only
@@ -1581,6 +1671,9 @@ class Engine:
             self._verify(decodes, chains, logits, hid[-1])
         else:
             self._sample_commit([(r, logits[i, 0], len(r.output)) for i, r in enumerate(decodes)])
+        if _tm is not None:
+            _tm.mark("sample", _t)
+            _t = time.perf_counter()
         if prefills:
             self._prefill_forwards += 1
             # mixed ticks included: excluding them reports a rate no request sees
@@ -1603,6 +1696,8 @@ class Engine:
                 self._sparse_process_offers(sparse_offers)
         elif sparse:
             self._sparse_process_offers(sparse_offers)
+        if _tm is not None:
+            _tm.mark("draft_offers", _t)
 
     def _sparse_live_stats(self) -> dict:
         """Flat sparse residency counters for a hybrid engine. The memory ledger
