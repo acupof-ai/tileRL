@@ -27,7 +27,6 @@ from __future__ import annotations
 from collections import OrderedDict
 
 import torch
-from tilerl_kernels.reference import select_pages
 from torch import Tensor
 
 from . import kv_cache
@@ -457,6 +456,7 @@ class SparseForward:
         tracker: SparseTracker,
         rows: list[dict] | None,
         device,
+        backend,
         device_select: bool = False,
         *,
         b: int = 0,
@@ -466,6 +466,7 @@ class SparseForward:
     ):
         self.tracker = tracker
         self.device = device
+        self.backend = backend
         self.n_groups = len(tracker.src_planes)
         #: bounds scores post-rope q only; index scoring also needs the
         #: full-precision post-input-norm hidden (model.py runs the extra norm
@@ -647,7 +648,7 @@ class SparseForward:
                 )
             # logical+1 ids keep real page 0 distinct from the right-pad 0.
             table = (torch.tensor(cand, device=self.device) + _SENTINEL).reshape(1, -1)
-            sel = select_pages(
+            sel = self.backend.select_pages(
                 table,
                 torch.tensor([len(cand)], device=self.device),
                 scores,
