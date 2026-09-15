@@ -450,8 +450,6 @@ def measured_best_floor(record: dict, lower_is_better: bool) -> dict:
     return {"value": v, "unit": record["unit"], "kind": "measured-best", "derivation": deriv}
 
 
-    return sys.modules[__name__]
-
 if __name__ == "__main__":
     # Selftest: the system must prove it goes red. A good world accepts; four
     # bad worlds each reject (or, for n=1, accept but stay out of regression).
