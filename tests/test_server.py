@@ -153,13 +153,17 @@ def test_health_says_degraded_when_the_engine_raises():
     engine.run()
     try:
         with TestClient(create_app(engine, _ByteTokenizer())) as c:
-            good = c.get("/health").json()
+            good_resp = c.get("/health")
+            good = good_resp.json()
         with TestClient(create_app(_StatsRaises(engine), _ByteTokenizer())) as c:
-            bad = c.get("/health").json()
+            bad_resp = c.get("/health")
+            bad = bad_resp.json()
     finally:
         engine.shutdown()
 
+    assert good_resp.status_code == 200
     assert good["status"] == "ok" and good["stats"], good
+    assert bad_resp.status_code == 503, "a stats-raising engine must answer 503"
     assert bad["status"] != "ok", f"a raising engine still reports {bad['status']!r}"
     assert bad["stats"] is None and "RuntimeError" in bad.get("error", ""), bad
 
@@ -3264,4 +3268,49 @@ def test_engine_liveness_idle_is_live_and_active_stall_is_not(monkeypatch):
         assert live is True and 0.0 <= stuck <= 60.0
     finally:
         eng._running.clear()
+        eng.shutdown()
+
+
+def test_engine_liveness_first_tick_after_long_idle_is_live():
+    """Regression for the quiet->traffic false 503: _last_progress_ts used to
+    move only when a forward RETURNED, so the first request after an idle gap
+    longer than the threshold read active with stuck = the whole idle gap and
+    503'd WHILE its first forward was in flight. The timestamp must refresh at
+    the START of the first non-idle tick (before the forward), not just at its
+    end. A plain timestamp check after step() cannot see this -- the end
+    refresh hides it -- so the assertion runs INSIDE a stubbed forward, i.e. at
+    the in-flight moment the bug actually 503'd."""
+    import time as _time
+
+    import numpy as np
+
+    cfg = tiny()
+    eng = build_engine(cfg, build_random(cfg, seed=91), get_backend(),
+                       num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096)
+    seen: dict = {}
+    real_forward = eng._run_forward
+
+    def forward_while_in_flight(decodes, prefills, chunks):
+        # We are inside step(), on the engine thread, before the real forward:
+        # exactly the "first prefill in flight after idle" instant.
+        live, stuck = eng.liveness(60.0)
+        seen["inflight_live"] = live
+        seen["inflight_stuck"] = stuck
+        # finish the tick so shutdown is clean
+        return real_forward(decodes, prefills, chunks)
+
+    eng._run_forward = forward_while_in_flight
+    try:
+        eng._last_progress_ts = _time.perf_counter() - 300.0  # long idle
+        assert eng.liveness(60.0) == (True, 0.0)  # idle stays live
+        eng.submit(np.arange(5, 5 + 128, dtype=np.int64),
+                   SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+        eng.step()
+        assert seen, "the in-flight forward hook never ran"
+        assert seen["inflight_live"] is True, (
+            f"first forward in flight after idle wrongly flagged stuck: "
+            f"{seen['inflight_stuck']}s")
+        eng.poll()
+    finally:
+        eng._run_forward = real_forward
         eng.shutdown()

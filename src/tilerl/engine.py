@@ -911,6 +911,13 @@ class Engine:
             if not decodes and not prefills:
                 idle = True
             else:
+                # Mark the START of an active tick too, not only its end: a long
+                # idle gap must not count as stall. Without this, the first
+                # request after a quiet period read active=True with stuck = the
+                # whole idle gap and 503'd until its prefill finished. A forward
+                # that never returns still trips: this moves only once at tick
+                # start, the clock then stays frozen for the stuck duration.
+                self._last_progress_ts = time.perf_counter()
                 if _tm is not None:
                     _tm.mark("plan", _t)
                     _t = time.perf_counter()
@@ -1286,10 +1293,13 @@ class Engine:
 
         Returns (live, stuck_secs). An IDLE engine (no running or waiting
         request) is always live: a quiet server must not report unhealthy. With
-        active requests, live means a non-idle tick completed within
-        ``stuck_after_s``. Read without the lock: the timestamp is a single
-        float write, and a wedged forward holds the lock anyway, so taking it
-        here would block /health on the exact stall it must detect.
+        active requests, live means a non-idle tick STARTED (or finished) within
+        ``stuck_after_s`` -- the timestamp is refreshed at tick start so a long
+        idle gap before the first request does not read as stall, and at tick
+        end; a forward that never returns leaves it frozen past the threshold.
+        Read without the lock: the timestamp is a single float write, and a
+        wedged forward holds the lock anyway, so taking it here would block
+        /health on the exact stall it must detect.
         """
         active = bool(self._running) or bool(self._waiting)
         if not active:
