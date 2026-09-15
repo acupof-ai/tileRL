@@ -690,6 +690,12 @@ def memory_rows(*, cfg, model_params, kv, states, held: dict[str, int],
     """The unified device ledger rows (memory_table input): every held allocation
     plus the transient residual, so ``measured peak = sum static + transient``.
     Pure: per-call plan/table; the Engine owns any static-ledger memoization."""
+    # Spec step planes live in the SAME pool as states (step_states/step_windows,
+    # sized by draft.width + 1 at build). Read the count off the real tensor: a
+    # hardcoded 0 priced 776 MiB where the pool holds 2273 (d1 hybrid), dropping
+    # both spec planes and making every device-byte judgment that reads the ledger
+    # undercount GDN state by ~3x.
+    spec_steps = 0 if states.step_states is None else states.step_states.shape[2]
     if sparse is None or sparse_min_tokens:
         derived = plan(
             cfg,
@@ -697,7 +703,7 @@ def memory_rows(*, cfg, model_params, kv, states, held: dict[str, int],
             0,
             num_slots=states.num_slots,
             num_blocks=kv.num_blocks,
-            spec_steps=0,
+            spec_steps=spec_steps,
             state_dtype=states.states.dtype,
             kv_io=kv.dtype,
             kv_fp8=kv.kv_fp8,
@@ -712,7 +718,7 @@ def memory_rows(*, cfg, model_params, kv, states, held: dict[str, int],
             0,
             num_slots=states.num_slots,
             num_blocks=kv.num_blocks,
-            spec_steps=0,
+            spec_steps=spec_steps,
             state_dtype=states.states.dtype,
             kv_io=kv.dtype,
             kv_fp8=kv.kv_fp8,

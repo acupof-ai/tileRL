@@ -784,3 +784,30 @@ def test_device_reserve_is_recorded_in_stats_and_ledger_off_cuda():
         assert eng.stats()["device_reserve_bytes"] == 123 * 1024 * 1024
     finally:
         eng.shutdown()
+
+
+def test_ledger_state_row_counts_the_spec_step_planes():
+    """Regression: memory_rows hardcoded spec_steps=0 in plan(), so a d1 hybrid
+    engine priced state_slots at 776 MiB while the LinearStatePool actually held
+    2273 MiB (states+conv+step_states+step_windows) -- the two spec planes
+    (sized by draft.width+1) were dropped, a ~3x undercount. The row must be read
+    off the real pool and equal its measured tensors."""
+    from tilerl.kv_cache import LinearStatePool
+    from tilerl.memory import memory_rows
+
+    cfg, model = build_model("tiny", seed=0)
+    n_lin = cfg.num_layers - len(cfg.full_attn_layers)
+    slots, spec = 3, 2
+    pool = LinearStatePool(
+        slots, n_lin, cfg.linear_num_value_heads, cfg.linear_value_head_dim,
+        conv_window=cfg.linear_conv_kernel_dim - 1, conv_dim=cfg.linear_qkv_dim,
+        spec_steps=spec)
+    kv = PagedKvPool(8, cfg.num_kv_heads, cfg.head_dim,
+                     num_layers=len(cfg.full_attn_layers), device="cpu")
+    actual = _state_actual(pool)
+    assert pool.step_states is not None  # sanity: the plane under test exists
+    rows = memory_rows(cfg=cfg, model_params=model.params, kv=kv, states=pool,
+                       held={}, peak_bytes=None)
+    state_row = next(r for r in rows if r["owner"] == "state_slots")
+    assert state_row["derived"] == actual, (
+        f"ledger {state_row['derived']} != live pool {actual}")
