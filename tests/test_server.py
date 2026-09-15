@@ -960,13 +960,6 @@ def test_configured_tokenizer_fails_closed(tmp_path):
         get_tokenizer(str(tmp_path))
 
 
-@pytest.mark.skipif(
-    os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="a wall-duration verdict on a live HTTP round-trip is machine load, not code: "
-    "the same flakiness class as the GIL-yield ratio that went red at 1.47 on a healthy "
-    "shared runner (errors/2026-09-11-flaky-wallclock-test-inventory.md). The non-blocking "
-    "property this covers is run locally/dedicated.",
-)
 @pytest.mark.parametrize("path,body", [
     ("/v1/messages", {"model": "tiny", "max_tokens": 8,
                       "messages": [{"role": "user", "content": "hi"}]}),
@@ -985,27 +978,27 @@ def test_a_request_in_flight_does_not_freeze_the_server(tmp_path, monkeypatch, p
     always awaited its wait through `asyncio.to_thread` (`server.py`); this is that, on the
     two routes that did not.
 
-    The gate is a second request answering while the first is still in flight, which is the
-    property the defect broke. A slow engine, not a slow model: `take` returning None for a
-    fixed number of polls is the same shape as a long generation and costs the suite ~1 s.
+    Deterministic, not a wall-clock bound: the engine's `take` sets `entered` and then
+    blocks on a release EVENT, so a reply is provably in flight (the route is parked in
+    take, not merely "probably polling inside a window"). A worker calls /health and the
+    gate fails unless it returns BEFORE the release is set — a route that awaited take on
+    the event loop cannot serve /health until release. The join margin is a deadlock
+    detector only, never a latency assertion.
     """
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "loop.jsonl"))
     tok = _ByteTokenizer()
 
     class _SlowEngine(_ScriptedEngine):
-        #: ~1.4 s of polling at _run's 0.02 s interval — long enough that a blocked loop
-        #: cannot answer /health inside the 1 s assertion, short enough for the suite.
-        POLLS = 70
-
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
-            self._left: dict[int, int] = {}
+            self.entered = threading.Event()
+            self.release = threading.Event()
 
         def take(self, request_id: int):
-            self._left.setdefault(request_id, self.POLLS)
-            if self._left[request_id] > 0:
-                self._left[request_id] -= 1
-                return None
+            # First poll parks; after release the scripted engine returns the reply.
+            if not self.entered.is_set():
+                self.entered.set()
+                self.release.wait(30.0)
             return super().take(request_id)
 
     engine = _SlowEngine(tok, ["</think>\n\ndone"])
@@ -1016,72 +1009,81 @@ def test_a_request_in_flight_does_not_freeze_the_server(tmp_path, monkeypatch, p
             code=c.post(path, json=body).status_code))
         t.start()
         try:
-            # Wait for the request to be IN FLIGHT, else /health answers before the poll
-            # loop starts and the arm passes on a server that was never busy.
-            for _ in range(200):
-                if engine.params:
-                    break
-                time.sleep(0.01)
-            assert engine.params, f"{path} never reached submit; the arm proves nothing"
-            t0 = time.monotonic()
-            health = c.get("/health")
-            elapsed = time.monotonic() - t0
+            assert engine.entered.wait(10.0), f"{path} never entered take; the arm proves nothing"
+            # The route is provably parked in take (release unset): /health must answer.
+            box: dict[str, object] = {}
+            ht = threading.Thread(target=lambda: box.update(resp=c.get("/health")))
+            ht.start()
+            ht.join(5.0)
+            assert not ht.is_alive(), (
+                f"/health did not return while {path} was in take — the route blocks the "
+                f"event loop instead of awaiting through asyncio.to_thread")
+            assert not engine.release.is_set(), (
+                "/health returned only after the in-flight request completed")
+            health = box["resp"]
         finally:
+            engine.release.set()
             t.join(timeout=30)
 
     assert health.status_code == 200, health.text
-    assert elapsed < 1.0, (
-        f"/health took {elapsed:.2f}s while {path} was generating — the route blocks the "
-        f"event loop instead of awaiting through asyncio.to_thread")
     assert done.get("code") == 200, f"the {path} request itself failed: {done}"
 
 
-@pytest.mark.skipif(
-    os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="the 100 ms wall verdict on a lock-holding forward is machine load, not code; "
-    "the 0.1 s bound is tighter than the GIL ratio that already went red at 1.47 on a "
-    "healthy shared runner (errors/2026-09-11-flaky-wallclock-test-inventory.md). The "
-    "lock-free-snapshot property is verified locally/dedicated.",
-)
 def test_health_does_not_wait_on_the_engine_lock(tmp_path):
-    """`/health` must answer while `step()` holds `_lock` across a forward.
+    """`/health` must read a published snapshot while `step()` HOLDS `_lock`.
 
-    Separate defect from the `to_thread` freeze above, and the reason both gates exist: that
-    one was the event loop, this one is the lock, and fixing the loop did not fix this. On
-    the live V100 during a 21.7k-token prefill /health ran at a median of 8.12 s and a max of
-    **87.66 s**, against 0.002 s idle — four orders of magnitude on identical code, because
-    `stats()` took the lock that a 43-chunk prefill holds one chunk at a time.
+    Separate defect from the `to_thread` freeze: on the live V100 during a
+    21.7k-token prefill /health ran at a median of 8.12 s and a max of 87.66 s,
+    because `stats()` took the lock a 43-chunk prefill holds one chunk at a time.
 
-    A real `Engine` is used, not a double: the property under test is which lock `stats()`
-    takes, and a double that reimplements `stats()` would assert its own behaviour. The
-    forward is replaced by a sleep so the tick is slow without needing a model — that is the
-    only substitution, and it is at the layer below the one being measured.
+    Deterministic, not a wall-clock performance bound: the forward blocks on a
+    release EVENT (so the lock is provably held, not "probably held inside a
+    window"), and a worker calls stats(). The assertion is binary — stats()
+    returns BEFORE the release is set (it never touched the lock). A lock-taking
+    stats() deadlocks the worker until the watchdog timeout. The generous 5 s
+    margin only distinguishes "returned" from "hung"; it is not asserted as a
+    latency target, so a slow CI cannot turn it red.
+
+    A real `Engine` is used, not a double: the property under test is which lock
+    `stats()` takes, and a double that reimplements `stats()` would assert its
+    own behaviour. The only substitution is the forward (the layer below).
     """
     cfg = tiny()
     engine = build_engine(cfg, build_random(cfg, seed=43), get_backend(),
                           num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096)
 
-    held = threading.Event()
+    entered = threading.Event()
+    release = threading.Event()
 
     def _slow_forward(*_a, **_kw):
-        held.set()
-        time.sleep(2.0)  # 20x the 100 ms assertion, so a lock-taking reader cannot pass
+        entered.set()
+        release.wait(20.0)  # hold the step lock until the test releases it
 
     engine._run_forward = _slow_forward
     engine.submit([1, 2, 3], SamplingParams(max_new_tokens=4))
     engine.run()
+    assert entered.wait(10.0), "the forward never started; the arm proves nothing"
     try:
-        assert held.wait(10.0), "the forward never started; the arm proves nothing"
-        t0 = time.monotonic()
-        snap = engine.stats()
-        elapsed = time.monotonic() - t0
+        box: dict[str, object] = {}
+
+        def _read():
+            box["snap"] = engine.stats()
+
+        reader = threading.Thread(target=_read)
+        reader.start()
+        # Lock is provably held (release unset). A lock-free stats returns at once;
+        # a lock-taking stats cannot return until release.set() below.
+        reader.join(5.0)
+        assert not reader.is_alive(), (
+            "stats() did not return while step() held the lock — /health waits on "
+            "the engine lock instead of reading a published snapshot")
+        assert not release.is_set(), "stats returned only because the lock was released"
+        snap = box["snap"]
     finally:
+        release.set()
         engine.shutdown()
 
     assert isinstance(snap, dict) and "pool_used_blocks" in snap, snap
-    assert elapsed < 0.1, (
-        f"stats() took {elapsed:.2f}s while step() held the lock across a forward — "
-        f"/health waits on the engine lock instead of reading a published snapshot")
 
 
 def test_messages_route_records_token_ids(client, tmp_path, monkeypatch):
