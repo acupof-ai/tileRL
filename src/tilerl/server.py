@@ -199,7 +199,9 @@ async def await_or_cancel(request: Request, engine: Any, rid_box: list,
             if worker in done:
                 return worker.result()
             if await request.is_disconnected():
-                engine.cancel(rid_box[0])
+                # Off the loop: cancel takes engine._lock across _release; a
+                # slow step tick holding it must not freeze the event loop.
+                await asyncio.to_thread(engine.cancel, rid_box[0])
                 raise ClientDisconnected()
     finally:
         if not worker.done():
@@ -392,8 +394,9 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             output_ids = await await_or_cancel(
                 request, engine, rid_box, _await_completion, request_id)
         except asyncio.CancelledError:
-            # Client hung up before the non-stream reply; stop generating for nobody.
-            engine.cancel(request_id)
+            # Client hung up before the non-stream reply; stop generating for
+            # nobody. Off the loop (cancel takes engine._lock across _release).
+            await asyncio.to_thread(engine.cancel, request_id)
             raise
         except ClientDisconnected:
             return Response(status_code=499)
@@ -401,13 +404,13 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             # The server gave up waiting but the row is still generating: cancel
             # frees the slot; cancel() on a row the engine already failed (the
             # RuntimeError below) is a False-returning no-op.
-            engine.cancel(request_id)
+            await asyncio.to_thread(engine.cancel, request_id)
             return JSONResponse(
                 status_code=504,
                 content={"error": {"message": str(exc), "type": "api_error"}},
             )
         except RuntimeError as exc:
-            engine.cancel(request_id)
+            await asyncio.to_thread(engine.cancel, request_id)
             return JSONResponse(
                 status_code=500,
                 content={"error": {"message": str(exc), "type": "api_error"}},
@@ -562,6 +565,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                 time.sleep(0.02)
             output_ids = _await_completion(request_id)
         except (TimeoutError, RuntimeError) as exc:
+            # Sync generator: already in a to_thread worker, off the loop.
             engine.cancel(request_id)
             yield "error", {"message": str(exc), "type": "api_error"}, seen
             return
@@ -650,7 +654,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             # Defense-in-depth only: the live disconnect path is stream_or_cancel
             # above. This fires when the abandoned sync generator is finalized at
             # GC/process teardown (anyio cannot interrupt the in-flight thread
-            # call itself), and still must free the row then.
+            # call itself), and still must free the row then. Executes inside
+            # the to_thread worker, never on the event loop: no to_thread here.
             engine.cancel(request_id)
             raise
         # A final usage-only chunk, OpenAI's include_usage shape. Without it a client can
@@ -723,7 +728,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             # gen.close() stops this poll loop; the cancel is what stops the engine,
             # measured at 1891 tokens and 104 KV blocks after one socket closed.
             gen.close()
-            engine.cancel(request_id)
+            await asyncio.to_thread(engine.cancel, request_id)
             return
         await ws.close()
 

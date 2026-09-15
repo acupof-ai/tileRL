@@ -90,22 +90,35 @@ mid-stream close cancelled the row with zero slot/block leaks. The first SSE
 content frame reached the client in 0.001–0.22 s; ~12% of disconnects landed
 during a slow late step tick 1–2.94 s long.
 
-That late-disconnect population exposed a SECOND defect in the same watcher:
-`stream_or_cancel` called `engine.cancel(rid)` synchronously ON the event loop.
-`Engine.cancel` takes `engine._lock`, which a step tick holds for the whole
-forward — independently measured on this box at 1–5.6 s on dense+d1 when free
-VRAM is near ~350 MiB. A disconnect arriving in that window parked the event
-loop thread behind the tick, and `/health` for EVERY other connection stalled
-up to a measured 5.57 s. Both watcher branches now run
-`await asyncio.to_thread(engine.cancel, rid)` (the same off-loop placement as
-`_submit`); cancel takes its own lock and is thread-safe. GeneratorExit and
-499 semantics are unchanged.
+That late-disconnect population exposed a SECOND defect, route-independent:
+every async handler called the lock-taking `engine.cancel(rid)` synchronously
+ON the event loop, not just the SSE watcher. `Engine.cancel` takes
+`engine._lock`, which a step tick holds for the whole forward — independently
+measured on this box at 1–5.6 s on dense+d1 when free VRAM is near ~350 MiB.
+A disconnect arriving in that window parked the event loop thread behind the
+tick, and `/health` for EVERY other connection stalled up to a measured 5.57 s.
+Every on-loop cancel now runs `await asyncio.to_thread(engine.cancel, rid)`
+(the same off-loop placement as `_submit`): both `stream_or_cancel` branches,
+`await_or_cancel`'s live-disconnect branch, the chat non-stream
+Cancelled/timeout/RuntimeError handlers, the messages and responses async
+handlers, and the `/ws/chat` WebSocketDisconnect handler. Cancel takes its own
+lock and is thread-safe. The two cancel calls INSIDE the sync SSE generator
+(error frame, GeneratorExit teardown) already execute in a `to_thread` worker
+and stay plain. GeneratorExit and 499 semantics are unchanged.
+
+Gates now cover both transports under a held lock: the SSE gate and a
+parametrized non-stream gate (chat/messages/responses) that disconnect
+mid-completion and require `/health` on the same loop under 0.5 s; both were
+red when all their cancels reverted to synchronous.
 
 Two separate indicators, and the gate reflects the split:
 
 1. **Event-loop responsiveness**: `/health` on the same loop answers <0.5 s
-   while cancel is parked behind a held lock (`test_a_late_sse_disconnect_does_not_freeze_the_event_loop`,
-   red against the synchronous call). This is fully under the server's control.
+   while cancel is parked behind a held lock — SSE
+   (`test_a_late_sse_disconnect_does_not_freeze_the_event_loop`) and, on the
+   non-stream paths, `test_a_nonstream_disconnect_does_not_freeze_the_event_loop`
+   across chat/messages/responses. Both were red against synchronous cancel.
+   This is fully under the server's control.
 2. **Row release**: blocks/state slot return only after the tick that owns the
    lock ends — the engine cannot release faster than its next tick, so the gate
    asserts "cancel recorded + loop stays responsive + allocation zero once the

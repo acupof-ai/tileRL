@@ -2054,19 +2054,32 @@ def test_the_routes_cancel_when_the_client_hangs_up():
     # and the GeneratorExit teardown line stays as GC/process defense.
     assert "stream_or_cancel(request, engine, request_id," in src, (
         "the SSE body must run under the shared disconnect watcher")
-    assert src.count("asyncio.to_thread(engine.cancel, request_id)") == 2, (
-        "both stream_or_cancel cancel branches (disconnect and task "
-        "cancellation) must run engine.cancel off the event loop, or a slow "
-        "step tick holding engine._lock freezes /health")
+    # Every cancel that runs ON the event loop (route handlers, watchers, ws)
+    # must go through to_thread: engine.cancel takes engine._lock across
+    # _release, and a synchronous call freezes /health during a long tick.
+    # The two SSE generator-internal cancels are off-loop and stay plain.
+    on_loop = src.count("asyncio.to_thread(engine.cancel, request_id)")
+    assert on_loop == 6, (
+        f"6 on-loop cancel sites must be off the loop (2 stream_or_cancel, "
+        f"chat Cancelled/timeout/RuntimeError, ws); found {on_loop}")
+    for mod in (messages, responses):
+        msrc = inspect.getsource(mod)
+        assert msrc.count("asyncio.to_thread(engine.cancel, rid_box[0])") == 2, (
+            f"{mod.__name__}: both on-loop cancels (CancelledError and the "
+            f"timeout/503 handler) must run through to_thread")
+    assert src.count("engine.cancel(request_id)") == 2, (
+        "only the two sync SSE-generator sites (error frame, GeneratorExit "
+        "teardown) may still call cancel directly; they run in worker threads")
     assert "except GeneratorExit:" in src, (
         "the SSE route keeps GeneratorExit as GC/teardown defense: the live "
         "watcher is the client hang-up path, but a finalized generator must "
         "still free its row")
     for mod in (messages, responses):
         msrc = inspect.getsource(mod)
-        assert "except asyncio.CancelledError:" in msrc and "engine.cancel(" in msrc, (
-            f"{mod.__name__}'s non-stream route must cancel on a client disconnect"
-        )
+        assert "except asyncio.CancelledError:" in msrc and \
+            "to_thread(engine.cancel" in msrc, (
+            f"{mod.__name__}'s non-stream route must cancel on a client "
+            "disconnect, off the event loop")
 
 
 @pytest.mark.parametrize("state_bytes", [0, 12345678])
@@ -2924,6 +2937,70 @@ def test_a_late_sse_disconnect_does_not_freeze_the_event_loop():
             time.sleep(0.02)
         assert eng.cancelled == [7] and eng.blocks_used == 0 \
             and eng.slots_used == 0
+    finally:
+        if eng.cancel_lock.locked():
+            eng.cancel_lock.release()
+        server.should_exit = True
+
+
+@pytest.mark.parametrize("path,body", [
+    ("/v1/chat/completions",
+     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 64}),
+    ("/v1/messages",
+     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 64}),
+    ("/v1/responses",
+     {"input": [{"role": "user", "content": [{"type": "input_text",
+                                               "text": "hi"}]}],
+      "max_output_tokens": 64}),
+])
+def test_a_nonstream_disconnect_does_not_freeze_the_event_loop(tmp_path,
+                                                                monkeypatch,
+                                                                path, body):
+    """await_or_cancel is the non-stream analog of stream_or_cancel: its live
+    disconnect branch used to call the lock-taking engine.cancel on the event
+    loop, so a disconnect in a long tick froze /health identically. All three
+    non-stream routes must cancel off the loop. Mirrors the SSE liveness gate
+    with the same _LockParkEngine; the parked cancel is still pending while
+    /health on the same loop must answer."""
+    import socket
+
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "r.jsonl"))
+    tok = _ByteTokenizer()
+    eng = _LockParkEngine(tok, "nonstream reply", cancel_park_s=2.0)
+    eng.cancel_lock.acquire()  # the slow step tick, held across the disconnect
+    server, port = _uvicorn_server(eng, tok)
+    try:
+        payload = json.dumps(body).encode()
+        request = (
+            f"POST {path} HTTP/1.1\r\nHost: t\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+            f"\r\n").encode() + payload
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            s.sendall(request)
+            # No response can arrive (take is blocked in the worker); close the
+            # socket to deliver http.disconnect.
+            time.sleep(0.1)
+        assert eng.cancel_started.wait(2.0), (
+            f"{path}: await_or_cancel never dispatched engine.cancel")
+        probe = socket.create_connection(("127.0.0.1", port), timeout=5)
+        probe.sendall(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        t0 = time.monotonic()
+        answer = b""
+        while b"\r\n\r\n" not in answer:
+            part = probe.recv(4096)
+            assert part, "/health never answered"
+            answer += part
+        elapsed = time.monotonic() - t0
+        probe.close()
+        assert b" 200 " in answer.split(b"\r\n", 1)[0], answer[:80]
+        assert elapsed < 0.5, (
+            f"{path}: event loop froze {elapsed:.2f}s behind cancel's lock")
+        eng.cancel_lock.release()
+        deadline = time.monotonic() + 3.0
+        while (not eng.cancelled or eng.blocks_used or eng.slots_used) \
+                and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert eng.cancelled and eng.blocks_used == 0 and eng.slots_used == 0
     finally:
         if eng.cancel_lock.locked():
             eng.cancel_lock.release()
