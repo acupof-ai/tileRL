@@ -179,6 +179,64 @@ def overloaded_body(exc: Exception) -> dict[str, Any] | None:
 
 _DISCONNECT_POLL_S = 0.05
 
+
+def _worker_retrieved(t: Any) -> None:
+    """Retrieve a to_thread(next) worker's exception so it is not logged as
+    "never retrieved". A worker cancelled while its SSE task is torn down
+    (simultaneous hangups) is an expected cancellation, not an error: the
+    detached drain owns the body's lifecycle, so swallow CancelledError here."""
+    if t.cancelled():
+        return
+    t.exception()
+
+#: Cap on detaching an SSE body's final drain. A disconnected SSE task must not
+#: await its in-flight executor worker from INSIDE its own cancellation: under a
+#: Starlette task-group teardown that cancellation is re-delivered on every
+#: checkpoint, so a shield await re-raises forever and busy-spins the event loop
+#: (the 2026-09-16 wedge). Instead the drain runs as a detached task, OUTSIDE the
+#: cancelled scope; this bounds how long it waits for an already-running next()
+#: before giving up (the worker thread itself is never killed).
+_DRAIN_WAIT_S = 30.0
+
+#: Detached SSE body-drain tasks. A strong module-level set (not a local the
+#: generator frame drops on teardown): without a reachable reference the task can
+#: be GC'd mid-drain, which is exactly what would orphan the sync body and defer
+#: its close() to nondeterministic GC. Discarded when the drain completes.
+_draining: set = set()
+
+
+def _detach_drain(engine: Any, request_id: int, worker: Any, body: Any) -> None:
+    """Finalize an SSE sync generator OFF its (possibly being-cancelled) task.
+
+    Runs in a detached task that is not a child of the disconnecting SSE task's
+    cancel scope — so repeated cancellation of that task cannot re-raise inside
+    this wait and spin the loop. The body is closed on a worker thread (its
+    GeneratorExit calls engine.cancel, which takes a lock; doing that on the
+    event loop froze /health). Bounded by _DRAIN_WAIT_S; a worker that never
+    returns is abandoned (its daemon thread is not killed, but it is no longer
+    blocking the loop)."""
+    task = asyncio.ensure_future(_drain_body(engine, request_id, worker, body))
+    _draining.add(task)
+    task.add_done_callback(_draining.discard)
+
+
+async def _drain_body(engine: Any, request_id: int, worker: Any, body: Any) -> None:
+    # Detached from the SSE cancel scope, so these awaits are not re-cancelled by
+    # the disconnecting task group.
+    # Cancel FIRST: a teardown whose throw lands at the `yield` is a GeneratorExit
+    # the loop's `except CancelledError` disconnect branch never sees, so no
+    # in-scope cancel ran, and the in-flight next() is parked until exactly this
+    # cancel (measured 2026-09-16: 2 of 8 storm hangups leaked this way). This is
+    # the same idempotent cancel body.close()'s GeneratorExit would run — moved
+    # before the wait, since waiting on a worker blocked on this cancel deadlocks.
+    # Idempotent: cancel on a finished/unknown row is a no-op.
+    await asyncio.to_thread(engine.cancel, request_id)
+    try:
+        await asyncio.wait_for(asyncio.shield(worker), timeout=_DRAIN_WAIT_S)
+    except Exception:
+        return  # timeout or the worker itself raised; the body is not safe to close
+    await asyncio.to_thread(body.close)
+
 #: /health reports unhealthy when active requests make no step progress for this
 #: long. A long but RETURNING prefill (up to a few s) must stay healthy; a
 #: wedged device forward (never returns) must not. Overridable for tests/ops.
@@ -206,7 +264,7 @@ async def await_or_cancel(request: Request, engine: Any, rid_box: list,
     # raises without ever calling worker.result(). A callback attached only to a
     # still-pending worker would skip that case -> "Task exception was never
     # retrieved". On an already-done future the callback is scheduled now.
-    worker.add_done_callback(lambda t: t.exception())
+    worker.add_done_callback(_worker_retrieved)
     while True:
         done, _ = await asyncio.wait({worker}, timeout=_DISCONNECT_POLL_S)
         if worker in done:
@@ -235,7 +293,7 @@ async def stream_or_cancel(request: Request, engine: Any, request_id: int,
     the race: it returns before a disconnect tick can cancel the finished row,
     and cancel() on a finished id is a no-op."""
     worker = asyncio.ensure_future(asyncio.to_thread(next, body, _STREAM_END))
-    worker.add_done_callback(lambda t: t.exception())
+    worker.add_done_callback(_worker_retrieved)
     try:
         while True:
             try:
@@ -261,32 +319,22 @@ async def stream_or_cancel(request: Request, engine: Any, request_id: int,
                 yield item
                 worker = asyncio.ensure_future(
                     asyncio.to_thread(next, body, _STREAM_END))
-                worker.add_done_callback(lambda t: t.exception())
+                worker.add_done_callback(_worker_retrieved)
             elif await request.is_disconnected():
                 await asyncio.to_thread(engine.cancel, request_id)
                 return
     finally:
-        # Finalize the INNER sync generator OFF the event loop. Dropping `body`
-        # here is not enough: when this async frame tears down on the loop thread
-        # it gen_close()s the still-suspended sync body there, and the body's
-        # GeneratorExit calls engine.cancel -- a lock-taking call on the event
-        # loop, which froze /health for the seconds a step tick held the lock
-        # (the 1-in-10 late-SSE stall).
-        #
-        # The in-flight next() has to finish first: generator.close() on a body
-        # still executing on the worker thread raises ValueError. shield() keeps
-        # awaiting it even when the route task is cancelled; the body's poll
-        # sleep is short, so the wait is bounded. Once next() returns the body
-        # is paused and close() on a worker thread runs its GeneratorExit cancel
-        # off the loop. A normally-finished body is stopped, so close() no-ops.
-        while not worker.done():
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                continue
-            except BaseException:
-                break
-        await asyncio.to_thread(body.close)
+        # Finalize the INNER sync generator OUTSIDE this task's cancellation.
+        # Awaiting the in-flight to_thread(next) here used to live inside the SSE
+        # task's own cancel scope: a burst of hangups re-delivered cancellation on
+        # every checkpoint, so `await shield(worker)` re-raised in a tight loop
+        # with no real waiter, spinning the event loop and starving the GIL (the
+        # 2026-09-16 wedge). Detach the drain instead — it cancels the row, awaits
+        # the worker and runs body.close on a worker thread from a task the cancel
+        # cannot reach. The in-scope awaited engine.cancel calls above stay: they
+        # release the slot before this frame unwinds; the drain's cancel is the
+        # idempotent backstop for a GeneratorExit that skipped them.
+        _detach_drain(engine, request_id, worker, body)
 
 
 # ---------------------------------------------------------------------------

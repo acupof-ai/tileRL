@@ -2063,12 +2063,15 @@ def test_the_routes_cancel_when_the_client_hangs_up():
     # Every cancel that runs ON the event loop (route handlers, watchers, ws)
     # must go through to_thread: engine.cancel takes engine._lock across
     # _release, and a synchronous call freezes /health during a long tick.
-    # The two SSE generator-internal cancels are off-loop and stay plain.
+    # The detached SSE drain's backstop cancel (2026-09-16: a GeneratorExit at
+    # the yield skips the in-scope cancels) runs through to_thread as well. The
+    # two SSE generator-internal cancels are off-loop and stay plain.
     on_loop = src.count("asyncio.to_thread(engine.cancel, request_id)")
-    assert on_loop == 7, (
-        f"7 on-loop cancel sites must be off the loop (3 stream_or_cancel: "
-        f"CancelledError, fetch-finished-while-disconnected, the poll-wait "
-        f"disconnect; chat Cancelled/timeout/RuntimeError; ws); found {on_loop}")
+    assert on_loop == 8, (
+        f"8 to_thread cancel sites (3 stream_or_cancel: CancelledError, "
+        f"fetch-finished-while-disconnected, the poll-wait disconnect; chat "
+        f"Cancelled/timeout/RuntimeError; ws; the detached drain backstop); "
+        f"found {on_loop}")
     for mod in (messages, responses):
         msrc = inspect.getsource(mod)
         assert msrc.count("asyncio.to_thread(engine.cancel, rid_box[0])") == 2, (
@@ -2651,23 +2654,29 @@ class _MidStreamEngine:
         return {}
 
 
-def _uvicorn_server(engine, tok):
+def _uvicorn_server(engine, tok, wrap_app=None):
     """A real uvicorn loop over a custom engine: the ONLY transport under
     which an SSE socket close reaches engine.cancel. httptools reads the EOF,
     posts http.disconnect, Starlette's disconnect watcher cancels the
     stream task group, the async generator's aclose runs in the worker
     thread and throws GeneratorExit into _stream -- no hand ASGI harness
     reproduces that chain (a send() that raises orphans the generator for
-    nondeterministic GC)."""
+    nondeterministic GC).
+
+    ``wrap_app`` optionally wraps the ASGI app (used to widen the loop's
+    default executor for many-socket cancel gates)."""
     import socket
 
     import uvicorn
 
+    app = create_app(engine, tok)
+    if wrap_app is not None:
+        app = wrap_app(app)
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     server = uvicorn.Server(uvicorn.Config(
-        create_app(engine, tok), host="127.0.0.1", port=port, log_level="error"))
+        app, host="127.0.0.1", port=port, log_level="error"))
     threading.Thread(target=server.run, daemon=True).start()
     for _ in range(400):
         if server.started:
@@ -3467,3 +3476,239 @@ def test_health_stats_carry_in_process_device_free_and_limit():
         assert s["device_limit_bytes"] == 0
     finally:
         eng.shutdown()
+
+
+class _MultiParkEngine:
+    """N independent SSE rows: each emits one frame, then its peek() BLOCKS on a
+    per-rid event (the sync body is parked in to_thread(next), the exact
+    "worker in flight" state the wedge needs). cancel() releases the park and
+    frees the slot. Tracks per-rid cancel + completion off the loop."""
+
+    def __init__(self, tok, n):
+        self.tok = tok
+        self.ids = [1000 + i for i in range(n)]
+        self._next = 0
+        self.park = {rid: threading.Event() for rid in self.ids}
+        self.frame_sent = {rid: threading.Event() for rid in self.ids}
+        self.cancelled: set = set()
+        self.slots_used = 0
+        self.params: list = []
+
+    def submit(self, input_ids, params=None) -> int:
+        rid = self.ids[self._next]
+        self._next += 1
+        self.slots_used += 1
+        self.params.append(params)
+        return rid
+
+    def peek(self, rid):
+        if not self.frame_sent[rid].is_set():
+            self.frame_sent[rid].set()
+            return self.tok.encode(f"frame-{rid}")
+        self.park[rid].wait(30.0)   # blocked in-flight poll; cancel sets the event
+        return None if rid in self.cancelled else self.tok.encode(f"more-{rid}")
+
+    def take(self, rid):
+        self.park[rid].wait(30.0)
+        if rid in self.cancelled:
+            raise RuntimeError("cancelled")
+        return self.tok.encode(f"more-{rid}")
+
+    def stop_text(self, rid):
+        return None
+
+    def cancel(self, rid) -> bool:
+        if rid in self.cancelled:
+            return False
+        self.cancelled.add(rid)
+        self.slots_used = max(0, self.slots_used - 1)
+        self.park[rid].set()
+        return True
+
+    def room_for(self, prompt_tokens):
+        return 4096
+
+
+def _open_stream_socket(port, payload):
+    import socket
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    req = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
+           f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+           f"\r\n{payload}").encode()
+    s.sendall(req)
+    return s
+
+
+class _WideDefaultExecutor:
+    """ASGI lifespan wrapper: give uvicorn's loop a wider default executor.
+    N parked in-flight to_thread(next) workers each need a SECOND pool thread for
+    the disconnect's to_thread(engine.cancel); the stock executor is
+    min(32, cpu+4) = 8 on 4-vCPU CI, so N=8 cancels would queue behind the parked
+    workers forever (each park's future does not release until cancel sets it).
+    The replacement is shut down on lifespan shutdown so its non-daemon worker
+    threads do not hang interpreter exit. Test-only; production hosts run >16
+    vCPU and the hybrid server's slots bound the in-flight count below the pool."""
+
+    def __init__(self, inner, max_workers):
+        self.inner = inner
+        self.max_workers = max_workers
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "lifespan":
+            await self.inner(scope, receive, send)
+            return
+        import concurrent.futures
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
+        self._pool = pool
+        self._loop = asyncio.get_running_loop()
+        self._loop.set_default_executor(pool)
+        try:
+            await self.inner(scope, receive, send)
+        finally:
+            # The gate proves every parked row is released before should_exit, so
+            # no worker is stuck here; wait=False only bounds a broken run.
+            pool.shutdown(wait=False)
+
+
+def _read_one_frame(s):
+    buf = b""
+    while b'"content"' not in buf:
+        chunk = s.recv(4096)
+        assert chunk, "no SSE frame before hang-up"
+        buf += chunk
+    return buf
+
+
+def test_simultaneous_sse_hangups_with_inflight_workers_do_not_freeze_the_loop():
+    """2026-09-16 wedge, real transport (only real uvicorn delivers the anyio
+    task-group cancellation that latches: Starlette 1.6 + ASGI 2.3 httptools uses
+    a collapsing task group whose CancelScope stays cancelled, so every checkpoint
+    the SSE task hits in its final drain re-raised CancelledError).
+
+    N SSE responses are each parked in to_thread(next) after their first frame.
+    All sockets are shut down in one loop turn. The OLD final drain awaited the
+    in-flight worker from inside the cancelled scope (`shield; continue`): it
+    re-raised on every checkpoint with no real waiter, and N of them together
+    starved the loop -> a /health probe through the teardown window stalled. The
+    fix detaches the drain, so /health keeps answering and every body is
+    cancelled/off-loop-closed. Event-synced (frame-arrived gates); the only wall
+    bound is the responsiveness assertion itself."""
+    import socket
+
+    N = 8
+    tok = _ByteTokenizer()
+    eng = _MultiParkEngine(tok, N)
+    server, port = _uvicorn_server(
+        eng, tok, wrap_app=lambda app: _WideDefaultExecutor(app, N * 2 + 8))
+    payload = json.dumps({"messages": [{"role": "user", "content": "hi"}],
+                          "stream": True, "max_tokens": 64})
+    socks = []
+    try:
+        for _ in range(N):
+            s = _open_stream_socket(port, payload)
+            socks.append(s)
+        # each connection is now parked in its blocked second peek()
+        for rid in eng.ids:
+            assert eng.frame_sent[rid].wait(5.0), f"rid {rid} never sent a frame"
+        for s in socks:
+            _read_one_frame(s)
+
+        def health_latency():
+            probe = socket.create_connection(("127.0.0.1", port), timeout=5)
+            try:
+                probe.sendall(b"GET /health HTTP/1.1\r\nHost: t\r\n"
+                              b"Connection: close\r\n\r\n")
+                t0 = time.monotonic()
+                ans = b""
+                while b"\r\n\r\n" not in ans:
+                    c = probe.recv(4096)
+                    assert c, "no /health response"
+                    ans += c
+                return time.monotonic() - t0, ans
+            finally:
+                probe.close()
+
+        # one baseline probe, then hang up ALL sockets in one turn and keep
+        # probing /health THROUGH the teardown: the spin starved it for minutes.
+        lat0, _ = health_latency()
+        assert lat0 < 0.5
+        for s in socks:
+            s.shutdown(socket.SHUT_RDWR)
+        for s in socks:
+            s.close()
+        socks = []
+        worst = 0.0
+        deadline = time.monotonic() + 3.0
+        healthy = 0
+        while time.monotonic() < deadline:
+            lat, ans = health_latency()
+            worst = max(worst, lat)
+            # The stub engine never ticks, so liveness may answer 503 once rows
+            # park; the wedge symptom is NON-ANSWER (loop starved), not the code.
+            # Any complete status line within the bound proves the loop scheduled.
+            assert b"HTTP/1.1 " in ans, ans[:80]
+            healthy += 1
+        assert healthy >= 20, f"too few /health probes got through teardown: {healthy}"
+        assert worst < 0.5, f"/health stalled {worst:.2f}s during SSE cancel storm"
+
+        # every parked row was cancelled (its peek worker unblocked, slot freed).
+        # 10s is the fail-loud bound, not the measured path: event-synced, and on
+        # an unloaded host delivery takes milliseconds; the wide bound tolerates a
+        # CI host already running OpenMP-heavy earlier tests in this file.
+        for rid in eng.ids:
+            assert eng.park[rid].wait(10.0), f"rid {rid} worker never released"
+        assert eng.slots_used == 0
+    finally:
+        for s in socks:
+            with contextlib.suppress(OSError):
+                s.close()
+        server.should_exit = True
+
+
+def test_stream_or_cancel_final_drain_is_detached_not_awaited_in_cancel_scope():
+    """Structural pin for the 2026-09-16 wedge root: the SSE final drain MUST NOT
+    await an executor future from inside the (cancellable) SSE task. Any
+    shield/wait-on-worker in that frame is re-raised on every checkpoint of a
+    latched anyio cancel scope and busy-spins the loop. The drain is detached
+    (module-level strong-ref set + a helper), and body.close runs on a worker
+    thread inside that helper. Deterministically red on the old shield/continue
+    loop, which the timing-sensitive real-socket gate cannot guarantee on every
+    host."""
+    import ast
+    import inspect
+    import pathlib
+
+    import tilerl.server as srv_mod
+
+    src = inspect.getsource(srv_mod.stream_or_cancel)
+    tree = ast.parse(src)
+    # no shield / wait-for on an executor inside stream_or_cancel at all
+    for node in ast.walk(tree):
+        assert not (isinstance(node, ast.Attribute) and node.attr == "shield"), (
+            "stream_or_cancel must not shield/await an executor in its cancel scope")
+        assert not (isinstance(node, ast.Attribute) and node.attr == "wait_for"), (
+            "stream_or_cancel must not wait_for an executor in its cancel scope")
+    # the frame detaches to the helper
+    calls = {n.func.id for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "_detach_drain" in calls, "final drain must be detached via _detach_drain"
+    assert "to_thread" not in calls, "stream_or_cancel must not run body.close on the loop"
+
+    full = pathlib.Path(srv_mod.__file__).read_text()
+    # the detached registry exists and is a module-level set (strong refs)
+    assert isinstance(srv_mod._draining, set)
+    # _drain_body cancels BEFORE awaiting, then closes off the loop
+    dsrc = inspect.getsource(srv_mod._drain_body)
+    assert "to_thread(engine.cancel, request_id)" in dsrc
+    assert "to_thread(body.close)" in dsrc
+    assert "wait_for(asyncio.shield(worker)" in dsrc
+    assert dsrc.index("to_thread(engine.cancel") < dsrc.index("wait_for(asyncio.shield"), (
+        "drain must cancel the row before waiting on its in-flight worker: "
+        "a GeneratorExit-at-yield skips the in-scope cancel and the worker is "
+        "parked until cancel runs, so waiting first deadlocks the drain")
+    # the set is both added and discard-on-done (no unbounded growth / GC)
+    assert "_draining.add" in full and "discard" in full
+    # the prompt disconnect paths still await their cancel IN the frame (slot
+    # release is not best-effort); the drain's cancel is only the backstop
+    fsrc = src
+    assert fsrc.count("to_thread(engine.cancel, request_id)") >= 2
