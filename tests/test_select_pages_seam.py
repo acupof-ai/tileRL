@@ -34,17 +34,35 @@ _ALLOWED = {"testing.py"}  # RefBackend is the CPU backend, the one import site
 
 
 def _violations(src: str) -> list[str]:
-    """Every binding shape of reference.select_pages is a violation; the one
-    allowed call is `<...>.backend.select_pages` (the seam).
+    """Every binding of reference.select_pages is a violation; the one allowed
+    call is ``<...>.backend.select_pages`` on the real backend.
 
-    * ``from ...reference import select_pages [as x]`` -- caught at the import,
-      since the as-bound bare name is then untraceable;
-    * ``<recv>.select_pages`` whose receiver is not a ``backend`` -- catches
-      ``reference.select_pages``, an aliased ``_r.select_pages``, and the fully
-      qualified ``tilerl_kernels.reference.select_pages`` alike.
+    Binding-aware, not spelling-aware: a receiver NAMED backend is still a
+    violation if the source bound the reference module to that name
+    (``from tilerl_kernels import reference as backend``). We collect the
+    reference module's local aliases first, then flag:
+
+    * ``from ...reference import select_pages [as x]`` at the import (the
+      as-bound bare name is otherwise untraceable);
+    * ``<recv>.select_pages`` where recv resolves to the reference module --
+      a plain/aliased module name or the fully-qualified chain.
     """
-    bad: list[str] = []
     tree = ast.parse(src)
+    ref_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "tilerl_kernels.reference":
+                    ref_aliases.add(a.asname or "reference")
+                if a.name == "tilerl_kernels":
+                    ref_aliases.add("tilerl_kernels")  # fully-qualified chain
+        if (isinstance(node, ast.ImportFrom)
+                and (node.module or "") == "tilerl_kernels"):
+            for a in node.names:
+                if a.name == "reference":
+                    ref_aliases.add(a.asname or "reference")
+
+    bad: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             mod = node.module or ""
@@ -54,7 +72,12 @@ def _violations(src: str) -> list[str]:
                         bad.append(f"imports select_pages as {a.asname or a.name}")
         if isinstance(node, ast.Attribute) and node.attr == "select_pages":
             recv = ast.unparse(node.value)
-            if recv != "backend" and not recv.endswith(".backend"):
+            is_ref = (
+                (isinstance(node.value, ast.Name) and node.value.id in ref_aliases)
+                or recv == "tilerl_kernels.reference"
+                or recv.endswith(".reference"))
+            is_backend = recv == "backend" or recv.endswith(".backend")
+            if is_ref or not is_backend:
                 bad.append(f"{recv}.select_pages is not the backend seam")
     return bad
 
@@ -75,10 +98,13 @@ def test_framework_reaches_select_pages_only_via_the_backend():
     "import tilerl_kernels.reference as _r\nz = _r.select_pages\n",
     "from tilerl_kernels import reference\nz = reference.select_pages\n",
     "import tilerl_kernels\nz = tilerl_kernels.reference.select_pages\n",
+    # the receiver is LITERALLY backend but binds the reference module
+    "from tilerl_kernels import reference as backend\nz = backend.select_pages\n",
+    "import tilerl_kernels.reference as backend\nz = backend.select_pages\n",
 ])
 def test_every_reference_binding_shape_is_red(mutant):
-    """The four ways to reach the reference directly must all be violations; the
-    last two differ only by the import binding name."""
+    """Every way to reach the reference is a violation, including aliasing the
+    reference module to the name 'backend' so a spelling-only gate reads green."""
     assert _violations(mutant), f"gate missed:\n{mutant}"
 
 
