@@ -828,6 +828,11 @@ class Engine:
                 own_blocks=0,
                 sparse_on=sparse_on,
             )
+            # Idle->active edge: refresh here too, else the submit-to-first-tick
+            # gap after a long idle reads as stall. Later submits must not refresh:
+            # an unadmitted backlog that old is genuinely stuck.
+            if not self._running and not self._waiting:
+                self._last_progress_ts = time.perf_counter()
             self._waiting.append(req)
         return rid
 
