@@ -214,7 +214,9 @@ def test_every_registered_required_flag_exists_in_its_collector():
     # add_record_args adds --build/--target/--device-name/--card/--model-name to every
     # collector, so a required flag the script does not declare itself may come from
     # the shared helper instead.
-    helper = (root / "scripts" / "benchrec.py").read_text()
+    # add_record_args (the shared collector flag helper) moved into the
+    # packaged module with benchrec; scripts/benchrec.py is only a shim.
+    helper = (root / "src" / "tilerl" / "benchrec.py").read_text()
     for name, m in reg.items():
         c = m.get("collector")
         if not c:

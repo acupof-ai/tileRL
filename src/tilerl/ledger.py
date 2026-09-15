@@ -397,15 +397,12 @@ def format_run(m: dict) -> str:
 
 @functools.lru_cache(maxsize=1)
 def _benchrec():
-    """The ruler's validator/store, loaded from scripts/benchrec.py."""
-    # ponytail: scripts/ bridge, package benchrec after the scripts sweep
-    import importlib.util
+    """The ruler's validator/store. Packaged as tilerl.benchrec; the
+    scripts/benchrec.py file is only a compatibility shim now, so a wheel
+    install (no scripts/ directory) works."""
+    from . import benchrec
 
-    p = Path(__file__).resolve().parents[2] / "scripts" / "benchrec.py"
-    spec = importlib.util.spec_from_file_location("benchrec", p)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    return benchrec
 
 
 def residency_row(
