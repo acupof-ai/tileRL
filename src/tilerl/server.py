@@ -193,21 +193,22 @@ async def await_or_cancel(request: Request, engine: Any, rid_box: list,
     not awaited.
     """
     worker = asyncio.ensure_future(asyncio.to_thread(run_fn, *args))
-    try:
-        while True:
-            done, _ = await asyncio.wait({worker}, timeout=_DISCONNECT_POLL_S)
-            if worker in done:
-                return worker.result()
-            if await request.is_disconnected():
-                # Off the loop: cancel takes engine._lock across _release; a
-                # slow step tick holding it must not freeze the event loop.
-                await asyncio.to_thread(engine.cancel, rid_box[0])
-                raise ClientDisconnected()
-    finally:
-        if not worker.done():
-            # The cancelled row makes its next take() raise; consume it so the
-            # exception is never reported as unretrieved.
-            worker.add_done_callback(lambda t: t.exception())
+    # Attach unconditionally before the worker can finish: the off-loop cancel
+    # opens a window where the worker dies with RequestFailed while the
+    # disconnect branch is still inside to_thread(cancel), and the route then
+    # raises without ever calling worker.result(). A callback attached only to a
+    # still-pending worker would skip that case -> "Task exception was never
+    # retrieved". On an already-done future the callback is scheduled now.
+    worker.add_done_callback(lambda t: t.exception())
+    while True:
+        done, _ = await asyncio.wait({worker}, timeout=_DISCONNECT_POLL_S)
+        if worker in done:
+            return worker.result()
+        if await request.is_disconnected():
+            # Off the loop: cancel takes engine._lock across _release; a
+            # slow step tick holding it must not freeze the event loop.
+            await asyncio.to_thread(engine.cancel, rid_box[0])
+            raise ClientDisconnected()
 
 
 _STREAM_END = object()

@@ -7,6 +7,7 @@ boundary — the gate is HTTP/SSE behaviour, not tokenization fidelity.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import threading
@@ -3005,3 +3006,92 @@ def test_a_nonstream_disconnect_does_not_freeze_the_event_loop(tmp_path,
         if eng.cancel_lock.locked():
             eng.cancel_lock.release()
         server.should_exit = True
+
+
+def test_a_disconnect_with_an_already_failed_worker_retrieves_its_exception():
+    """#637 follow-up: engine.cancel runs off the loop in a worker thread, which
+    opens a window: disconnect is observed, the route awaits to_thread(cancel),
+    and WHILE that await is in flight the completion worker finishes with
+    RequestFailed. The route then raises ClientDisconnected without calling
+    worker.result(), so a done-callback attached only when `not worker.done()`
+    never runs -> "Task exception was never retrieved". The consume callback has
+    to be attached before the worker can finish.
+
+    Timing is event-synchronized, not slept: cancel() signals that the route is
+    inside the cancel await, then sleeps long enough that take()'s failure (and
+    the worker task's death) lands strictly before the cancel await returns and
+    the finally clause runs."""
+    import asyncio
+
+    from tilerl.server import ClientDisconnected
+
+    class _FailInsideCancel:
+        def __init__(self):
+            self.cancel_started = threading.Event()
+            self.cancelled: list[int] = []
+
+        def submit(self, input_ids, params=None) -> int:
+            return 7
+
+        def take(self, request_id: int):
+            # Block the completion worker until the route has entered
+            # to_thread(cancel); failing before that would be retrieved by the
+            # normal worker.result() path, not the leak under test.
+            if not self.cancel_started.wait(2.0):
+                raise RuntimeError("cancel never started")
+            raise RuntimeError("RequestFailed: cancelled: the reader disconnected")
+
+        def cancel(self, request_id: int) -> bool:
+            if request_id not in self.cancelled:
+                self.cancelled.append(request_id)
+            self.cancel_started.set()
+            # Stay inside the cancel await until the take thread has failed and
+            # its worker task has settled as done-with-exception.
+            time.sleep(0.5)
+            return True
+
+        def room_for(self, prompt_tokens: int) -> int:
+            return 512
+
+        def stats(self) -> dict:
+            return {}
+
+    async def scenario(errors):
+        import gc
+
+        engine = _FailInsideCancel()
+        app = create_app(engine, _ByteTokenizer())
+        peeks = {"n": 0}
+
+        async def receive():
+            peeks["n"] += 1
+            if peeks["n"] == 1:
+                return {"type": "http.request",
+                        "body": b'{"messages":[{"role":"user","content":"hi"}]}',
+                        "more_body": False}
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            pass
+
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                 "method": "POST", "scheme": "http",
+                 "path": "/v1/chat/completions", "query_string": b"",
+                 "root_path": "",
+                 "headers": [(b"content-type", b"application/json")],
+                 "client": ("t", 1), "server": ("t", 80)}
+        asyncio.get_running_loop().set_exception_handler(
+            lambda loop, ctx: errors.append(ctx))
+        with contextlib.suppress(ClientDisconnected, Exception):
+            await app(scope, receive, send)
+        # The leak is reported when the failed Task is destroyed without its
+        # exception retrieved, i.e. on GC after the stack frame drops it -- not
+        # when it finishes. Force collection and give the handler a tick.
+        gc.collect()
+        await asyncio.sleep(0.2)
+
+    errors: list[dict] = []
+    asyncio.run(scenario(errors))
+    leaked = [e for e in errors
+              if "Task exception was never retrieved" in str(e.get("message", ""))]
+    assert not leaked, [str(e["message"]) for e in leaked]
