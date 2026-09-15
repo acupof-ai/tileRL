@@ -3314,3 +3314,40 @@ def test_engine_liveness_first_tick_after_long_idle_is_live():
     finally:
         eng._run_forward = real_forward
         eng.shutdown()
+
+
+def test_liveness_stamped_on_submit_idle_to_active_edge_only():
+    """submit() must refresh _last_progress_ts only on the idle->active edge.
+    Before the edge stamp the submit-to-first-tick gap inherited the idle
+    timestamp, so the first request queued after a long idle read stuck for the
+    whole gap (a stale /health poll in that window). A second submit onto an
+    unadmitted backlog must NOT stamp: that backlog really is waiting, and one
+    that old must still 503. No run() loop here, so no tick intervenes -- the
+    assertions observe the exact submit->tick window. Removing the edge stamp
+    fails the first assertion; stamping on every submit fails the second."""
+    import time as _time
+
+    import numpy as np
+
+    cfg = tiny()
+    eng = build_engine(cfg, build_random(cfg, seed=97), get_backend(),
+                       num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096)
+    try:
+        prompt = np.arange(5, 5 + 128, dtype=np.int64)
+        params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=0)
+
+        eng._last_progress_ts = _time.perf_counter() - 61.0
+        assert eng.liveness(60.0) == (True, 0.0)  # idle stays live
+
+        eng.submit(prompt, params)  # idle -> active edge: stamps
+        live, stuck = eng.liveness(60.0)
+        assert live is True and stuck < 0.05, f"false stall window after submit: {stuck}s"
+
+        # Aged clock + second submit while the first is still unadmitted:
+        # not an edge, so no refresh and the 61s-old backlog is flagged.
+        eng._last_progress_ts = _time.perf_counter() - 61.0
+        eng.submit(prompt + 1, params)
+        live, stuck = eng.liveness(60.0)
+        assert live is False and stuck > 60.0
+    finally:
+        eng.shutdown()
