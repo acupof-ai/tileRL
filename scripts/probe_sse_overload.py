@@ -57,6 +57,9 @@ import contextlib
 import http.client
 import json
 import os
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -131,30 +134,42 @@ def short_sanity(tag: str) -> bool:
     return ok
 
 
-def _wait_zero(t0: float, tag: str) -> float | None:
+def _wait_zero(t0: float, tag: str, base_blocks: int) -> float | None:
     """Release is NOT wall-clock gated: after cancel moves off the event loop a
     multi-second slow engine tick still postpones row reclamation (the slow
-    OPEN). Wait generously for the zero state; only a hard 60 s cap guards a
-    genuine hang, which would be a real failure."""
+    OPEN). Wait generously for the IDLE state; only a hard 60 s cap guards a
+    genuine hang, which would be a real failure.
+
+    blocks returns to the pre-arm IDLE baseline, not necessarily literal zero:
+    a completed request can legitimately leave a resident prefix block pinned
+    (blocks_used=1 with no running row or slot is normal after traffic), so
+    absolute zero is the wrong no-leak signal on a warm serve."""
+
+    def idle(s: dict) -> bool:
+        return s["running"] == 0 and s.get("slots_used", 0) == 0 and s["blocks_used"] == base_blocks
+
     for _ in range(1200):  # 60 s, 0.05 s poll
         s = stats()
-        if s["running"] == 0 and s.get("slots_used", 0) == 0 and s["blocks_used"] == 0:
+        if idle(s):
             dt = time.time() - t0
             time.sleep(0.5)
-            s2 = stats()
-            if s2["running"] != 0 or s2.get("slots_used", 0) != 0 or s2["blocks_used"] != 0:
-                log(f"{tag} FAIL: counters reached zero then rose again")
+            if not idle(stats()):
+                log(f"{tag} FAIL: counters reached idle then rose again")
                 return None
             return dt
         time.sleep(0.05)
-    log(f"{tag} FAIL: row never released to zero within 60 s (true leak/hang)")
+    log(
+        f"{tag} FAIL: row never released to idle baseline within 60 s "
+        f"(true leak/hang; base blocks {base_blocks})"
+    )
     return -1.0
 
 
 def sse_once(frames: int = 1) -> float | None:
-    """Seconds from socket close to zero state; None on handshake failure.
+    """Seconds from socket close to idle state; None on handshake failure.
     frames=1 disconnects on the first content frame (the classic SSE leak);
     larger values disconnect mid-generation (the late-tick lock tail)."""
+    base_blocks = stats()["blocks_used"]
     body = {
         "model": MODEL,
         "messages": [{"role": "user", "content": f"nonce {uuid.uuid4().hex} {PROMPT}"}],
@@ -188,10 +203,11 @@ def sse_once(frames: int = 1) -> float | None:
                 break
     t0 = time.time()
     _hangup(c)  # hard hang-up right after the target content frame
-    return _wait_zero(t0, f"SSE(frame {frames})")
+    return _wait_zero(t0, f"SSE(frame {frames})", base_blocks)
 
 
 def nonstream_once(dwell_s: float = 3.0) -> float | None:
+    base_blocks = stats()["blocks_used"]
     """Submit a NON-stream request with a long generation and hang up while it
     is parked mid-decode (never reading the JSON reply). The server's
     await_or_cancel path must observe http.disconnect and cancel off the event
@@ -225,34 +241,83 @@ def nonstream_once(dwell_s: float = 3.0) -> float | None:
     time.sleep(dwell_s)
     t0 = time.time()
     _hangup(c)
-    return _wait_zero(t0, "NONSTREAM")
+    return _wait_zero(t0, "NONSTREAM", base_blocks)
 
 
-class HealthSampler(threading.Thread):
-    """Polls /health ~every 50 ms and records the worst latency. In loop mode
-    stats() serves a cached snapshot lock-free, so a healthy event loop answers
-    in tens of ms even while a long engine tick holds the engine lock. A slow
-    answer therefore means the LOOP itself is blocked -- pre-fix that was the
-    synchronous engine.cancel() on the event loop (measured up to 5.57 s). This
-    is the after-fix gate: while disconnects are in flight, /health < 0.5 s."""
+_SAMPLER_SRC = (
+    "import http.client,json,sys,time\n"
+    "h,p=sys.argv[1].split('://')[1].split(':');p=int(p)\n"
+    "while True:\n"
+    " t=time.time()\n"
+    " try:\n"
+    "  c=http.client.HTTPConnection(h,p,timeout=10);c.request('GET','/health')\n"
+    "  json.loads(c.getresponse().read());c.close()\n"
+    " except Exception: pass\n"
+    # emit "<epoch-of-response-start> <latency-s>" so stalls align to wall clock
+    " sys.stdout.write(f'{t:.3f} {time.time()-t:.3f}\\n');sys.stdout.flush()\n"
+    " time.sleep(0.05)\n"
+)
 
-    def __init__(self) -> None:
-        super().__init__(daemon=True)
-        self.stop = threading.Event()
-        self.latencies: list[float] = []
 
-    def run(self) -> None:
-        while not self.stop.is_set():
-            t0 = time.time()
-            try:
-                stats(timeout=10)
-            except Exception:  # noqa: BLE001 - a timeout counts as a stall
-                self.latencies.append(10.0)
-            self.latencies.append(time.time() - t0)
-            time.sleep(0.05)
+class HealthSampler:
+    """Polls /health ~every 50 ms and records worst latency from a SEPARATE
+    subprocess. It must be its own process, not a thread: under the probe's own
+    holder/client thread load the GIL stalled an in-process sampler to 0.94 s
+    while an independent curl loop measured 0.044 s -- client-side contention,
+    not the server. stats() is lock-free, so a healthy event loop answers in
+    tens of ms even while a long engine tick holds the lock; a slow independent
+    answer means the LOOP itself is blocked (pre-fix the on-loop engine.cancel
+    froze it, measured up to 5.57 s). Gate: /health < 0.5 s during disconnects."""
+
+    def __init__(self, keep_path: str = "") -> None:
+        self._keep = keep_path
+        if keep_path:
+            self._path = keep_path
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(keep_path)
+        else:
+            fd, self._path = tempfile.mkstemp(suffix=".log", prefix="hlth")
+            os.close(fd)
+        # Popen dup's the fd at spawn; closing our copy with `with` leaves the
+        # child holding its own write end.
+        with open(self._path, "w") as out:
+            self.proc = subprocess.Popen(
+                [sys.executable, "-c", _SAMPLER_SRC, BASE], stdout=out, stderr=subprocess.DEVNULL
+            )
+        self._start = len(self._read())
+
+    def _read(self) -> list[tuple[float, float]]:
+        vals: list[tuple[float, float]] = []
+        with open(self._path) as f:
+            for line in f:
+                parts = line.split()
+                try:
+                    if len(parts) == 2:
+                        vals.append((float(parts[0]), float(parts[1])))
+                    else:  # tolerate an old single-latency line
+                        vals.append((0.0, float(parts[0])))
+                except (ValueError, IndexError):
+                    pass
+        return vals
+
+    def samples(self) -> list[tuple[float, float]]:
+        return self._read()[self._start :]
+
+    def latencies(self) -> list[float]:
+        return [lat for _, lat in self.samples()]
 
     def mark(self) -> int:
-        return len(self.latencies)
+        # index into the post-construction list samples() returns
+        return len(self.samples())
+
+    def stop(self) -> None:
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        if not self._keep:
+            os.unlink(self._path)
 
 
 def _summarize(
@@ -283,7 +348,6 @@ def disconnect_check(reps: int = 6, nonstream_reps: int = 3, health_gate: float 
     # One SSE sampler spans BOTH arms: the gate is that the event loop stays
     # alive across every disconnect path #637 moved off the loop.
     sampler = HealthSampler()
-    sampler.start()
     overall = True
     try:
         # SSE: rep 0 on frame 1 (the original leak shape), the rest late in
@@ -302,7 +366,7 @@ def disconnect_check(reps: int = 6, nonstream_reps: int = 3, health_gate: float 
             time.sleep(0.5)
         if len(times) == len(frame_plan):
             overall &= _summarize(
-                "SSE", times, len(frame_plan), sampler.latencies[m0:], health_gate
+                "SSE", times, len(frame_plan), sampler.latencies()[m0:], health_gate
             )
         else:
             overall = False
@@ -322,12 +386,12 @@ def disconnect_check(reps: int = 6, nonstream_reps: int = 3, health_gate: float 
             time.sleep(0.5)
         if len(ntimes) == nonstream_reps:
             overall &= _summarize(
-                "NONSTREAM", ntimes, nonstream_reps, sampler.latencies[mn:], health_gate
+                "NONSTREAM", ntimes, nonstream_reps, sampler.latencies()[mn:], health_gate
             )
         else:
             overall = False
     finally:
-        sampler.stop.set()
+        sampler.stop()
     return overall
 
 
@@ -611,14 +675,163 @@ def overload(cap: int = 8) -> bool:
     return allok and drained
 
 
+def normal_gen_once(gen: int = 120) -> int:
+    """Stream a full generation to completion with NO disconnect; returns the
+    number of SSE lines consumed. Paired with the HealthSampler it is the
+    control that separates a disconnect-correlated /health stall from a generic
+    long prefill/decode tick."""
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": f"nonce {uuid.uuid4().hex} {PROMPT}"}],
+        "temperature": 0,
+        "max_tokens": gen,
+        "stream": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    conn = http.client.HTTPConnection(_host, PORT, timeout=120)
+    conn.request(
+        "POST",
+        "/v1/chat/completions",
+        json.dumps(body).encode(),
+        {"Content-Type": "application/json"},
+    )
+    r = conn.getresponse()
+    n = 0
+    if r.status == 200:
+        for _ in range(gen * 4):
+            if not r.readline():
+                break
+            n += 1
+    conn.close()
+    return n
+
+
+def long_prefill_once(words: int = 250, max_tokens: int = 4) -> float:
+    """One uninterrupted NON-stream request on a long prompt, timing just the
+    wait for the first token region (prefill), never disconnecting. The JIT-vs-
+    real-kernel control: run it AFTER the disconnect load so kernels are warm;
+    if a same-length prefill is still multi-second the cost is the kernel, not
+    first-batch warmup. Returns wall seconds from submit to response."""
+    body = {
+        "model": MODEL,
+        "messages": [
+            {"role": "user", "content": f"nonce {uuid.uuid4().hex} {'serendipity ' * words}"}
+        ],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    c = http.client.HTTPConnection(_host, PORT, timeout=180)
+    t0 = time.time()
+    c.request(
+        "POST",
+        "/v1/chat/completions",
+        json.dumps(body).encode(),
+        {"Content-Type": "application/json"},
+    )
+    r = c.getresponse()
+    r.read()
+    dt = time.time() - t0
+    c.close()
+    return dt
+
+
+def timing_run(sse_reps: int, nonstream_reps: int, health_log: str = "") -> bool:
+    """Root-cause data collection for the slow-tick OPEN, not a pass/fail gate:
+    one independent-subprocess /health sampler (kept at health_log with
+    '<epoch> <latency-s>' per line) spans (a) SSE disconnects,
+    (b) non-stream disconnects, (c) an uninterrupted decode control, and
+    (d) a warm, same-length uninterrupted PREFILL control. Logs the worst
+    /health latency and every >=0.5 s / >=2 s sample's epoch per phase so fixkv
+    can align them to servetiming.log. Release delay is printed as-is."""
+    sampler = HealthSampler(keep_path=health_log)
+
+    def phase_report(name: str, a: int, b: int) -> float:
+        window = sampler.samples()[a:b]
+        worst_v = max((lat for _, lat in window), default=0.0)
+        over05 = [(round(ts, 3), round(lat, 3)) for ts, lat in window if lat >= 0.5]
+        over2 = [(round(ts, 3), round(lat, 3)) for ts, lat in window if lat >= 2.0]
+        log(f"TIMING {name}: /health worst={worst_v:.3f}s n={len(window)}")
+        if over05:
+            log(f"TIMING {name}: >=0.5s samples (epoch,lat) {over05}")
+        if over2:
+            log(f"TIMING {name}: >=2.0s samples (epoch,lat) {over2}")
+        return worst_v
+
+    try:
+        m0 = sampler.mark()
+        frame_plan = [1] + [45] * (sse_reps - 1)
+        rel_sse = []
+        for i, frames in enumerate(frame_plan):
+            dt = sse_once(frames)
+            rel_sse.append(None if dt is None else round(dt, 3))
+            log(f"timing SSE rep {i} (frame {frames}): release {dt}")
+            time.sleep(0.4)
+        m1 = sampler.mark()
+        rel_ns = []
+        for i in range(nonstream_reps):
+            dt = nonstream_once(dwell_s=3.0)
+            rel_ns.append(None if dt is None else round(dt, 3))
+            log(f"timing NONSTREAM rep {i}: release {dt}")
+            time.sleep(0.4)
+        m2 = sampler.mark()
+        lines = normal_gen_once()
+        m3 = sampler.mark()
+        # warm, same-length, uninterrupted NON-stream prefill (control d)
+        tpf = time.time()
+        pf_s = long_prefill_once(words=250)
+        log(f"timing warm long-prefill submit epoch={tpf:.3f} wait={pf_s:.3f}s")
+        m4 = sampler.mark()
+
+        log(f"TIMING SSE releases={rel_sse}")
+        log(f"TIMING NONSTREAM releases={rel_ns}")
+        phase_report("SSE", m0, m1)
+        phase_report("NONSTREAM", m1, m2)
+        wc = phase_report("DECODE-control", m2, m3)
+        log(f"TIMING decode control: {lines} SSE lines, /health worst={wc:.3f}s")
+        wp = phase_report("WARM-PREFILL-control", m3, m4)
+        log(f"TIMING warm same-length prefill: wait={pf_s:.3f}s /health worst={wp:.3f}s")
+        log(
+            "TIMING read: a warm prefill still >=2s => real kernel time; "
+            "<0.5s => first-batch/JIT warmup only."
+        )
+        return True
+    finally:
+        sampler.stop()
+
+
 def main() -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "--timing",
+        action="store_true",
+        help="slow-tick data run: SSE+nonstream disconnects plus an "
+        "uninterrupted control, independent /health sampler",
+    )
+    ap.add_argument("--sse-reps", type=int, default=10)
+    ap.add_argument("--nonstream-reps", type=int, default=3)
+    ap.add_argument(
+        "--health-log",
+        default=os.path.expanduser("~/health_timing.log"),
+        help="kept path for '<epoch> <latency>' /health samples",
+    )
+    args = ap.parse_args()
+
     s = stats()
     log(
         f"start: running={s['running']} waiting={s['waiting']} slots={s['slots_total']} "
         f"decode_graph={s['decode_graph']} blocks={s['blocks_used']}/{s['blocks_total']}"
     )
+    if args.timing:
+        return 0 if timing_run(args.sse_reps, args.nonstream_reps, args.health_log) else 1
+
     a = short_sanity("before")
-    b = disconnect_check()
+    b = disconnect_check(reps=args.sse_reps, nonstream_reps=args.nonstream_reps)
     c = overload()
     d = short_sanity("after")
     overall = a and b and c and d
