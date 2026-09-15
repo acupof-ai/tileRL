@@ -94,6 +94,24 @@ class RefBackend:
         dist.all_reduce(x, group=self._dp_pg)
         return x.div_(self.dp_world)
 
+    @property
+    def max_verify_width(self):
+        """See ``Backend.max_verify_width``. Lazy import: this reference module
+        must not pull the tilelang-jit Backend in at module load."""
+        from tilerl_kernels.backend import MAX_VERIFY_W
+
+        return MAX_VERIFY_W
+
+    def dp_all_gather(self, x):
+        """See ``Backend.dp_all_gather``: per-rank rows on the dp group."""
+        if self.dp_world == 1:
+            return [x]
+        import torch.distributed as dist
+
+        parts = [torch.empty_like(x) for _ in range(self.dp_world)]
+        dist.all_gather(parts, x, group=self._dp_pg)
+        return parts
+
     def all_reduce(self, x):
         if self.tp_world == 1:
             return x

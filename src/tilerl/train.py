@@ -148,12 +148,9 @@ def _order_agrees(order: list[str], backend: Any) -> None:
     """
     import hashlib
 
-    import torch.distributed as dist
-
     h = hashlib.sha256("\n".join(order).encode()).digest()[:8]
     mine = torch.tensor([len(order), *h], dtype=torch.float64)
-    parts = [torch.empty_like(mine) for _ in range(backend.dp_world)]
-    dist.all_gather(parts, mine, group=backend._dp_pg)
+    parts = backend.dp_all_gather(mine)
     if any(not bool((p == parts[0]).all()) for p in parts):
         counts = sorted({int(p[0].item()) for p in parts})
         raise RuntimeError(
