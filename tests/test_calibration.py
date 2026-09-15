@@ -201,16 +201,16 @@ def test_calibrate_refuses_off_cuda(monkeypatch):
     # cuda device to time. Check the CLI exits with the card-bound command printed.
     import argparse
 
-    from tilerl import cli
+    from tilerl import bench
 
     args = argparse.Namespace(card=None)
     with pytest.raises(SystemExit, match="--card"):
-        cli.cmd_bench_calibrate(args)
+        bench.cmd_bench_calibrate(args)
     args = argparse.Namespace(card=0)
     monkeypatch.setattr(torch, "cuda",
                         type("C", (), {"is_available": lambda self: False})())
     with pytest.raises(SystemExit, match="cuda-only"):
-        cli.cmd_bench_calibrate(args)
+        bench.cmd_bench_calibrate(args)
 
 
 def _valid_row(metric, value, unit, name=H20, card=0):
@@ -375,13 +375,13 @@ def test_kernels_checkpoint_guard_refuses_model_mismatch(tmp_path, monkeypatch):
         "num_key_value_heads": 4, "head_dim": 256}))
     import argparse
 
-    from tilerl import cli
+    from tilerl import bench
 
     args = argparse.Namespace(model="tiny", batches=None, context=4096, prefill=0,
                               checkpoint=str(tmp_path), device_name="x",
                               kv_fp8=False)
     with pytest.raises(SystemExit, match="not a tiny checkpoint"):
-        cli.cmd_bench_kernels(args)
+        bench.cmd_bench_kernels(args)
 
 
 def test_kernels_table_pending_when_no_calibration(tmp_path, monkeypatch, capsys):
@@ -390,11 +390,11 @@ def test_kernels_table_pending_when_no_calibration(tmp_path, monkeypatch, capsys
     monkeypatch.setenv("TILERL_BENCH_STORE", str(tmp_path / "none.jsonl"))
     import argparse
 
-    from tilerl import cli
+    from tilerl import bench
 
     args = argparse.Namespace(model="tiny", batches=None, context=4096, prefill=0,
                               checkpoint=None, device_name="tiny-cpu-no-cal")
-    cli.cmd_bench_kernels(args)
+    bench.cmd_bench_kernels(args)
     out = capsys.readouterr().out
     assert "pending-remote" in out
     assert "TICK TOTAL" in out
@@ -433,17 +433,17 @@ def test_bench_kernels_decode_times_one_token_launch(monkeypatch):
     monkeypatch.setattr(kb, "get_backend", lambda: object())
     import argparse
 
-    from tilerl import cli
+    from tilerl import bench
 
     args = argparse.Namespace(model="tiny", batches="1", context=512, prefill=0,
                               checkpoint=None, device_name=None)
-    cli.cmd_bench_kernels(args)
+    bench.cmd_bench_kernels(args)
     assert seen and all(m == 1 for _, m in seen), seen
 
     seen.clear()
     args2 = argparse.Namespace(model="tiny", batches=None, context=512, prefill=256,
                                checkpoint=None, device_name=None)
-    cli.cmd_bench_kernels(args2)
+    bench.cmd_bench_kernels(args2)
     # prefill early-returns after the prefill table, so only prefill linear rows
     # are timed here (lm_head renders in the non-prefill path) — all at M=256.
     assert seen and all(m == 256 for _, m in seen), seen
@@ -561,7 +561,7 @@ def test_kernels_sparse_table_renders_derived_hbm_and_pcie_bounds(tmp_path, monk
     With no pcie row the PCIe column is pending while HBM still resolves."""
     import argparse
 
-    from tilerl import cli
+    from tilerl import bench
 
     def ns(pcie_name):
         return argparse.Namespace(
@@ -574,7 +574,7 @@ def test_kernels_sparse_table_renders_derived_hbm_and_pcie_bounds(tmp_path, monk
         _row(cal.BW_METRIC, 4000.0, "GB/s", "tiny-cpu-floor"),
         _row(cal.PEAK_METRIC, 100.0, "TFLOP/s", "tiny-cpu-floor"),
         _row(cal.PCIE_METRIC, 24.0, "GB/s", "tiny-cpu-floor")])
-    cli.cmd_bench_kernels(ns("tiny-cpu-floor"))
+    bench.cmd_bench_kernels(ns("tiny-cpu-floor"))
     out = capsys.readouterr().out
     assert "sparse_indexer_score" in out and "sparse_cold_fetch" in out
     assert "sparse selection k_pages=4 scorer=index" in out
