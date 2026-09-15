@@ -573,6 +573,13 @@ class Engine:
         self._thread: threading.Thread | None = None
         #: Published by the loop so `stats()` never takes the lock a forward holds.
         self._stats_snapshot: dict[str, Any] | None = None
+        #: perf_counter() of the last step tick that actually advanced (a
+        #: non-idle forward completed). Read by liveness(): a wedged device
+        #: forward never returns, so this timestamp stops moving while requests
+        #: stay running -- the only signal that distinguishes a live server from
+        #: one frozen inside a kernel (stats() alone keeps serving the last
+        #: snapshot and looks healthy).
+        self._last_progress_ts: float = time.perf_counter()
         #: Memoized dense ledger: weights/pools/slots are static after build, and
         #: _build_stats (twice a step) used to re-walk every param tensor per tick.
         #: Keyed on len(params): add_lora attaches adapter tensors post-build, so
@@ -904,6 +911,13 @@ class Engine:
             if not decodes and not prefills:
                 idle = True
             else:
+                # Mark the START of an active tick too, not only its end: a long
+                # idle gap must not count as stall. Without this, the first
+                # request after a quiet period read active=True with stuck = the
+                # whole idle gap and 503'd until its prefill finished. A forward
+                # that never returns still trips: this moves only once at tick
+                # start, the clock then stays frozen for the stuck duration.
+                self._last_progress_ts = time.perf_counter()
                 if _tm is not None:
                     _tm.mark("plan", _t)
                     _t = time.perf_counter()
@@ -936,6 +950,10 @@ class Engine:
                 if _tm is not None:
                     _tm.mark("charge", _t)
                     _tm.tick_end()
+                # A tick that ran a forward and returned is progress. Updated
+                # INSIDE the lock alongside the snapshot: a forward stuck in the
+                # kernel never reaches here, so liveness() sees a frozen clock.
+                self._last_progress_ts = time.perf_counter()
         if idle:
             return
 
@@ -1269,6 +1287,25 @@ class Engine:
         self._thread = None
         if self._sparse is not None and self._sparse.prefix is not None:
             self._sparse.prefix.clear()  # release shared prefix blobs to the cold tier
+
+    def liveness(self, stuck_after_s: float) -> tuple[bool, float]:
+        """Whether the step loop is advancing, and how long it has been stuck.
+
+        Returns (live, stuck_secs). An IDLE engine (no running or waiting
+        request) is always live: a quiet server must not report unhealthy. With
+        active requests, live means a non-idle tick STARTED (or finished) within
+        ``stuck_after_s`` -- the timestamp is refreshed at tick start so a long
+        idle gap before the first request does not read as stall, and at tick
+        end; a forward that never returns leaves it frozen past the threshold.
+        Read without the lock: the timestamp is a single float write, and a
+        wedged forward holds the lock anyway, so taking it here would block
+        /health on the exact stall it must detect.
+        """
+        active = bool(self._running) or bool(self._waiting)
+        if not active:
+            return True, 0.0
+        stuck = time.perf_counter() - self._last_progress_ts
+        return stuck <= stuck_after_s, stuck
 
     def stats(self) -> dict[str, Any]:
         """Lock-free while the loop thread runs; a fresh build when it does not."""
