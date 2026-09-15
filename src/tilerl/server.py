@@ -230,27 +230,57 @@ async def stream_or_cancel(request: Request, engine: Any, request_id: int,
     and cancel() on a finished id is a no-op."""
     worker = asyncio.ensure_future(asyncio.to_thread(next, body, _STREAM_END))
     worker.add_done_callback(lambda t: t.exception())
-    while True:
-        try:
-            done, _ = await asyncio.wait({worker}, timeout=_DISCONNECT_POLL_S)
-        except asyncio.CancelledError:
-            # Response teardown while a fetch is in flight: same outcome as a
-            # client hang-up. Off the loop: cancel takes engine._lock, which a
-            # slow step tick can hold for seconds; a synchronous call would
-            # block the event loop and freeze /health for every connection.
-            await asyncio.to_thread(engine.cancel, request_id)
-            raise
-        if worker in done:
-            item = worker.result()
-            if item is _STREAM_END:
+    try:
+        while True:
+            try:
+                done, _ = await asyncio.wait({worker}, timeout=_DISCONNECT_POLL_S)
+            except asyncio.CancelledError:
+                # Response teardown while a fetch is in flight: same outcome as a
+                # client hang-up. Off the loop: cancel takes engine._lock, which a
+                # slow step tick can hold for seconds; a synchronous call would
+                # block the event loop and freeze /health for every connection.
+                await asyncio.to_thread(engine.cancel, request_id)
+                raise
+            if worker in done:
+                item = worker.result()
+                if item is _STREAM_END:
+                    return
+                # A fetch can finish in the same window the client hung up. Check
+                # BEFORE launching another fetch: otherwise the post-disconnect
+                # next() is abandoned in flight and the body is only ever reaped
+                # by GC -- which gen_close()s it on the event loop thread.
+                if await request.is_disconnected():
+                    await asyncio.to_thread(engine.cancel, request_id)
+                    return
+                yield item
+                worker = asyncio.ensure_future(
+                    asyncio.to_thread(next, body, _STREAM_END))
+                worker.add_done_callback(lambda t: t.exception())
+            elif await request.is_disconnected():
+                await asyncio.to_thread(engine.cancel, request_id)
                 return
-            yield item
-            worker = asyncio.ensure_future(
-                asyncio.to_thread(next, body, _STREAM_END))
-            worker.add_done_callback(lambda t: t.exception())
-        elif await request.is_disconnected():
-            await asyncio.to_thread(engine.cancel, request_id)
-            return
+    finally:
+        # Finalize the INNER sync generator OFF the event loop. Dropping `body`
+        # here is not enough: when this async frame tears down on the loop thread
+        # it gen_close()s the still-suspended sync body there, and the body's
+        # GeneratorExit calls engine.cancel -- a lock-taking call on the event
+        # loop, which froze /health for the seconds a step tick held the lock
+        # (the 1-in-10 late-SSE stall).
+        #
+        # The in-flight next() has to finish first: generator.close() on a body
+        # still executing on the worker thread raises ValueError. shield() keeps
+        # awaiting it even when the route task is cancelled; the body's poll
+        # sleep is short, so the wait is bounded. Once next() returns the body
+        # is paused and close() on a worker thread runs its GeneratorExit cancel
+        # off the loop. A normally-finished body is stopped, so close() no-ops.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        await asyncio.to_thread(body.close)
 
 
 # ---------------------------------------------------------------------------
@@ -653,11 +683,18 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                     yield _sse(_chat_chunk(chunk_id, created, model_name, {},
                                            finish=payload))
         except GeneratorExit:
-            # Defense-in-depth only: the live disconnect path is stream_or_cancel
-            # above. This fires when the abandoned sync generator is finalized at
-            # GC/process teardown (anyio cannot interrupt the in-flight thread
-            # call itself), and still must free the row then. Executes inside
-            # the to_thread worker, never on the event loop: no to_thread here.
+            # Free the row if the sync generator is finalized without going
+            # through stream_or_cancel's disconnect branch. Threading caveat:
+            # GeneratorExit can run on WHATEVER thread drops the body's last ref
+            # -- historically that included the event loop thread when this
+            # generator was GC'd as stream_or_cancel's frame tore down, and a
+            # synchronous lock-taking cancel there froze /health for the seconds
+            # a step tick held engine._lock. stream_or_cancel now closes this
+            # body from a worker thread (to_thread(body.close)), so on the live
+            # path GeneratorExit runs off the loop; this bare cancel stays for
+            # the non-ASGI / direct-iteration cases where there is no loop to
+            # offload from. Do NOT re-add an assumption that this never runs on
+            # the event loop.
             engine.cancel(request_id)
             raise
         # A final usage-only chunk, OpenAI's include_usage shape. Without it a client can

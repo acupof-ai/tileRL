@@ -7,6 +7,7 @@ boundary — the gate is HTTP/SSE behaviour, not tokenization fidelity.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -2060,9 +2061,10 @@ def test_the_routes_cancel_when_the_client_hangs_up():
     # _release, and a synchronous call freezes /health during a long tick.
     # The two SSE generator-internal cancels are off-loop and stay plain.
     on_loop = src.count("asyncio.to_thread(engine.cancel, request_id)")
-    assert on_loop == 6, (
-        f"6 on-loop cancel sites must be off the loop (2 stream_or_cancel, "
-        f"chat Cancelled/timeout/RuntimeError, ws); found {on_loop}")
+    assert on_loop == 7, (
+        f"7 on-loop cancel sites must be off the loop (3 stream_or_cancel: "
+        f"CancelledError, fetch-finished-while-disconnected, the poll-wait "
+        f"disconnect; chat Cancelled/timeout/RuntimeError; ws); found {on_loop}")
     for mod in (messages, responses):
         msrc = inspect.getsource(mod)
         assert msrc.count("asyncio.to_thread(engine.cancel, rid_box[0])") == 2, (
@@ -3103,3 +3105,99 @@ def test_a_disconnect_with_an_already_failed_worker_retrieves_its_exception():
     leaked = [e for e in errors
               if "Task exception was never retrieved" in str(e.get("message", ""))]
     assert not leaked, [str(e["message"]) for e in leaked]
+
+
+def test_sse_body_generator_exit_cancel_runs_off_the_event_loop():
+    """The sync SSE body's GeneratorExit calls engine.cancel. Dropping the body
+    on the event loop (which happened when stream_or_cancel's frame tore down)
+    gen_close()d it THERE, so a lock-held cancel froze the loop for the seconds
+    a step tick owned engine._lock -- the late-SSE 1-in-10 /health stall.
+
+    The disconnect must finalize the body via to_thread(body.close), so (1) the
+    GeneratorExit cancel runs on a worker thread, never the loop, and (2) a
+    parked cancel does not stall an in-flight /health-style loop callback.
+    """
+    import threading
+
+    from tilerl.server import stream_or_cancel
+
+    loop_id = threading.get_ident()
+    gen_threads: list[int] = []
+    ge_started = threading.Event()
+    release = threading.Event()
+    ge_done = threading.Event()
+
+    fetch_proceed = threading.Event()
+
+    def body():
+        # frame-1 yields INSIDE the try. The second fetch then blocks on
+        # fetch_proceed (the real body polls peek/take); the test releases it
+        # after the disconnect, mirroring the poll noticing the cancel. The body
+        # resumes and yields frame-2 while still paused INSIDE the try;
+        # stream_or_cancel sees the disconnect before launching a third fetch,
+        # so finally closes a body suspended at that yield on a worker thread,
+        # injecting GeneratorExit there.
+        try:
+            yield "frame-1"
+            fetch_proceed.wait(5.0)
+            yield "frame-2"
+        except GeneratorExit:
+            # Runs at close(). Record the thread, then park as a lock-held
+            # cancel would: if this is the event loop thread, the loop probe in
+            # the test cannot run until release.
+            gen_threads.append(threading.get_ident())
+            ge_started.set()
+            release.wait(5.0)
+            ge_done.set()
+            raise
+
+    class _Req:
+        def __init__(self):
+            self._disc = threading.Event()
+
+        async def is_disconnected(self):
+            return self._disc.is_set()
+
+    class _Engine:
+        def cancel(self, rid):
+            return False  # the explicit disconnect cancel; GeneratorExit does the work
+
+    async def scenario():
+        req = _Req()
+        gen = stream_or_cancel(req, _Engine(), 7, body())
+
+        async def consume():
+            with contextlib.suppress(Exception):
+                async for _ in gen:
+                    pass  # StreamingResponse keeps pulling; that drives the poll loop
+
+        consumer = asyncio.ensure_future(consume())
+        # wait for frame-1 and the second fetch to park on fetch_proceed
+        await asyncio.sleep(0.08)
+        # hang up while that fetch is in flight, then release it: the poll notices
+        # the cancel, next() returns frame-2, stream_or_cancel re-checks
+        # disconnect and returns, and finally closes the paused body off-loop.
+        req._disc.set()
+        await asyncio.sleep(0.08)
+        fetch_proceed.set()
+        # let the released worker return frame-2 and finally's to_thread(close)
+        # run; the assertion itself is event-driven below.
+        await asyncio.sleep(0.05)
+        assert ge_started.wait(2.0), "GeneratorExit never fired"
+        # GeneratorExit is parked on a WORKER thread; the event loop must still
+        # run a callback while that worker holds the (modelled) cancel lock.
+        t0 = time.monotonic()
+        await asyncio.sleep(0.12)
+        loop_responsive = (time.monotonic() - t0) < 0.5
+        release.set()
+        assert ge_done.wait(2.0)
+        await asyncio.sleep(0.05)
+        with contextlib.suppress(Exception):
+            await consumer
+        return loop_responsive
+
+    responsive = asyncio.run(scenario())
+    assert gen_threads, "body GeneratorExit did not run"
+    assert all(t != loop_id for t in gen_threads), (
+        f"GeneratorExit ran on the event loop thread ({loop_id}), threads {gen_threads}")
+    assert responsive, "event loop stalled while GeneratorExit cancel parked"
