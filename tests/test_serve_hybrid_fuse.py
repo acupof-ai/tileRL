@@ -35,7 +35,7 @@ def sandbox(env_extra):
     try:
         repo = d / "tilerl-v100-sse"
         (repo / "src").mkdir(parents=True)
-        (repo / "venv70/bin").mkdir(parents=True)
+        (d / "venv70/bin").mkdir(parents=True)
         (d / "models").mkdir()
         (d / "mmlu-assets").mkdir()
         # Crashes immediately, no matter the serve argv; sleeps make boots distinct.
