@@ -12,8 +12,7 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "tilerl"
 
-# Lower rank = lower layer. Pre-placed future modules (bench) are
-# absent from disk today and must not error while absent.
+# Lower rank = lower layer.
 LAYERS: dict[str, frozenset[str]] = {
     "L0": frozenset({"precision", "config", "tokenizer", "testing"}),
     "L1": frozenset({"model", "tensor_parallel", "autograd"}),
@@ -32,6 +31,7 @@ LAYERS: dict[str, frozenset[str]] = {
             "judge",
             "math_answer",
             "bench",
+            "benchrec",
             "train",
             "iso",
             "merge",
@@ -125,12 +125,6 @@ def test_level0_from_tilerl_import_of_a_higher_module_is_flagged() -> None:
 def test_unlisted_module_is_flagged() -> None:
     _, unlayered = violations(_inject(read_sources(), "newmodule", "x = 1\n"))
     assert "newmodule" in unlayered
-
-
-def test_preplaced_absent_future_modules_do_not_error() -> None:
-    for future in ("bench",):
-        assert future in _RANK and not (SRC / f"{future}.py").exists()
-    # violations() over the real tree (which lacks them) is already green above.
 
 
 def test_downward_edge_is_not_flagged() -> None:
