@@ -136,6 +136,28 @@ def _dry_run_checkpoint(args, backend) -> None:
               f"target={backend.target} device_free {device_free/1e6:.0f} MiB")
         print(format_memory_table(table))
 
+def _apply_device_reserve(args, backend) -> None:
+    """Set the held-VRAM fence before weights load (the first allocator cudaMalloc).
+
+    --device-reserve-mib is one knob with one path: the process memory fraction
+    HOLDS the floor (an over-fence cudaMalloc raises catchable OOM that the
+    supervisor restarts), and it caps mem_get_info, so build's peak-live block
+    trim must not run too (that would double-charge). 0 is a full-card no-op and
+    skips the call entirely. Off cuda there is no fraction to set."""
+    reserve = int(getattr(args, "device_reserve_mib", 0) or 0) * 1024 * 1024
+    if not reserve or backend.device.type != "cuda":
+        return
+    import torch
+
+    from .memory import reserve_memory_fraction
+
+    total = torch.cuda.get_device_properties(backend.device).total_memory
+    frac = reserve_memory_fraction(total, reserve)
+    torch.cuda.set_per_process_memory_fraction(frac, backend.device)
+    print(f"serve: device memory fraction {frac:.5f} "
+          f"(reserve {reserve / 2**20:.0f} MiB of {total / 2**30:.2f} GiB held)", flush=True)
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     import uvicorn
     from tilerl_kernels.backend import get_backend
@@ -143,6 +165,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     from .server import create_app, get_tokenizer
 
     backend = get_backend()
+    _apply_device_reserve(args, backend)
     if args.checkpoint:
         if not args.dry_run:
             sys.exit("error: --checkpoint is a --dry-run header-only query; "
@@ -157,7 +180,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         draft = load_draft(model, args.draft)
     # Before the engine: it takes the decode for stop sequences.
     tokenizer = _qwen38_tokenizer() if args.model == "qwen38-27b" else get_tokenizer(None)
-    engine = build_serving_engine(cfg, model, backend,
+    try:
+        engine = build_serving_engine(cfg, model, backend,
                            draft=draft, depth=args.depth, slots=args.slots,
                            blocks=args.blocks, max_ctx=args.max_ctx,
                            max_batch=args.max_batch, dram_bytes=args.dram_bytes,
@@ -175,6 +199,16 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            sparse_min_tokens=getattr(args, "sparse_min_tokens", 0),
                            sparse_prefill_tokens=getattr(args, "sparse_prefill_tokens", 0),
                            device_reserve_mib=getattr(args, "device_reserve_mib", 0))
+    except Exception as build_exc:
+        # Startup OOM (e.g. a fraction too small for weights): exit fatally instead
+        # of half-starting, so the supervisor's marker path restarts cleanly.
+        import torch as _torch_build
+
+        if isinstance(build_exc, _torch_build.cuda.OutOfMemoryError):
+            from .engine import fatal_device_exit
+
+            fatal_device_exit(build_exc)
+        raise
     app = create_app(engine, tokenizer, model_name=cfg.name)
     # --dry-run: build (which materializes and fits) then print the memory ledger and stop,
     # never bind the HTTP port. --json prints the rows for the cost-model tooling. The budget
@@ -473,9 +507,10 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.add_argument("--device-reserve-mib", type=int,
                          default=int(os.environ.get("TILERL_DEVICE_RESERVE_MIB", "0")),
                          metavar="MIB",
-                         help="build-time free-device-VRAM floor in MiB; the KV pool is trimmed "
-                              "once at startup if idle free would be below it (sm70 edge-memory "
-                              "wedge headroom). 0 (default) changes nothing.")
+                         help="hold this many MiB of device VRAM free via a process memory "
+                              "fraction set before weights load; an over-fence cudaMalloc then "
+                              "raises catchable OOM (supervisor restart) instead of blocking at "
+                              "the edge (sm70 wedge headroom). 0 (default) = full card, no-op.")
     p_serve.add_argument("--kv-fp8", choices=["e4m3", "e5m2"], default="",
                          help="store the KV planes in fp8: 65536 -> 33280 bytes per token at the "
                               "27B's 16 planes x 4 heads x 256, a 1.969x saving, the 0.031 being "

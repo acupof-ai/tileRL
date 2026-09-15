@@ -86,6 +86,48 @@ must not sink the server):
    / sparse admission (the ~114 MiB headroom is too tight; reserve on the order
    of one PO / a few hundred MiB) to reduce the chance of reaching the edge.
 
+### 2026-09-16: a build-time peak-live reserve does NOT hold — allocator re-reserves
+
+#654 first implemented the margin as a build-time KV-pool trim: read free after
+weights/state, size the pool down once so projected idle free met the floor.
+The V100 env experiment (`TILERL_DEVICE_RESERVE_MIB=768` on c52fbbdc) showed
+this is **not a held reservation** and excluded that hypothesis:
+
+- the reserve recorded (`device_reserve_bytes=768 MiB`) but **cut 0 blocks** —
+  the sparse pool stayed 2213, post-warmup idle free only **602 MiB < 768**;
+- decomposition from `/health`'s ledger: live tensors ~28035 MiB (live-only free
+  ~4733 MiB) but `mem_get_info` free 602 MiB — the missing ~4.1 GiB is the
+  caching allocator's **reserved-but-unused segments**, which appear after the
+  build snapshot (warmup/lazy JIT) and which a build-time projection cannot see.
+  Trimming the pool lowers the peak of live tensors; it does not pin free
+  against the allocator reclaiming it.
+
+The held mechanism is a process memory fraction
+(`torch.cuda.set_per_process_memory_fraction((total−reserve)/total)`) set before
+weights load: it caps `mem_get_info` and turns an over-fence `cudaMalloc` into
+an explicit, **catchable** `torch.cuda.OutOfMemoryError` (the supervisor restarts
+on that) instead of a host-side blocking launch. Precondition verified on sm70
+(torch 2.5.1+cu121) by the one-off on-box probe `~/probe_memory_fraction.py`
+(kept on the V100 host, not in `scripts/` — a closure-gate dead script; rerun if
+a torch/CUDA change is suspected to alter OOM behavior): fence raised catchable
+OOM and a small alloc+fill+sync after it succeeded, so the context survives.
+Result: `PROBE_OK`.
+
+That catchable OOM is **fatal, not swallowed**: a first implementation let
+`step()`'s `except Exception` drain the rows and re-raise into `_loop`'s
+log-and-continue, so the process stayed alive, drained to idle, answered
+`/health` 200, and kept accepting rows — the #650 watchdog could not catch it.
+The fix classifies `torch.cuda.OutOfMemoryError` (forward AND build allocation
+paths) as a `FatalDeviceError`: rows are NOT drained, the engine records fatal,
+`liveness()` reports dead, `submit()` refuses new rows, and a single seam
+(`fatal_device_exit`, os._exit(11) with a greppable marker) terminates so the
+#652 supervisor restarts. There is no in-process recovery — the fraction is
+fixed for the process, so freeing the rows in flight cannot make room. Ordinary
+per-request `RuntimeError`s still go through `_finish` and keep serving. The
+GDN state ledger row was also found to undercount ~3x
+(776 vs 2273 MiB) — `memory_rows` passed `spec_steps=0` and dropped both spec
+step planes; fixed alongside the fraction work.
+
 Related: [2026-09-15-sm70-long-step-tick-holds-engine-lock.md](2026-09-15-sm70-long-step-tick-holds-engine-lock.md)
 (the self-limiting 1–5.6 s sibling tick — that one returns, this one does not),
 [2026-09-15-sse-midstream-disconnect-never-cancelled-the-row.md](2026-09-15-sse-midstream-disconnect-never-cancelled-the-row.md).

@@ -232,6 +232,30 @@ class _StepTiming:
         print(f"[step-timing] {self.n} ticks avg: {parts}", file=sys.stderr, flush=True)
 
 
+class FatalDeviceError(RuntimeError):
+    """A device error the process cannot serve through: an allocator OOM past the
+    held memory fraction. The fraction is fixed for the process, so freeing the
+    rows in flight cannot make room — continuing leaves a half-dead server that
+    drains to idle and answers /health 200. The only recovery is a process restart.
+    """
+
+
+#: Exit code the #652 supervisor treats as a fatal-marker restart (its guard exits
+#: 11 on a CUDA marker); printed so the grep convention matches.
+FATAL_DEVICE_EXIT_CODE = 11
+FATAL_DEVICE_MARKER = "FATAL device error (out of memory): restarting process"
+
+
+def fatal_device_exit(exc: BaseException) -> None:
+    """Terminate NOW on an unrecoverable device OOM. os._exit, not raise: the
+    daemon loop's log-and-continue would otherwise swallow it, and SystemExit is
+    caught by `except Exception`. The marker is the #652 supervisor's restart
+    trigger. Module-level so a CPU gate monkeypatches it instead of exiting itself.
+    """
+    print(FATAL_DEVICE_MARKER + f": {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    os._exit(FATAL_DEVICE_EXIT_CODE)
+
+
 class RequestFailed(RuntimeError):
     """A request ended in failure. ``reason`` is a stable tag for the failure
     class (None = untagged); a caller that tolerates one class catches on it.
@@ -574,6 +598,9 @@ class Engine:
 
         self._pin = backend.device.type == "cuda"
         self._lock = threading.RLock()
+        #: Set by an unrecoverable device OOM; once set the loop terminates and
+        #: submit() refuses new rows (the process is on its way to a restart).
+        self._fatal: BaseException | None = None
         self._step_timing = _StepTiming() if os.environ.get("TILERL_STEP_TIMING") else None
         if self._step_timing is not None:
             atexit.register(self._step_timing.report)
@@ -776,6 +803,10 @@ class Engine:
         if any(not s for s in params.stop_texts):
             # "" is in every string, so it would end the request at token 1.
             raise ValueError("stop_texts entries must be non-empty")
+        if self._fatal is not None:
+            # The process is exiting for a supervisor restart after a device OOM;
+            # never take another row (a half-dead server must not look healthy).
+            raise FatalDeviceError(f"engine is fatally failed: {self._fatal}")
         if params.max_new_tokens > 0:
             total = len(tokens) + params.max_new_tokens
             if total > self.limits.max_total_tokens:
@@ -945,6 +976,12 @@ class Engine:
                 try:
                     self._hybrid_t0 = time.perf_counter()
                     self._run_forward(decodes, prefills, chunks)
+                except torch.cuda.OutOfMemoryError as exc:
+                    # Fatal, and deliberately NOT _finish: draining the rows would
+                    # move the engine to idle so /health answered 200 while the
+                    # process kept swallowing OOMs. Raise into the loop, which marks
+                    # the engine failed and terminates for the supervisor to restart.
+                    raise FatalDeviceError(str(exc)) from exc
                 except Exception as exc:
                     for req in list(self._running):
                         self._finish(req, error=str(exc))
@@ -1315,6 +1352,10 @@ class Engine:
         /health on the exact stall it must detect.
         """
         active = bool(self._running) or bool(self._waiting)
+        if self._fatal is not None:
+            # A fatally failed process must read dead even if its rows were never
+            # drained, in the window before fatal_device_exit runs; never idle-200.
+            return False, float("inf")
         if not active:
             return True, 0.0
         stuck = time.perf_counter() - self._last_progress_ts
@@ -1476,15 +1517,14 @@ class Engine:
         )
         hybrid = self._sparse is not None and self._sparse_min_tokens
         if self._device_reserve_bytes:
-            # A target free floor, not a held allocation: kind budget keeps it out
-            # of the peak = Σstatic + transient invariant. Peak-LIVE reduction —
-            # the build sizes the KV pool smaller so the floor is left free; it
-            # does not pin that free against the caching allocator reclaiming it.
+            # Held by the process memory fraction set in cmd_serve, not by a KV
+            # allocation, so it stays a budget row (out of the peak = Σstatic +
+            # transient invariant). The fraction caps mem_get_info and turns an
+            # over-fence cudaMalloc into catchable OOM; build cuts no blocks.
             rows.append({
                 "tier": "device", "owner": "device_reserve", "kind": "budget",
                 "derived": self._device_reserve_bytes,
-                "note": f"peak-live free floor (not held); KV pool cut by "
-                        f"{self._reserve_dropped_blocks} blocks at build",
+                "note": "held by set_per_process_memory_fraction; no KV blocks cut",
                 "measured": None, "delta": None,
             })
         if hybrid or (
@@ -2413,6 +2453,15 @@ class Engine:
                     self._wake.wait(0.01)
                 try:
                     self.step()
+                except FatalDeviceError as exc:
+                    # Unrecoverable allocator OOM: stop accepting work and exit so
+                    # the supervisor restarts. Recorded before the seam so a gate
+                    # monkeypatching fatal_device_exit still sees the engine failed.
+                    with self._lock:
+                        self._fatal = exc
+                    self._wake.set()
+                    fatal_device_exit(exc)
+                    return
                 except Exception:
                     # ponytail: log-and-continue (a crashed daemon hangs the server); backpressure is the upgrade.
                     import traceback

@@ -3351,3 +3351,102 @@ def test_liveness_stamped_on_submit_idle_to_active_edge_only():
         assert live is False and stuck > 60.0
     finally:
         eng.shutdown()
+
+
+def test_forward_oom_is_fatal_but_a_normal_error_finishes_the_row():
+    """Allocator OOM past the held memory fraction must terminate for a supervisor
+    restart, NOT be swallowed by the daemon loop's log-and-continue (a half-dead
+    server drains to idle and answers /health 200). A plain per-request error must
+    still _finish and keep serving. Drives the REAL loop thread; the process-exit
+    seam is monkeypatched so the test does not os._exit itself."""
+    import time
+
+    import numpy as np
+    import torch
+
+    import tilerl.engine as eng_mod
+    from tilerl.engine import FatalDeviceError
+
+    def make_engine():
+        cfg = tiny()
+        return build_engine(cfg, build_random(cfg, seed=71), get_backend(),
+                            num_blocks=32, num_slots=4, max_batch=4,
+                            max_total_tokens=4096, sparse_k=0)
+
+    prompt = np.arange(5, 5 + 64, dtype=np.int64)
+    params = dict(temperature=0.0, max_new_tokens=2, seed=0)
+
+    # --- positive: OutOfMemoryError in _run_forward is fatal ----------------
+    eng = make_engine()
+    calls: list = []
+    real_forward = eng._run_forward
+    real_exit = eng_mod.fatal_device_exit
+
+    def boom(*a, **k):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory (fraction fence)")
+
+    def fake_exit(exc):
+        calls.append(exc)
+        eng._wake.set()  # stop the loop without exiting the test process
+
+    eng._run_forward = boom
+    eng_mod.fatal_device_exit = fake_exit
+    eng.submit(prompt, SamplingParams(**params))
+    eng.run()
+    try:
+        for _ in range(100):
+            if calls:
+                break
+            time.sleep(0.02)
+        assert len(calls) == 1, f"fatal seam called {len(calls)} times"
+        assert isinstance(calls[0], FatalDeviceError)
+        # engine records fatal and reads dead even before the process exits
+        assert eng._fatal is calls[0]
+        assert eng.liveness(60.0)[0] is False
+        # the loop must not accept a NEW submit after the OOM
+        with pytest.raises(FatalDeviceError):
+            eng.submit(np.arange(5, 5 + 32, dtype=np.int64), SamplingParams(**params))
+    finally:
+        eng_mod.fatal_device_exit = real_exit
+        eng._run_forward = real_forward
+        eng.shutdown()
+
+    # --- negative: an ordinary RuntimeError is recovered, not fatal ----------
+    eng2 = make_engine()
+    real_forward2 = eng2._run_forward
+
+    def ordinary(*a, **k):
+        raise RuntimeError("transient per-request failure")
+
+    eng2._run_forward = ordinary
+    rid2 = eng2.submit(prompt, SamplingParams(**params))
+    eng2.run()
+    try:
+        from tilerl.engine import RequestFailed
+
+        # poll() RAISES a failed row rather than returning it
+        for _ in range(100):
+            try:
+                out = eng2.poll()
+                if rid2 in out:
+                    raise AssertionError("failed row unexpectedly returned data")
+            except RequestFailed as rf:
+                if rf.request_id == rid2:
+                    assert "transient" in str(rf)
+                    break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("failed row never surfaced")
+        assert eng2._fatal is None
+        # still serves a second request once the forward works again (rid2's
+        # failure stays in _failed and must not block rid3)
+        eng2._run_forward = real_forward2
+        rid3 = eng2.submit(np.arange(5, 5 + 32, dtype=np.int64), SamplingParams(**params))
+        for _ in range(100):
+            if rid3 in eng2._finished:
+                break
+            time.sleep(0.02)
+        assert rid3 in eng2._finished
+    finally:
+        eng2.shutdown()
+
