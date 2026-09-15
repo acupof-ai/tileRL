@@ -696,92 +696,69 @@ def test_benchrec_loads_without_the_repo_scripts_directory(monkeypatch, tmp_path
         ledger._benchrec.cache_clear()
 
 
-def test_reserve_kv_blocks_three_tiers():
-    """The build-time headroom recovery is pure arithmetic (idle free is measured
-    by the caller): a floor already met drops nothing; a shortfall drops exactly
-    ceil(shortfall/per_block); a reserve the whole pool cannot meet is an explicit
-    error rather than a silent 0-block fit. Shortfall 1400 over a 1000-byte block
-    must drop 2, not 1, so a floor/rounding bug cannot hide."""
-    from tilerl.memory import reserve_kv_blocks
+def test_reserve_memory_fraction_holds_the_floor_and_rejects_impossible():
+    """The held reserve is one pure formula: (total-reserve)/total. 0 reserve is
+    an exact 1.0 no-op; a positive reserve leaves exactly that fraction of the
+    card; meeting/exceeding the card raises rather than requesting a negative
+    fraction. Float-exact on the 0 and 1 endpoints so the no-op path skips the
+    torch call."""
+    from tilerl.memory import reserve_memory_fraction as frac
 
-    kw = dict(base_kv_blocks=100, kv_per_block=1000, idle_free_bytes=100)
-    assert reserve_kv_blocks(reserve_bytes=50, **kw) == (100, 0)
-    assert reserve_kv_blocks(reserve_bytes=100, **kw) == (100, 0)
-    assert reserve_kv_blocks(reserve_bytes=1500, **kw) == (98, 2)
+    assert frac(32 << 30, 0) == 1.0
+    assert frac(1000, 250) == 0.75
+    assert 0 < frac(1000, 999) < 1
     with pytest.raises(ValueError, match="reserve"):
-        reserve_kv_blocks(reserve_bytes=200_000, **kw)
+        frac(1000, 1000)
+    with pytest.raises(ValueError, match="reserve"):
+        frac(1000, -1)
 
 
-def test_layout_with_reserve_sizes_pool_once_from_one_snapshot():
-    """The redesign: no build-full-then-resize. layout_with_reserve takes the ONE
-    pre-pool measured free and the frozen base/draft/store bytes and returns the
-    final KV block count directly. Shows (a) reserve 0 is an exact no-op, (b) the
-    pad and draft bytes count in the projected idle so the same reserve cuts the
-    same blocks it must with the finished layout, (c) a shortfall is recovered
-    only from trimmable KV (pad is never dropped), (d) an unmeetable floor raises.
-    """
+def test_reserve_has_single_path_no_block_trim():
+    """One knob, one path: with the fraction holding the floor, build must not
+    ALSO cut KV blocks (the fence already caps mem_get_info; a second trim
+    double-charges). There is no reserve block arithmetic in src at all —
+    set_per_process_memory_fraction is the sole mechanism — and
+    reserve_dropped_blocks exists only to report 0."""
     import ast
     import pathlib
 
-    from tilerl import kv_cache as kv_mod
-    from tilerl.memory import layout_with_reserve
+    import tilerl.build as build_mod
+    import tilerl.memory as memory_mod
 
-    # The resize API must be gone, not merely uncalled: a build-full-then-shrink
-    # reallocates new+old KV tensors and OOMs in the exact low-free case guarded.
-    src = pathlib.Path(kv_mod.__file__).read_text()
-    assert "resize_blocks" not in src
-    for node in ast.walk(ast.parse(src)):
-        assert not (isinstance(node, ast.Attribute) and node.attr == "resize_blocks")
-    tree = ast.parse(pathlib.Path(build_engine.__code__.co_filename).read_text())
-    assert not any(
-        isinstance(n, ast.Attribute) and n.attr == "resize_blocks"
-        for n in ast.walk(tree)
-    )
-
-    # free0=100000, base 100 kv blocks * 1000, no pad/draft/other -> idle 0.
-    # reserve 0 unchanged; reserve 1000 -> cut ceil(1000/1000)=1 -> 99.
-    assert layout_with_reserve(
-        free0_bytes=100_000, reserve_bytes=0, base_kv_blocks=100,
-        kv_per_block=1000) == (100, 0)
-    assert layout_with_reserve(
-        free0_bytes=100_000, reserve_bytes=1000, base_kv_blocks=100,
-        kv_per_block=1000) == (99, 1)
-    # pad counts toward projected idle but is NOT cut: same free0 with a 10-block
-    # pad makes idle = -10000, so reserve 1000 cuts 11 (ceil(11000/1000)) and the
-    # returned trimmable count stays >=0 while the pad survives in the tensor.
-    final, dropped = layout_with_reserve(
-        free0_bytes=100_000, reserve_bytes=1000, base_kv_blocks=100,
-        kv_per_block=1000, pad_blocks=10)
-    assert (final, dropped) == (89, 11)
-    # frozen draft bytes reduce idle exactly like kv bytes (same snapshot base)
-    assert layout_with_reserve(
-        free0_bytes=100_000, reserve_bytes=1000, base_kv_blocks=100,
-        kv_per_block=1000, draft_blocks=5, draft_per_block=1000) == (94, 6)
-    # even cutting every trimmable KV block cannot meet the floor -> raise
-    with pytest.raises(ValueError, match="reserve"):
-        layout_with_reserve(
-            free0_bytes=100_000, reserve_bytes=200_000, base_kv_blocks=100,
-            kv_per_block=1000, pad_blocks=10)
+    for mod in (build_mod, memory_mod):
+        src = pathlib.Path(mod.__file__).read_text()
+        tree = ast.parse(src)
+        names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+        # the deleted peak-live path must not return
+        assert "layout_with_reserve" not in names
+        assert "reserve_kv_blocks" not in names
+        assert "resize_blocks" not in attrs
+    # the held path is the fraction call
+    assert "set_per_process_memory_fraction" in pathlib.Path(
+        __import__("tilerl.cli", fromlist=["cli"]).__file__).read_text()
 
 
 def test_device_reserve_is_recorded_in_stats_and_ledger_off_cuda():
-    """Wiring for --device-reserve-mib: off CUDA the build cannot measure free so
-    it cuts no blocks, but the floor is still in stats and a budget (non-held)
-    ledger row so /health reconciles it and the note says peak-live, not held.
-    The cuda cut is pending-remote."""
+    """Wiring for --device-reserve-mib: the floor is enforced by the process memory
+    fraction in cmd_serve (cuda only, before weights load); build never cuts
+    blocks, so dropped is 0 on every backend. Off cuda no fraction is set, but the
+    floor is still reported in stats and a budget ledger row so /health reconciles
+    it. The note says the floor is held by the fraction."""
     cfg, model = build_model("tiny", seed=0)
     eng = build_engine(cfg, model, RefBackend(), num_blocks=8, num_slots=4,
                        max_batch=4, max_total_tokens=2048, max_num_batched_tokens=512,
                        sparse_k=0, device_reserve_bytes=123 * 1024 * 1024)
     try:
         assert eng._device_reserve_bytes == 123 * 1024 * 1024
-        assert eng._reserve_dropped_blocks == 0
+        assert eng._reserve_dropped_blocks == 0  # fraction-only; no block trim ever
         owners = {r["owner"]: r for r in eng._memory_rows()}
         row = owners["device_reserve"]
         assert row["kind"] == "budget"
         assert row["derived"] == 123 * 1024 * 1024
-        assert "not held" in row["note"]
+        assert "fraction" in row["note"]
         assert eng.stats()["device_reserve_bytes"] == 123 * 1024 * 1024
+        assert eng.stats()["reserve_dropped_blocks"] == 0
     finally:
         eng.shutdown()
 
