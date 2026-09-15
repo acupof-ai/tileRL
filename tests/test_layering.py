@@ -89,6 +89,15 @@ def violations(sources: dict[str, str]) -> tuple[set[tuple[str, str]], set[str]]
     return upward, unlayered
 
 
+def test_every_layered_module_file_exists() -> None:
+    """The reverse of the unlayered-module check: every name in LAYERS must
+    resolve to a file. Without this a module listed (and imported by cli) before
+    its file landed was silently tolerated -- bench.py was exactly that. New L5
+    command modules are real files, so the table must not list a ghost."""
+    missing = [m for m in _RANK if not (SRC / f"{m}.py").exists()]
+    assert not missing, f"LAYERS lists modules with no file: {sorted(missing)}"
+
+
 def test_real_tree_has_only_allowlisted_upward_edges() -> None:
     upward, unlayered = violations(read_sources())
     assert unlayered == set(), f"module missing from LAYERS: {sorted(unlayered)}"

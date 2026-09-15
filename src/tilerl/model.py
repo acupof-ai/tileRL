@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -118,6 +119,15 @@ def checkpoint_matches_config(cfg: ModelConfig, ckpt_dir: str) -> tuple[bool, st
             return False, (f"{field}={actual} in {cp} but --model cfg expects {expected}; "
                            f"pass the --model this checkpoint belongs to")
     return True, ""
+
+
+def require_checkpoint_matches(cfg: ModelConfig, model_name: str, checkpoint: str) -> None:
+    """Refuse before loading a checkpoint whose config.json is not this model's.
+    sys.exit form of checkpoint_matches_config, shared by cli's --dry-run and
+    bench --kernels. See that function for why this is a hard guard."""
+    ok, reason = checkpoint_matches_config(cfg, checkpoint)
+    if not ok:
+        sys.exit(f"error: --checkpoint {checkpoint} is not a {model_name} checkpoint: {reason}")
 
 
 def checkpoint_weight_faces(
