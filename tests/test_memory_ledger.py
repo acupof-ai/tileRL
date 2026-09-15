@@ -666,3 +666,31 @@ def test_cpu_measured_peak_falls_back_to_held_storage_not_cuda_hwm():
     peak = eng._measured_peak_bytes()
     device_total = next(r["derived"] for r in rows if r["owner"] == "device_total")
     assert peak is not None and peak == device_total, (peak, device_total)
+
+
+def test_benchrec_loads_without_the_repo_scripts_directory(monkeypatch, tmp_path):
+    """Finding 24: ledger used to load benchrec by an absolute path into
+    <repo>/scripts/benchrec.py, so a wheel/sdist install (package only, no
+    scripts/) crashed on every ledger call. benchrec is now a packaged module;
+    hide scripts/ from sys.path and the loader must still return a validator
+    that appends to a redirected store."""
+    import sys
+
+    monkeypatch.setattr(sys, "path",
+                        [p for p in sys.path if not p.endswith("/scripts")])
+    monkeypatch.setenv("TILERL_BENCH_STORE", str(tmp_path / "m.jsonl"))
+    # Drop any cached scripts-style import; the canonical module is the source.
+    sys.modules.pop("benchrec", None)
+    from tilerl import ledger
+    ledger._benchrec.cache_clear()
+    try:
+        br = ledger._benchrec()
+        assert br.__name__ == "tilerl.benchrec", br.__name__
+        from tilerl.ledger import append_residency, residency_row
+
+        row = residency_row("tiny-cpu", None, 500, static_bytes=450,
+                            transient_bytes=50, target="cpu", model="tiny")
+        rid = append_residency(row, str(tmp_path / "m.jsonl"))
+        assert rid and (tmp_path / "m.jsonl").read_text().strip()
+    finally:
+        ledger._benchrec.cache_clear()
