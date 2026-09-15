@@ -2592,6 +2592,11 @@ class _MidStreamEngine:
         self._half, self._full = ids[: len(ids) // 2], ids
         self._peeks = 0
         self._gate = threading.Event()
+        # Test synchronization replaces wall-clock sleeps: submit done, the
+        # first content frame has been produced, and cancel has fully run.
+        self.submitted = threading.Event()
+        self.frame_sent = threading.Event()
+        self.cancel_finished = threading.Event()
         self.cancelled: list[int] = []
         self.blocks_used = self.slots_used = 0
         self.params: list = []
@@ -2600,11 +2605,13 @@ class _MidStreamEngine:
         self.blocks_used += 4
         self.slots_used += 1
         self.params.append(params)
+        self.submitted.set()
         return 7
 
     def peek(self, request_id: int):
         self._peeks += 1
         if self._peeks == 1:
+            self.frame_sent.set()
             return self._half
         if self._peeks == 2:
             return self._full
@@ -2628,6 +2635,7 @@ class _MidStreamEngine:
         self.cancelled.append(request_id)
         self.blocks_used = self.slots_used = 0
         self._gate.set()
+        self.cancel_finished.set()
         return True
 
     def room_for(self, prompt_tokens: int) -> int:
@@ -2876,6 +2884,7 @@ class _LockParkEngine(_MidStreamEngine):
         self.cancelled.append(request_id)
         self.blocks_used = self.slots_used = 0
         self._gate.set()
+        self.cancel_finished.set()
         return True
 
 
@@ -2906,6 +2915,10 @@ def test_a_late_sse_disconnect_does_not_freeze_the_event_loop():
             f"\r\n{payload}").encode()
         with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
             s.sendall(request)
+            # Event-synced, not a wall-clock race: the engine marks the first
+            # frame produced; reading until the marker then proves it actually
+            # crossed the real socket before this "late" disconnect.
+            assert eng.frame_sent.wait(10.0), "engine never produced a first frame"
             buf = b""
             while b'"content"' not in buf:
                 chunk = s.recv(4096)
@@ -2913,7 +2926,7 @@ def test_a_late_sse_disconnect_does_not_freeze_the_event_loop():
                 buf += chunk
         # Disconnect delivered; stream_or_cancel must dispatch cancel to a
         # worker thread, leaving the event loop free.
-        assert eng.cancel_started.wait(2.0), "cancel was never attempted"
+        assert eng.cancel_started.wait(10.0), "cancel was never attempted"
         # A probe ON the same uvicorn event loop must answer while cancel is
         # still parked behind the held lock. 0.5 s bound, not the 2 s park.
         probe = socket.create_connection(("127.0.0.1", port), timeout=5)
@@ -2930,12 +2943,10 @@ def test_a_late_sse_disconnect_does_not_freeze_the_event_loop():
         assert elapsed < 0.5, (
             f"event loop froze {elapsed:.2f}s waiting for engine.cancel's lock")
         # Release the parked critical section: the queued cancel completes and
-        # the next-tick cleanup flag drains the allocation.
+        # the next-tick cleanup flag drains the allocation. Wait on the
+        # completion event, not a poll deadline.
         eng.cancel_lock.release()
-        deadline = time.monotonic() + 3.0
-        while (not eng.cancelled or eng.blocks_used or eng.slots_used) \
-                and time.monotonic() < deadline:
-            time.sleep(0.02)
+        assert eng.cancel_finished.wait(10.0), "queued cancel never finished"
         assert eng.cancelled == [7] and eng.blocks_used == 0 \
             and eng.slots_used == 0
     finally:
@@ -2978,10 +2989,10 @@ def test_a_nonstream_disconnect_does_not_freeze_the_event_loop(tmp_path,
             f"\r\n").encode() + payload
         with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
             s.sendall(request)
-            # No response can arrive (take is blocked in the worker); close the
-            # socket to deliver http.disconnect.
-            time.sleep(0.1)
-        assert eng.cancel_started.wait(2.0), (
+            # Wait until the request is enqueued (take is blocked in the
+            # worker), then close to deliver http.disconnect. Event, not sleep.
+            assert eng.submitted.wait(10.0), f"{path}: request never submitted"
+        assert eng.cancel_started.wait(10.0), (
             f"{path}: await_or_cancel never dispatched engine.cancel")
         probe = socket.create_connection(("127.0.0.1", port), timeout=5)
         probe.sendall(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
@@ -2997,10 +3008,7 @@ def test_a_nonstream_disconnect_does_not_freeze_the_event_loop(tmp_path,
         assert elapsed < 0.5, (
             f"{path}: event loop froze {elapsed:.2f}s behind cancel's lock")
         eng.cancel_lock.release()
-        deadline = time.monotonic() + 3.0
-        while (not eng.cancelled or eng.blocks_used or eng.slots_used) \
-                and time.monotonic() < deadline:
-            time.sleep(0.02)
+        assert eng.cancel_finished.wait(10.0), f"{path}: queued cancel never finished"
         assert eng.cancelled and eng.blocks_used == 0 and eng.slots_used == 0
     finally:
         if eng.cancel_lock.locked():
