@@ -160,16 +160,23 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
             rid_box[0] = rid
         out = await_completion(engine, rid, completion_timeout_s)
         reasoning, text = split_think(tokenizer.decode(out), bool(thinking))
+        # Re-encoding the extracted text is an approximation of the sampled
+        # reasoning span: a token whose bytes straddle the split counts in one
+        # side of the real run and in the other here. There is no per-span token
+        # boundary from split_think, and off by one beats a hardcoded 0.
+        n_reasoning = len(tokenizer.encode(reasoning)) if reasoning else 0
         stopped = engine.stop_text(rid)
         text, calls = _parse_tool_calls(cut_at_stop(text, stopped), tools)
         if choice_name(req.tool_choice) == "none":
             calls = []
         return _body(rid, req, model_name, reasoning, text, calls,
-                     len(input_ids), len(out), params.max_new_tokens, stopped=stopped)
+                     len(input_ids), len(out), params.max_new_tokens,
+                     n_reasoning=n_reasoning, stopped=stopped)
 
     def _body(rid: int, req: ResponsesRequest, model: str, reasoning: str, text: str,
               calls: list, n_in: int, n_out: int, max_new: int,
-              output: list | None = None, stopped: str | None = None) -> dict[str, Any]:
+              output: list | None = None, n_reasoning: int = 0,
+              stopped: str | None = None) -> dict[str, Any]:
         """``Response``, with the fields the SDK's model requires.
 
         ``parallel_tool_calls`` and ``tool_choice`` are declared required and
@@ -199,8 +206,12 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
             "top_p": req.top_p,
             "usage": {"input_tokens": n_in, "output_tokens": n_out,
                       "total_tokens": n_in + n_out,
-                      "input_tokens_details": {"cached_tokens": 0},
-                      "output_tokens_details": {"reasoning_tokens": 0}},
+                      # cache_write_tokens is a required int on the SDK model;
+                      # we cache nothing, and null makes model_validate fail (#687).
+                      "input_tokens_details": {"cached_tokens": 0,
+                                               "cache_read_input_tokens": 0,
+                                               "cache_write_tokens": 0},
+                      "output_tokens_details": {"reasoning_tokens": n_reasoning}},
         }
 
     def _output_items(rid: int, reasoning: str, text: str, calls: list) -> list[dict]:
@@ -212,10 +223,11 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         items: list[dict[str, Any]] = []
         if reasoning:
             items.append({"id": f"rs_{rid}", "type": "reasoning",
-                          # summary is required and must be a list; we do not
-                          # summarise, so the text goes in `content` and summary
-                          # stays empty rather than being faked.
-                          "summary": [],
+                          # GA clients read summary[summary_text]; an empty
+                          # summary made the reasoning invisible (#687). The
+                          # legacy content[reasoning_text] is kept alongside for
+                          # older SDKs that still model it there.
+                          "summary": [{"type": "summary_text", "text": reasoning}],
                           "content": [{"type": "reasoning_text", "text": reasoning}],
                           "status": "completed"})
         if text or not calls:

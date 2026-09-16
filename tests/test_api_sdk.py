@@ -362,6 +362,27 @@ def test_responses_reasoning_is_its_own_item(oa):
     assert REASON not in r.output_text
 
 
+def test_responses_reasoning_is_readable_from_the_ga_summary(oa, base_url):
+    """#687: current SDKs read summary[summary_text]; the legacy content field
+    alone left them with no reasoning. Both paths must expose it."""
+    import httpx
+
+    r = oa.responses.create(model="tilerl", input="hi", extra_body=THINKING_ON)
+    item = next(i for i in r.output if i.type == "reasoning")
+    assert "".join(s.text for s in item.summary).rstrip("\n") == REASON
+
+    # The whole body must validate: a null cache_write_tokens raised on
+    # Response.model_validate before the reasoning shape was even reached.
+    raw = httpx.post(f"{base_url}/v1/responses", timeout=30,
+                     json={"model": "tilerl", "input": "hi",
+                           "chat_template_kwargs": {"enable_thinking": True}}).json()
+    openai.types.responses.Response.model_validate(raw)
+    in_details = raw["usage"]["input_tokens_details"]
+    assert isinstance(in_details["cache_write_tokens"], int)
+    assert isinstance(in_details["cached_tokens"], int)
+    assert raw["usage"]["output_tokens_details"]["reasoning_tokens"] > 0
+
+
 def test_responses_stream_events_and_order(oa):
     names, text = [], ""
     for ev in oa.responses.create(model="tilerl", input="hi", stream=True, extra_body=THINKING_ON):
