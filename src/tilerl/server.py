@@ -235,8 +235,18 @@ async def _drain_body(engine: Any, request_id: int, worker: Any, body: Any) -> N
     # cancel (measured 2026-09-16: 2 of 8 storm hangups leaked this way). This is
     # the same idempotent cancel body.close()'s GeneratorExit would run — moved
     # before the wait, since waiting on a worker blocked on this cancel deadlocks.
-    # Idempotent: cancel on a finished/unknown row is a no-op.
-    await asyncio.to_thread(engine.cancel, request_id)
+    # Idempotent: cancel on a finished/unknown row is a no-op. A cancel that RAISES
+    # must not abort the drain before the worker join and body.close() -- a raised
+    # cancel used to skip both, leaking the in-flight worker and leaving the
+    # generator unclosed. Log it and keep going: the worker is joined bounded below
+    # regardless, and body.close()'s GeneratorExit backstop retries the (idempotent)
+    # cancel once the generator is suspended.
+    try:
+        await asyncio.to_thread(engine.cancel, request_id)
+    except Exception:
+        logging.warning(
+            "body drain rid=%s: engine.cancel raised; continuing to worker join "
+            "and generator close", request_id, exc_info=True)
     try:
         await asyncio.wait_for(asyncio.shield(worker), timeout=_DRAIN_WAIT_S)
     except TimeoutError:
@@ -316,6 +326,53 @@ async def await_or_cancel(request: Request, engine: Any, rid_box: list,
 
 
 _STREAM_END = object()
+
+#: Poll cadence for the websocket disconnect watcher; matches the HTTP routes'
+#: _DISCONNECT_POLL_S so a prefill-time close cancels within ~one chunk tick.
+_WS_DISCONNECT_POLL_S = 0.05
+
+
+class _WsClientGone(Exception):
+    """The websocket client disconnected while a turn was generating."""
+
+
+async def _ws_next_or_gone(ws: WebSocket, next_worker: Any) -> Any:
+    """Await one in-flight ``to_thread(next(gen, end))`` while watching the
+    websocket for a client close, polling at :data:`_WS_DISCONNECT_POLL_S`.
+
+    The old WS loop awaited the blocking ``next`` directly. ``WebSocketDisconnect``
+    is raised only by a ``receive``/``send``; prefill emits no frame and the loop
+    sends nothing before the first token, so a close before the first frame was
+    never seen and ``engine.cancel`` never ran — the slot stayed held for the whole
+    prefill (issue #667). A websocket's only close signal is a pending
+    ``receive()`` resolving to ``websocket.disconnect``, so a watcher future is
+    raced alongside each item fetch (the HTTP routes poll ``is_disconnected``,
+    which a websocket does not expose). One turn per socket: any inbound message
+    while generating is treated as a close too.
+    """
+    watcher = asyncio.ensure_future(ws.receive())
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                {next_worker, watcher},
+                timeout=_WS_DISCONNECT_POLL_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if next_worker in done:
+                # Resolve/cancel the watcher without leaving it orphaned; if it
+                # already had an inbound (disconnect) message, retrieve it now.
+                if watcher in done:
+                    watcher.result()
+                else:
+                    watcher.cancel()
+                return next_worker.result()
+            if watcher in done:
+                raise _WsClientGone
+    except BaseException:
+        # The caller owns the generator's in-flight next() (gen.close on teardown);
+        # only the watcher is ours to cancel here.
+        watcher.cancel()
+        raise
 
 
 async def stream_or_cancel(request: Request, engine: Any, request_id: int,
@@ -712,6 +769,15 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
                         f"request {request_id} did not finish within {_COMPLETION_TIMEOUT_S}s")
                 time.sleep(POLL_INTERVAL_S)
             output_ids = _await_completion(request_id)
+        except GeneratorExit:
+            # Mirrors _stream: the drain closes this generator from a worker
+            # thread while it is suspended at a yield, so free the row here. This
+            # is the WS path's only cancel backstop when the drain's own
+            # engine.cancel raised (the close retries the idempotent cancel).
+            # Off the loop on the live path (to_thread(gen.close)); do NOT assume
+            # it can never run on the loop (GC of a direct iterator would land here).
+            engine.cancel(request_id)
+            raise
         except (TimeoutError, RuntimeError) as exc:
             # Sync generator: already in a to_thread worker, off the loop.
             engine.cancel(request_id)
@@ -862,8 +928,17 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
         gen, end = _deltas(request_id, max_new, opened, stop_texts(req.stop),
                            tools, choice_name(req.tool_choice) != "none"), object()
         calls = None
+        worker = None
+        gone = False
         try:
-            while (item := await asyncio.to_thread(next, gen, end)) is not end:
+            while True:
+                # Race each blocking next() against a client close so a close
+                # during the frame-less prefill cancels within a chunk tick (#667).
+                worker = asyncio.ensure_future(asyncio.to_thread(next, gen, end))
+                worker.add_done_callback(_worker_retrieved)
+                item = await _ws_next_or_gone(ws, worker)
+                if item is end:
+                    break
                 kind, payload, completion = item
                 if kind == "delta":
                     await ws.send_json({"t": "delta", **payload})
@@ -879,13 +954,29 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
                     await ws.send_json({"t": "done", "finish_reason": payload,
                                         **({"tool_calls": calls} if payload == "tool_calls" else {}),
                                         "usage": _usage(prompt_tokens, completion)})
-        except WebSocketDisconnect:
-            # gen.close() stops this poll loop; the cancel is what stops the engine,
-            # measured at 1891 tokens and 104 KV blocks after one socket closed.
-            gen.close()
-            await asyncio.to_thread(engine.cancel, request_id)
-            return
-        await ws.close()
+        except asyncio.CancelledError:
+            # Bare parent-task cancel (shutdown/supervisor): no websocket.disconnect
+            # frame ever arrives, so the disconnect watcher cannot see it. Let the
+            # finally detach the drain, then re-raise so the cancellation is not
+            # swallowed (a bare handler teardown used to leak the slot to fill end).
+            raise
+        except (_WsClientGone, WebSocketDisconnect):
+            # The client went away mid-turn. The finally drains the row/generator;
+            # the socket is already closed, so skip the normal close below.
+            gone = True
+        finally:
+            # Detach the teardown OUTSIDE this (possibly being-cancelled) task, the
+            # same transport-neutral path SSE uses (stream_or_cancel): cancel the
+            # row off the loop, bounded-join the in-flight next() worker, then
+            # gen.close() on a worker thread. It must be detached (not awaited
+            # in-scope) so a bare parent-task CancelledError still schedules it —
+            # the strong module-level _draining set keeps the task alive past this
+            # frame's unwind, and _lifespan joins it at shutdown. The parked next()
+            # is still executing the generator, so gen.close() runs only after the
+            # worker join, inside _drain_body.
+            _detach_drain(engine, request_id, worker, gen)
+        if not gone:
+            await ws.close()
 
     @app.get("/about", response_class=HTMLResponse)
     def about() -> str:

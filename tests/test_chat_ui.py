@@ -930,3 +930,53 @@ def test_gfm_tables_nested_lists_and_blockquotes_render():
     # no marker leaked as text
     for marker in ("| ---", "~~", "> quoted"):
         assert marker not in a, f"{marker!r} reached the reader as text: {a}"
+
+
+def test_ws_watcher_raises_while_next_worker_blocks():
+    """#667 unit core: a client disconnect resolving while the generator next()
+    is still blocked makes _ws_next_or_gone raise promptly, without waiting for
+    the 5s blocked fetch. A fake websocket only needs receive()."""
+    import asyncio
+
+    import tilerl.server as srv
+
+    class _FakeWs:
+        async def receive(self):
+            await asyncio.sleep(0.02)
+            return {"type": "websocket.disconnect", "code": 1000}
+
+    async def case():
+        async def blocked_next():
+            await asyncio.sleep(5.0)
+            return "NEVER"
+
+        worker = asyncio.ensure_future(blocked_next())
+        t0 = asyncio.get_event_loop().time()
+        with pytest.raises(srv._WsClientGone):
+            await srv._ws_next_or_gone(_FakeWs(), worker)
+        assert asyncio.get_event_loop().time() - t0 < 1.0
+
+    asyncio.run(case())
+
+
+def test_ws_watcher_returns_item_when_connected():
+    """A next() that finishes first returns its item and the receive watcher is
+    cancelled without raising."""
+    import asyncio
+
+    import tilerl.server as srv
+
+    class _FakeWs:
+        async def receive(self):
+            await asyncio.sleep(5.0)
+            return {"type": "websocket.receive"}
+
+    async def case():
+        async def quick_next():
+            await asyncio.sleep(0.01)
+            return "item"
+
+        worker = asyncio.ensure_future(quick_next())
+        assert await srv._ws_next_or_gone(_FakeWs(), worker) == "item"
+
+    asyncio.run(case())
