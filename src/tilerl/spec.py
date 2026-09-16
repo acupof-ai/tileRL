@@ -62,6 +62,15 @@ _PREFILL_BUCKET = 64
 #: 122-128 it cost when the flag stopped at 8.
 LADDER_WIDTHS = (1, 2, 4, 8, 32)
 
+#: Production default for the draft decode trailing-window READ, in tokens.
+#: 0 = full prefix (window off), the current default — behavior identical to no
+#: window. The non-zero fixed W is chosen from the V100 W-sweep
+#: (scripts/probe_draft_window_sweep.py): the smallest window whose spec
+#: acceptance/tok-s matches the full-prefix arm. v1 is a FIXED window, not an
+#: adaptive one. Until that data lands this stays 0; the CLI flag and the
+#: TILERL_DRAFT_ATTN_WINDOW_TOKENS env override it either way.
+DRAFT_ATTN_WINDOW_TOKENS_DEFAULT = 0
+
 
 def survival(confidences: list[float]) -> list[float]:
     out, p = [], 1.0
@@ -331,12 +340,14 @@ class DraftHead:
         self.layers = Model(cfg, params)
         self.has_confidence = "confidence.weight" in params
         self.width = 3  # 2 drafts; ``set_depth`` overrides
-        # Diagnostic only (TILERL_DRAFT_ATTN_WINDOW_TOKENS): cap how many trailing
-        # tokens the draft decode attention READS. 0/unset = full prefix (default,
-        # identical behavior). The draft still WRITES and RETAINS its whole dense
-        # KV; only the read view is windowed. Used to sweep accept-rate/tok-s vs
-        # window before deciding the production sliding window.
-        self.attn_window_tokens = int(os.environ.get("TILERL_DRAFT_ATTN_WINDOW_TOKENS", "0"))
+        # Trailing READ window for draft decode attention, in tokens. 0/unset =
+        # full prefix (default, identical behavior). The draft still WRITES and
+        # RETAINS its whole dense KV; only the read view is windowed. Precedence:
+        # the explicit --draft-attn-window-tokens serve flag (assigned on the
+        # loaded head) wins; otherwise this env var; otherwise the module default.
+        self.attn_window_tokens = int(os.environ.get(
+            "TILERL_DRAFT_ATTN_WINDOW_TOKENS",
+            str(DRAFT_ATTN_WINDOW_TOKENS_DEFAULT)))
         self.forwards = 0  # cumulative draft forwards; a probe divides its own timing by this
         # Last engaged window view, exposed by read_window_stats() for a device
         # self-proof (the V100 sweep confirms the view really truncates). None when

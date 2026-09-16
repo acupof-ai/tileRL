@@ -294,6 +294,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--device-free',
         '--device-reserve-mib',
         '--draft',
+        '--draft-attn-window-tokens',
         '--dram-bytes',
         '--dry-run',
         '--help',

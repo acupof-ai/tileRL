@@ -67,6 +67,44 @@ def test_window_off_builds_no_read_view(monkeypatch):
         eng.shutdown()
 
 
+def test_draft_window_cli_flag_precedence(monkeypatch):
+    """The serve flag --draft-attn-window-tokens reaches the loaded draft head and
+    overrides env/module default; omitting it leaves the head's own resolution
+    (default 0 / env). Wiring + default-behavior gate; the frozen CLI surface is
+    pinned separately in test_docs_links."""
+    import inspect
+
+    from tilerl import cli
+    from tilerl.spec import DRAFT_ATTN_WINDOW_TOKENS_DEFAULT
+
+    parser = cli._build_parser()
+    omitted = parser.parse_args(["serve"])
+    explicit = parser.parse_args(["serve", "--draft-attn-window-tokens", "2048"])
+    assert omitted.draft_attn_window_tokens is None
+    assert explicit.draft_attn_window_tokens == 2048
+    # cmd_serve applies an explicit flag to the loaded draft and keeps None as
+    # "don't override"; a negative value is rejected rather than read as a window.
+    assert "draft.attn_window_tokens = args.draft_attn_window_tokens" in inspect.getsource(
+        cli.cmd_serve)
+    assert DRAFT_ATTN_WINDOW_TOKENS_DEFAULT == 0
+
+    # Head resolution independent of the CLI: unset -> 0; env -> env; the CLI
+    # override is a plain assignment on the already-loaded head.
+    monkeypatch.delenv("TILERL_DRAFT_ATTN_WINDOW_TOKENS", raising=False)
+    eng0, _ = _engine(0, monkeypatch)
+    try:
+        assert eng0._draft.attn_window_tokens == 0
+    finally:
+        eng0.shutdown()
+    eng_env, _ = _engine(4096, monkeypatch)
+    try:
+        assert eng_env._draft.attn_window_tokens == 4096
+        eng_env._draft.attn_window_tokens = 2048
+        assert eng_env._draft.attn_window_tokens == 2048
+    finally:
+        eng_env.shutdown()
+
+
 def test_real_accept_tick_sq2_window_engages_in_engine(monkeypatch):
     """Engine-level gate for the device-inert root cause. A random draft rarely
     matches the trunk, so force deterministic ACCEPTANCE: the draft's greedy and
