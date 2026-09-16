@@ -1,14 +1,109 @@
-# sm70 paged_attention launch hangs forever after SSE churn, wedging the engine — 2026-09-15
+# sm70 serve wedges under a simultaneous-SSE-hangup cancel storm (GIL spin), not a CUDA launch — 2026-09-15/16
 
-**Status:** open — unresolved. Trigger and exact blocking point not reproduced
-in isolation; do not record as root-caused.
+**Status:** root-caused 2026-09-16 (fix in review). The title's "paged_attention
+launch hang" was a misread: the engine thread is the *victim*, parked waiting
+for the GIL. The main event-loop thread busy-spins inside `stream_or_cancel`'s
+SSE final drain during a burst of simultaneous hangups.
 **Arch:** V100 sm70, hybrid 27B serve (`--sparse-k 128 --draft … --decode-graph`),
-served sha ad0d3a1a.
+served shas ad0d3a1a → ff3e08e9.
 **Discovered:** P0 during ops late-frame SSE disconnect verification (≈16
-mid-stream cancellations). Evidence bundle on the card:
-`~/wedge_evidence_2026-09-15/`.
+mid-stream cancellations). Evidence bundles on the card:
+`~/wedge_evidence_2026-09-15/` and `~/wedge_evidence_2026-09-16/`
+(`pyspy_*.txt`, `gdb_bt.txt`, `probe.log`, `free.log`).
 
-## Observed
+## Actual root cause (2026-09-16)
+
+`stream_or_cancel`'s `finally` drained the in-flight `asyncio.to_thread(next,
+body, …)` worker from **inside the disconnecting SSE task's own cancellation**:
+
+```python
+while not worker.done():
+    try:
+        await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        continue          # <- spins under a latched anyio cancel scope
+    except BaseException:
+        break
+```
+
+Starlette 1.6 + ASGI 2.3 (httptools) wraps each `StreamingResponse` in an anyio
+collapsing task group; a client hang-up cancels that scope **once**, and the
+scope stays cancelled, so **every checkpoint** the SSE task hits inside it
+re-raises `CancelledError`. With the `to_thread(next)` worker in flight,
+`await asyncio.shield(worker)` (itself a checkpoint in the cancelled scope)
+throws immediately; `continue` re-checks `done()` (still false) and re-awaits —
+no real waiter, a tight Python loop. Eight SSE tasks doing this on one loop turn
+pin the main thread on the GIL; the engine `_loop` thread, re-entering Python
+through tvm_ffi, blocks in `PyEval_RestoreThread` (gdb: no cuLaunch/cudaMalloc
+in the frame). `/health` never gets scheduled. That is why the apparent "stuck
+kernel leaf" moved between op shapes (paged_attention, then `_mlp` model.py:566):
+the engine is wherever it last crossed into Python. Trigger is op-independent.
+
+A bare `task.cancel()` / `async for` aclose does NOT reproduce it (single
+cancel, one re-raise, then a normal wait; bare async-gen aclose throws
+GeneratorExit at the yield). It needs the **latched anyio CancelScope** plus N
+simultaneous in-flight hangups. A unit reproduction of the inner construct:
+inside a cancelled anyio scope a `shield(executor_future); continue` loop spins
+~9k iterations/150 ms and starves a peer coroutine.
+
+**Fix:** finalize the sync generator in a task **detached from the SSE cancel
+scope** — a module-level strong-ref set holds `_drain_body`, which cancels the
+row (idempotent backstop), awaits the in-flight worker (bounded by a timeout)
+and then runs `body.close()` on a worker thread, so #649's off-loop
+GeneratorExit/cancel constraint still holds. The SSE task returns at once and
+cannot spin in its own cancellation. The prompt-path `engine.cancel(rid)` slot
+releases stay where they are (awaited in frame, not detached).
+
+**Second defect found by the reproduction gate (same day):** the first detached
+drain awaited the worker *before* cancelling. In an 8-way hangup storm, 2 of 8
+teardowns (measured) delivered the throw to the `yield` point as a plain
+`GeneratorExit`, which `stream_or_cancel`'s `except CancelledError` disconnect
+branch never sees — so no in-scope cancel ran, the in-flight `to_thread(next)`
+was parked until a cancel that never came, and the drain dead-waited its full
+timeout and abandoned `body.close()`: a leaked slot, with no loop spin. The
+deterministic structural gate pins the drain's ordering (cancel before
+wait-for-worker); the real-uvicorn 8-socket gate asserts all rows release.
+Both are red on pre-fix code and green after, and the socket gate also required
+a widened default executor in the harness: N parked workers plus N cancel jobs
+exceed the stock executor's `min(32, cpu+4)` (=8 on 4-vCPU CI), a harness-only
+constraint since the real sync body polls in short slices rather than parking
+solid.
+
+Review added two more requirements to the detached drain, both about its
+failure/exit edges:
+
+- a drain that times out or whose worker raises no longer skips `body.close()`
+  silently — it logs a warning with the rid, timeout-vs-exception, and
+  "close skipped"; the slot is already free from the first cancel, but an
+  unclosed generator on the wedge box must be visible;
+- graceful shutdown (SIGTERM) joins in-flight drains via the app lifespan with
+  the same bounded `asyncio.wait(_draining, timeout=_DRAIN_WAIT_S)` (it does
+  NOT cancel them — each is already self-bounded — and logs pending count).
+  The supervisor's SIGKILL-on-wedge path needs no join; ordinary restarts do,
+  since an unclosed sync generator on that path is a real leak. A gate starts a
+  drain with a blocking stub `close()` and asserts the join stays pending until
+  close returns.
+
+## The VRAM/allocator hypothesis — refuted as the cause
+
+Two candidate preventions were built and measured before the GIL root was found;
+both are useful defense-in-depth but neither is causal:
+
+- a build-time KV-pool trim (#654, peak-live reserve) could not hold free:
+  `TILERL_DEVICE_RESERVE_MIB=768` cut 0 blocks, post-warmup idle free 602 MiB,
+  because the caching allocator re-reserves ~4.1 GiB of segments after the build
+  snapshot;
+- a held process memory fraction (#655, `set_per_process_memory_fraction`)
+  deployed and bounded the process correctly, but the 2026-09-16 churn wedged
+  again with **zero** fence hits (no exit-11/OOM; min physical free 98 MiB was
+  correlational), and the engine thread was off-CUDA waiting on the GIL.
+
+#655 stays (default off): an over-fence allocator OOM is independently made
+fatal — classified by concrete `torch.cuda.OutOfMemoryError` in the forward and
+build paths → `FatalDeviceError` → `os._exit(11)` + marker → supervisor restart,
+instead of being swallowed by the daemon loop's log-and-continue.
+
+## Earlier observations (2026-09-15, consistent with the GIL root)
 
 After a burst of late-frame SSE disconnects, the engine loop thread held
 `engine._lock` and never returned:
