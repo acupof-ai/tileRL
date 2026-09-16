@@ -478,11 +478,12 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "4-row rung exactly (spec.LADDER_WIDTHS) — 4 spills to the "
                               "8-row rung and measured slower than no speculation")
     p_serve.add_argument("--draft-attn-window-tokens", type=int, default=None,
-                         help="draft decode trailing READ window in tokens (0 = full "
-                              "prefix). Default: TILERL_DRAFT_ATTN_WINDOW_TOKENS env, "
-                              "else 0. Only the draft attention READ is windowed; KV "
-                              "write/retention is unchanged. No production non-zero "
-                              "default yet — chosen from the V100 W sweep")
+                         help="draft decode trailing READ window in tokens. Default "
+                              "2048 (spec.DRAFT_ATTN_WINDOW_TOKENS_DEFAULT; chosen from "
+                              "the V100 W-sweep); 0 = full prefix, restoring the "
+                              "pre-window behavior; the TILERL_DRAFT_ATTN_WINDOW_TOKENS "
+                              "env sits between them. Only the draft attention READ is "
+                              "windowed; KV write/retention is unchanged")
     p_serve.add_argument("--slots", type=int, default=8,
                          help="GDN state slots. A slot is held from submit to finish, so "
                               "this must be >= --max-batch or that concurrency is "

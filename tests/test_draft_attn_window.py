@@ -67,40 +67,60 @@ def test_window_off_builds_no_read_view(monkeypatch):
         eng.shutdown()
 
 
-def test_draft_window_cli_flag_precedence(monkeypatch):
-    """The serve flag --draft-attn-window-tokens reaches the loaded draft head and
-    overrides env/module default; omitting it leaves the head's own resolution
-    (default 0 / env). Wiring + default-behavior gate; the frozen CLI surface is
-    pinned separately in test_docs_links."""
+def test_draft_window_default_is_2048_and_explicit_zero_disables(monkeypatch):
+    """Default flip (#product): with no env and no CLI flag the draft READ window is
+    DRAFT_ATTN_WINDOW_TOKENS_DEFAULT=2048. An explicit 0 (CLI/env) restores the full
+    prefix; an env value is honored; the CLI flag overrides all. This is the
+    output-gate on the combined default, not just the wiring."""
     import inspect
 
+    from test_e2e import _random_draft
+    from tilerl_kernels.backend import get_backend
+
     from tilerl import cli
+    from tilerl.build import build_engine
+    from tilerl.config import tiny
+    from tilerl.model import build_random
     from tilerl.spec import DRAFT_ATTN_WINDOW_TOKENS_DEFAULT
 
+    assert DRAFT_ATTN_WINDOW_TOKENS_DEFAULT == 2048
+
     parser = cli._build_parser()
-    omitted = parser.parse_args(["serve"])
-    explicit = parser.parse_args(["serve", "--draft-attn-window-tokens", "2048"])
-    assert omitted.draft_attn_window_tokens is None
-    assert explicit.draft_attn_window_tokens == 2048
-    # cmd_serve applies an explicit flag to the loaded draft and keeps None as
-    # "don't override"; a negative value is rejected rather than read as a window.
+    assert parser.parse_args(["serve"]).draft_attn_window_tokens is None
+    assert parser.parse_args(
+        ["serve", "--draft-attn-window-tokens", "0"]).draft_attn_window_tokens == 0
+    assert parser.parse_args(
+        ["serve", "--draft-attn-window-tokens", "4096"]).draft_attn_window_tokens == 4096
     assert "draft.attn_window_tokens = args.draft_attn_window_tokens" in inspect.getsource(
         cli.cmd_serve)
-    assert DRAFT_ATTN_WINDOW_TOKENS_DEFAULT == 0
 
-    # Head resolution independent of the CLI: unset -> 0; env -> env; the CLI
-    # override is a plain assignment on the already-loaded head.
+    def engine():
+        cfg = tiny()
+        model = build_random(cfg, seed=7)
+        return build_engine(cfg, model, get_backend(), num_blocks=32, num_slots=2,
+                            max_batch=2, max_total_tokens=512,
+                            draft=_random_draft(cfg, 7, model), spec_depth=1, sparse_k=0)
+
+    # No env, no CLI -> production default engages.
     monkeypatch.delenv("TILERL_DRAFT_ATTN_WINDOW_TOKENS", raising=False)
-    eng0, _ = _engine(0, monkeypatch)
+    eng_def = engine()
     try:
-        assert eng0._draft.attn_window_tokens == 0
+        assert eng_def._draft.attn_window_tokens == 2048
+        assert eng_def._draft.read_window_stats() is None  # no forward yet
     finally:
-        eng0.shutdown()
+        eng_def.shutdown()
+    # Explicit env 0 -> full prefix, the escape hatch.
+    eng_off, _ = _engine(0, monkeypatch)
+    try:
+        assert eng_off._draft.attn_window_tokens == 0
+    finally:
+        eng_off.shutdown()
+    # A nonzero env is honored, and the CLI override is a plain head assignment.
     eng_env, _ = _engine(4096, monkeypatch)
     try:
         assert eng_env._draft.attn_window_tokens == 4096
-        eng_env._draft.attn_window_tokens = 2048
-        assert eng_env._draft.attn_window_tokens == 2048
+        eng_env._draft.attn_window_tokens = 0
+        assert eng_env._draft.attn_window_tokens == 0
     finally:
         eng_env.shutdown()
 
