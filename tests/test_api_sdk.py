@@ -278,6 +278,35 @@ def test_messages_stream_events_and_text(an):
     assert names[-1] == "message_stop"
 
 
+def test_messages_stream_splits_usage_across_start_and_delta(an):
+    """#694: the server used to send the FULL usage on both message_start and
+    message_delta, so a client that sums usage across events double-counted
+    every token. Anthropic's contract is input/cache on start, final output on
+    delta; assert that exact split from the raw events."""
+    start_usage = None
+    delta_usage = None
+    with an.messages.stream(model="tilerl", max_tokens=64,
+                            messages=[{"role": "user", "content": "hi"}]) as s:
+        for e in s:
+            if e.type == "message_start":
+                start_usage = e.message.usage
+            elif e.type == "message_delta":
+                delta_usage = e.usage
+    assert start_usage is not None and delta_usage is not None
+    assert start_usage.input_tokens > 0
+    assert start_usage.output_tokens == 0
+    assert delta_usage.output_tokens > 0
+    # The delta carries output and nothing an aggregator could double-count.
+    assert not hasattr(delta_usage, "input_tokens") or \
+        getattr(delta_usage, "input_tokens", None) is None
+    assert getattr(delta_usage, "cache_creation_input_tokens", None) is None
+    # A sum-across-events aggregator must land on the true counts.
+    assert start_usage.input_tokens + (delta_usage.input_tokens or 0) \
+        == start_usage.input_tokens
+    assert start_usage.output_tokens + delta_usage.output_tokens \
+        == delta_usage.output_tokens
+
+
 def test_messages_thinking_is_a_thinking_block(an):
     """Anthropic's native shape for reasoning is a `thinking` content block.
 
