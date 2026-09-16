@@ -68,12 +68,16 @@ def test_window_off_builds_no_read_view(monkeypatch):
 
 
 def test_full_covering_window_is_numerically_identical(monkeypatch):
-    """W >= context: windowed read must equal the full-prefix draft output."""
+    """A window larger than the whole context returns None and leaves the draft
+    output bit-identical to the full prefix. (The all-pages-via-remap identity at
+    a sub-boundary W is pinned in the geometry test, where context is fixed; a
+    growing e2e run with a fixed sub-page window genuinely truncates and is
+    allowed to differ.)"""
     prompt = np.random.default_rng(0).integers(3, 320, size=40).astype(np.int64)
     full = _run(monkeypatch, 0, prompt)                 # full prefix
-    covered = _run(monkeypatch, 1 << 20, prompt)        # window > context
+    covered = _run(monkeypatch, 1 << 20, prompt)        # window > context -> None
     assert len(full) == len(covered) == 20
-    assert covered == full, "a window covering the whole context changed draft numerics"
+    assert covered == full, "a W>=context window changed draft numerics"
 
 
 def test_narrow_window_actually_truncates_and_completes(monkeypatch):
@@ -109,20 +113,90 @@ def test_windowed_read_view_geometry_and_write_target():
                    kv_pool=draft.kv, state_pool=None,
                    seq_q_lens=torch.tensor(sq))
 
+    # Aligned windows (hi=320, W a multiple of BLOCK): floor first page is
+    # total-wp, windowed seq_len == W, last write maps to the same block/offset.
     for W_pages, W_tok in ((2, 32), (4, 64), (8, 128)):
         draft.attn_window_tokens = W_tok
         view = draft._windowed_read_kv(full, sl, sq, [dblocks])
         assert view is not None
+        width = view.block_table.shape[1]      # wp+1
+        assert width == W_pages + 1
         got = [int(x) for x in view.block_table[0, :W_pages].tolist()]
         assert got == dblocks[nblk - W_pages:], (W_pages, got)
         assert int(view.block_table[0, W_pages:].abs().sum()) == 0
         wsl = int(view.seq_len[0])
-        assert wsl == 320 - (nblk - W_pages) * BLOCK_TOKENS
-        # write index for the new token maps to the same physical block + offset
+        assert wsl == W_tok
         wpage = (wsl - sq[0]) // BLOCK_TOKENS
         woff = (wsl - sq[0]) % BLOCK_TOKENS
         assert int(view.block_table[0, wpage]) == dblocks[-1]
         assert woff == (sl[0] - sq[0]) % BLOCK_TOKENS
 
+    # UNALIGNED window floor rule:
+    # hi=40,W=32 -> first=(40-32)//16=0, no page dropped -> None (full), yet the
+    # oldest wanted token 8 is inside kept page 0 (the last-wp cut would have
+    # started at page 1 = token 16 and dropped tokens 8..15).
+    draft.attn_window_tokens = 32
+    sl40 = [40]
+    assert draft._windowed_read_kv(full, sl40, [1], [dblocks]) is None
+    # genuinely truncating unaligned case: hi=100 -> first=(68)//16=4, pages 4..6
+    # cover tokens 64..99, including the oldest wanted token hi-W=68.
+    sl100 = [100]
+    full100 = BatchKv(
+        block_table=bt, seq_len=torch.tensor(sl100),
+        state_slot=torch.zeros(1, dtype=torch.long),
+        kv_pool=draft.kv, state_pool=None, seq_q_lens=torch.tensor([1]))
+    v = draft._windowed_read_kv(full100, sl100, [1], [dblocks])
+    assert v is not None
+    first = (100 - 32) // BLOCK_TOKENS            # 4
+    tot = (100 + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+    assert [int(x) for x in v.block_table[0, : tot - first].tolist()] == dblocks[first:tot]
+    assert int(v.seq_len[0]) == 100 - first * BLOCK_TOKENS
+    assert first * BLOCK_TOKENS <= 68
+
+    # W larger than / sub-page below the context that drops no page -> None.
+    draft.attn_window_tokens = 319
+    assert draft._windowed_read_kv(full, sl, sq, [dblocks]) is None
     draft.attn_window_tokens = 1 << 20
     assert draft._windowed_read_kv(full, sl, sq, [dblocks]) is None
+
+
+def test_mixed_batch_short_row_keeps_its_own_kv_and_prefill_bypasses():
+    """A long truncated decode row batched with a SHORT decode row must not zero
+    the short row's windowed table/seq_len (the CHANGE-REQ bug: hist=-1 read
+    page 0). A batch containing any sq!=1 (prefill) row bypasses the window
+    entirely."""
+    cfg = tiny()
+    backend = get_backend()
+    draft = DraftHead.__new__(DraftHead)
+    draft.kv = PagedKvPool(64, cfg.num_kv_heads, cfg.head_dim, num_layers=1,
+                           device=backend.device, layer_map=(0,))
+
+    def kv_of(blocks):
+        bt = torch.zeros(1, 64, dtype=torch.long)
+        bt[0, : len(blocks)] = torch.tensor(blocks)
+        return bt
+
+    # row 0: 120 tokens (8 pages), row 1: 40 tokens (~3 pages); W=32 (2 pages)
+    db0 = [200 + i for i in range(8)]
+    db1 = [300 + i for i in range(3)]
+    wbt0, wbt1 = kv_of(db0), kv_of(db1)
+    bt = torch.cat([wbt0, wbt1], 0)
+    sl, sq = [120, 40], [1, 1]
+    full = BatchKv(block_table=bt, seq_len=torch.tensor(sl),
+                   state_slot=torch.zeros(2, dtype=torch.long),
+                   kv_pool=draft.kv, state_pool=None,
+                   seq_q_lens=torch.tensor(sq))
+    draft.attn_window_tokens = 32
+    view = draft._windowed_read_kv(full, sl, sq, [db0, db1])
+    assert view is not None
+    # long row: floor first=(120-32)//16=5 -> pages 5,6,7 (keeps the page holding
+    # token hi-W=88; not a hard last-wp cut), wsl=120-5*16=40
+    assert [int(x) for x in view.block_table[0, :3].tolist()] == db0[5:]
+    assert int(view.seq_len[0]) == 40
+    # short row: first=(40-32)//16=0 -> ALL 3 pages, true seq_len 40, never zeroed
+    assert [int(x) for x in view.block_table[1, :3].tolist()] == db1
+    assert int(view.seq_len[1]) == 40
+
+    # any prefill/multi-token row in the batch -> whole batch bypasses (None)
+    sq_prefill = [1, 4]
+    assert draft._windowed_read_kv(full, sl, sq_prefill, [db0, db1]) is None

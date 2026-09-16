@@ -339,19 +339,25 @@ class DraftHead:
         self.forwards = 0  # cumulative draft forwards; a probe divides its own timing by this
 
     def _windowed_read_kv(self, kv, sl, sq, dblocks):
-        """Diagnostic trailing-window READ view for a decode forward, or None when
-        the window is off / a prefill (multi-token) forward / already shorter than
-        the window. Builds a per-row table of the last Wp physical blocks and a
-        windowed seq_len, sharing the same kv_pool as ``kv``.
+        """Diagnostic trailing-window READ view for a decode batch, or None.
+
+        None when the window is off; when ANY row is a prefill/multi-token forward
+        (sq != 1, the remap is single-token-decode only); or when no row is past
+        the window (read the real descriptor, no allocation). Otherwise a single
+        per-batch descriptor of fixed width wp+1: a row past the window reads
+        from first page ``(hi-W)//BLOCK`` (FLOOR — the page holding the oldest
+        wanted token hi-W, so a recent token is never dropped; it reads up to
+        BLOCK-1 extra prefix tokens and an aligned hi degenerates to exactly wp
+        pages), and a row at/inside the window keeps ALL its pages and true
+        seq_len (never a zeroed/page-0 row).
 
         Correctness (the read/write separation):
         - WRITE still goes through the full ``kv`` (model.write_tokens), writing
           the new token at its absolute tail page; this view is read-only.
         - The windowed table lists trailing physical blocks in logical order, so
-          column j == logical window page j. The windowed seq_len is
-          ``hi+1 - first_logical*BLOCK``; the last query's write index
-          (seq_len-sq .. seq_len-1) then maps to the SAME physical block and
-          in-page offset as the full table (verified algebraically), so the
+          column j == logical window page j. A truncated row's windowed seq_len
+          is ``hi+1 - first_logical*BLOCK``; its last query write index maps to
+          the SAME physical block and in-page offset as the full table, so the
           retained full-prefix KV is untouched.
         - RoPE is unaffected: K/V in the pool already carry absolute-position
           rotary encoding (applied before write_tokens); attention only gathers
@@ -360,27 +366,41 @@ class DraftHead:
         W = getattr(self, "attn_window_tokens", 0)
         if W <= 0:
             return None
-        wp = (W + BLOCK_TOKENS - 1) // BLOCK_TOKENS  # window pages
-        dev = kv.block_table.device
-        n = len(sl)
-        wbt = torch.zeros(n, wp, dtype=torch.long, device=dev)
-        wsl = torch.zeros(n, dtype=torch.long, device=dev)
-        active = False
-        for i in range(n):
-            hi1 = int(sl[i])          # full seq_len (== hi+1)
-            q = int(sq[i])
-            if q != 1 or hi1 <= W:
-                continue             # only single-token decode past the window
-            total_pages = (hi1 + BLOCK_TOKENS - 1) // BLOCK_TOKENS
-            first = max(0, total_pages - wp)
-            tail = dblocks[i][first:total_pages]
-            if not tail:
-                continue
-            wbt[i, : len(tail)] = torch.tensor(tail, dtype=torch.long, device=dev)
-            wsl[i] = hi1 - first * BLOCK_TOKENS
-            active = True
-        if not active:
+        # The view is one per-BATCH descriptor: every row in the shared draft
+        # forward must read through it. A prefill/multi-token row (sq != 1) does
+        # not fit the single-token decode remap, so leave the whole batch full
+        # (a zeroed windowed seq_len on one row would point attention at page 0
+        # and silently corrupt that row's draft logits).
+        if any(int(q) != 1 for q in sq):
             return None
+        wp = (W + BLOCK_TOKENS - 1) // BLOCK_TOKENS  # window pages
+        width = wp + 1          # floor start can span wp or wp+1 pages
+        n = len(sl)
+        # Per-row kept span. The window MUST contain the trailing W tokens
+        # [hi-W, hi); at an unaligned boundary "last wp pages" would drop the
+        # most recent 1..BLOCK-1 tokens (e.g. hi=40, W=32 wants token 8 but
+        # last-wp starts at page 1 = token 16). Floor the first page so the page
+        # holding token hi-W is included — reads 0..BLOCK-1 extra prefix tokens,
+        # never loses a recent one; an aligned hi degenerates to exactly wp pages.
+        firsts: list[int] = []
+        pages_all: list[list[int]] = []
+        for i in range(n):
+            hi = int(sl[i])
+            tot = (hi + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+            first = 0 if hi <= W else (hi - W) // BLOCK_TOKENS
+            firsts.append(first)
+            pages_all.append(list(dblocks[i])[first:tot])
+        if not any(f > 0 for f in firsts):
+            return None             # no row truncated -> read the full descriptor
+        dev = kv.block_table.device
+        wbt = torch.zeros(n, width, dtype=torch.long, device=dev)
+        wsl = torch.zeros(n, dtype=torch.long, device=dev)
+        for i, pages in enumerate(pages_all):
+            hi = int(sl[i])
+            if not pages:
+                continue
+            wbt[i, : len(pages)] = torch.tensor(pages, dtype=torch.long, device=dev)
+            wsl[i] = hi - firsts[i] * BLOCK_TOKENS
         return BatchKv(
             block_table=wbt,
             seq_len=wsl,
