@@ -2174,8 +2174,25 @@ def test_a_nonstream_client_disconnect_cancels_its_request():
             assert await asyncio.to_thread(admitted.wait, 30.0), (
                 f"{path}: request never reached the engine")
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            # The wrapper task ends one of two ways under a cancel delivered at
+            # this instant. It raises CancelledError if the cancel is scheduled
+            # before completion; or it returns normally if the row finishes in
+            # the SAME event-loop turn the cancel lands -- under a contended
+            # loop (CI xdist) resume is delayed and the engine loop completes a
+            # short row first. That race is legal: a completion that beats the
+            # hang-up is supposed to return, and #14 guarantees the row/slot
+            # contract below, not which outcome this HTTP task gets. Asserting
+            # the raise itself is the flake (#659): it failed whenever completion
+            # won the race. A non-200 return is NOT that race -- a failed row
+            # surfaces 500, which is a separate defect and must fail here.
+            try:
+                raced = await task
+            except asyncio.CancelledError:
+                pass
+            else:
+                assert raced.status_code == 200, (
+                    f"{path}: disconnect window ended {raced.status_code}, "
+                    "not a clean same-turn completion")
 
             # cancel() drops the row under the lock; two loop polls is the bound the
             # route contract claims.
@@ -3041,10 +3058,25 @@ def test_a_nonstream_disconnect_does_not_freeze_the_event_loop(tmp_path,
             assert part, "/health never answered"
             answer += part
         elapsed = time.monotonic() - t0
-        probe.close()
+        # Event-synced primary assertion, not a wall bound: when /health's
+        # headers come back the off-loop engine.cancel must STILL be parked on
+        # the held lock. If the route had called cancel on the event loop, the
+        # loop could not serve /health until the 2 s lock released, so cancel
+        # would already be finished here. This proves liveness independent of
+        # host scheduling jitter (CI xdist measured 0.57 s of pure scheduling
+        # delay with the loop otherwise healthy -- #659 family).
         assert b" 200 " in answer.split(b"\r\n", 1)[0], answer[:80]
-        assert elapsed < 0.5, (
-            f"{path}: event loop froze {elapsed:.2f}s behind cancel's lock")
+        assert not eng.cancel_finished.is_set(), (
+            f"{path}: /health did not answer until cancel's lock released -- "
+            "the loop was serialized behind engine.cancel")
+        # Sanity cap only: a loop genuinely frozen behind the lock answers at
+        # ~cancel_park_s (2 s, after the release). Anything clearly below that is
+        # scheduling jitter, not a freeze; do not hard-code a tight host-specific
+        # number that a contended CI runner misses.
+        assert elapsed < eng._cancel_park_s - 0.25, (
+            f"{path}: /health took {elapsed:.2f}s, within {eng._cancel_park_s:.2f}s of "
+            "the parked lock -- serialized, not jitter")
+        probe.close()
         eng.cancel_lock.release()
         assert eng.cancel_finished.wait(10.0), f"{path}: queued cancel never finished"
         assert eng.cancelled and eng.blocks_used == 0 and eng.slots_used == 0
