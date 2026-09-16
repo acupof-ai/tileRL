@@ -38,13 +38,13 @@ production correctness bugs were found and fixed during the move (#605: sparse
 no-draft full-prefix hang + phantom final-tick block). The follow-on packaging
 fix that made `benchrec` importable from a wheel is #638.
 
-### 1.2 Quality audit — 32/32 executed findings closed; three sm90/H20 device arms deferred
+### 1.2 Quality audit — 32/32 executed + F6 device arm closed; F21/F22 deferred
 
 The 2026-09-14 audit ([`docs/quality-audit-2026-09-14.md`](../../quality-audit-2026-09-14.md))
-confirmed **35 findings, 11 refuted**. Of the 35, three are sm90/H20-only (F21, F22, and
-F6's verification arm) and wait on a card; the other **32 executable findings are 32/32
-closed** — F6's gate defect (print-to-pass, unconditional CI skip) is fixed, with only
-its sm90 arm deferred. Every executable finding is fixed and on main:
+confirmed **35 findings, 11 refuted**. Of the 35, two are sm90/H20-only (F21, F22) and
+wait on a card; the other **32 executable findings are 32/32 closed**, and **F6's sm90
+verification arm has now run green on an H20** (2026-09-16) — only F21/F22 remain
+device-deferred. Every executable finding is fixed and on main:
 
 | finding | fix | PR |
 |---|---|---|
@@ -71,20 +71,27 @@ its sm90 arm deferred. Every executable finding is fixed and on main:
 | 31–34 pod selftests / audit scanner / gil bench rewrites / `--source` | one sweep (selftests later gated in #645) | #603 |
 | 35 duplicated `0.02` poll literal | shared `POLL_INTERVAL_S` | #644 |
 
-Deferred on H20 availability:
+Device arms:
 
-- **F6 — split accounting.** The gate defect is fixed: `tests/test_attn_prelude_oracle.py`
-  now asserts (real `torch.allclose`/structural asserts, no print-to-pass) and its
-  CPU-expressible half runs in CI, so it counts among the **32/32 executed findings**.
-  What remains is only the sm90 verification arm, under the legitimate
-  `@pytest.mark.skipif(arch != "sm90")` — deferred to an H20 window alongside F21/F22,
-  not a vacuous gate.
+- **F6 — closed, including sm90 (2026-09-16).** The gate defect is fixed in #663:
+  `tests/test_attn_prelude_oracle.py` now builds both preludes into a real
+  `PagedKvPool` and asserts the fused `attn_prep` is strictly closer to the f64 oracle
+  than the discrete chain by mean error (`ef < ed`, `ef ≤ 0.6 ed`), with non-vacuity
+  guards. The sm90 arm ran **unskipped on H20 card 0** (tree `8428babd` + #663,
+  `/work/tl013` torch 2.11.0+cu129): 3/3 PASSED, and on 3579 differing elements the
+  discrete mean was 1.815e-03 vs fused 9.297e-04 — discrete/fused **1.9527** (fused
+  ≈ 0.512× discrete), matching the 27B record of 2.0007x in
+  [`errors/2026-09-03-unfused-prelude-double-rounds.md`](../errors/2026-09-03-unfused-prelude-double-rounds.md).
+  The run used the pod's maintained `/work/tl013` (torch 2.11.0+cu129) via
+  `python -m pytest`, not `uv run` — the fresh `.venv` carries a cu130 torch the 12.9
+  driver cannot load; runbook:
+  [`errors/2026-09-16-h20-pod-uses-tl013-cu129-not-uv-run-cu130.md`](../errors/2026-09-16-h20-pod-uses-tl013-cu129-not-uv-run-cu130.md).
 - **F21** KV fp8 quant/dequant framework code has no sm90 parity gate for its kernel twin.
 - **F22** Quest `page_bounds` cells are sm70-only with no target-neutral CPU twins and
   the Backend methods are unused by production.
 
-So: 32 CPU/route-executable findings, **32/32 closed** (F6's gate half fixed, its sm90
-arm deferred); the three sm90/H20 device arms (F6-sm90, F21, F22) wait on a named card.
+So: 32 CPU/route-executable findings **32/32 closed**, and the F6 sm90 verification arm
+ran green on H20; only the two sm90/H20 device arms **F21 and F22** wait on a named card.
 
 ## 2. Online capability (V100 sm70)
 
@@ -172,7 +179,8 @@ the one P0, and it is closed rather than worked around.
   and the partial 5-of-8 NLL result. The sparse cold tier's mmap spill still lives
   behind `--cold-ssd-path`; the dense SSD KvTier was removed (1.65x worse at 12
   sessions).
-- **Three H20/sm90 device arms** (F6-sm90, F21, F22) wait on a named H20 window.
+- **Two H20/sm90 device arms** (F21, F22) wait on a named H20 window; the F6 sm90 arm
+  closed green on card 0 (§1.2).
 - **Slow periodic forward pair (unlogged observation).** On the device the forward
   time shows a recurring slow pair at roughly **~980 / ~1100 ms every ~50 ticks**
   against a normal ~10 ms baseline. This is an on-box observation only — it is not yet
