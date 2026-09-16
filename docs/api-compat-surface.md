@@ -10,9 +10,16 @@ Three completion routes share one engine and present three vendor shapes:
 
 This page records where the OpenAI-flavoured routes match the published schema and
 the deliberate, named deviations, so a client integration does not discover them by
-crashing. Verified against the live V100 serve on 2026-09-16 with `openai-python`
-2.15.0 (short and 3 KB tool arguments) and raw `curl`. It is descriptive of the
-implemented surface; the source of truth remains the routes in `src/tilerl/`.
+crashing. Verification is at three confidence levels, marked per section:
+
+- **live** — exercised against the running V100 serve on 2026-09-16 with
+  `openai-python` 2.15.0 and raw `curl`;
+- **SDK fixture** — real server-shape payloads validated through the official
+  SDK's own models locally (no GPU);
+- **【静态·待真机 / static, pending live】** — source reading only.
+
+It is descriptive of the implemented surface; the source of truth remains the
+routes in `src/tilerl/`.
 
 ## What matches OpenAI
 
@@ -88,29 +95,57 @@ SDK, but a UI may want to treat empty `content` as "no answer" rather than rende
 an empty bubble. Tracked as a possible one-line self-consistency fix; not an
 SDK-compatibility break.
 
-## `/v1/messages` and `/v1/responses` — static review, NOT live-verified
+## `/v1/messages` — Anthropic envelope (SDK-fixture verified, 0 parse-level RED)
 
-The two non-chat routes were read against their source
-(`src/tilerl/messages.py`, `src/tilerl/responses.py`) but **not** exercised with
-live streams on 2026-09-16 (GPU was reserved). Everything below is a
-**【静态·待真机 / static, pending live】** source-only conclusion; treat the
-live-verified OpenAI notes above as higher confidence. Risks, highest first:
+On 2026-09-16 the route's real payloads (non-stream body and every SSE event,
+including a tool call) were run through the official `anthropic` 1.4.0 SDK's own
+pydantic models — `Message`, `Usage`, `MessageDeltaUsage`, and the six
+`Raw*Event` models — not read against the docs and guessed. Every shape parsed.
+This is **SDK-fixture** confidence: it proves the current SDK accepts the
+envelope; it is not a live Claude Code run (one owed item, below).
 
-1. **【静态·待真机】 Responses reasoning item may be a stale beta shape.** It is
-   emitted as `summary: []` plus `content: [{type: "reasoning_text", text}]`
-   (`responses.py` `_output_items`). Current OpenAI GA models the reasoning item
-   on `summary: [{type: "summary_text", text}]`; the `content`/`reasoning_text`
-   form was an earlier beta. A current SDK that reads only `summary` could see no
-   reasoning. Most-likely-real-debt item; verify with the openai-python Responses
-   client before changing anything.
+| Surface | Official Anthropic | Server (`src/tilerl/messages.py`) | Verdict |
+|---|---|---|---|
+| non-stream content blocks | `text` / `tool_use` / `thinking`; `thinking.signature` required | all three present, ordered thinking → text → tool_use; `signature: ""` placeholder | ✅ SDK-parsed; signature is replay-only and the server is the endpoint, not a replay source |
+| `stop_reason` enum | `end_turn` / `stop_sequence` / `tool_use` / `max_tokens` | all four emitted; tool_use first, then stop_sequence, else max_tokens/end_turn | ✅ all four SDK-parsed |
+| `stop_sequence` | matched sequence or `null` | the sequence on a match, `null` otherwise | ✅ |
+| `usage` fields | `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` (names differ entirely from OpenAI's `cache_write_tokens`) | all four present as integer 0 when no caching | ✅ both `Usage` and `MessageDeltaUsage` SDK-parsed |
+| SSE sequence | `message_start` → per block (`content_block_start` / `content_block_delta` / `content_block_stop`) → `message_delta` (`stop_reason` + `usage`) → `message_stop` | identical; tool args via `input_json_delta.partial_json`, thinking via `thinking_delta`, text via `text_delta`; `message_start` carries `content: []` | ✅ all six event models SDK-parsed |
 
-2. **【静态·待真机】 No reasoning deltas during the Responses stream.** The
+Non-breaking strictness notes (recorded, no issue — none fails parsing):
+
+1. **Streaming is one whole-block delta, not per token.** A UI watching the
+   route does not get a typewriter effect; the client accumulates the block in
+   one event. Marked `ponytail` at the SSE generator; a per-token forward is its
+   own change.
+2. **`message_delta` carries the full four-field `usage`** instead of the
+   official convention's output-only increment (input usage is on
+   `message_start`). The SDK accepts the full object; left as-is. Follow-up only
+   if a client is observed double-counting.
+3. **`thinking.signature` is an empty string.** A block replayed to the real
+   Anthropic API would be rejected, but this server terminates the request and
+   never replays; the SDK parse does not fail.
+4. **【待真机】 Claude Code token accounting** with usage present at both
+   `message_start` and `message_delta` has not been observed against a live
+   client. Listed under owed live checks below.
+
+## `/v1/responses` — remaining source-only notes
+
+The Responses reasoning-item and usage gaps that this section used to list were
+confirmed **RED on the live V100 serve on 2026-09-16** (issue #687) and fixed by
+#690: the reasoning item now carries GA
+`summary: [{type: "summary_text", text}]` (legacy `content[reasoning_text]`
+kept for older SDKs), `cache_write_tokens` is an integer 0, and
+`reasoning_tokens` reflects the extracted reasoning span. The regression probe
+is `scripts/probe_responses_reasoning_shape.py`. Still source-only:
+
+1. **【静态·待真机】 No reasoning deltas during the Responses stream.** The
    `content_part.*` events are emitted only for `message` items; a `reasoning`
    item is added with `content: []` and has no incremental event, so the thinking
    text appears only in the final `response.completed` body. Source-visible gap;
    whether the SDK tolerates it is unverified.
 
-3. **【静态·待真机】 Both streaming routes replay a finished body, they do not
+2. **【静态·待真机】 Both streaming routes replay a finished body, they do not
    stream tokens as generated.** Source-visible shape: each route's SSE generator
    first awaits the full completion (`await_completion`) and only then emits the
    block/item events; it is not a token-by-token forward of the engine. Stated
@@ -121,28 +156,19 @@ live-verified OpenAI notes above as higher confidence. Risks, highest first:
    event is emitted on either route, so a long cold prefill sends no bytes for
    tens of seconds.
 
-4. **【静态·待真机】 `reasoning_tokens` is always 0.** Responses `usage.output_tokens_details.reasoning_tokens` is hardcoded 0 even when thinking is
-   produced, so reasoning-token accounting under-reports.
-
-5. **【静态·待真机】 Enum/block coverage is the model's actual surface, not the
+3. **【静态·待真机】 Enum/block coverage is the model's actual surface, not the
    full vendor set.** Messages emits only `thinking`/`text`/`tool_use` blocks and
    `stop_reason` ∈ `end_turn`/`max_tokens`/`stop_sequence`/`tool_use` (no
-   `pause_turn`, `refusal`, redacted/server/web tool use, multimodal output); the
-   thinking block carries `signature: ""` by design (not for replay to real
-   Anthropic). Responses emits only `reasoning`/`message`/`function_call` items
-   (no web/code/image/local-shell calls). Consistent with a text model; noted so
-   a client expecting the extra variants is not surprised.
+   `pause_turn`, `refusal`, redacted/server/web tool use, multimodal output;
+   those four stop reasons and three blocks are now SDK-fixture verified above).
+   Responses emits only `reasoning`/`message`/`function_call` items (no
+   web/code/image/local-shell calls). Consistent with a text model; noted so a
+   client expecting the extra variants is not surprised.
 
-6. **【静态·待真机】 Messages usage appears on both `message_start` and
-   `message_delta`.** The start message spreads the whole completed body (with
-   full `usage`) under `content: []`, and the terminal `message_delta` carries
-   `usage` again. Whether Claude Code double-counts or takes the terminal value is
-   unverified.
-
-Shapes that static inspection finds **correct**: the Anthropic error envelope
-`{type:"error",error:{type,message}}` and 400/503 types; tool_use
-`input`/`id`/`name` and the `input_json_delta.partial_json` block-delta
-placement; Responses `sequence_number` on every event, the
+Shapes that static inspection and the SDK fixtures find **correct**: the
+Anthropic error envelope `{type:"error",error:{type,message}}` and 400/503
+types; tool_use `input`/`id`/`name` and the `input_json_delta.partial_json`
+block-delta placement; Responses `sequence_number` on every event, the
 created/in_progress/output_item.*/completed event names, `call_id` on
 function_call, and `status:"incomplete"` + `incomplete_details.reason:
 max_output_tokens` for a capped turn.
@@ -152,8 +178,9 @@ max_output_tokens` for a capped turn.
 To run in a coordinated idle window after the in-flight server work deploys; file
 a fix issue **only if one goes red** (no speculative issues):
 
-1. openai-python **Responses** client: does reasoning parse from the current
-   item shape, and is thinking visible during the stream or only at completion?
+1. ~~openai-python **Responses** client reasoning shape~~ — done 2026-09-16:
+   live RED (#687), fixed #690; rerun `scripts/probe_responses_reasoning_shape.py`
+   against the deployed serve once to confirm GREEN.
 2. **Claude Code** against `/v1/messages`: is token usage double-counted given
    usage is present at both `message_start` and `message_delta`?
 3. **Cold long-prefill SSE** (tens of seconds of silence, no `ping`): do the
