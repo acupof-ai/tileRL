@@ -80,12 +80,6 @@ MANUAL_KEEP: dict[str, str] = {
                                 "three-state read_window_stats proof that the "
                                 "window really truncated. Manual run after "
                                 "deploy, --time-draft; no CPU twin.",
-    "probe_responses_reasoning_shape": "ui runs by hand in a V100 serve window: "
-                                       "OpenAI Responses compatibility probe for #687 "
-                                       "(GA reasoning summary shape, cache_write_tokens "
-                                       "integer, reasoning_tokens). Manual live check, "
-                                       "no CPU twin, --self-check exercises the "
-                                       "red/green evaluator offline.",
 }
 
 
