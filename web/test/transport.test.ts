@@ -103,6 +103,18 @@ test("a refused handshake resolves unreachable", async () => {
   assert.equal(kind, "unreachable")
 })
 
+test("a close after a tool_calls frame but no done is still dropped", async () => {
+  // tool_calls precedes done and is not terminal: a close in that gap must not
+  // classify as a clean terminal finish (or the dropped/unconfirmed UI is lost).
+  autoOpen = true
+  const p = ask("ws://x/ws/chat", {}, () => {})
+  await new Promise((r) => setTimeout(r, 0))
+  current.onmessage?.({ data: JSON.stringify({ t: "tool_calls", tool_calls: [
+    { id: "c", name: "f", arguments: "{}" }] }) })
+  current.onclose?.()
+  assert.equal(await p, "dropped")
+})
+
 test("an unparseable frame is dropped without ending the stream", async () => {
   autoOpen = true
   const seen: Frame[] = []

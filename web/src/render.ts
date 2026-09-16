@@ -283,14 +283,21 @@ export const lastBlockStart = (src: string): number => {
 /** One collapsed block per tool call: the function name is the summary and the
  * arguments are verbatim JSON. The page never EXECUTES a call — it only shows
  * what the model asked for, so pretty-printing unknown arguments as text is the
- * whole job. */
+ * whole job.
+ *
+ * Idempotent by call id: a resent/redelivered `tool_calls` frame (or a future
+ * sharded form) must not stack a second block for the same call. The rendered id
+ * is carried on a data attribute, not a module Map, so it lives and dies with
+ * the turn's DOM. */
 export const renderToolCalls = (
   t: Turn,
   calls: ReadonlyArray<{ id: string; name: string; arguments: string }>,
 ): void => {
   for (const c of calls) {
+    if (t.toolsBody.querySelector(`[data-call-id="${CSS.escape(c.id)}"]`) !== null) continue
     const d = document.createElement("details")
     d.className = "tool-call"
+    d.setAttribute("data-call-id", c.id)
     const s = document.createElement("summary")
     s.appendChild(document.createTextNode(`tool: ${c.name}`))
     d.appendChild(s)
@@ -302,6 +309,22 @@ export const renderToolCalls = (
     pre.appendChild(code)
     d.appendChild(pre)
     t.toolsBody.appendChild(d)
+  }
+}
+
+/** Mark any tool block already shown before a disrupted turn as unconfirmed:
+ * the call was emitted but no terminal frame arrived, so the reader cannot know
+ * whether the server finished/executed it. Called on the dropped state only. */
+export const markToolCallsUnconfirmed = (t: Turn): void => {
+  for (const d of Array.from(t.toolsBody.querySelectorAll<HTMLElement>(".tool-call"))) {
+    if (d.dataset.confirmed === "true") continue
+    const s = d.querySelector("summary")
+    if (s !== null && s.querySelector(".tool-unconfirmed") === null) {
+      const tag = document.createElement("span")
+      tag.className = "tool-unconfirmed"
+      tag.appendChild(document.createTextNode(" (unconfirmed)"))
+      s.appendChild(tag)
+    }
   }
 }
 

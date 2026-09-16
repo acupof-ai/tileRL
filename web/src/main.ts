@@ -1,6 +1,7 @@
 import { outcome } from "./protocol.ts"
 import {
   newTurn,
+  markToolCallsUnconfirmed,
   paint,
   pruneTurns,
   renderToolCalls,
@@ -99,6 +100,10 @@ const note = (turn: Turn, message: string, retry?: () => void): void => {
 
 let stopStream: (() => void) | null = null
 let activeFlush: (() => void) | null = null
+/** Close the turn's socket. Captured for every ask (including one whose
+ * handshake never opens), so it survives the later reassignment of stopStream
+ * to the /health poll's abort during an unreachable turn. */
+let socketClose: (() => void) | null = null
 
 const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<void> => {
   const stopWaiting = startWaiting(turn)
@@ -177,6 +182,7 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
       }
     },
     (close) => {
+      socketClose = close
       stopStream = close
     },
   ).then(async (kind) => {
@@ -185,14 +191,26 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
     // undisclosed in the reveal queue. Idempotent after the done-frame flush.
     reveal.flush()
     if (kind === "dropped") {
+      // Tool calls seen before the break were never confirmed by a terminal
+      // frame, so flag them rather than leaving them looking finished.
+      markToolCallsUnconfirmed(turn)
       settle(turn, "dropped", cap ?? 0)
-      note(turn, "connection lost before the reply finished — retry?", resend)
+      note(turn, "connection lost before the reply finished — retry? Retry regenerates and may repeat a tool call.", resend)
     } else if (kind === "unreachable") {
       // The socket never opened: the supervisor is restarting the server (the
       // reload takes tens of seconds). Poll the public /health endpoint with
       // backoff; Stop aborts the wait. No auto-resend even after recovery — the
       // protocol has no frame ids, so a resend regenerates the turn.
       settle(turn, "error", cap ?? 0)
+      let healthAbort: (() => void) | null = null
+      // Stop during the unreachable window must do BOTH: close the (possibly
+      // late-opening) socket and stop the /health poll. stopStream was the socket
+      // close; the poll's abort now wraps it rather than replacing it, so no
+      // handle to a still-open socket is lost.
+      stopStream = () => {
+        socketClose?.()
+        healthAbort?.()
+      }
       const back = await waitForHealth(
         "/health",
         (attempt, delayMs) => {
@@ -200,11 +218,11 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
         },
         { sleep: (ms) => new Promise((r) => setTimeout(r, ms)), now: () => Date.now() },
         (abort) => {
-          stopStream = abort
+          healthAbort = abort
         },
       )
-      if (back) note(turn, "connection restored — retry?", resend)
-      else note(turn, "server unreachable for 3 minutes — retry?", resend)
+      if (back) note(turn, "connection restored — retry? Retry regenerates and may repeat a tool call.", resend)
+      else note(turn, "server unreachable for 3 minutes — retry? Retry regenerates and may repeat a tool call.", resend)
     } else if (kind === "stopped") {
       settle(turn, "stopped", cap ?? 0)
       // A `done` frame that crossed the close in flight already pushed the
@@ -259,6 +277,7 @@ const submit = async (text?: string): Promise<void> => {
     send.disabled = false
     stop.hidden = true
     stopStream = null
+    socketClose = null
     activeFlush = null
     turn.root.classList.remove("pending")
     pruneTurns(log, MAX_TURNS)
