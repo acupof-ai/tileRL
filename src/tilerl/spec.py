@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -329,7 +330,65 @@ class DraftHead:
         self.layers = Model(cfg, params)
         self.has_confidence = "confidence.weight" in params
         self.width = 3  # 2 drafts; ``set_depth`` overrides
+        # Diagnostic only (TILERL_DRAFT_ATTN_WINDOW_TOKENS): cap how many trailing
+        # tokens the draft decode attention READS. 0/unset = full prefix (default,
+        # identical behavior). The draft still WRITES and RETAINS its whole dense
+        # KV; only the read view is windowed. Used to sweep accept-rate/tok-s vs
+        # window before deciding the production sliding window.
+        self.attn_window_tokens = int(os.environ.get("TILERL_DRAFT_ATTN_WINDOW_TOKENS", "0"))
         self.forwards = 0  # cumulative draft forwards; a probe divides its own timing by this
+
+    def _windowed_read_kv(self, kv, sl, sq, dblocks):
+        """Diagnostic trailing-window READ view for a decode forward, or None when
+        the window is off / a prefill (multi-token) forward / already shorter than
+        the window. Builds a per-row table of the last Wp physical blocks and a
+        windowed seq_len, sharing the same kv_pool as ``kv``.
+
+        Correctness (the read/write separation):
+        - WRITE still goes through the full ``kv`` (model.write_tokens), writing
+          the new token at its absolute tail page; this view is read-only.
+        - The windowed table lists trailing physical blocks in logical order, so
+          column j == logical window page j. The windowed seq_len is
+          ``hi+1 - first_logical*BLOCK``; the last query's write index
+          (seq_len-sq .. seq_len-1) then maps to the SAME physical block and
+          in-page offset as the full table (verified algebraically), so the
+          retained full-prefix KV is untouched.
+        - RoPE is unaffected: K/V in the pool already carry absolute-position
+          rotary encoding (applied before write_tokens); attention only gathers
+          them in window order, so no position is renumbered.
+        """
+        W = getattr(self, "attn_window_tokens", 0)
+        if W <= 0:
+            return None
+        wp = (W + BLOCK_TOKENS - 1) // BLOCK_TOKENS  # window pages
+        dev = kv.block_table.device
+        n = len(sl)
+        wbt = torch.zeros(n, wp, dtype=torch.long, device=dev)
+        wsl = torch.zeros(n, dtype=torch.long, device=dev)
+        active = False
+        for i in range(n):
+            hi1 = int(sl[i])          # full seq_len (== hi+1)
+            q = int(sq[i])
+            if q != 1 or hi1 <= W:
+                continue             # only single-token decode past the window
+            total_pages = (hi1 + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+            first = max(0, total_pages - wp)
+            tail = dblocks[i][first:total_pages]
+            if not tail:
+                continue
+            wbt[i, : len(tail)] = torch.tensor(tail, dtype=torch.long, device=dev)
+            wsl[i] = hi1 - first * BLOCK_TOKENS
+            active = True
+        if not active:
+            return None
+        return BatchKv(
+            block_table=wbt,
+            seq_len=wsl,
+            state_slot=kv.state_slot,
+            kv_pool=kv.kv_pool,
+            state_pool=kv.state_pool,
+            seq_q_lens=kv.seq_q_lens,
+        )
 
     def forward(self, hidden, ids, positions, kv, backend, hidden_out=None,
                 last_only=False) -> torch.Tensor:
@@ -457,6 +516,9 @@ class DraftHead:
             kv_pool=self.kv, state_pool=None,
             seq_q_lens=torch.tensor(sq, device=dev),
         )
+        # Diagnostic trailing-window READ view (write/retain stay on the full kv).
+        kv.read_kv = self._windowed_read_kv(
+            kv, sl, sq, [dblocks for _, _, _, dblocks in plan])
         dh: list = []
         # last_only, or the vocab readout runs over every position of a prefill chunk and
         # one row is read: 512 x 248320 f32 = 485 MiB, which is the allocation that OOMed

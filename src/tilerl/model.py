@@ -459,10 +459,14 @@ class Model:
                 out = backend.attention(q, k, v, 1.0 / math.sqrt(d), gate=gate)
         else:
             _refuse_cp_serving(backend)
+            # write_tokens ALWAYS uses the full kv: a draft read-window must never
+            # move the write or truncate retained KV. Only the attention READ may
+            # take the trailing-window view (read_kv), which shares the same pool.
             backend.write_tokens(k, v, kv, layer_idx)
-            k_plane, v_plane, ks, vs = _kv_operands(backend, kv, layer_idx)
+            rkv = getattr(kv, "read_kv", None) or kv
+            k_plane, v_plane, ks, vs = _kv_operands(backend, rkv, layer_idx)
             block_table, seq_len = _sparse_attention_args(
-                self, backend, kv, layer_idx, x, q)
+                self, backend, rkv, layer_idx, x, q)
             out = backend.paged_attention(
                 q,
                 k_plane,
@@ -471,7 +475,7 @@ class Model:
                 seq_len,
                 1.0 / math.sqrt(d),
                 gate=gate,
-                seq_q_lens=getattr(kv, "seq_q_lens", None),
+                seq_q_lens=getattr(rkv, "seq_q_lens", None),
                 k_scale=ks,
                 v_scale=vs,
             )
