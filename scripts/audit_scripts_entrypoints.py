@@ -80,6 +80,18 @@ MANUAL_KEEP: dict[str, str] = {
                                 "three-state read_window_stats proof that the "
                                 "window really truncated. Manual run after "
                                 "deploy, --time-draft; no CPU twin.",
+    "probe_messages_usage_accounting": "ui runs by hand in a V100 serve window: "
+                                       "live check for #694 that /v1/messages and "
+                                       "/v1/chat/completions report the same token "
+                                       "counts and SSE usage is not repeated on "
+                                       "message_start/message_delta. Manual, no CPU "
+                                       "twin, --self-check covers the evaluator.",
+    "probe_sse_cold_first_event": "ui runs by hand in a V100 serve window: times "
+                                  "the cold-prefill silence before the first SSE "
+                                  "frame on /v1/messages|responses and reports any "
+                                  "keepalive comment frames or an early close. "
+                                  "Manual live check, no CPU twin, --self-check "
+                                  "covers classify().",
 }
 
 
