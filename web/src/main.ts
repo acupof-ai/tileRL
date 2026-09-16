@@ -1,6 +1,13 @@
 import { outcome } from "./protocol.ts"
-import { newTurn, paint, pruneTurns, settle, type Turn } from "./render.ts"
-import { ask, socketUrl } from "./transport.ts"
+import {
+  newTurn,
+  paint,
+  pruneTurns,
+  renderToolCalls,
+  settle,
+  type Turn,
+} from "./render.ts"
+import { ask, socketUrl, waitForHealth } from "./transport.ts"
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id)
@@ -48,6 +55,27 @@ const schedulePaint = (turn: Turn): void => {
   })
 }
 
+/** Cold-TTFT feedback. A long sparse prefill can take tens of seconds with no
+ * frame arriving; the socket does not time out (the server allows 1800s) but a
+ * static caret reads as a frozen page. Show elapsed seconds in the turn's
+ * waiting line until the first content-bearing frame. */
+const startWaiting = (turn: Turn): () => void => {
+  const t0 = Date.now()
+  turn.waiting.hidden = false
+  const tick = (): void => {
+    turn.waiting.replaceChildren(
+      document.createTextNode(`waiting for the first token… ${Math.round((Date.now() - t0) / 1000)}s`),
+    )
+  }
+  tick()
+  const h = setInterval(tick, 250)
+  return () => {
+    clearInterval(h)
+    turn.waiting.hidden = true
+    turn.waiting.replaceChildren()
+  }
+}
+
 /** A long session is a long DOM: cap the rendered log. Conversation history is
  * text and stays intact; the in-flight turn and the freshest reply are exempt
  * inside pruneTurns. A "clear history" affordance is a later change. */
@@ -68,15 +96,12 @@ const note = (turn: Turn, message: string, retry?: () => void): void => {
   }
 }
 
-const fail = (turn: Turn, cap: number, message: string): void => {
-  settle(turn, "empty", cap)
-  note(turn, message)
-}
-
 let stopStream: (() => void) | null = null
 
-const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<void> =>
-  ask(
+const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<void> => {
+  const stopWaiting = startWaiting(turn)
+  let firstFrame = true
+  return ask(
     socketUrl(window.location, "/ws/chat"),
     {
       messages: history,
@@ -91,10 +116,21 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
       // to a connection the server is already shutting down.
       if (turn.root.classList.contains("final")) return
       if (f.t === "delta") {
+        if (firstFrame) {
+          stopWaiting()
+          firstFrame = false
+        }
         if (f.reasoning_content !== undefined) turn.reasoning += f.reasoning_content
         if (f.content !== undefined) turn.answer += f.content
         schedulePaint(turn)
+      } else if (f.t === "tool_calls") {
+        if (firstFrame) {
+          stopWaiting()
+          firstFrame = false
+        }
+        renderToolCalls(turn, f.tool_calls)
       } else if (f.t === "done") {
+        stopWaiting()
         turn.root.classList.add("final")
         // Flush the coalesced paint before settling, or the last tokens can miss
         // the DOM of a turn that is already marked finished.
@@ -113,17 +149,40 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
         // replaying an empty answer teaches the model to answer nothing.
         if (turn.answer !== "") history.push({ role: "assistant", content: turn.answer })
       } else {
+        stopWaiting()
         turn.root.classList.add("final")
-        fail(turn, cap ?? 0, f.message)
+        // An in-band error is a refusal/failure, not an empty reply: show the
+        // server's message under the error state.
+        settle(turn, "error", cap ?? 0)
+        note(turn, f.message)
       }
     },
     (close) => {
       stopStream = close
     },
-  ).then((kind) => {
+  ).then(async (kind) => {
+    stopWaiting()
     if (kind === "dropped") {
       settle(turn, "dropped", cap ?? 0)
       note(turn, "connection lost before the reply finished — retry?", resend)
+    } else if (kind === "unreachable") {
+      // The socket never opened: the supervisor is restarting the server (the
+      // reload takes tens of seconds). Poll the public /health endpoint with
+      // backoff; Stop aborts the wait. No auto-resend even after recovery — the
+      // protocol has no frame ids, so a resend regenerates the turn.
+      settle(turn, "error", cap ?? 0)
+      const back = await waitForHealth(
+        "/health",
+        (attempt, delayMs) => {
+          note(turn, `server unreachable — restarting, retrying in ${Math.round(delayMs / 1000)}s (${attempt})`)
+        },
+        { sleep: (ms) => new Promise((r) => setTimeout(r, ms)), now: () => Date.now() },
+        (abort) => {
+          stopStream = abort
+        },
+      )
+      if (back) note(turn, "connection restored — retry?", resend)
+      else note(turn, "server unreachable for 3 minutes — retry?", resend)
     } else if (kind === "stopped") {
       settle(turn, "stopped", cap ?? 0)
       // A `done` frame that crossed the close in flight already pushed the
@@ -133,6 +192,7 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
       }
     }
   })
+}
 
 const submit = async (text?: string): Promise<void> => {
   const typed0 = text ?? composer.value.trim()
@@ -168,7 +228,8 @@ const submit = async (text?: string): Promise<void> => {
   try {
     await stream(turn, cap, resend)
   } catch (e) {
-    fail(turn, cap ?? 0, String(e))
+    settle(turn, "error", cap ?? 0)
+    note(turn, String(e))
   } finally {
     // A stream that ends without a `done` frame -- a dropped connection -- still
     // has to release the composer, or the page is stuck with no error shown.

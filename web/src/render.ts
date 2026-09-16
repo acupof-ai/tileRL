@@ -253,6 +253,10 @@ export interface Turn {
   readonly answerBody: HTMLElement
   /** The block still being written; the only node a frame replaces. */
   readonly answerTail: HTMLElement
+  /** Tool calls the model asked for; rendered once when the frame arrives. */
+  readonly toolsBody: HTMLElement
+  /** Cold-TTFT elapsed-time line; hidden after the first frame. */
+  readonly waiting: HTMLElement
   readonly note: HTMLElement
 }
 
@@ -276,6 +280,31 @@ export const lastBlockStart = (src: string): number => {
   return gap === -1 ? 0 : gap + 2
 }
 
+/** One collapsed block per tool call: the function name is the summary and the
+ * arguments are verbatim JSON. The page never EXECUTES a call — it only shows
+ * what the model asked for, so pretty-printing unknown arguments as text is the
+ * whole job. */
+export const renderToolCalls = (
+  t: Turn,
+  calls: ReadonlyArray<{ id: string; name: string; arguments: string }>,
+): void => {
+  for (const c of calls) {
+    const d = document.createElement("details")
+    d.className = "tool-call"
+    const s = document.createElement("summary")
+    s.appendChild(document.createTextNode(`tool: ${c.name}`))
+    d.appendChild(s)
+    const pre = document.createElement("pre")
+    const code = document.createElement("code")
+    // Show the arguments as the server sent them. A malformed body is rendered
+    // verbatim rather than hidden; the call still happened.
+    code.appendChild(document.createTextNode(c.arguments))
+    pre.appendChild(code)
+    d.appendChild(pre)
+    t.toolsBody.appendChild(d)
+  }
+}
+
 export const newTurn = (into: HTMLElement, role: "user" | "assistant"): Turn => {
   const root = document.createElement("div")
   root.className = `turn ${role}`
@@ -295,14 +324,19 @@ export const newTurn = (into: HTMLElement, role: "user" | "assistant"): Turn => 
   const answerTail = document.createElement("div")
   answerTail.className = "tail"
   answerBody.appendChild(answerTail)
+  const toolsBody = document.createElement("div")
+  toolsBody.className = "tools"
+  const waiting = document.createElement("div")
+  waiting.className = "waiting"
+  waiting.hidden = true
   const note = document.createElement("div")
   note.className = "note"
   note.hidden = true
 
-  root.append(fold, answerBody, note)
+  root.append(fold, toolsBody, waiting, answerBody, note)
   into.appendChild(root)
   return { root, reasoning: "", answer: "", settled: 0, fold, reasoningBody,
-           answerBody, answerTail, note }
+           answerBody, answerTail, toolsBody, waiting, note }
 }
 
 /** Render what has arrived, re-parsing only the block still being written.
@@ -345,10 +379,11 @@ export const pruneTurns = (el: HTMLElement, max: number): void => {
 /** The end state. `truncated` and `dropped` write a notice: truncated keeps the
  * reasoning open so the reader sees what the budget was spent on; `stopped`
  * writes nothing because a user stop is not a failure and the partial reply
- * already on screen is the answer. */
+ * already on screen is the answer. `error` writes no text of its own — the
+ * caller has the server's message and shows that, distinct from an empty reply. */
 export const settle = (
   t: Turn,
-  kind: "answered" | "truncated" | "empty" | "stopped" | "dropped",
+  kind: "answered" | "truncated" | "empty" | "stopped" | "dropped" | "error",
   cap: number,
 ): void => {
   t.root.classList.remove("pending")
@@ -367,4 +402,5 @@ export const settle = (
     t.note.hidden = false
     t.note.replaceChildren(document.createTextNode("connection lost before the reply finished"))
   }
+  // "error" only clears pending: main.ts writes the server's message into note.
 }

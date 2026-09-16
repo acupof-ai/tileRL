@@ -66,6 +66,17 @@
     margin-top: var(--s1); }
   .note { color: var(--warn); font-size: 13px; }
   .note .retry { padding: 2px 12px; margin-left: var(--s2); font-size: 13px; }
+  /* Cold prefill: no frame for tens of seconds, the elapsed line says the page
+     is waiting rather than frozen. */
+  .waiting { color: var(--dim); font-size: 13px; font-variant-numeric: tabular-nums; }
+  details.tool-call { background: var(--sunk); border: 1px solid var(--line);
+    border-radius: 10px; padding: var(--s1) var(--s2); margin-bottom: var(--s2); }
+  details.tool-call summary { color: var(--dim); font-size: 13px; cursor: pointer;
+    list-style: none; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  details.tool-call summary::before { content: "▸ "; }
+  details.tool-call[open] summary::before { content: "▾ "; }
+  details.tool-call summary::-webkit-details-marker { display: none; }
+  details.tool-call pre { margin: var(--s1) 0 0; }
   /* Jump back to the live end; hidden at rest and whenever the log is pinned. */
   #to-bottom {
     position: fixed; left: 50%; bottom: 92px; translate: -50% 0;
