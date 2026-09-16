@@ -73,6 +73,13 @@ MANUAL_KEEP: dict[str, str] = {
                           "each gate's operand came to its threshold across "
                           "recorded runs, to tell a live gate from a decorative "
                           "one. Hand-run over the measurements store.",
+    "probe_draft_window_sweep": "perf1 runs on the V100 sm70 sparse 27B line as "
+                                "the #684 device acceptance tool: in-process "
+                                "W=0/1k/2k/4k/8k paired arms measuring draft "
+                                "CUDA ms, spec acceptance and tok/s, with a "
+                                "three-state read_window_stats proof that the "
+                                "window really truncated. Manual run after "
+                                "deploy, --time-draft; no CPU twin.",
 }
 
 
