@@ -70,25 +70,96 @@ def test_the_cpu_cell_cannot_observe_the_preludes_extra_rounding():
 
 @pytest.mark.skipif(get_backend().arch != "sm90", reason="attn_prep is sm90-only")
 def test_attn_prep_is_closer_to_exact_than_the_discrete_prelude():
-    """The gate the fix needs, on the target that can see it.
+    """The gate F6 needs, on the only target that can see it: the FUSED prelude
+    must land closer to the f64 oracle than the discrete rmsnorm->rope chain.
 
-    Ranked by mean error over the elements that actually differ, never by max:
+    The discrete chain rounds its norm output to bf16 before RoPE; the fused
+    ``attn_prep`` keeps norm+RoPE in f32 registers and casts once at the store, so
+    on the elements where the two differ the fused mean error is about half the
+    discrete one (measured 2.0007x on the 27B: errors/2026-09-03
+    -unfused-prelude-double-rounds.md). Both arms write into a real PagedKvPool
+    because ``attn_prep`` performs the K/V write itself; only q is compared here
+    (q carries the two-prelude rounding difference with no pool dtype gap).
+
+    Ranked by mean error over the elements that ACTUALLY differ, never by max:
     both arms round to the same bf16 grid, so max|d| is the quantum at the same
-    largest element in both and reads as a tie to four figures."""
+    largest element in both and reads as a tie. The fused==discrete case is the
+    negative control: then ef_mean == ed_mean and the strict ``<`` fails.
+    """
+    from tilerl.kv_cache import PagedKvPool
+
     be = get_backend()
     cfg = qwen38_27b()
     d, rd = cfg.head_dim, cfg.effective_rotary_dim
+    hq, hkv = cfg.num_attention_heads, cfg.num_kv_heads
+    b, s = 2, 8
+    # Full gated layout: [query; gate] per head, then k, v -- exactly what attn_prep
+    # reads (it normalizes the query half of the interleaved 2*D block).
+    nqkv = hq * d * (2 if cfg.full_attn_gated else 1) + 2 * hkv * d
     torch.manual_seed(0)
-    x = torch.randn(2, 8, cfg.num_kv_heads, d, dtype=torch.float32, device=be.device)
-    w = torch.randn(d, dtype=torch.float32, device=be.device)
-    pos = torch.arange(8, dtype=torch.int32, device=be.device).unsqueeze(0).expand(2, -1)
+    qkv = torch.randn(b, s, nqkv, dtype=torch.float32, device=be.device)
+    pos = torch.arange(s, dtype=torch.int32, device=be.device).unsqueeze(0).expand(b, -1)
+    # Random norm weights are enough to expose the rounding-direction difference;
+    # the gate does not need the 27B checkpoint.
+    wq = torch.randn(d, dtype=torch.float32, device=be.device)
+    wk = torch.randn(d, dtype=torch.float32, device=be.device)
 
-    ref = reference.attn_prelude(x, w, pos, cfg.rope_theta, cfg.rms_eps, rotary_dim=rd)
-    # the discrete chain, exactly as model.py:239-242 calls it, then the pool's cast
-    disc = be.rope(be.rmsnorm(x, w, cfg.rms_eps), pos, cfg.rope_theta, rotary_dim=rd)
-    disc = disc.to(torch.bfloat16).float()
+    # --- fused arm: one launch does q_norm + rope (and the K/V write) ---
+    fused_pool = PagedKvPool(b * 8, hkv, d, num_layers=1, device=be.device)
+    fused_kv = _PreludeKv(fused_pool, b, s, be.device)
+    q_fused = be.attn_prep(qkv, wq, wk, pos, cfg.rope_theta, rd, fused_kv,
+                           0, hq, hkv, cfg.rms_eps)
+    assert q_fused is not None, "no fused attn_prep kernel registered in this sm90 cell"
 
-    ed = (disc - ref).abs()
+    # --- discrete arm: reshape, rmsnorm, rope as model.py does it ---
+    q_rows = hq * d * (2 if cfg.full_attn_gated else 1)
+    q = qkv[..., :q_rows]
+    q = q.reshape(b, s, hq, 2, d)[..., 0, :] if cfg.full_attn_gated \
+        else q.reshape(b, s, hq, d)
+    q_disc = be.rope(be.rmsnorm(q, wq, cfg.rms_eps), pos, cfg.rope_theta,
+                     rotary_dim=rd)
+    q_disc = q_disc.to(torch.bfloat16).float()  # the pool's one cast, as in serving
+
+    # --- f64 oracle both approximate ---
+    q_ref = reference.attn_prelude(q, wq, pos, cfg.rope_theta, cfg.rms_eps,
+                                   rotary_dim=rd).float()
+
+    ed = (q_disc - q_ref).abs()
+    ef = (q_fused.float() - q_ref).abs()
+    differ = ed != ef
+    # Non-triviality: if the discrete chain matched f64 exactly there would be no
+    # double rounding to rank -- keeps this from passing on a vacuous comparison.
     assert ed.max().item() > 0, "the discrete chain matched f64 exactly: check the harness"
-    # one bf16 rounding of a value already rounded once is ~2x the error of one
-    print(f"discrete vs f64 oracle: mean {ed.mean().item():.3e} max {ed.max().item():.3e}")
+    assert differ.any(), (
+        "fused and discrete are bit-identical on q: no prelude-rounding difference "
+        "is visible in this shape -- the closer-than comparison would be vacuous")
+
+    ed_mean = ed[differ].mean().item()
+    ef_mean = ef[differ].mean().item()
+    print(f"on {int(differ.sum())} differing elements: discrete mean {ed_mean:.3e}, "
+          f"fused mean {ef_mean:.3e}, ratio {ed_mean / max(ef_mean, 1e-30):.4f}")
+    # Fused keeps one less bf16 rounding, so it must be strictly closer. The 0.6
+    # band codifies the ~half (measured 2.0007x -> fused ~0.4996) and still fails
+    # on fused==discrete (ratio 1.0) or a fused regression above 0.6.
+    assert ef_mean < ed_mean, (
+        f"fused prelude is not closer to exact: fused {ef_mean:.3e} >= "
+        f"discrete {ed_mean:.3e} -- the extra bf16 rounding is not being avoided")
+    assert ef_mean <= 0.6 * ed_mean, (
+        f"fused mean {ef_mean:.3e} is not ~half the discrete {ed_mean:.3e} "
+        f"(ratio {ef_mean / ed_mean:.3f}); expected one fewer bf16 rounding, ~0.5x")
+
+
+class _PreludeKv:
+    """Minimal batch state attn_prep reads off a KV pool (mirrors
+    scripts/probe_attn_prep.py): contiguous block_table with s fitting block 0."""
+
+    dense = False
+
+    def __init__(self, pool, b, s, device):
+        self.kv_pool = pool
+        nb = pool.k_pool.shape[-2]
+        assert s <= nb, f"s={s} must fit one block ({nb})"
+        self.block_table = torch.arange(b * 8, dtype=torch.int32,
+                                        device=device).reshape(b, 8)
+        self.seq_len = torch.full((b,), s, dtype=torch.int32, device=device)
+        self.seq_q_lens = torch.full((b,), s, dtype=torch.int32, device=device)
