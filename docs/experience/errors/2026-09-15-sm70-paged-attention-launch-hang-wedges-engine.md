@@ -1,9 +1,11 @@
 # sm70 serve wedges under a simultaneous-SSE-hangup cancel storm (GIL spin), not a CUDA launch — 2026-09-15/16
 
-**Status:** root-caused 2026-09-16 (fix in review). The title's "paged_attention
-launch hang" was a misread: the engine thread is the *victim*, parked waiting
-for the GIL. The main event-loop thread busy-spins inside `stream_or_cancel`'s
-SSE final drain during a burst of simultaneous hangups.
+**Status:** root-caused and fixed 2026-09-16, merged as #658 (0cc82a36); device
+confirmation on the V100 (20/20 SSE overload storm, stable pid/boot, 128k
+sparse) is the only open step. The title's "paged_attention launch hang" was a
+misread: the engine thread is the *victim*, parked waiting for the GIL. The
+main event-loop thread busy-spins inside `stream_or_cancel`'s SSE final drain
+during a burst of simultaneous hangups.
 **Arch:** V100 sm70, hybrid 27B serve (`--sparse-k 128 --draft … --decode-graph`),
 served shas ad0d3a1a → ff3e08e9.
 **Discovered:** P0 during ops late-frame SSE disconnect verification (≈16
