@@ -8,6 +8,7 @@ import {
   type Turn,
 } from "./render.ts"
 import { ask, socketUrl, waitForHealth } from "./transport.ts"
+import { createReveal } from "./streamBuffer.ts"
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id)
@@ -97,10 +98,19 @@ const note = (turn: Turn, message: string, retry?: () => void): void => {
 }
 
 let stopStream: (() => void) | null = null
+let activeFlush: (() => void) | null = null
 
 const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<void> => {
   const stopWaiting = startWaiting(turn)
   let firstFrame = true
+  // Reveal streamed answer characters at a steady per-frame rate instead of in
+  // token-sized lumps (sparse decode delivers one token every ~110-167 ms).
+  // reasoning is folded away, so it needs no smoothing.
+  const reveal = createReveal((chars) => {
+    turn.answer += chars
+    schedulePaint(turn)
+  })
+  activeFlush = () => reveal.flush()
   return ask(
     socketUrl(window.location, "/ws/chat"),
     {
@@ -121,7 +131,7 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
           firstFrame = false
         }
         if (f.reasoning_content !== undefined) turn.reasoning += f.reasoning_content
-        if (f.content !== undefined) turn.answer += f.content
+        if (f.content !== undefined) reveal.push(f.content)
         schedulePaint(turn)
       } else if (f.t === "tool_calls") {
         if (firstFrame) {
@@ -132,6 +142,9 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
       } else if (f.t === "done") {
         stopWaiting()
         turn.root.classList.add("final")
+        // Reveal every buffered character before the synchronous final paint,
+        // or tokens still in the reveal queue miss the finished turn.
+        reveal.flush()
         // Flush the coalesced paint before settling, or the last tokens can miss
         // the DOM of a turn that is already marked finished.
         paint(turn)
@@ -150,6 +163,7 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
         if (turn.answer !== "") history.push({ role: "assistant", content: turn.answer })
       } else {
         stopWaiting()
+        reveal.flush()
         turn.root.classList.add("final")
         // An in-band error is a refusal/failure, not an empty reply: show the
         // server's message under the error state.
@@ -162,6 +176,9 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
     },
   ).then(async (kind) => {
     stopWaiting()
+    // A stop, a mid-turn drop, or a normal close: never leave received tokens
+    // undisclosed in the reveal queue. Idempotent after the done-frame flush.
+    reveal.flush()
     if (kind === "dropped") {
       settle(turn, "dropped", cap ?? 0)
       note(turn, "connection lost before the reply finished — retry?", resend)
@@ -237,6 +254,7 @@ const submit = async (text?: string): Promise<void> => {
     send.disabled = false
     stop.hidden = true
     stopStream = null
+    activeFlush = null
     turn.root.classList.remove("pending")
     pruneTurns(log, MAX_TURNS)
     composer.focus()
@@ -260,3 +278,8 @@ toBottom.addEventListener("click", () => {
 log.addEventListener("scroll", () => {
   toBottom.hidden = atBottom(log)
 })
+
+// Reveal every buffered character before the page is hidden so a token that
+// arrived but was still queued in the reveal buffer is not lost from the turn
+// (the socket-close-on-hide is handled separately).
+window.addEventListener("pagehide", () => activeFlush?.())
