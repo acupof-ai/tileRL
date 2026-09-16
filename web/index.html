@@ -76,6 +76,7 @@
   details.tool-call summary::before { content: "▸ "; }
   details.tool-call[open] summary::before { content: "▾ "; }
   details.tool-call summary::-webkit-details-marker { display: none; }
+  details.tool-call summary .tool-unconfirmed { color: var(--warn); font-style: italic; }
   details.tool-call pre { margin: var(--s1) 0 0; }
   /* Jump back to the live end; hidden at rest and whenever the log is pinned. */
   #to-bottom {

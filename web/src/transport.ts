@@ -38,7 +38,10 @@ export const ask = (
       // rather than silently rendering short.
       if (f === null) console.warn("tilerl: unparseable frame", e.data)
       else {
-        if (f.t !== "delta") terminal = true
+        // Only a terminal frame (done/error) ends the classification. A
+        // tool_calls frame is NOT terminal — it precedes done — so a close after
+        // it but before done must still read as a drop, not a clean finish.
+        terminal = f.t === "done" || f.t === "error"
         onFrame(f)
       }
     }

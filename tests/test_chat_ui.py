@@ -182,6 +182,11 @@ _DOM_STUB = """
 const mk = (tag) => ({
   tagName: tag.toUpperCase(), nodeValue: null, className: "", children: [],
   hidden: false, open: false, value: "", checked: false, disabled: false,
+  dataset: {},
+  setAttribute(k, v){
+    if (k === "data-call-id") this.dataset.callId = String(v);
+    else this["_attr_" + k] = v;
+  },
   classList: { _s: new Set(),
     add(...c){ c.forEach((x) => this._s.add(x)); },
     remove(...c){ c.forEach((x) => this._s.delete(x)); },
@@ -200,6 +205,33 @@ const mk = (tag) => ({
     this.children.forEach((k) => { k._parent = this; }); },
   remove(){ const p = this._parent; if (p) {
     const i = p.children.indexOf(this); if (i !== -1) p.children.splice(i, 1); } },
+  // Minimal selector support for what render.ts uses: an exact
+  // [data-call-id="x"] and a ".class" within this subtree.
+  _walk(){ const out = [];
+    const go = (n) => { for (const k of n.children || []) { out.push(k); go(k); } };
+    go(this); return out; },
+  querySelector(sel){
+    const all = this._walk();
+    const hasCls = (k, c) => (k.classList && k.classList.contains(c))
+      || (typeof k.className === "string" && k.className.split(" ").includes(c));
+    if (sel.startsWith("[data-call-id=")) {
+      const id = sel.slice('[data-call-id="'.length, sel.length - 2);
+      return all.find((k) => k.dataset && k.dataset.callId === id) ?? null;
+    }
+    if (sel.startsWith(".")) {
+      const cls = sel.slice(1);
+      return all.find((k) => hasCls(k, cls)) ?? null;
+    }
+    // Bare tag-name selector (the stub's only other use).
+    return all.find((k) => k.tagName === sel.toUpperCase()) ?? null;
+  },
+  querySelectorAll(sel){
+    const all = this._walk();
+    if (sel.startsWith(".")) { const cls = sel.slice(1);
+      return all.filter((k) => (k.classList && k.classList.contains(cls))
+        || (typeof k.className === "string" && k.className.split(" ").includes(cls))); }
+    return [];
+  },
   addEventListener(ev, fn){ (this._h ||= {})[ev] = fn; },
   focus(){}, scrollIntoView(){},
   // Scroll geometry, so the page's "am I at the bottom" check has something to
@@ -218,6 +250,9 @@ globalThis.document = {
 globalThis.window = { location: { protocol: "http:", host: "x", href: "http://x/" },
   addEventListener(ev, fn){ (this._h ||= {})[ev] = fn; } };
 globalThis.location = globalThis.window.location;
+// renderToolCalls keys its dedupe selector through CSS.escape; the ids under
+// test (call_N_M) need no escaping, so an identity shim is sufficient.
+globalThis.CSS = { escape: (s) => String(s) };
 // Frames replay synchronously, so a paint frame runs synchronously too: the
 // coalescing collapses to paint-per-frame, which is the behaviour these gates
 // already assert. A rAF that deferred would put every assertion ahead of the
@@ -266,7 +301,13 @@ globalThis.WebSocket = class {
 };
 // /health answers 200 immediately in these gates, so an unreachable turn settles
 // to the "restored, retry" state without a real wait.
-globalThis.fetch = async () => ({ ok: !UNREACHABLE || HEALTH_OK });
+globalThis.fetch = async () => {
+  // STOP_UNREACHABLE: park the /health poll on a never-resolving promise so the
+  // turn is sitting inside waitForHealth when Stop is clicked; the gate asserts
+  // Stop still closes the underlying socket (it must combine ws-close + abort).
+  if (STOP_UNREACHABLE) return await new Promise(() => {});
+  return { ok: !UNREACHABLE || HEALTH_OK };
+};
 // The visible text of a subtree, tags included where they carry meaning.
 const _html = (el) => el.tagName === "#TEXT" ? el.nodeValue
   : (el.tagName.startsWith("#") ? "" : `<${el.tagName.toLowerCase()}>`)
@@ -451,7 +492,8 @@ def test_the_websocket_protocol_library_is_installed():
 def _page_after(frames: list[str], budget: str = "",
                 scroll_top: int | None = None, stop_after: bool = False,
                 drop: bool = False, unreachable: bool = False,
-                health_ok: bool = True, pagehide: bool = False) -> dict:
+                health_ok: bool = True, pagehide: bool = False,
+                stop_unreachable: bool = False) -> dict:
     """Run the shipped bundle over `frames`; return what landed in the DOM.
 
     ``budget`` is what the user typed in the budget box; "" is the shipped default
@@ -475,6 +517,7 @@ def _page_after(frames: list[str], budget: str = "",
         + "const STOP = " + ("true" if stop_after else "false") + ";\n"
         + "const DROP = " + ("true" if drop else "false") + ";\n"
         + "const PAGEHIDE = " + ("true" if pagehide else "false") + ";\n"
+        + "const STOP_UNREACHABLE = " + ("true" if stop_unreachable else "false") + ";\n"
         + "const UNREACHABLE = " + ("true" if unreachable else "false") + ";\n"
         + "const HEALTH_OK = " + ("true" if health_ok else "false") + ";\n"
         + _DOM_STUB
@@ -493,6 +536,13 @@ def _page_after(frames: list[str], budget: str = "",
           // queue into the turn and close the in-flight socket itself.
           await new Promise((r) => setTimeout(r, 0));
           globalThis.window._h.pagehide();
+        } else if (STOP_UNREACHABLE) {
+          // Refused handshake, then the /health poll parks forever. Let the turn
+          // enter waitForHealth, click Stop, then read immediately (do NOT await
+          // `done`, which never resolves while the poll is parked).
+          await new Promise((r) => setTimeout(r, 0));
+          await new Promise((r) => setTimeout(r, 0));
+          IDS.stop._h.click();
         } else {
           // Mid-stream: the socket replays its frames on a microtask, so a click
           // scheduled here lands while the turn is still pending.
@@ -707,6 +757,15 @@ def test_pagehide_flushes_the_buffer_and_closes_the_inflight_socket():
     assert got["closes"] == 1, f"pagehide closed the socket {got['closes']} times"
 
 
+def test_stop_during_unreachable_health_poll_still_closes_the_socket():
+    """B: after a refused handshake the page parks in the /health poll. Stop there
+    must run the COMBINED stop — close the (late-openable) socket AND abort the
+    poll — rather than replacing the socket close with only the poll abort, which
+    would leak the handle to a socket that then opens server-side."""
+    got = _page_after([], unreachable=True, stop_unreachable=True)
+    assert got["closes"] >= 1, f"Stop in the unreachable poll did not close the socket: {got['closes']}"
+
+
 def test_a_close_before_the_terminal_frame_is_a_drop_not_a_stop():
     """A server restart mid-turn must not look like a deliberate stop.
 
@@ -753,6 +812,42 @@ def test_a_tool_calls_frame_renders_the_call_as_a_collapsed_block():
     assert '{"city":"sf"}' in (got["tools"] or ""), got["tools"]
     assert "calling the weather" in got["answer"], got["answer"]
     assert got["waitingVisible"] is False, "the waiting line outlived the first frame"
+
+
+def test_a_redelivered_tool_calls_frame_with_the_same_id_renders_one_block():
+    """Dedupe by call id: a resent/sharded tool_calls frame must not stack a second
+    block for the same call (regression would render two get_weather blocks)."""
+    call = {"id": "call_7_0", "type": "function", "name": "get_weather",
+            "arguments": '{"city":"sf"}'}
+    frames = [
+        json.dumps({"t": "tool_calls", "tool_calls": [call]}),
+        # Same id delivered again (a redelivery or a future sharded form).
+        json.dumps({"t": "tool_calls", "tool_calls": [dict(call)]}),
+        json.dumps({"t": "done", "finish_reason": "tool_calls",
+                    "tool_calls": [call],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1}}),
+    ]
+    got = _page_after(frames)
+    # One collapsed <details> per call id, even though the frame arrived twice.
+    assert (got["tools"] or "").count("<details>") == 1, got["tools"]
+    assert "unconfirmed" not in (got["tools"] or ""), got["tools"]
+
+
+def test_a_tool_call_before_a_drop_is_marked_unconfirmed():
+    """A tool frame seen without a terminal frame cannot be known to have finished;
+    the dropped turn flags the block rather than showing it as complete."""
+    frames = [
+        json.dumps({"t": "tool_calls", "tool_calls": [
+            {"id": "call_3_0", "type": "function", "name": "do_thing",
+             "arguments": "{}"}]}),
+        json.dumps({"t": "done", "finish_reason": "stop",
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1}}),
+    ]
+    # DROP replays every frame except the terminal done, so the tool frame lands
+    # with no confirmation.
+    got = _page_after(frames, drop=True)
+    assert "do_thing" in (got["tools"] or ""), got["tools"]
+    assert "unconfirmed" in (got["tools"] or ""), got["tools"]
 
 
 def test_the_page_renders_the_frames_this_server_sends():
