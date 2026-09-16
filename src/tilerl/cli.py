@@ -585,6 +585,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "disables it (sm70: dense capture fails there and poisons the "
                               "allocator; with --sparse-k the sparse graph is captured "
                               "instead). Informed opt-in for capture measurement.")
+    p_serve.add_argument("--no-decode-graph", dest="decode_graph", action="store_const", const=False,
+                         help="force eager decode ticks on an arch whose AUTO path captures "
+                              "(sm90+); the graph-vs-eager control arm")
     p_serve.add_argument("--no-warmup", dest="warmup", action="store_false",
                          help="skip precapturing the decode graphs; the first real messages "
                               "then pay for them (1088 ms/token falling to 26 over six "
