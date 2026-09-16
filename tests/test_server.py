@@ -2136,6 +2136,24 @@ def test_a_nonstream_client_disconnect_cancels_its_request():
     import httpx
 
     engine = _build_engine(seed=71)
+
+    # Event-synced admission, not a wall poll (#659). The old version polled
+    # engine.stats()["running"] for a fixed 5 s after dispatch; on a contended host
+    # submit -> first daemon-loop tick (what actually admits the row) could elapse
+    # that deadline, so the assertion fired "request never reached the engine"
+    # before any disconnect was exercised. _admit runs on the loop thread exactly
+    # when a row becomes running, so an event set there is the positive signal; the
+    # generous bound only guards a genuinely wedged loop.
+    admit_gate = {"event": threading.Event()}
+    real_admit = engine._admit
+
+    def _admit_with_event(req) -> bool:
+        ok = real_admit(req)
+        if ok:
+            admit_gate["event"].set()
+        return ok
+
+    engine._admit = _admit_with_event
     engine.run()
     app = create_app(engine, _ByteTokenizer())
 
@@ -2143,13 +2161,15 @@ def test_a_nonstream_client_disconnect_cancels_its_request():
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t",
                                      timeout=30.0) as ac:
+            # Fresh gate per scenario: the follow-up post at the end also admits a
+            # row and would leave a shared event already set before this dispatch.
+            admitted = admit_gate["event"] = threading.Event()
             req = ac.build_request("POST", path, json=body)
             task = asyncio.ensure_future(ac.send(req))
-            # Wait until the engine owns the row, then emulate the reader leaving.
-            deadline = time.monotonic() + 5.0
-            while not engine.stats()["running"] and time.monotonic() < deadline:
-                await asyncio.sleep(0.005)
-            assert engine.stats()["running"], f"{path}: request never reached the engine"
+            # Wait until THIS request's row is owned by the engine, then emulate
+            # the reader leaving. Event, not a fixed wall deadline.
+            assert await asyncio.to_thread(admitted.wait, 30.0), (
+                f"{path}: request never reached the engine")
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
