@@ -67,6 +67,57 @@ def test_window_off_builds_no_read_view(monkeypatch):
         eng.shutdown()
 
 
+def test_real_accept_tick_sq2_window_engages_in_engine(monkeypatch):
+    """Engine-level gate for the device-inert root cause. A random draft rarely
+    matches the trunk, so force deterministic ACCEPTANCE: the draft's greedy and
+    the trunk's verify sampler both return one constant token (temperature 0).
+    After the first commit every verify tick then re-drafts q = n_ok + 1 = 2
+    positions, which the old sq==1 guard silently bypassed. Drive real
+    eng.step() decode ticks past the window and assert an engaged window on a
+    genuine sq=2 row whose floor truncates (first>0)."""
+    import torch as _t
+
+    prompt = np.random.default_rng(2).integers(3, 320, size=120).astype(np.int64)
+    eng, _ = _engine(32, monkeypatch)             # W=32 tokens (2 pages), context 120
+    tok7 = 7
+    try:
+        backend = eng._backend
+        orig_greedy, orig_sample = backend.greedy, backend.sample_batch
+
+        def const_greedy(logits):
+            t, p = orig_greedy(logits)
+            return _t.full_like(t, tok7), p
+
+        def const_sample(logits, *a, **k):
+            t, lp = orig_sample(logits, *a, **k)
+            return _t.full_like(t, tok7), lp
+
+        backend.greedy = const_greedy
+        backend.sample_batch = const_sample
+
+        rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=24,
+                                                seed=0))
+        engaged = []
+        for _ in range(120):
+            done = eng.poll()
+            if rid in done and len(done[rid]) >= 24:
+                break
+            eng.step()
+            st = eng._draft.read_window_stats()
+            if st is not None:
+                engaged.append(st)
+        # At least one engaged view is exactly the post-accept shape: a single
+        # decode row with q=2 whose floor truncates (>=1 prefix page dropped).
+        assert any(
+            st["sq"] == [2] and st["first"] == [f] and f > 0 and st["pages"][0]
+            for st in engaged for f in [st["first"][0]]
+        ), f"no engaged sq=2 truncating window across ticks: {engaged[:4]}"
+    finally:
+        backend.greedy = orig_greedy
+        backend.sample_batch = orig_sample
+        eng.shutdown()
+
+
 def test_full_covering_window_is_numerically_identical(monkeypatch):
     """A window larger than the whole context returns None and leaves the draft
     output bit-identical to the full prefix. (The all-pages-via-remap identity at
@@ -103,6 +154,7 @@ def test_windowed_read_view_geometry_and_write_target():
     draft = DraftHead.__new__(DraftHead)
     draft.kv = PagedKvPool(64, cfg.num_kv_heads, cfg.head_dim, num_layers=1,
                            device=backend.device, layer_map=(0,))
+    draft.width = 3
     nblk = 20                       # 320-token full context; last query at seq 320
     dblocks = [100 + i for i in range(nblk)]
     bt = torch.zeros(1, 64, dtype=torch.long)
@@ -113,14 +165,17 @@ def test_windowed_read_view_geometry_and_write_target():
                    kv_pool=draft.kv, state_pool=None,
                    seq_q_lens=torch.tensor(sq))
 
-    # Aligned windows (hi=320, W a multiple of BLOCK): floor first page is
+    # Aligned windows (length=320, W a multiple of BLOCK): floor first page is
     # total-wp, windowed seq_len == W, last write maps to the same block/offset.
+    # The windowed descriptor keeps the FULL table width nb=64 (the kernel's
+    # compiled-in Mb -> no recompile); kept pages are packed from column 0 and the
+    # remaining columns are zero.
+    nb = bt.shape[1]
     for W_pages, W_tok in ((2, 32), (4, 64), (8, 128)):
         draft.attn_window_tokens = W_tok
         view = draft._windowed_read_kv(full, sl, sq, [dblocks])
         assert view is not None
-        width = view.block_table.shape[1]      # wp+1
-        assert width == W_pages + 1
+        assert view.block_table.shape[1] == nb          # same Mb, packed from col 0
         got = [int(x) for x in view.block_table[0, :W_pages].tolist()]
         assert got == dblocks[nblk - W_pages:], (W_pages, got)
         assert int(view.block_table[0, W_pages:].abs().sum()) == 0
@@ -132,14 +187,14 @@ def test_windowed_read_view_geometry_and_write_target():
         assert woff == (sl[0] - sq[0]) % BLOCK_TOKENS
 
     # UNALIGNED window floor rule:
-    # hi=40,W=32 -> first=(40-32)//16=0, no page dropped -> None (full), yet the
+    # length=40,W=32 -> first=(40-32)//16=0, no page dropped -> None (full), yet the
     # oldest wanted token 8 is inside kept page 0 (the last-wp cut would have
     # started at page 1 = token 16 and dropped tokens 8..15).
     draft.attn_window_tokens = 32
     sl40 = [40]
     assert draft._windowed_read_kv(full, sl40, [1], [dblocks]) is None
-    # genuinely truncating unaligned case: hi=100 -> first=(68)//16=4, pages 4..6
-    # cover tokens 64..99, including the oldest wanted token hi-W=68.
+    # genuinely truncating unaligned case: length=100 -> first=(68)//16=4, pages
+    # 4..6 cover tokens 64..99, including the oldest wanted token length-W=68.
     sl100 = [100]
     full100 = BatchKv(
         block_table=bt, seq_len=torch.tensor(sl100),
@@ -163,8 +218,8 @@ def test_windowed_read_view_geometry_and_write_target():
 def test_mixed_batch_short_row_keeps_its_own_kv_and_prefill_bypasses():
     """A long truncated decode row batched with a SHORT decode row must not zero
     the short row's windowed table/seq_len (the CHANGE-REQ bug: hist=-1 read
-    page 0). A batch containing any sq!=1 (prefill) row bypasses the window
-    entirely."""
+    page 0). Prefill/catch-up rows are flagged per row (``decode=False``), not by
+    sq: any one of them bypasses the window for the whole batch."""
     cfg = tiny()
     backend = get_backend()
     draft = DraftHead.__new__(DraftHead)
@@ -198,9 +253,18 @@ def test_mixed_batch_short_row_keeps_its_own_kv_and_prefill_bypasses():
     assert [int(x) for x in view.block_table[1, :3].tolist()] == db1
     assert int(view.seq_len[1]) == 40
 
-    # any prefill/multi-token row in the batch -> whole batch bypasses (None)
-    sq_prefill = [1, 4]
-    assert draft._windowed_read_kv(full, sl, sq_prefill, [db0, db1]) is None
+    # any PREFILL/catch-up row in the batch (decode=False) -> whole batch bypasses,
+    # regardless of that row's sq.
+    assert draft._windowed_read_kv(
+        full, sl, [1, 4], [db0, db1], decode=[True, False]) is None
+    # ... a decode verify TAIL (q <= draft.width) windows regardless of q: with
+    # width=2, q=2 alongside q=1 engages (sq alone no longer bails).
+    assert draft._windowed_read_kv(
+        full, sl, [1, 2], [db0, db1], decode=[True, True]) is not None
+    # ... but a decode-phase CATCH-UP row (q > width, the hidden-gap case) stays
+    # full-prefix even though its phase is decode.
+    assert draft._windowed_read_kv(
+        full, sl, [1, 4], [db0, db1], decode=[True, True]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -211,10 +275,10 @@ def test_mixed_batch_short_row_keeps_its_own_kv_and_prefill_bypasses():
 # ACCEPT (the common case) -> q = 2 at spec_depth=1; reject -> q = 1. The #668
 # guard ``any(q != 1 for q in sq)`` therefore returned None on almost every real
 # tick, so the window never engaged on device and the W sweep was bit-identical.
-# The correct discriminator is a verify TAIL (sq <= draft.width) vs a prefill
-# CHUNK (sq > draft.width): tail rows window their history exactly like the
-# single-query case, with uniform renumbering preserving the multi-query causal
-# mask. These gates are RED on the sq==1-only implementation.
+# The fix windows DECODE rows per row regardless of q (the verify tail reads the
+# same trailing history; uniform renumbering preserves the multi-query causal
+# mask), and bails the whole batch only when a row is still PREFILLING (signalled
+# per row via decode=False, not by sq — a verify tail can itself carry q>1).
 # ---------------------------------------------------------------------------
 
 
@@ -306,30 +370,46 @@ def test_per_row_floor_never_splits_across_page_boundary():
     assert int(view.seq_len[0]) == 101 - first * BLOCK_TOKENS
 
 
-def test_window_shorter_than_tail_span_bypasses_whole_batch():
-    """If the trailing window would start AFTER a row's oldest tail query (window
-    shorter than the verify span), that row cannot be windowed without dropping
-    the query's own context, and it does not fit the fixed wp+1 table -> the whole
-    batch falls back to None rather than silently truncating causal context."""
+def test_window_shorter_than_tail_span_keeps_that_row_full():
+    """If the trailing window would start AFTER a decode row's oldest tail query
+    (window shorter than the verify span), that row is kept FULL rather than
+    dropping its queries' own causal context (its floor is clamped to 0), so the
+    whole single-row batch reads unwindowed. Not reachable at the production W
+    (hundreds of tokens vs a handful of tail queries), but it is the correctness
+    rule."""
     draft = _bare_draft()
     draft.width = 16
-    db = [100 + i for i in range(13)]         # hi=200 seq 201
+    db = [100 + i for i in range(13)]         # length=201
     sl, sq = [201], [16]                       # long tail, lo=185
     full = _full_view(draft, [db], sl, sq)
     draft.attn_window_tokens = 4              # window < tail span
+    # floor would be (201-4)//16=12 -> 192 > lo 185, so it is clamped to 0 and no
+    # page truncates -> None (full descriptor).
     assert draft._windowed_read_kv(full, sl, sq, [db]) is None
 
 
-def test_prefill_chunk_still_bypasses_with_verify_tail_present():
-    """A prefill CHUNK row (sq > draft.width) in the batch keeps the pre-#668
-    whole-batch bypass even when another row is a windowable verify tail."""
+def test_prefill_or_catchup_row_bypasses_with_verify_tail_present():
+    """A row outside the verify-tail shape in the batch keeps the conservative
+    whole-batch bypass even when another row is a windowable verify tail. Both
+    exclusions are covered: a still-PREFILLING row (decode=False) and a
+    decode-phase CATCH-UP row (q > width)."""
     draft = _bare_draft()                        # width=2
     db0 = [200 + i for i in range(8)]
     db1 = [300 + i for i in range(8)]
-    sl, sq = [121, 121], [2, 8]                  # row1 is a prefill chunk (8>width)
+    sl, sq = [121, 121], [2, 8]
     full = _full_view(draft, [db0, db1], sl, sq)
     draft.attn_window_tokens = 32
-    assert draft._windowed_read_kv(full, sl, sq, [db0, db1]) is None
+    # row1 still prefilling
+    assert draft._windowed_read_kv(
+        full, sl, sq, [db0, db1], decode=[True, False]) is None
+    assert draft.read_window_stats() is None
+    # row1 phase=decode but CATCHING UP (q=8 > width=2): also full prefix
+    assert draft._windowed_read_kv(
+        full, sl, sq, [db0, db1], decode=[True, True]) is None
+    # control: make row1 a real verify tail (width>=8, q=8) and it windows
+    draft.width = 8
+    assert draft._windowed_read_kv(
+        full, sl, sq, [db0, db1], decode=[True, True]) is not None
 
 
 def test_read_window_stats_observable_when_engaged():
