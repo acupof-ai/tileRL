@@ -549,6 +549,11 @@ class SparseRuntime:
                         (sp.states[r.state_slot].clone(),
                          sp.window_snapshot(r.state_slot)),
                         boundary_h)
+                if getattr(sf, "device_select", False) and sf.device.type == "cuda":
+                    # Captured tick: skip the device→host pin readback here;
+                    # evict_victim prunes on promotion and the eager refresh tick
+                    # reconciles the pin set and publishes drops.
+                    continue
                 kept = sf.selected_pages(bi)
                 dropped = [p for p in live if p not in kept]
                 for p in dropped:

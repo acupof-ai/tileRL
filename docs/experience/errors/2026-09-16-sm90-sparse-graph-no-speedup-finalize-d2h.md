@@ -1,7 +1,13 @@
 # sm90 sparse graph capture gives no speedup — out-of-graph finalize reads selected pages back to host every tick — 2026-09-16
 
-**Status:** open — diagnosed, fix not started. The fix (device-resident pin/evict
-page table; no host readback in finalize) is queued for fixkv after #667.
+**Status:** fixed (stacked on the diagnostic PR #674) — captured CUDA decode
+ticks no longer reconcile the host pin set; they skip the
+`selected_pages().tolist()` readback in `finalize`, residency self-prunes via
+`evict_victim`, and the 1-in-8 eager refresh tick reconciles and publishes.
+32k: −17.6% ms/forward, D2H −94%, stream sync −67%. See the win
+[2026-09-16-defer-sparse-pin-readback-off-captured-ticks.md](../wins/2026-09-16-defer-sparse-pin-readback-off-captured-ticks.md).
+The residual out-of-graph verify/sample/draft stall stays open as a separate
+lever. Full device-resident page tables were not needed for this gain.
 **Arch:** H20 sm90, 27B NVFP4, sparse-k 128 / sparse-min-tokens 8192, draft depth 1.
 **Discovered:** perf investigation of the V100 sparse-decode slowdown (6-9 tok/s,
 GPU util 21-37%) carried to sm90 to test whether CUDA graph capture removes the
