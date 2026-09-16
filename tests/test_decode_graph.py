@@ -34,8 +34,9 @@ from tilerl.spec import DraftHead
 def _draft(cfg, trunk):
     seed = 21
     dcfg = replace(cfg, num_layers=1, full_attn_layers=(0,), fp4=False)
-    params = {k: v for k, v in build_random(dcfg, seed=seed).params.items()
-              if k.startswith("layers.")}
+    params = {
+        k: v for k, v in build_random(dcfg, seed=seed).params.items() if k.startswith("layers.")
+    }
     gen = torch.Generator().manual_seed(seed)
     h = cfg.hidden_size
     params["fc"] = (torch.randn(h, 2 * h, generator=gen) * 0.02).to(torch.bfloat16)
@@ -57,8 +58,15 @@ def test_decode_graph_matches_eager(spec):
     def engine(decode_graph):
         model = build_random(cfg, seed=7)
         return build_engine(
-            cfg, model, backend, num_blocks=8, num_slots=2, decode_graph=decode_graph,
-            draft=_draft(cfg, model) if spec else None, spec_depth=1, sparse_k=0,
+            cfg,
+            model,
+            backend,
+            num_blocks=8,
+            num_slots=2,
+            decode_graph=decode_graph,
+            draft=_draft(cfg, model) if spec else None,
+            spec_depth=1,
+            sparse_k=0,
         )
 
     eager, captured = engine(False), engine(True)
@@ -75,20 +83,31 @@ def test_decode_graph_matches_eager(spec):
             # the verify width require the wide one, not just the W=1 fallback.
             widths = {w for _, w in captured._decode_graphs}
             assert captured._decode_graph_on and widths, "decode graph capture fell back to eager"
-            assert captured.stats()["decode_graph"], "stats() must report the runtime state /health reads"
+            assert captured.stats()["decode_graph"], (
+                "stats() must report the runtime state /health reads"
+            )
             assert not spec or max(widths) > 1, f"no verify-width graph captured: {widths}"
             return
     raise AssertionError("requests did not finish")
 
 
-@pytest.mark.skipif(torch.cuda.is_available(), reason="CPU is the target where capture always fails")
+@pytest.mark.skipif(
+    torch.cuda.is_available(), reason="CPU is the target where capture always fails"
+)
 def test_stats_reports_the_eager_fallback_after_a_capture_failure():
     """A failed capture must flip stats()["decode_graph"] to False: /health reads
     stats(), and a silent eager fallback cost 6x wall before anyone saw it
     (errors/2026-09-09-graph-capture-fell-back-silently.md)."""
     cfg, backend = tiny(), get_backend()
-    engine = build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=8,
-                          num_slots=1, decode_graph=True, sparse_k=0)
+    engine = build_engine(
+        cfg,
+        build_random(cfg, seed=7),
+        backend,
+        num_blocks=8,
+        num_slots=1,
+        decode_graph=True,
+        sparse_k=0,
+    )
     engine.submit([1, 2, 3], SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # the warn is the loud part; keep the test run quiet
@@ -110,8 +129,16 @@ def test_the_graphs_padding_row_is_not_taken_from_the_callers_capacity():
     n = 3
 
     def engine(decode_graph):
-        return build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=16,
-                            num_slots=n, max_batch=n, decode_graph=decode_graph, sparse_k=0)
+        return build_engine(
+            cfg,
+            build_random(cfg, seed=7),
+            backend,
+            num_blocks=16,
+            num_slots=n,
+            max_batch=n,
+            decode_graph=decode_graph,
+            sparse_k=0,
+        )
 
     on, off = engine(True), engine(False)
     # The pad row is engine overhead: the pool grows by it, the reported capacity does not.
@@ -122,8 +149,9 @@ def test_the_graphs_padding_row_is_not_taken_from_the_callers_capacity():
     assert off._states.num_slots == n and off._kv.num_blocks == 16
     assert off._graph_capture.pad_slot is None and off.stats()["slots_total"] == n
 
-    prompt = torch.randint(0, cfg.vocab_size, (8,),
-                           generator=torch.Generator().manual_seed(5)).tolist()
+    prompt = torch.randint(
+        0, cfg.vocab_size, (8,), generator=torch.Generator().manual_seed(5)
+    ).tolist()
     params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=0)
     ids = [on.submit(prompt, params) for _ in range(n)]  # the N-th used to raise
     on.step()  # slots are taken at admission now, not in submit
@@ -156,16 +184,25 @@ def test_submitting_past_usable_slots_queues_rather_than_raising(decode_graph):
     """
     cfg, backend = tiny(), get_backend()
     usable, over = 4, 8
-    prompt = torch.randint(0, cfg.vocab_size, (8,),
-                           generator=torch.Generator().manual_seed(5)).tolist()
+    prompt = torch.randint(
+        0, cfg.vocab_size, (8,), generator=torch.Generator().manual_seed(5)
+    ).tolist()
     params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=0)
 
     def run(num_slots):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            e = build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=64,
-                             num_slots=num_slots, max_batch=over,
-                             max_total_tokens=1024, decode_graph=decode_graph, sparse_k=0)
+            e = build_engine(
+                cfg,
+                build_random(cfg, seed=7),
+                backend,
+                num_blocks=64,
+                num_slots=num_slots,
+                max_batch=over,
+                max_total_tokens=1024,
+                decode_graph=decode_graph,
+                sparse_k=0,
+            )
         # The pad row is the engine's, so the pool grows by it and usable does not:
         # num_slots >= max_batch is exact through build_engine on either arm.
         assert e._states.num_slots == num_slots + decode_graph
@@ -216,17 +253,26 @@ def test_the_kv_guard_measures_usable_capacity_not_the_pool():
     nb = 16  # 16 blocks x BLOCK_TOKENS 16 = 256 tokens usable, 272 gross
 
     def engine(decode_graph):
-        return build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=nb,
-                            num_slots=2, max_batch=2, max_total_tokens=512,
-                            decode_graph=decode_graph, sparse_k=0)
+        return build_engine(
+            cfg,
+            build_random(cfg, seed=7),
+            backend,
+            num_blocks=nb,
+            num_slots=2,
+            max_batch=2,
+            max_total_tokens=512,
+            decode_graph=decode_graph,
+            sparse_k=0,
+        )
 
     on, off = engine(True), engine(False)
     assert on.usable_blocks == nb and on._kv.num_blocks == nb + 1
     assert off.usable_blocks == nb and off._kv.num_blocks == nb
 
     # 260 + spec_depth needs 17 blocks: over the 16 usable, inside the 17 gross.
-    big = torch.randint(0, cfg.vocab_size, (260,),
-                        generator=torch.Generator().manual_seed(2)).tolist()
+    big = torch.randint(
+        0, cfg.vocab_size, (260,), generator=torch.Generator().manual_seed(2)
+    ).tolist()
     params = SamplingParams(temperature=0.0, max_new_tokens=1, seed=0)
     for eng in (on, off):  # graph off is the control: same rejection, no pad row
         with pytest.raises(ValueError, match="exceeds KV pool capacity"):
@@ -265,8 +311,15 @@ def test_the_block_fit_prices_a_block_at_what_the_pools_actually_allocate(monkey
     backend = SimpleNamespace(device=torch.device("cuda"), io=io)
 
     def pool_bytes_per_block(layers, layer_map):
-        p = PagedKvPool(8, cfg.num_kv_heads, cfg.head_dim, num_layers=layers,
-                        device="cpu", dtype=io, layer_map=layer_map)
+        p = PagedKvPool(
+            8,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            num_layers=layers,
+            device="cpu",
+            dtype=io,
+            layer_map=layer_map,
+        )
         return (p.k_pool.numel() + p.v_pool.numel()) * p.k_pool.element_size() / 8
 
     trunk = pool_bytes_per_block(len(cfg.full_attn_layers), cfg.full_attn_layers)
@@ -280,7 +333,8 @@ def test_the_block_fit_prices_a_block_at_what_the_pools_actually_allocate(monkey
         assert 0.999 <= spent / budget <= 1.0, (
             f"draft_layers={draft_layers}: {blocks} blocks x {real:.0f} real B "
             f"= {spent / 2**30:.4f} GiB against a {budget / 2**30:.4f} GiB budget "
-            f"({spent / budget:.4f}x) -- the fit is pricing a block wrong")
+            f"({spent / budget:.4f}x) -- the fit is pricing a block wrong"
+        )
 
 
 def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
@@ -320,8 +374,17 @@ def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
     # patch goes on engine and is seen through that call.
     monkeypatch.setattr(eng_mod, "_quantize_draft", spy_quant)
     cfg = tiny()
-    e = build_engine(cfg, build_random(cfg, seed=7), get_backend(), num_blocks=0,
-                     num_slots=2, max_batch=2, max_total_tokens=512, max_blocks=16, sparse_k=0)
+    e = build_engine(
+        cfg,
+        build_random(cfg, seed=7),
+        get_backend(),
+        num_blocks=0,
+        num_slots=2,
+        max_batch=2,
+        max_total_tokens=512,
+        max_blocks=16,
+        sparse_k=0,
+    )
     assert seen == ["state", "fit"], f"the KV fit ran before the state pool: {seen}"
     assert e.usable_blocks == 16, f"max_blocks must cap the fit, got {e.usable_blocks}"
 
@@ -334,11 +397,22 @@ def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
     # reclaim between them is what turns the fit into a measurement.
     seen.clear()
     trunk = build_random(cfg, seed=7)
-    build_engine(cfg, trunk, get_backend(), num_blocks=0, num_slots=3, max_batch=2,
-                 max_total_tokens=512, max_blocks=16, sparse_k=0,
-                 draft=_draft(cfg, trunk), spec_depth=3)
+    build_engine(
+        cfg,
+        trunk,
+        get_backend(),
+        num_blocks=0,
+        num_slots=3,
+        max_batch=2,
+        max_total_tokens=512,
+        max_blocks=16,
+        sparse_k=0,
+        draft=_draft(cfg, trunk),
+        spec_depth=3,
+    )
     assert seen[:3] == ["draft", "state", "fit"], (
-        f"the draft's weights must be served before the state pool and the fit: {seen}")
+        f"the draft's weights must be served before the state pool and the fit: {seen}"
+    )
     # Engine.__init__ still calls it, for a caller who builds an Engine directly with an
     # unquantized draft. That call is a no-op on already-packed params (_quantize_draft
     # returns its input when it sees a .wq/.w8 key), which is why it may follow the fit.
@@ -358,8 +432,16 @@ def test_a_tick_with_no_pad_row_runs_eager_instead_of_capturing_mid_request():
     capture. `_graph_for` is spied so the assertion is the call itself.
     """
     cfg, backend = tiny(), get_backend()
-    e = build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=16,
-                     num_slots=4, max_batch=4, decode_graph=True, sparse_k=0)
+    e = build_engine(
+        cfg,
+        build_random(cfg, seed=7),
+        backend,
+        num_blocks=16,
+        num_slots=4,
+        max_batch=4,
+        decode_graph=True,
+        sparse_k=0,
+    )
     asked: list[tuple[int, int]] = []
     e._graph_for = lambda B, W, keep: asked.append((B, W))  # None => caller runs eager
 
@@ -395,9 +477,16 @@ def test_graph_keys_covers_what_a_decode_tick_keys_on():
     backend = get_backend()
     cfg = tiny()
     for max_batch in (1, 2, 4, 8):
-        e = build_engine(cfg, build_random(cfg, seed=21), backend, num_blocks=16,
-                         num_slots=max_batch + 1, max_batch=max_batch,
-                         max_total_tokens=256, sparse_k=0)
+        e = build_engine(
+            cfg,
+            build_random(cfg, seed=21),
+            backend,
+            num_blocks=16,
+            num_slots=max_batch + 1,
+            max_batch=max_batch,
+            max_total_tokens=256,
+            sparse_k=0,
+        )
         keys = e.graph_keys()
         for rows in range(1, max_batch + 1):
             assert (e._graph_bucket(rows), 1) in keys, (
@@ -411,8 +500,18 @@ def test_graph_keys_covers_what_a_decode_tick_keys_on():
     # `precapture` died with AttributeError on the FIRST drafted run — every case
     # above builds a dense engine and takes the `(1,)` path.
     trunk = build_random(cfg, seed=21)
-    e = build_engine(cfg, trunk, backend, num_blocks=16, num_slots=3, max_batch=2,
-                     max_total_tokens=256, draft=_draft(cfg, trunk), spec_depth=3, sparse_k=0)
+    e = build_engine(
+        cfg,
+        trunk,
+        backend,
+        num_blocks=16,
+        num_slots=3,
+        max_batch=2,
+        max_total_tokens=256,
+        draft=_draft(cfg, trunk),
+        spec_depth=3,
+        sparse_k=0,
+    )
     keys = e.graph_keys()
     for w in range(1, e._width + 1):
         assert (e._graph_bucket(1), w) in keys, (
@@ -440,8 +539,18 @@ def test_the_engines_verify_width_is_reachable_from_outside():
     backend, cfg = get_backend(), tiny()
     trunk = build_random(cfg, seed=21)
     head = _draft(cfg, trunk)
-    e = build_engine(cfg, trunk, backend, num_blocks=16, num_slots=3, max_batch=2,
-                     max_total_tokens=256, draft=head, spec_depth=3, sparse_k=0)
+    e = build_engine(
+        cfg,
+        trunk,
+        backend,
+        num_blocks=16,
+        num_slots=3,
+        max_batch=2,
+        max_total_tokens=256,
+        draft=head,
+        spec_depth=3,
+        sparse_k=0,
+    )
     assert e._width == 4, f"spec_depth=3 must build width 4, got {e._width}"
     for depth in (2, 1, 3):
         head.set_depth(depth)
@@ -450,8 +559,7 @@ def test_the_engines_verify_width_is_reachable_from_outside():
         assert e._width == depth + 1
         # The width has to reach what a tick keys on, or the move is cosmetic.
         assert max(k[1] for k in e.graph_keys()) == depth + 1, (
-            f"depth {depth} did not reach graph_keys: "
-            f"{sorted({k[1] for k in e.graph_keys()})}"
+            f"depth {depth} did not reach graph_keys: {sorted({k[1] for k in e.graph_keys()})}"
         )
     # And the attribute the broken script wrote is still not one the engine reads,
     # so a harness that regresses to it fails here rather than on the pod.
@@ -478,8 +586,6 @@ def test_the_sweeps_launch_buckets_match_each_arch():
         runpy.run_path("scripts/ab_draft_depth.py", run_name="__main__")
     finally:
         _sys.argv = ["pytest"]
-
-
 
 
 def test_invalidate_refills_the_cached_casts_a_replay_would_read_stale():
@@ -549,9 +655,19 @@ def test_a_live_drafted_tick_keys_on_a_width_precapture_built():
     """
     cfg, backend = tiny(), get_backend()
     trunk = build_random(cfg, seed=21)
-    e = build_engine(cfg, trunk, backend, num_blocks=32, num_slots=3, max_batch=2,
-                     max_total_tokens=256, draft=_draft(cfg, trunk), spec_depth=3,
-                     decode_graph=True, sparse_k=0)
+    e = build_engine(
+        cfg,
+        trunk,
+        backend,
+        num_blocks=32,
+        num_slots=3,
+        max_batch=2,
+        max_total_tokens=256,
+        draft=_draft(cfg, trunk),
+        spec_depth=3,
+        decode_graph=True,
+        sparse_k=0,
+    )
     keys = e.graph_keys()
     asked: list[tuple[int, int]] = []
     real = e._graph_for
@@ -612,6 +728,7 @@ def test_graph_auto_off_on_sm70_before_capture_can_poison_the_allocator():
 
 def test_serve_decode_graph_flag_plumbs_to_engine_on_sm70(monkeypatch):
     import inspect
+
     """serve --decode-graph must reach build_engine as decode_graph=True and
     flip _graph_on on a cuda-shaped sm70 backend; omitted stays None (auto,
     which the sm70 exclusion disables). Red without the cmd_serve plumb:
@@ -626,7 +743,9 @@ def test_serve_decode_graph_flag_plumbs_to_engine_on_sm70(monkeypatch):
 
     def _stub_build_engine(cfg, model, backend, **kw):
         seen.update(kw)
-        return SimpleNamespace(_decode_graph_on=engine_mod._graph_on(backend, kw.get("decode_graph")))
+        return SimpleNamespace(
+            _decode_graph_on=engine_mod._graph_on(backend, kw.get("decode_graph"))
+        )
 
     monkeypatch.setattr(build_mod, "build_engine", _stub_build_engine)
     sm70 = SimpleNamespace(device=torch.device("cuda"), arch="sm70")
@@ -635,9 +754,47 @@ def test_serve_decode_graph_flag_plumbs_to_engine_on_sm70(monkeypatch):
     args_on = parser.parse_args(["serve", "--model", "tiny", "--decode-graph"])
     cfg = SimpleNamespace(max_position_embeddings=512)
     build_mod.build_serving_engine(
-        cfg, None, sm70, decode_graph=getattr(args_on, "decode_graph", None))
+        cfg, None, sm70, decode_graph=getattr(args_on, "decode_graph", None)
+    )
     assert seen["decode_graph"] is True
 
     args_off = parser.parse_args(["serve", "--model", "tiny"])
     assert getattr(args_off, "decode_graph", None) is None
     assert "decode_graph=getattr(args" in inspect.getsource(cli.cmd_serve)
+
+
+def test_sparse_decode_staging_fill_is_byte_equal_on_cpu():
+    """D-0: SparseDecodeGraph per-tick host staging fill is pure host indexing,
+    verified without a card. ids/pos/scalars match each row's chain/geometry and
+    pad rows past the live batch take the pad slot/block; this is exactly what
+    gets one non_blocking copy_ into the static device buffers on CUDA."""
+    from types import SimpleNamespace
+
+    from tilerl.decode_graph import SparseDecodeGraph
+
+    B, W = 3, 1
+    ids_h = torch.zeros(B, W, dtype=torch.long)
+    pos_h = torch.zeros(B, W, dtype=torch.long)
+    sl_h = torch.zeros(B, dtype=torch.long)
+    slots_h = torch.zeros(B, dtype=torch.long)
+    sql_h = torch.full((B,), W, dtype=torch.long)
+    own_table = torch.zeros(B, 1, dtype=torch.long)
+
+    # two live rows: a plain W=1 decode row and a verify-width W=1 here; the
+    # third bucket row is the pad.
+    r0 = SimpleNamespace(output=[42], seq_len=100, state_slot=7)
+    r1 = SimpleNamespace(output=[99, 7], seq_len=200, state_slot=8)
+    srows = [{"req": r0}, {"req": r1}]
+    chains = [(42,), (99,)]
+    sf = SimpleNamespace(own_table=own_table)
+
+    SparseDecodeGraph.fill_staging(
+        srows, chains, W, ids_h, pos_h, sl_h, slots_h, sql_h, sf, pad=(3, 55)
+    )
+
+    assert ids_h[:, 0].tolist() == [42, 99, 0]
+    assert pos_h[:, 0].tolist() == [99, 199, 0]  # seq_len-1, pad 0
+    assert sl_h.tolist() == [100, 200, W]
+    assert slots_h.tolist() == [7, 8, 3]
+    assert sql_h.tolist() == [1, 1, W]
+    assert own_table[2, 0].item() == 55  # pad block stamped for the sf table
