@@ -1,0 +1,8 @@
+{"_source": "crashed full-table stdout, JSON never written",
+ "_note": "9k rows from the earlier full-table run (probe revision before 535bea76); that run hit the corpus-size SystemExit on the 16k length BEFORE the JSON flush, so no JSON was written and these five rows were recovered from the captured stdout table (V100 /tmp/w_fulltable.log, 'context=9216' section). Aggregate numbers are complete and proof=ok, but these rows lack the shapes_sample truncation field that later probe versions emit. n=30.",
+ "rows":
+[{"W":0,"length":9216,"cold_fill_s_med":29.103,"draft_ms_med":33.68,"accept_rate":0.757,"accept_len":1.751,"tok_s_med":9.00,"draft_ms_ratio_vs_W0":1.0,"tok_s_ratio_vs_W0":1.0,"proof":"ok","n_prompts":30},
+{"W":1024,"length":9216,"cold_fill_s_med":29.108,"draft_ms_med":9.20,"accept_rate":0.721,"accept_len":1.713,"tok_s_med":9.93,"draft_ms_ratio_vs_W0":0.273,"tok_s_ratio_vs_W0":1.104,"proof":"ok","n_prompts":30},
+{"W":2048,"length":9216,"cold_fill_s_med":29.108,"draft_ms_med":11.20,"accept_rate":0.743,"accept_len":1.737,"tok_s_med":10.01,"draft_ms_ratio_vs_W0":0.332,"tok_s_ratio_vs_W0":1.112,"proof":"ok","n_prompts":30},
+{"W":4096,"length":9216,"cold_fill_s_med":29.115,"draft_ms_med":15.45,"accept_rate":0.743,"accept_len":1.735,"tok_s_med":9.74,"draft_ms_ratio_vs_W0":0.459,"tok_s_ratio_vs_W0":1.082,"proof":"ok","n_prompts":30},
+{"W":8192,"length":9216,"cold_fill_s_med":29.120,"draft_ms_med":30.00,"accept_rate":0.746,"accept_len":1.736,"tok_s_med":9.24,"draft_ms_ratio_vs_W0":0.891,"tok_s_ratio_vs_W0":1.026,"proof":"ok","n_prompts":30}]}

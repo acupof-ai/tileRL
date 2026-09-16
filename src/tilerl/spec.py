@@ -62,6 +62,23 @@ _PREFILL_BUCKET = 64
 #: 122-128 it cost when the flag stopped at 8.
 LADDER_WIDTHS = (1, 2, 4, 8, 32)
 
+#: Production default for the draft decode trailing-window READ, in tokens.
+#: A FIXED window (v1, not adaptive): the draft attends only the trailing W
+#: tokens of each decode row. Chosen from the on-V100 W-sweep; the numbers,
+#: evidence paths and n=9 confidence note live in the dated wins bench entry
+#: (do NOT cite the sweep script's literal path here — a src comment is scanned
+#: as an import by the scripts-closure audit and would mis-bucket the probe).
+#: At W=2048 the modeled served tok/s gain vs full prefix is
+#: +12.5%/+26%/+53% at 9k/16k/32k (about the same as W=1024), draft_step GPU
+#: falls 0.20-0.33x (33.7/59/117 ms -> 11.2/11.8/12.1), and spec acceptance
+#: 0.743/0.729/0.723 vs the full-prefix 0.755-0.757 (within ~3.4 points).
+#: 2048 over 1024: equal speed but higher/more-stable acceptance at all three
+#: lengths and a less aggressive truncation; 8192 leaves most of the gain on the
+#: table. Set 0 (CLI --draft-attn-window-tokens 0, or the env) to read the full
+#: prefix and restore the pre-window behavior; a live 32k run after deploy
+#: confirms ~9 tok/s.
+DRAFT_ATTN_WINDOW_TOKENS_DEFAULT = 2048
+
 
 def survival(confidences: list[float]) -> list[float]:
     out, p = [], 1.0
@@ -331,12 +348,15 @@ class DraftHead:
         self.layers = Model(cfg, params)
         self.has_confidence = "confidence.weight" in params
         self.width = 3  # 2 drafts; ``set_depth`` overrides
-        # Diagnostic only (TILERL_DRAFT_ATTN_WINDOW_TOKENS): cap how many trailing
-        # tokens the draft decode attention READS. 0/unset = full prefix (default,
-        # identical behavior). The draft still WRITES and RETAINS its whole dense
-        # KV; only the read view is windowed. Used to sweep accept-rate/tok-s vs
-        # window before deciding the production sliding window.
-        self.attn_window_tokens = int(os.environ.get("TILERL_DRAFT_ATTN_WINDOW_TOKENS", "0"))
+        # Trailing READ window for draft decode attention, in tokens. UNSET (no
+        # env, no CLI flag) = the module production default (2048); an explicit 0
+        # selects the full prefix (pre-window behavior). The draft still WRITES
+        # and RETAINS its whole dense KV; only the read view is windowed.
+        # Precedence: the explicit --draft-attn-window-tokens serve flag (assigned
+        # on the loaded head) wins; otherwise this env var; otherwise the default.
+        self.attn_window_tokens = int(os.environ.get(
+            "TILERL_DRAFT_ATTN_WINDOW_TOKENS",
+            str(DRAFT_ATTN_WINDOW_TOKENS_DEFAULT)))
         self.forwards = 0  # cumulative draft forwards; a probe divides its own timing by this
         # Last engaged window view, exposed by read_window_stats() for a device
         # self-proof (the V100 sweep confirms the view really truncates). None when

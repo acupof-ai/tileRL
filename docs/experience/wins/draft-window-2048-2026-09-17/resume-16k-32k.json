@@ -1,0 +1,10 @@
+[{"W":0,"length":16384,"cold_fill_s_med":56.85,"draft_ms_med":58.99,"accept_rate":0.7555,"accept_len":1.744,"tok_s_med":7.91,"proof":"ok","n_prompts":18,"draft_ms_ratio_vs_W0":1.0,"tok_s_ratio_vs_W0":1.0},
+{"W":1024,"length":16384,"cold_fill_s_med":56.84,"draft_ms_med":9.63,"accept_rate":0.7171,"accept_len":1.707,"tok_s_med":9.21,"proof":"ok","n_prompts":18,"draft_ms_ratio_vs_W0":0.163,"tok_s_ratio_vs_W0":1.165},
+{"W":2048,"length":16384,"cold_fill_s_med":56.85,"draft_ms_med":11.85,"accept_rate":0.7290,"accept_len":1.721,"tok_s_med":9.26,"proof":"ok","n_prompts":18,"draft_ms_ratio_vs_W0":0.201,"tok_s_ratio_vs_W0":1.171},
+{"W":4096,"length":16384,"cold_fill_s_med":56.86,"draft_ms_med":16.61,"accept_rate":0.7490,"accept_len":1.740,"tok_s_med":9.37,"proof":"ok","n_prompts":18,"draft_ms_ratio_vs_W0":0.282,"tok_s_ratio_vs_W0":1.185},
+{"W":8192,"length":16384,"cold_fill_s_med":56.83,"draft_ms_med":30.02,"accept_rate":0.7490,"accept_len":1.740,"tok_s_med":8.76,"proof":"ok","n_prompts":18,"draft_ms_ratio_vs_W0":0.509,"tok_s_ratio_vs_W0":1.108},
+{"W":0,"length":32768,"cold_fill_s_med":160.04,"draft_ms_med":117.41,"accept_rate":0.7537,"accept_len":1.746,"tok_s_med":6.36,"proof":"ok","n_prompts":9,"draft_ms_ratio_vs_W0":1.0,"tok_s_ratio_vs_W0":1.0},
+{"W":1024,"length":32768,"cold_fill_s_med":153.97,"draft_ms_med":9.82,"accept_rate":0.6992,"accept_len":1.691,"tok_s_med":4.71,"proof":"ok","n_prompts":9,"draft_ms_ratio_vs_W0":0.0836,"tok_s_ratio_vs_W0":0.741},
+{"W":2048,"length":32768,"cold_fill_s_med":153.59,"draft_ms_med":12.09,"accept_rate":0.7228,"accept_len":1.715,"tok_s_med":4.65,"proof":"ok","n_prompts":9,"draft_ms_ratio_vs_W0":0.103,"tok_s_ratio_vs_W0":0.731},
+{"W":4096,"length":32768,"cold_fill_s_med":160.85,"draft_ms_med":16.73,"accept_rate":0.7343,"accept_len":1.726,"tok_s_med":8.41,"proof":"ok","n_prompts":9,"draft_ms_ratio_vs_W0":0.142,"tok_s_ratio_vs_W0":1.323},
+{"W":8192,"length":32768,"cold_fill_s_med":153.54,"draft_ms_med":30.46,"accept_rate":0.7248,"accept_len":1.717,"tok_s_med":4.48,"proof":"ok","n_prompts":9,"draft_ms_ratio_vs_W0":0.259,"tok_s_ratio_vs_W0":0.705}]
