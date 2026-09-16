@@ -130,3 +130,7 @@ A captured graph that replays the forward does not make the tick graph-bound.
 Profile the GPU timeline before crediting capture: here the wall timer put the
 stall inside `model` and stopped, but the kernels only filled 12% of it — the
 rest was a post-replay `.tolist()` readback the wall bracket could not see.
+
+CI note: GitHub Actions dropped the pull_request events for two prior commits
+on this branch (no ci workflow run was created, only the security check suite),
+recorded while retriggering checks for review.
