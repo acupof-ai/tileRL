@@ -43,13 +43,15 @@ SCORE_ATOL = 1e-3
 _THREADS = 128
 
 
-def _case(*, p=64, hkv=8, blk=16, d=128, tq=1):
+def _case(device, *, p=64, hkv=8, blk=16, d=128, tq=1):
     """K spans a wide per-token magnitude range so kmin != kmax and scores are
-    large/nondegenerate (D=128 = the 27B linear_key_head_dim)."""
+    large/nondegenerate (D=128 = the 27B linear_key_head_dim). All tensors are
+    created on `device` so the same case runs on the CPU C target and a GPU."""
     torch.manual_seed(0)
-    k = torch.randn(p, hkv, blk, d, dtype=torch.float32)
-    k = k * torch.logspace(-1, 1, blk, dtype=torch.float32).view(1, 1, blk, 1)
-    q = torch.randn(tq, hkv, d, dtype=torch.float32)
+    k = torch.randn(p, hkv, blk, d, dtype=torch.float32, device=device)
+    k = k * torch.logspace(-1, 1, blk, dtype=torch.float32,
+                           device=device).view(1, 1, blk, 1)
+    q = torch.randn(tq, hkv, d, dtype=torch.float32, device=device)
     return k, q
 
 
@@ -63,7 +65,7 @@ def _kernels(device):
 
 
 def test_page_bounds_is_bit_exact_to_reference():
-    k, _ = _case()
+    k, _ = _case(torch.device("cpu"))
     got, _ = _kernels(k.device)
     got = got(k)
     want = page_bounds(k)
@@ -76,7 +78,7 @@ def test_page_bounds_is_bit_exact_to_reference():
 
 
 def test_page_bound_scores_matches_reference_within_reduction_order():
-    k, q = _case()
+    k, q = _case(torch.device("cpu"))
     kb, ks = _kernels(k.device)
     bounds = kb(k)
     got, want = ks(q, bounds), page_bound_scores(q, bounds)
@@ -94,7 +96,7 @@ def test_score_band_rejects_structural_mistakes(mistake):
     reduction-order noise. half_dim drops half the head dim; kmin_only scores
     q*kmin without the max(q*kmin, q*kmax). Both are legal f32 sums, so the
     test proves the band discriminates structure, not dtype noise."""
-    k, q = _case()
+    k, q = _case(torch.device("cpu"))
     d = k.shape[-1]
     kmin, kmax = page_bounds(k).unbind(dim=2)  # [p,h,d]
     q0 = q.unsqueeze(0)  # [1,tq,h,d]
@@ -124,12 +126,15 @@ def test_sm90_backend_dispatches_the_kernel_not_the_reference():
     be = get_backend()
     assert "page_bounds" in _resolve(be.precision, be.arch)
     assert "page_bound_scores" in _resolve(be.precision, be.arch)
-    k, q = _case()
+    k, q = _case(be.device)
     bounds = be.page_bounds(k)
     assert bounds.dtype == torch.float32, "sm90 bounds store f32"
+    # measured maxrel is printed so the on-card band can be calibrated as maxRel*10
     scores = be.page_bound_scores(q, bounds)
-    assert torch.allclose(scores, page_bound_scores(q, bounds),
-                          rtol=SCORE_RTOL, atol=SCORE_ATOL)
+    ref = page_bound_scores(q, bounds)
+    rel = ((scores - ref).abs() / ref.abs().clamp_min(1e-6)).max().item()
+    print(f"sm90 page_bound_scores maxrel {rel:.3e} (gate rtol {SCORE_RTOL})")
+    assert torch.allclose(scores, ref, rtol=SCORE_RTOL, atol=SCORE_ATOL)
 
 
 def test_kernel_bounds_rank_pages_the_same_as_reference():
@@ -138,7 +143,7 @@ def test_kernel_bounds_rank_pages_the_same_as_reference():
     The bounds dtype/impl (f32 here; f16 on sm70, widened by the scorer) must
     not change which pages Quest would attend. Compare the top-k index set of
     per-page scores directly, bypassing the layer-batched select_pages."""
-    k, q = _case(p=64)
+    k, q = _case(torch.device("cpu"), p=64)
     p = k.shape[0]
     kb, _ = _kernels(k.device)
     topk = p // 2
