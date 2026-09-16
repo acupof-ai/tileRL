@@ -25,8 +25,12 @@ export const ask = (
   new Promise<CloseKind>((resolve) => {
     let stopped = false
     let terminal = false
+    let opened = false
     const ws = new WebSocket(url)
-    ws.onopen = () => ws.send(JSON.stringify(body))
+    ws.onopen = () => {
+      opened = true
+      ws.send(JSON.stringify(body))
+    }
     ws.onmessage = (e) => {
       const f = parseFrame(typeof e.data === "string" ? e.data : "")
       // A frame we cannot parse is dropped, not fatal: the stream is still live
@@ -38,9 +42,10 @@ export const ask = (
         onFrame(f)
       }
     }
-    ws.onclose = () => resolve(classifyClose(stopped, terminal))
-    // A failed handshake fires onerror then onclose; with no terminal frame that
-    // classifies as "dropped", which is the honest reason too.
+    ws.onclose = () => resolve(classifyClose(stopped, terminal, opened))
+    // A failed handshake (server down or restarting) fires onerror then onclose
+    // with onopen never having run: that is "unreachable", distinct from a
+    // mid-turn drop.
     ws.onerror = () => {}
     // Closing the socket cancels the request server-side.
     onStop?.(() => {
@@ -53,3 +58,38 @@ export const ask = (
  * the bundle carries no host and works behind whatever the pod puts in front. */
 export const socketUrl = (loc: Location, path: string): string =>
   `${loc.protocol === "https:" ? "wss:" : "ws:"}//${loc.host}${path}`
+
+/** Poll /health until it answers 200, backing off across a supervisor restart
+ * (a reload takes tens of seconds). Resolves true when the server is back;
+ * false on timeout; the caller supplies the timers so tests run them
+ * synchronously. An abort function is handed to onStop so Stop ends the wait.
+ */
+export const waitForHealth = async (
+  healthUrl: string,
+  onTick: (attempt: number, delayMs: number) => void,
+  timers: { sleep: (ms: number) => Promise<void>; now: () => number },
+  onStop?: (abort: () => void) => void,
+): Promise<boolean> => {
+  const MAX_MS = 180_000
+  const start = timers.now()
+  let attempt = 0
+  let aborted = false
+  onStop?.(() => {
+    aborted = true
+  })
+  for (;;) {
+    if (aborted) return false
+    attempt += 1
+    // 1,2,4… capped at 16s.
+    const delayMs = Math.min(16_000, 500 * 2 ** (attempt - 1))
+    try {
+      const r = await fetch(healthUrl, { cache: "no-store" })
+      if (r.ok) return true
+    } catch {
+      // connection refused during the reload window
+    }
+    if (timers.now() - start > MAX_MS) return false
+    onTick(attempt, delayMs)
+    await timers.sleep(delayMs)
+  }
+}

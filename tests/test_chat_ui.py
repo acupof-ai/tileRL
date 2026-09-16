@@ -223,11 +223,23 @@ globalThis.location = globalThis.window.location;
 // already assert. A rAF that deferred would put every assertion ahead of the
 // paint it checks.
 globalThis.requestAnimationFrame = (fn) => { fn(); return 0; };
+// Cold-TTFT timer: the interval must exist, but never fire in these gates (the
+// waiting line is cleared the moment a frame is delivered). clearInterval is a
+// no-op.
+globalThis.setInterval = () => 0;
+globalThis.clearInterval = () => {};
 // One socket, driven from the test: the bundle opens it, we replay the captured
 // frames into onmessage, then close. No network, no timing.
 globalThis.SENT = [];
 globalThis.WebSocket = class {
   constructor(url){ globalThis.SOCK = this; this.url = url;
+    if (UNREACHABLE) {
+      // Refused handshake: onerror then onclose, onopen NEVER runs -- the
+      // supervisor restart window. The bundle must classify "unreachable" and
+      // start polling /health, not offer a retry that fails instantly.
+      queueMicrotask(() => { this.onerror && this.onerror(); this.onclose && this.onclose(); });
+      return;
+    }
     queueMicrotask(() => this.onopen && this.onopen()); }
   send(d){ SENT.push(d); queueMicrotask(() => {
     // DROP: replay every frame EXCEPT the terminal one, then close -- a server
@@ -238,6 +250,9 @@ globalThis.WebSocket = class {
   }); }
   close(){}
 };
+// /health answers 200 immediately in these gates, so an unreachable turn settles
+// to the "restored, retry" state without a real wait.
+globalThis.fetch = async () => ({ ok: !UNREACHABLE || HEALTH_OK });
 // The visible text of a subtree, tags included where they carry meaning.
 const _html = (el) => el.tagName === "#TEXT" ? el.nodeValue
   : (el.tagName.startsWith("#") ? "" : `<${el.tagName.toLowerCase()}>`)
@@ -421,7 +436,8 @@ def test_the_websocket_protocol_library_is_installed():
 
 def _page_after(frames: list[str], budget: str = "",
                 scroll_top: int | None = None, stop_after: bool = False,
-                drop: bool = False) -> dict:
+                drop: bool = False, unreachable: bool = False,
+                health_ok: bool = True) -> dict:
     """Run the shipped bundle over `frames`; return what landed in the DOM.
 
     ``budget`` is what the user typed in the budget box; "" is the shipped default
@@ -444,6 +460,8 @@ def _page_after(frames: list[str], budget: str = "",
         + ("const SCROLLTOP = " + json.dumps(scroll_top) + ";\n" if scroll_top is not None else "")
         + "const STOP = " + ("true" if stop_after else "false") + ";\n"
         + "const DROP = " + ("true" if drop else "false") + ";\n"
+        + "const UNREACHABLE = " + ("true" if unreachable else "false") + ";\n"
+        + "const HEALTH_OK = " + ("true" if health_ok else "false") + ";\n"
         + _DOM_STUB
         + "".join(f'IDS["{i}"] = mk("div");\n' for i in ids)
         + "".join(f'IDS["{i}"].checked = true;\n' for i in sorted(checked))
@@ -462,15 +480,19 @@ def _page_after(frames: list[str], budget: str = "",
         const turn = IDS.log.children.at(-1);
         const fold = turn.children.find((c) => c.className === "reasoning");
         const answer = turn.children.find((c) => c.className === "answer");
+        const tools = turn.children.find((c) => c.className === "tools");
+        const waiting = turn.children.find((c) => c.className === "waiting");
         const note = turn.children.find((c) => c.className === "note");
         console.log(JSON.stringify({
           url: SOCK.url,
           scrollTop: IDS.log.scrollTop,
           stopHidden: IDS.stop.hidden,
-          sent: JSON.parse(SENT[0]),
+          sent: SENT[0] ? JSON.parse(SENT[0]) : null,
           reasoning: fold ? _text(fold.children[1]) : null,
           foldOpen: fold ? fold.open : null,
           answer: _html(answer),
+          tools: tools ? _html(tools) : null,
+          waitingVisible: waiting ? !waiting.hidden : null,
           note: note.hidden ? null : _text(note),
           meter: _text(IDS.meter),
           pending: turn.classList.contains("pending"),
@@ -658,6 +680,40 @@ def test_a_close_before_the_terminal_frame_is_a_drop_not_a_stop():
     assert got["note"] and "connection lost" in got["note"], got
     assert "half a reply" in got["answer"], got["answer"]
     assert got["pending"] is False, "the dropped turn stayed pending"
+
+
+def test_a_refused_handshake_polls_health_then_offers_retry():
+    """The supervisor restart window: WS onerror+onclose with onopen never firing.
+
+    That is "unreachable", distinct from a mid-turn drop: nothing was ever sent,
+    so SENT is empty and the page polls /health instead of offering a Retry that
+    would fail the same way. With /health answering 200 the note switches to
+    "connection restored — retry?".
+    """
+    got = _page_after([], unreachable=True, health_ok=True)
+    assert got["sent"] is None, f"the ask was sent on a socket that never opened: {got}"
+    assert got["note"] and "restored" in got["note"], got
+    assert "Retry" in (got["note"] or ""), "retry is manual, never an auto-resend"
+
+
+def test_a_tool_calls_frame_renders_the_call_as_a_collapsed_block():
+    """A model tool request must be visible; the frame used to fail parseFrame and
+    be dropped with only a console.warn."""
+    frames = [
+        json.dumps({"t": "delta", "content": "calling the weather"}),
+        json.dumps({"t": "tool_calls", "tool_calls": [
+            {"id": "call_1_0", "type": "function", "name": "get_weather",
+             "arguments": '{"city":"sf"}'}]}),
+        json.dumps({"t": "done", "finish_reason": "tool_calls",
+                    "tool_calls": [{"id": "call_1_0", "type": "function",
+                                    "name": "get_weather", "arguments": '{"city":"sf"}'}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2}}),
+    ]
+    got = _page_after(frames)
+    assert "get_weather" in (got["tools"] or ""), got["tools"]
+    assert '{"city":"sf"}' in (got["tools"] or ""), got["tools"]
+    assert "calling the weather" in got["answer"], got["answer"]
+    assert got["waitingVisible"] is False, "the waiting line outlived the first frame"
 
 
 def test_the_page_renders_the_frames_this_server_sends():

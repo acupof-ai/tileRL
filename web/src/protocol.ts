@@ -9,16 +9,44 @@ export interface Ask {
   readonly enable_thinking?: boolean
 }
 
+export interface ToolCall {
+  readonly id: string
+  readonly name: string
+  readonly arguments: string
+}
+
 /** `reasoning_content` and `content` are the SSE route's field names (#159). Same
- * names here so a reader of either transport learns one vocabulary. */
+ * names here so a reader of either transport learns one vocabulary.
+ *
+ * `tool_calls` is additive: emitted once before the terminal frame when the
+ * model asked for a tool. */
 export type Frame =
   | { readonly t: "delta"; readonly reasoning_content?: string; readonly content?: string }
-  | { readonly t: "done"; readonly finish_reason: string; readonly usage: Usage }
+  | { readonly t: "tool_calls"; readonly tool_calls: ReadonlyArray<ToolCall> }
+  | {
+      readonly t: "done"
+      readonly finish_reason: string
+      readonly tool_calls?: ReadonlyArray<ToolCall>
+      readonly usage: Usage
+    }
   | { readonly t: "error"; readonly message: string }
 
 export interface Usage {
   readonly prompt_tokens: number
   readonly completion_tokens: number
+}
+
+const asToolCalls = (v: unknown): ReadonlyArray<ToolCall> | null => {
+  if (!Array.isArray(v)) return null
+  const out: ToolCall[] = []
+  for (const item of v) {
+    if (typeof item !== "object" || item === null) return null
+    const o = item as Record<string, unknown>
+    if (typeof o["id"] !== "string" || typeof o["name"] !== "string") return null
+    if (typeof o["arguments"] !== "string") return null
+    out.push({ id: o["id"], name: o["name"], arguments: o["arguments"] })
+  }
+  return out
 }
 
 /** A frame off the socket is untrusted input: it arrives as text and is parsed
@@ -44,6 +72,11 @@ export const parseFrame = (raw: string): Frame | null => {
       ...(typeof c === "string" ? { content: c } : {}),
     }
   }
+  if (o["t"] === "tool_calls") {
+    const calls = asToolCalls(o["tool_calls"])
+    if (calls === null) return null
+    return { t: "tool_calls", tool_calls: calls }
+  }
   if (o["t"] === "done") {
     const u = o["usage"]
     if (typeof o["finish_reason"] !== "string" || typeof u !== "object" || u === null) return null
@@ -51,9 +84,12 @@ export const parseFrame = (raw: string): Frame | null => {
     if (typeof uo["prompt_tokens"] !== "number" || typeof uo["completion_tokens"] !== "number") {
       return null
     }
+    const calls = o["tool_calls"] === undefined ? undefined : asToolCalls(o["tool_calls"])
+    if (o["tool_calls"] !== undefined && calls === null) return null
     return {
       t: "done",
       finish_reason: o["finish_reason"],
+      ...(calls ? { tool_calls: calls } : {}),
       usage: { prompt_tokens: uo["prompt_tokens"], completion_tokens: uo["completion_tokens"] },
     }
   }
@@ -66,12 +102,20 @@ export const parseFrame = (raw: string): Frame | null => {
 /** Why a stream's socket closed. The close code alone cannot say it: the server
  * ends a finished turn with 1000 and a user stop also sends 1000, and a 1001
  * after a `done` frame is a normal post-terminal shutdown, not a dropped turn.
- * Track the two facts that actually distinguish the cases. */
-export type CloseKind = "stopped" | "terminal" | "dropped"
+ * `unreachable` means the socket never opened — the server is down or restarting
+ * (the supervisor reloads for tens of seconds), so the caller polls /health
+ * before offering a retry rather than failing a click instantly. Track the three
+ * facts that distinguish the cases. */
+export type CloseKind = "stopped" | "terminal" | "dropped" | "unreachable"
 
-export const classifyClose = (stopped: boolean, terminal: boolean): CloseKind => {
+export const classifyClose = (
+  stopped: boolean,
+  terminal: boolean,
+  opened: boolean,
+): CloseKind => {
   if (stopped) return "stopped"
-  return terminal ? "terminal" : "dropped"
+  if (terminal) return "terminal"
+  return opened ? "dropped" : "unreachable"
 }
 
 /** What the page shows once the stream ends.
@@ -80,7 +124,8 @@ export const classifyClose = (stopped: boolean, terminal: boolean): CloseKind =>
  * block, so the reply is reasoning only and the answer is empty. `truncated` is
  * that case and nothing else -- an empty answer that finished normally is a model
  * that chose to say nothing, which is not the same bug and should not carry the
- * same notice. */
+ * same notice. `error` is an in-band `error` frame: the server refused or failed
+ * the request, which is not an "empty reply" even when zero tokens arrived. */
 export const outcome = (
   finish: string,
   answer: string,
