@@ -187,6 +187,7 @@ def test_mixed_batch_short_row_keeps_its_own_kv_and_prefill_bypasses():
                    kv_pool=draft.kv, state_pool=None,
                    seq_q_lens=torch.tensor(sq))
     draft.attn_window_tokens = 32
+    draft.width = 2
     view = draft._windowed_read_kv(full, sl, sq, [db0, db1])
     assert view is not None
     # long row: floor first=(120-32)//16=5 -> pages 5,6,7 (keeps the page holding
@@ -200,3 +201,157 @@ def test_mixed_batch_short_row_keeps_its_own_kv_and_prefill_bypasses():
     # any prefill/multi-token row in the batch -> whole batch bypasses (None)
     sq_prefill = [1, 4]
     assert draft._windowed_read_kv(full, sl, sq_prefill, [db0, db1]) is None
+
+
+# ---------------------------------------------------------------------------
+# Verify-tick gates (#668 follow-up).
+#
+# Root cause being pinned: a served spec verify tick re-drafts the bonus token
+# plus the new chain in ONE forward, so its row spans q = n_ok + 1 positions:
+# ACCEPT (the common case) -> q = 2 at spec_depth=1; reject -> q = 1. The #668
+# guard ``any(q != 1 for q in sq)`` therefore returned None on almost every real
+# tick, so the window never engaged on device and the W sweep was bit-identical.
+# The correct discriminator is a verify TAIL (sq <= draft.width) vs a prefill
+# CHUNK (sq > draft.width): tail rows window their history exactly like the
+# single-query case, with uniform renumbering preserving the multi-query causal
+# mask. These gates are RED on the sq==1-only implementation.
+# ---------------------------------------------------------------------------
+
+
+def _bare_draft():
+    cfg = tiny()
+    backend = get_backend()
+    draft = DraftHead.__new__(DraftHead)
+    draft.kv = PagedKvPool(64, cfg.num_kv_heads, cfg.head_dim, num_layers=1,
+                           device=backend.device, layer_map=(0,))
+    draft.width = 2  # spec_depth=1: one committed token + one draft
+    return draft
+
+
+def _full_view(draft, blocks_per_row, sl, sq):
+    tables = []
+    for blocks in blocks_per_row:
+        bt = torch.zeros(1, 64, dtype=torch.long)
+        bt[0, : len(blocks)] = torch.tensor(blocks)
+        tables.append(bt)
+    bt = tables[0] if len(tables) == 1 else torch.cat(tables, 0)
+    return BatchKv(block_table=bt, seq_len=torch.tensor(sl),
+                   state_slot=torch.zeros(len(sl), dtype=torch.long),
+                   kv_pool=draft.kv, state_pool=None,
+                   seq_q_lens=torch.tensor(sq))
+
+
+def test_verify_tick_accepted_row_sq2_window_engages():
+    """An accepted verify tick drafts q=2 tail positions. The window MUST engage:
+    today the sq==1 guard returns None (the device-inert bug).
+
+    hi=120 (seq_len 121), lo=119, q=2, W=32 -> floor first=(120-32)//16=5,
+    pages 5..7 cover global tokens 80..120, windowed seq_len=121-80=41 so
+    hist'=41-2=39 == lo-80 (causal history length preserved under renumber)."""
+    draft = _bare_draft()
+    db = [100 + i for i in range(8)]          # 128 logical slots; hi=120 -> 8 pages
+    sl, sq = [121], [2]
+    full = _full_view(draft, [db], sl, sq)
+    draft.attn_window_tokens = 32
+    view = draft._windowed_read_kv(full, sl, sq, [db])
+    assert view is not None, "accept tick (sq=2) must window, not bypass"
+    assert [int(x) for x in view.block_table[0, :3].tolist()] == db[5:8]
+    assert int(view.block_table[0, 3:].abs().sum()) == 0
+    assert int(view.seq_len[0]) == 41
+    # last query (global hi=120) maps to the SAME physical page/in-page offset
+    wsl = int(view.seq_len[0])
+    assert int(view.block_table[0, (wsl - 1) // BLOCK_TOKENS]) == db[-1]
+    assert (wsl - 1) % BLOCK_TOKENS == (sl[0] - 1) % BLOCK_TOKENS
+    # renumbered history equals the true tail-query history length
+    assert int(wsl - sq[0]) == 121 - sq[0] - 5 * BLOCK_TOKENS
+
+
+def test_mixed_verify_batch_sq2_and_sq1_each_windowed_or_full():
+    """One ACCEPT row (sq=2, long) batched with one REJECT row (sq=1, short) in
+    the same forward (the real multi-row serving shape, missing from #668): the
+    long row truncates, the short row keeps ALL its own pages/seq_len and is
+    never zero-filled to page 0."""
+    draft = _bare_draft()
+    db0 = [200 + i for i in range(8)]          # long row, hi=120 seq 121
+    db1 = [300 + i for i in range(3)]          # short reject row, seq 40
+    sl, sq = [121, 40], [2, 1]
+    full = _full_view(draft, [db0, db1], sl, sq)
+    draft.attn_window_tokens = 32
+    view = draft._windowed_read_kv(full, sl, sq, [db0, db1])
+    assert view is not None
+    # accept row: floor first=5 -> pages 5,6,7 and wsl=41
+    assert [int(x) for x in view.block_table[0, :3].tolist()] == db0[5:]
+    assert int(view.seq_len[0]) == 41
+    # reject row: hi=40<=W-ish -> first=0, keeps ALL 3 pages, true seq_len
+    assert [int(x) for x in view.block_table[1, :3].tolist()] == db1
+    assert int(view.seq_len[1]) == 40
+    assert int(view.block_table[1, 3:].abs().sum()) == 0
+
+
+def test_per_row_floor_never_splits_across_page_boundary():
+    """Unaligned hi keeps the PAGE holding the oldest wanted token hi-W for a
+    verify-tail row, and does not read the page before that floor."""
+    draft = _bare_draft()
+    db = [100 + i for i in range(8)]
+    # hi=100 (seq 101), q=2 (lo=99), W=32 -> first=(100-32)//16=4, pages 4..6
+    sl, sq = [101], [2]
+    full = _full_view(draft, [db], sl, sq)
+    draft.attn_window_tokens = 32
+    view = draft._windowed_read_kv(full, sl, sq, [db])
+    assert view is not None
+    first = (100 - 32) // BLOCK_TOKENS
+    tot = (101 + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+    assert [int(x) for x in view.block_table[0, : tot - first].tolist()] == db[first:tot]
+    assert first * BLOCK_TOKENS <= 101 - sq[0]          # floor at/before oldest query
+    assert int(view.seq_len[0]) == 101 - first * BLOCK_TOKENS
+
+
+def test_window_shorter_than_tail_span_bypasses_whole_batch():
+    """If the trailing window would start AFTER a row's oldest tail query (window
+    shorter than the verify span), that row cannot be windowed without dropping
+    the query's own context, and it does not fit the fixed wp+1 table -> the whole
+    batch falls back to None rather than silently truncating causal context."""
+    draft = _bare_draft()
+    draft.width = 16
+    db = [100 + i for i in range(13)]         # hi=200 seq 201
+    sl, sq = [201], [16]                       # long tail, lo=185
+    full = _full_view(draft, [db], sl, sq)
+    draft.attn_window_tokens = 4              # window < tail span
+    assert draft._windowed_read_kv(full, sl, sq, [db]) is None
+
+
+def test_prefill_chunk_still_bypasses_with_verify_tail_present():
+    """A prefill CHUNK row (sq > draft.width) in the batch keeps the pre-#668
+    whole-batch bypass even when another row is a windowable verify tail."""
+    draft = _bare_draft()                        # width=2
+    db0 = [200 + i for i in range(8)]
+    db1 = [300 + i for i in range(8)]
+    sl, sq = [121, 121], [2, 8]                  # row1 is a prefill chunk (8>width)
+    full = _full_view(draft, [db0, db1], sl, sq)
+    draft.attn_window_tokens = 32
+    assert draft._windowed_read_kv(full, sl, sq, [db0, db1]) is None
+
+
+def test_read_window_stats_observable_when_engaged():
+    """Self-proof observability: when the env window engages on a verify tick the
+    actual per-row windowed pages/seq_len/sq are externally readable; with the
+    window off it reports None. Pins the interface BEFORE the src implements it
+    (red), so perf1 can visually confirm truncation before re-sweeping."""
+    draft = _bare_draft()
+    db = [100 + i for i in range(8)]
+    sl, sq = [121], [2]
+    full = _full_view(draft, [db], sl, sq)
+
+    draft.attn_window_tokens = 0
+    assert draft._windowed_read_kv(full, sl, sq, [db]) is None
+    off = draft.read_window_stats()
+    assert off is None
+
+    draft.attn_window_tokens = 32
+    draft._windowed_read_kv(full, sl, sq, [db])
+    stats = draft.read_window_stats()
+    assert stats is not None
+    assert stats["window_tokens"] == 32
+    assert stats["sq"] == [2]
+    assert stats["seq_len"] == [41]
+    assert stats["pages"][0] == db[5:8]
