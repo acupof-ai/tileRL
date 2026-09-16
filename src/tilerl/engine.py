@@ -194,7 +194,7 @@ class _StepTiming:
     carries "graph" alone. Do not sum it together with its inner segments.
     """
 
-    __slots__ = ("slow_s", "tot", "count", "cur", "t0", "n", "last_total")
+    __slots__ = ("slow_s", "tot", "count", "cur", "t0", "n", "last_total", "note")
 
     def __init__(self) -> None:
         self.slow_s = float(os.environ.get("TILERL_STEP_TIMING_SLOW_MS", "1000")) / 1000.0
@@ -204,9 +204,11 @@ class _StepTiming:
         self.t0 = 0.0
         self.n = 0
         self.last_total = 0.0
+        self.note = ""
 
     def tick_start(self) -> None:
         self.cur.clear()
+        self.note = ""
         self.t0 = time.perf_counter()
 
     def mark(self, seg: str, t: float) -> None:
@@ -221,7 +223,8 @@ class _StepTiming:
             self.count[k] = self.count.get(k, 0) + 1
         if dt > self.slow_s:
             parts = " ".join(f"{k}={v * 1000:.0f}ms" for k, v in self.cur.items())
-            print(f"[step-timing] tick {self.n} total={dt * 1000:.0f}ms {parts}",
+            extra = f" [{self.note}]" if self.note else ""
+            print(f"[step-timing] tick {self.n} total={dt * 1000:.0f}ms {parts}{extra}",
                   file=sys.stderr, flush=True)
 
     def report(self) -> None:
@@ -664,9 +667,12 @@ class Engine:
         self._keep_draft_logits = False
         self._trunk_logits = None
         self._verify_chains = None
-        #: Set to a list to time each draft forward directly, as (forwards, ms). A
-        #: per-tick sync, so never on in serving; None keeps the path unchanged.
-        self._draft_ms: list[tuple[int, float]] | None = None
+        #: Diagnostic only: populated when TILERL_STEP_TIMING is on, None keeps
+        #: the path unchanged. Entries ``(forwards_delta, gpu_ms, max_seq_len)``
+        #: — the seq_len dimension tests whether draft GPU time is a fixed cost or
+        #: scales with the dense prefix the one decode forward reads.
+        self._draft_ms: list[tuple[int, float, int]] | None = (
+            [] if self._step_timing is not None else None)
         self._finished_logprobs: dict[int, list[float]] = {}
         self._taken_logprobs: set[int] = set()
         self._last_logprobs: list[float] | None = None
@@ -1724,6 +1730,14 @@ class Engine:
             promote_ctx.__enter__()
             if _tm is not None:
                 _tm.mark("sparse_select", _t)
+                # Diagnostic: sparse geometry on the slow-tick line, to catch a
+                # cmax bucket recalc or a hot-selection slide that widens the
+                # attention table (the sporadic 1.3-1.5s 32k ticks). All three
+                # are host-side ints, so this adds no device sync.
+                _table = getattr(sf, "table", None)
+                _tm.note = (f"sparse cmax={getattr(sf, 'cmax', '?')} "
+                            f"own_w={getattr(sf, 'own_w', '?')} "
+                            f"table_w={_table.shape[1] if _table is not None else '?'}")
                 _t = time.perf_counter()
         # Bucket a prefill width: kernels specialize per shape (MMLU compiled
         # 662 variants). A verify width is exact, at most 1+depth.
@@ -1817,14 +1831,20 @@ class Engine:
             # captured-graph path (#621). Also covers a row that left prefill
             # this tick (the growth loop above only handles `decodes`).
             rows = self.ensure_draft_write_blocks(rows)
+            if _tm is not None:
+                _tm.mark("draft_blocks", _t)
+                _t = time.perf_counter()
             self._draft_step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
+            if _tm is not None:
+                _tm.mark("draft_step", _t)
+                _t = time.perf_counter()
             if sparse:
                 # draft K/V for this tick's dropped pages now exist: publish them
                 self._sparse_process_offers(sparse_offers)
         elif sparse:
             self._sparse_process_offers(sparse_offers)
         if _tm is not None:
-            _tm.mark("draft_offers", _t)
+            _tm.mark("offers_pub", _t)
 
     def _sparse_live_stats(self) -> dict:
         """Flat sparse residency counters for a hybrid engine. The memory ledger
@@ -2165,8 +2185,16 @@ class Engine:
         this so the graph and eager ticks stay one call site."""
         if self._draft_ms is None:
             self._draft.step(rows)
-        else:
+        elif torch.cuda.is_available():
             self._draft_step_timed(rows)
+        else:
+            # CPU/deviceless host with TILERL_STEP_TIMING on: wall-clock fallback,
+            # no CUDA event. The diagnostic target is the GPU serve only.
+            t0 = time.perf_counter()
+            max_seq = max((r.seq_len for r in rows), default=0)
+            self._draft.step(rows)
+            self._draft_ms.append((self._draft.forwards, (time.perf_counter() - t0) * 1000,
+                                   max_seq))
 
     def _draft_step_timed(self, rows: list[_Req]) -> None:
         """``_draft.step`` with CUDA events around it, recording (forwards, ms).
@@ -2186,11 +2214,15 @@ class Engine:
         """
         a, b = (torch.cuda.Event(enable_timing=True) for _ in range(2))
         f0 = self._draft.forwards
+        max_seq = max((r.seq_len for r in rows), default=0)
         a.record()
         self._draft.step(rows)
         b.record()
         b.synchronize()
-        self._draft_ms.append((self._draft.forwards - f0, a.elapsed_time(b)))
+        gpu_ms = a.elapsed_time(b)
+        self._draft_ms.append((self._draft.forwards - f0, gpu_ms, max_seq))
+        print(f"[draft-timing] fwd={self._draft.forwards - f0} gpu={gpu_ms:.2f}ms "
+              f"max_seq={max_seq}", file=sys.stderr, flush=True)
 
     def _verify(self, rows, chains, logits, hidden) -> None:
         """Accept the leading run of drafts the trunk agrees with, adopt the

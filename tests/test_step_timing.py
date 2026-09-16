@@ -30,10 +30,12 @@ from tilerl.engine import SamplingParams
 #: docstring); graph ticks carry "graph" instead of the eager inner set.
 _SEGMENTS = {
     "plan", "stats", "forward", "charge", "graph",
-    "sparse_select", "prep", "model", "sparse_finalize", "sample", "draft_offers",
+    "sparse_select", "prep", "model", "sparse_finalize", "sample",
+    "draft_blocks", "draft_step", "offers_pub",
 }
 _INNER = {
-    "sparse_select", "prep", "model", "sparse_finalize", "sample", "draft_offers",
+    "sparse_select", "prep", "model", "sparse_finalize", "sample",
+    "draft_blocks", "draft_step", "offers_pub",
 }
 
 _ENGINE_PY = Path(engine_mod.__file__)
