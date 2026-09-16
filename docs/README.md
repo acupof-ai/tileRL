@@ -59,5 +59,6 @@ non-zero means SUPERSEDED, not delete.
 |---|---|
 | [serve-v100.md](serve-v100.md) | Running the 27B on the pod with the chat UI on a laptop — the SSH tunnel, the exact server command, and why warmup captures the decode graphs up front. |
 | [serve-h20.md](serve-h20.md) | The sm90 sparse+d1+decode-graph supervisor run through `pod_run.sh` — the `/work/tl013` cu129 interpreter (not `uv run`), the in-checkpoint draft, and the parameterized cold-spill path. Awaits a real-serve window. |
+| [serve-cold-prefill-cap.md](serve-cold-prefill-cap.md) | When to raise the sparse prefill chunk from the shared-server default 192 to 512 (dedicated/offline long-context cold fill), the two zero-code ways to do it, and why concurrent serving must keep 192. First-token latency only. |
 | [lessons/](lessons/) | Two measured Q&A notes on driving Claude Code against tileRL's own server: the Messages shim, and the rollout launcher's sandbox. (historical — both shims are built and gated by tests) |
 | [tick-anatomy.html](tick-anatomy.html) | A rendered page: every layer of one V100 speculative decode tick against its byte floor. |
