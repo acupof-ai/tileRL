@@ -179,6 +179,31 @@ def aggregate(w, cold, dec, expect_engage):
     }
 
 
+def _write_json(path, table) -> None:
+    """Atomic, incremental table write (tmp + replace): a crash in a LATER length
+    cannot destroy the lengths already finished. Called after every length."""
+    if not path:
+        return
+    p = pathlib.Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(table, indent=2))
+    os.replace(tmp, p)
+
+
+def plan_corpus(stream, lengths, want):
+    """Per-length ``(spans, n_eff)`` from one token stream, adapting n to corpus
+    size so a long ctx with too few disjoint spans does not crash. Disjoint
+    independent prompts (n_eff = min(want, (corpus-skip)//ctx)). The same span
+    list per length is reused across every W arm, so arms stay paired."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from corpus import tiled_spans  # noqa: E402
+
+    # skip=512 drops wikitext's header/newline head (corpus convention). Across
+    # lengths prompts need not be disjoint (separate analyses; prefix sharing is
+    # off), and skipping a full `length` at 32k would waste a scarce window.
+    return {length: tiled_spans(stream, want, length, skip=512) for length in lengths}
+
+
 def run(args) -> list[dict]:
     from tilerl_kernels.backend import get_backend
 
@@ -188,7 +213,7 @@ def run(args) -> list[dict]:
     from tilerl.tokenizer import get_tokenizer
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from corpus import wikitext_ids  # noqa: E402
+    from corpus import wikitext_ids_stream  # noqa: E402
 
     os.environ.setdefault("TILERL_TARGET", "cuda")
     os.environ.setdefault("TILERL_QWEN38_SOURCE", args.source)
@@ -198,6 +223,11 @@ def run(args) -> list[dict]:
     cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft)
     tok = get_tokenizer(args.source)
+
+    # Resolve prompts per length BEFORE the timed loop, adapting n to the corpus.
+    stream = wikitext_ids_stream(tok)
+    corpus_plan = plan_corpus(stream, args.lengths, args.prompts)
+    del stream
 
     max_len = max(args.lengths)
     need_blocks = -(-(max_len + args.out_tokens) // BLOCK_TOKENS) + 8
@@ -222,38 +252,51 @@ def run(args) -> list[dict]:
     print(f"# probe {_sha(__file__)}, engine tree {_engine_sha()}, arch {arch}")
     print(
         f"# one engine; W mutated in place; lengths={args.lengths}, "
-        f"windows={args.windows}, prompts/arm/len={args.prompts}, "
+        f"windows={args.windows}, requested prompts/len={args.prompts}, "
         f"out_tokens={args.out_tokens}, sparse_k={args.sparse_k}, prefix=off"
     )
 
     table = []
     for length in args.lengths:
-        prompts = wikitext_ids(tok, args.prompts, length, skip=length)
-        per_arm = {}
-        for w in args.windows:
-            draft.attn_window_tokens = w
-            cold, dec = [], []
-            for p in prompts:
-                cf, d = measure_one(eng, draft, p, args.out_tokens)
-                cold.append(cf)
-                if d is not None:
-                    dec.append(d)
-            row = aggregate(w, cold, dec, expect_engage=w > 0)
-            row["length"] = length
-            per_arm[w] = row
-            table.append(row)
-        # ratios vs the W=0 control for this length
-        base = per_arm.get(0) or {}
-        for row in (per_arm[w] for w in args.windows):
-            bt = base.get("tok_s_med") or 0.0
-            bd = base.get("draft_ms_med") or 0.0
-            row["tok_s_ratio_vs_W0"] = row["tok_s_med"] / bt if bt else 0.0
-            row["draft_ms_ratio_vs_W0"] = row["draft_ms_med"] / bd if bd else 0.0
-        _print_length(length, per_arm, args.windows)
+        prompts, n_eff = corpus_plan[length]
+        print(f"# context={length}: n_eff={n_eff}/{args.prompts} independent prompts"
+              + ("  (corpus-limited; median still valid, sample size labelled)"
+                 if n_eff < args.prompts else ""))
+        if not prompts:
+            print(f"# context={length}: corpus too small even for one span; skipping")
+            continue
+        try:
+            per_arm = {}
+            for w in args.windows:
+                draft.attn_window_tokens = w
+                cold, dec = [], []
+                for p in prompts:
+                    cf, d = measure_one(eng, draft, p, args.out_tokens)
+                    cold.append(cf)
+                    if d is not None:
+                        dec.append(d)
+                row = aggregate(w, cold, dec, expect_engage=w > 0)
+                row["length"] = length
+                row["n_requested"] = args.prompts
+                per_arm[w] = row
+                table.append(row)
+            # ratios vs the W=0 control for this length
+            base = per_arm.get(0) or {}
+            for row in (per_arm[w] for w in args.windows):
+                bt = base.get("tok_s_med") or 0.0
+                bd = base.get("draft_ms_med") or 0.0
+                row["tok_s_ratio_vs_W0"] = row["tok_s_med"] / bt if bt else 0.0
+                row["draft_ms_ratio_vs_W0"] = row["draft_ms_med"] / bd if bd else 0.0
+            _print_length(length, per_arm, args.windows)
+        except Exception as exc:  # one length failing must keep earlier lengths' JSON
+            print(f"# context={length}: ARM FAILED, keeping prior lengths: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            table.append({"length": length, "error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            _write_json(args.json, table)   # incremental: flush after EVERY length
     draft.attn_window_tokens = 0
     if args.json:
-        Path(args.json).write_text(json.dumps(table, indent=2))
-        print(f"# wrote {args.json}")
+        print(f"# wrote {args.json} ({len(table)} rows)")
     return table
 
 
@@ -309,7 +352,13 @@ def main() -> None:
         action="store_true",
         help="arm the CUDA-event draft_step seam (draft_ms columns)",
     )
-    ap.add_argument("--json", default="", help="optional path for the JSON table")
+    ap.add_argument("--json", default="", help="optional JSON table path; written "
+                    "incrementally (tmp+replace) once per length, so a later-length "
+                    "crash keeps earlier lengths; always a full JSON array (overwritten "
+                    "atomically, not appended)")
+    ap.add_argument("--dry-run-corpus-tokens", type=int, default=297054,
+                    help="corpus token count used only to preview n_eff in --dry-run "
+                         "(wikitext-103 test split measured on V100)")
     ap.add_argument(
         "--dry-run", action="store_true", help="resolve/validate the plan and exit; no model build"
     )
@@ -331,16 +380,27 @@ def main() -> None:
     print(f"[dry-run] probe {_sha(__file__) if __file__ else 'n/a'}")
     print(
         f"[dry-run] lengths={args.lengths} windows={args.windows} "
-        f"prompts/len={args.prompts} out_tokens={args.out_tokens} "
-        f"sparse_k={args.sparse_k} time_draft={args.time_draft}"
+        f"requested prompts/len={args.prompts} out_tokens={args.out_tokens} "
+        f"sparse_k={args.sparse_k} time_draft={args.time_draft} "
+        f"corpus_tokens={args.dry_run_corpus_tokens}"
     )
+    print(f"[dry-run] engine num_blocks~{need_blocks} (sized for {max_len}+{args.out_tokens})")
+    # Preview adaptive n_eff with a synthetic stream of the known corpus size (no
+    # parquet/model). n_eff=min(prompts,(corpus-512)//ctx): 30/18/9 at 9k/16k/32k.
+    preview = plan_corpus(list(range(args.dry_run_corpus_tokens)), args.lengths, args.prompts)
+    total_runs = 0
+    for length in args.lengths:
+        _, n_eff = preview[length]
+        total_runs += n_eff
+        limited = "  [corpus-limited]" if n_eff < args.prompts else ""
+        print(f"[dry-run]   ctx={length}: n_eff={n_eff}/{args.prompts} independent "
+              f"disjoint prompts{limited}")
+    print(f"[dry-run] total submit runs={total_runs} x {len(args.windows)} W-arms "
+          f"= {total_runs * len(args.windows)} measurements")
     print(
-        f"[dry-run] arms={len(args.windows)}  runs={len(args.lengths) * args.prompts}  "
-        f"engine num_blocks~{need_blocks} (sized for {max_len}+{args.out_tokens})"
-    )
-    print(
-        "[dry-run] paired prompts across W arms; NoPrefixStore; direct submit = "
-        "think-off, spec_depth=1; cold fill timed separately"
+        "[dry-run] paired disjoint prompts across W arms; NoPrefixStore; direct "
+        "submit=think-off, spec_depth=1; cold fill timed separately; JSON flushed "
+        "atomically after every length (full array, post-processing reads it directly)"
     )
     print(
         "[dry-run] TODO(if requested): a W-only vs +page0-anchor arm needs a "

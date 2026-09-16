@@ -39,13 +39,38 @@ def spans(ids: list[int], n: int, ctx: int, skip: int) -> list[list[int]]:
 
 def wikitext_ids(tok, n: int, ctx: int, skip: int = 512) -> list[list[int]]:
     """`n` prompts of `ctx` tokens each from wikitext-103's test split."""
+    ids = wikitext_ids_stream(tok)
+    got = spans(ids, n, ctx, skip)
+    return got
+
+
+def wikitext_ids_stream(tok) -> list[int]:
+    """The wikitext-103 test split as one token stream (all rows concatenated).
+
+    Lets a caller size/adapt spans against the actual corpus length instead of
+    asking :func:`spans` for more ctx-blocks than the corpus holds (it raises)."""
     paths = glob.glob(os.path.expanduser(WIKITEXT_GLOB))
     if not paths:
         raise SystemExit(f"wikitext-103 test parquet not in the HF cache: {WIKITEXT_GLOB}")
     import pyarrow.parquet as pq
 
     text = "\n".join(pq.read_table(sorted(paths)[0]).column("text").to_pylist())
-    return spans(tok.encode(text), n, ctx, skip)
+    return tok.encode(text)
+
+
+def tiled_spans(ids: list[int], n: int, ctx: int, skip: int = 512):
+    """Up to ``n`` DISJOINT spans of exactly ``ctx`` tokens past ``skip``, adapting
+    to the corpus instead of raising.
+
+    Returns ``(spans, n_eff)`` where ``n_eff = min(n, (len(ids) - skip) // ctx)``.
+    A long ctx on a small corpus (wikitext-103 test ≈ 297k tokens) yields FEWER
+    than ``n`` independent prompts — 18 at 16k, 9 at 32k — and the caller labels
+    that sample size rather than crashing. Deliberately disjoint, not overlapping:
+    shared-half windows would be correlated and bias the acceptance median, which
+    is the very quantity being compared across W. The same span list per length is
+    reused across every W arm (paired)."""
+    n_eff = max(0, min(n, (len(ids) - skip) // ctx))
+    return [ids[skip + i * ctx : skip + (i + 1) * ctx] for i in range(n_eff)], n_eff
 
 
 def long_doc_spans(ids: list[int], contexts: list[int], skip: int = 512,
