@@ -216,7 +216,7 @@ globalThis.document = {
   addEventListener(){}, body: mk("body"),
 };
 globalThis.window = { location: { protocol: "http:", host: "x", href: "http://x/" },
-  addEventListener(){} };
+  addEventListener(ev, fn){ (this._h ||= {})[ev] = fn; } };
 globalThis.location = globalThis.window.location;
 // Frames replay synchronously, so a paint frame runs synchronously too: the
 // coalescing collapses to paint-per-frame, which is the behaviour these gates
@@ -235,6 +235,7 @@ globalThis.clearInterval = () => {};
 // One socket, driven from the test: the bundle opens it, we replay the captured
 // frames into onmessage, then close. No network, no timing.
 globalThis.SENT = [];
+globalThis.CLOSES = 0;
 globalThis.WebSocket = class {
   constructor(url){ globalThis.SOCK = this; this.url = url;
     if (UNREACHABLE) {
@@ -246,13 +247,22 @@ globalThis.WebSocket = class {
     }
     queueMicrotask(() => this.onopen && this.onopen()); }
   send(d){ SENT.push(d); queueMicrotask(() => {
+    // PAGEHIDE: deliver the content deltas but leave the socket OPEN and no
+    // terminal frame, so the driver can fire pagehide while the turn is in
+    // flight (the real unload moment).
+    if (PAGEHIDE) {
+      for (const f of FRAMES) { const j = JSON.parse(f);
+        if (j.t === "delta") this.onmessage({ data: f }); }
+      globalThis.STREAM_LIVE = true;
+      return;
+    }
     // DROP: replay every frame EXCEPT the terminal one, then close -- a server
     // restart mid-turn. The bundle must call this "dropped", not "stopped".
     const out = DROP ? FRAMES.slice(0, -1) : FRAMES;
     for (const f of out) this.onmessage({ data: f });
     this.onclose && this.onclose();
   }); }
-  close(){}
+  close(){ globalThis.CLOSES += 1; }
 };
 // /health answers 200 immediately in these gates, so an unreachable turn settles
 // to the "restored, retry" state without a real wait.
@@ -441,7 +451,7 @@ def test_the_websocket_protocol_library_is_installed():
 def _page_after(frames: list[str], budget: str = "",
                 scroll_top: int | None = None, stop_after: bool = False,
                 drop: bool = False, unreachable: bool = False,
-                health_ok: bool = True) -> dict:
+                health_ok: bool = True, pagehide: bool = False) -> dict:
     """Run the shipped bundle over `frames`; return what landed in the DOM.
 
     ``budget`` is what the user typed in the budget box; "" is the shipped default
@@ -464,6 +474,7 @@ def _page_after(frames: list[str], budget: str = "",
         + ("const SCROLLTOP = " + json.dumps(scroll_top) + ";\n" if scroll_top is not None else "")
         + "const STOP = " + ("true" if stop_after else "false") + ";\n"
         + "const DROP = " + ("true" if drop else "false") + ";\n"
+        + "const PAGEHIDE = " + ("true" if pagehide else "false") + ";\n"
         + "const UNREACHABLE = " + ("true" if unreachable else "false") + ";\n"
         + "const HEALTH_OK = " + ("true" if health_ok else "false") + ";\n"
         + _DOM_STUB
@@ -476,11 +487,19 @@ def _page_after(frames: list[str], budget: str = "",
         IDS.composer.value = "page";
         if (typeof SCROLLTOP === "number") IDS.log.scrollTop = SCROLLTOP;
         const done = IDS.send._h.click();
-        // Mid-stream: the socket replays its frames on a microtask, so a click
-        // scheduled here lands while the turn is still pending.
-        if (STOP) IDS.stop._h.click();
-        await done;
-        await new Promise((r) => setTimeout(r, 0));
+        if (PAGEHIDE) {
+          // Let the content deltas land (socket deliberately left open, no
+          // terminal frame), then unload: pagehide must flush the whole reveal
+          // queue into the turn and close the in-flight socket itself.
+          await new Promise((r) => setTimeout(r, 0));
+          globalThis.window._h.pagehide();
+        } else {
+          // Mid-stream: the socket replays its frames on a microtask, so a click
+          // scheduled here lands while the turn is still pending.
+          if (STOP) IDS.stop._h.click();
+          await done;
+          await new Promise((r) => setTimeout(r, 0));
+        }
         const turn = IDS.log.children.at(-1);
         const fold = turn.children.find((c) => c.className === "reasoning");
         const answer = turn.children.find((c) => c.className === "answer");
@@ -491,6 +510,7 @@ def _page_after(frames: list[str], budget: str = "",
           url: SOCK.url,
           scrollTop: IDS.log.scrollTop,
           stopHidden: IDS.stop.hidden,
+          closes: globalThis.CLOSES,
           sent: SENT[0] ? JSON.parse(SENT[0]) : null,
           reasoning: fold ? _text(fold.children[1]) : null,
           foldOpen: fold ? fold.open : null,
@@ -670,6 +690,21 @@ def test_stopping_settles_the_turn_instead_of_raising():
     got = _page_after(_ws_frames(["</think>\npartial answer"], max_tokens=512), stop_after=True)
     assert got["note"] is None, f"a user stop rendered an error: {got['note']}"
     assert got["pending"] is False, "the turn stayed pending after a stop"
+
+
+def test_pagehide_flushes_the_buffer_and_closes_the_inflight_socket():
+    """Unloading mid-stream must not lose received tokens OR hold the engine slot.
+
+    The socket has delivered content deltas but stays open with no terminal frame
+    (the real unload moment). pagehide then has to (1) disclose every queued
+    character into the turn -- none received is left in the reveal buffer -- and
+    (2) close the in-flight WebSocket, exactly once, so the server cancels and
+    frees the slot. Both asserted on the same driver run.
+    """
+    body = "the complete streamed sentence survives the unload intact"
+    got = _page_after(_ws_frames([f"</think>\n\n{body}"], max_tokens=512), pagehide=True)
+    assert body in got["answer"], f"pagehide hid buffered tokens: {got['answer']}"
+    assert got["closes"] == 1, f"pagehide closed the socket {got['closes']} times"
 
 
 def test_a_close_before_the_terminal_frame_is_a_drop_not_a_stop():

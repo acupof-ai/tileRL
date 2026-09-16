@@ -130,9 +130,14 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
           stopWaiting()
           firstFrame = false
         }
-        if (f.reasoning_content !== undefined) turn.reasoning += f.reasoning_content
+        // reasoning renders immediately (it is folded away); answer content is
+        // queued and painted only when the reveal loop discloses characters, so
+        // a content-only frame schedules no empty paint before they land.
+        if (f.reasoning_content !== undefined) {
+          turn.reasoning += f.reasoning_content
+          schedulePaint(turn)
+        }
         if (f.content !== undefined) reveal.push(f.content)
-        schedulePaint(turn)
       } else if (f.t === "tool_calls") {
         if (firstFrame) {
           stopWaiting()
@@ -279,7 +284,10 @@ log.addEventListener("scroll", () => {
   toBottom.hidden = atBottom(log)
 })
 
-// Reveal every buffered character before the page is hidden so a token that
-// arrived but was still queued in the reveal buffer is not lost from the turn
-// (the socket-close-on-hide is handled separately).
-window.addEventListener("pagehide", () => activeFlush?.())
+// On hide: reveal every buffered character so a token already received but still
+// queued is not lost, then close the in-flight socket so a page unloaded while
+// streaming does not leave an engine slot occupied server-side.
+window.addEventListener("pagehide", () => {
+  activeFlush?.()
+  if (inFlight) stopStream?.()
+})
