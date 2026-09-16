@@ -4,8 +4,9 @@
 put the weight on the surrounding ecosystem ("不自己搞了，生态更重要"). This entry freezes
 the final state of the three closing work lines — the 11-step layered-architecture
 refactor, the 35-finding quality audit, and the online robustness chain — at
-origin/main `7fac8df3`. Every PR number below was read from `git log`/`gh`, not
-recalled. What remains is device-deferred work, not new framework work.
+origin/main `178af92b` (the SSE cancel-storm P0 closed at this point). Every PR
+number below was read from `git log`/`gh`, not recalled. What remains is
+device-deferred work and one fixed-deadline serving limit, not new framework work.
 
 ## 1. Final state
 
@@ -107,30 +108,64 @@ worker-exception hole after it closed (#641); worst in-flight `/health` while a 
 parks on the engine lock is under 0.5 s, versus a pre-fix multi-second event-loop
 freeze.
 
-## 3. P0 open — SSE cancel storm wedges the engine (GIL/launch spin)
+## 3. P0 — SSE cancel storm that wedged the engine (CLOSED)
 
-**Status: pending — fix in flight on the fixkv line; root cause not sealed here.**
-
-After ~16 late-SSE disconnects at ~114 MiB free on V100 sm70, one
-`paged_attention_split` launch (B=3, S=512, NB=2214) never returns: the loop
-R-state holds `engine._lock`, GPU sits at 0%, no Xid, submit and cancel block, and
-`/health` still answers 200. Shape (B dim and NB=2214) was ruled out by
-`scripts/repro_sm70_split_b3_hang.py` — every shape returns in ms; the defect is
-unreproduced and the leading hypothesis is edge-memory caching-allocator host-side
-state, not the kernel. Full OPEN row and evidence:
+**Status: closed 2026-09-16** — root-caused, fixed in #658 (`0cc82a36`), and
+verified end to end on the V100; documented in #661. Full evidence:
 [`errors/2026-09-15-sm70-paged-attention-launch-hang-wedges-engine.md`](../errors/2026-09-15-sm70-paged-attention-launch-hang-wedges-engine.md).
 
-The route-layer cancel mechanism (#631/#637/#641) is correct and off the event loop;
-the remaining defect is the engine/GIL interaction under storm load. The mitigation
-direction is resilience, not cancelling the in-flight C thread: (1) `/health` step
-last-progress → 503 when stuck (shipped in #650), (2) a forward wall watchdog →
-controlled process exit for the supervisor to restart (#652), (3) larger VRAM
-admission headroom (#655 holds a reserve). Fix owned by fixkv; this entry will be
-updated with the merge and the measured mitigation, not a guessed cause.
+Symptom on the unfixed server: after ~16 late-SSE disconnects at ~114 MiB free
+on sm70, the engine wedged — `/health` falsely 200, submit/cancel blocked, GPU 0%,
+no Xid. The apparent stuck op moved between shapes (`paged_attention_split`
+B=3/S=512/NB=2214, then `_mlp`), which is why neither the kernel nor the
+allocator was the cause.
+
+Actual root cause: `stream_or_cancel`'s `finally` drained the in-flight
+`to_thread(next, body)` worker from *inside the disconnecting SSE task's own
+cancellation*. Under Starlette 1.6 + ASGI 2.3 the anyio CancelScope latches
+cancelled, so every checkpoint re-raises `CancelledError`; an
+`await asyncio.shield(worker); continue` loop then spins with no real waiter.
+Eight SSE tasks doing it in one loop turn pinned the main thread on the GIL, and
+the engine thread re-entering Python via tvm_ffi blocked in
+`PyEval_RestoreThread` — op-independent, hence the moving "stuck leaf". Fix:
+finalize the sync generator in a task **detached from the SSE cancel scope**
+(a module-level strong-ref set cancels the row, awaits the worker bounded, and
+runs `body.close()` on a worker thread); a second storm-only drain-ordering defect
+found by the same gate was fixed in the same change.
+
+Device confirmation (ops-cb, V100 `0cc82a36`, env-off, boot 0):
+
+- serve child **pid 346578 unchanged for 1h06m**, boot stayed 0, zero
+  exit-10/exit-11, restart, or fuse trip;
+- **20/20 SSE** and **3/3 non-stream** disconnects cancelled and released (0.053–1.748 s);
+- the fixed shape — an 8-socket simultaneous-hangup storm — drained with no leaked
+  row and no loop spin; a sampler got **146/146 HTTP 200** through the storm, worst
+  in-flight answer **0.003 s**;
+- **causal discriminator:** physical free bottomed at **48 MiB — below the 98 MiB
+  free at which the pre-fix server wedged** — and it did not wedge, confirming the
+  GIL spin over the refuted VRAM/allocator hypothesis;
+- a 128k cold-sparse request streamed 200/`finish=stop` in **1037 s (~118 prefill
+  tok/s)** with a **333 MiB** SSD spill.
+
+The route-layer hardening beneath this (#631/#637/#641/#649) and the resilience
+pieces (#650 stuck-503, #652 supervisor restart, #655 reserve) all hold; this was
+the one P0, and it is closed rather than worked around.
 
 ## 4. Carry-forward ledger
 
-- **SSE-churn engine wedge** — the single P0, detailed in §3 with its errors entry.
+- **Non-stream 128k hits the fixed 30-min completion timeout (504).** The #658 gate
+  also exposed a real serving limit distinct from the now-closed wedge: a **non-stream**
+  128k cold-sparse request reaches the fixed `_COMPLETION_TIMEOUT_S = 1800.0` and 504s,
+  while the **streaming** arm has no such deadline and completes (the 1037 s / 118
+  tok/s fill in §3). The loop is healthy and the row progresses — only the fixed await
+  deadline fires. Tracked as OPEN:
+  [`errors/2026-09-16-nonstream-128k-hits-fixed-completion-timeout-504.md`](../errors/2026-09-16-nonstream-128k-hits-fixed-completion-timeout-504.md);
+  fix is a configurable per-request/long-context timeout or pointing long-context
+  callers at `stream=true`.
+- **One intermittent gate flake** is open, not blocking:
+  [`#659`](https://github.com/acupof-ai/tileRL/issues/659)
+  (`test_a_nonstream_client_disconnect_cancels_its_request` occasionally reports
+  "request never reached the engine").
 - **256k long-context is paused**, not abandoned, on device-memory grounds — see
   [`errors/2026-09-12-sparse-256k-spill-host-rss-oom.md`](../errors/2026-09-12-sparse-256k-spill-host-rss-oom.md),
   [`errors/2026-09-13-v100-256k-sparse-prefill-host-oom.md`](../errors/2026-09-13-v100-256k-sparse-prefill-host-oom.md),
@@ -147,21 +182,23 @@ updated with the merge and the measured mitigation, not a guessed cause.
   becomes a measured defect. (Instrumentation for that capture landed in #639, the
   env-gated per-segment step timing.)
 
-The standing OPEN list at seal time is [`docs/experience/OPEN.md`](../OPEN.md), eleven
-live rows, led by the P0 wedge: the sm70 `paged_attention` launch hang after SSE
-churn (§3); the sm70 1–5.6 s lock-holding step tick; sm70 sparse-decode-graph + MTP d1
-multi-token corruption; the 5.59 tok/s short-request-during-sparse-prefill; the
-irreproducible sm90 B=8 cold spec wave; the recorded 2.6x training/serving rollout gap
-(no gap on sm70, needs sm90); four sparse-publish cost rows (self-reinforcing miss,
-entries-per-row vs snapshot budget, the 1.2–2.5 s depth-independent hit cost, and the
-tier converting byte pressure into block pressure); and the unbounded CUDA GDN
-chunk-rounding path. These are measured and owned; they are deferred device work, not
-gaps in the shipped architecture.
+The standing OPEN list is [`docs/experience/OPEN.md`](../OPEN.md), eleven live rows:
+the non-stream 128k 504 above; the sm70 1–5.6 s lock-holding step tick; sm70
+sparse-decode-graph + MTP d1 multi-token corruption; the 5.59 tok/s
+short-request-during-sparse-prefill; the irreproducible sm90 B=8 cold spec wave; the
+recorded 2.6x training/serving rollout gap (no gap on sm70, needs sm90); four
+sparse-publish cost rows (self-reinforcing miss, entries-per-row vs snapshot budget,
+the 1.2–2.5 s depth-independent hit cost, and the tier converting byte pressure into
+block pressure); and the unbounded CUDA GDN chunk-rounding path. The former P0 wedge
+(§3) was closed and replaced on the list by the non-stream 504, so the count holds at
+eleven. These are measured and owned; they are deferred device work or a fixed-deadline
+limit, not gaps in the shipped architecture.
 
 ## 5. What this deliberately is not
 
 No new framework feature ships after this. Remaining effort is device verification
-(H20 windows), the one P0 cancel-storm fix, and ecosystem-facing work. The CPU/route
+(H20 windows), the non-stream 128k completion-timeout limit (§4), and
+ecosystem-facing work; the cancel-storm P0 is closed (§3). The CPU/route
 surface is sealed by CI: the layering gate, the scripts reachability gate, the
 frozen-route shapes, the real-uvicorn disconnect gates, and the docs count gates all
 fail on regression rather than relying on a reviewer remembering.
