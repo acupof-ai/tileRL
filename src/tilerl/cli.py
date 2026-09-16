@@ -209,7 +209,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
             fatal_device_exit(build_exc)
         raise
-    app = create_app(engine, tokenizer, model_name=cfg.name)
+    app = create_app(engine, tokenizer, model_name=cfg.name,
+                     completion_timeout_s=getattr(args, "completion_timeout_s", None))
     # --dry-run: build (which materializes and fits) then print the memory ledger and stop,
     # never bind the HTTP port. --json prints the rows for the cost-model tooling. The budget
     # rows need device_free: the card's free on CUDA, else --device-free (bytes) is required.
@@ -543,6 +544,15 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.add_argument("--cold-ssd-bytes", type=int, default=0, metavar="BYTES",
                          help="countable SSD spill capacity for admission (0 with "
                               "--cold-ssd-path = free space on the spill filesystem).")
+
+    p_serve.add_argument("--completion-timeout-s", type=float,
+                         default=float(os.environ.get("TILERL_COMPLETION_TIMEOUT_S", "1800")),
+                         metavar="SECONDS",
+                         help="wall-clock cap for a non-stream request to finish a whole "
+                              "reply (chat/messages/responses); a cold long-context sparse "
+                              "prefill can cross the 1800 s default, so raise it for a "
+                              "long-context server. 0 = no deadline (the disconnect watcher "
+                              "still drops a hung client). Streamed SSE and /ws are unaffected.")
 
     p_serve.add_argument("--sparse-k", type=int, default=DEFAULT_SPARSE_K, metavar="PAGES",
                          help=f"sparse-KV pages selected per row (default {DEFAULT_SPARSE_K} "
