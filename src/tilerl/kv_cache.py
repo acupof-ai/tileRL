@@ -922,6 +922,11 @@ class BatchKv:
     page_base: torch.Tensor | None = None
     #: sparse engine only: the per-tick SparseForward selection descriptor
     sparse: Any = None
+    #: Draft sliding-window probe only: when set, paged_attention READS this
+    #: descriptor (a trailing-window view) while write_tokens still writes through
+    #: the full table/seq_len above, so the read window never moves a write or
+    #: drops retained draft KV. None = read the full descriptor (default).
+    read_kv: BatchKv | None = None
 
     def inputs_for(self, ids, pos, row: int) -> dict:
         """Clone of every tensor the forward reads for row ``row``.
