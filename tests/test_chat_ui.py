@@ -223,6 +223,10 @@ globalThis.location = globalThis.window.location;
 // already assert. A rAF that deferred would put every assertion ahead of the
 // paint it checks.
 globalThis.requestAnimationFrame = (fn) => { fn(); return 0; };
+// The reveal buffer cancels a still-queued drain when a terminal frame flushes
+// it; cancelAnimationFrame is a browser global the synchronous rAF shim also has
+// to provide (a no-op, since the shim's frame already ran).
+globalThis.cancelAnimationFrame = () => {};
 // Cold-TTFT timer: the interval must exist, but never fire in these gates (the
 // waiting line is cleared the moment a frame is delivered). clearInterval is a
 // no-op.
