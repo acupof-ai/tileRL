@@ -354,8 +354,18 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             def ev(name: str, payload: dict[str, Any]) -> str:
                 return f"event: {name}\ndata: {json.dumps(payload)}\n\n"
 
+            # Anthropic splits usage across the stream: input (and cache) tokens
+            # on message_start, the final OUTPUT count on message_delta. The real
+            # API sends output_tokens as a small estimate at start; we send 0 so a
+            # client that sums usage across events (#694 saw 16 counted twice)
+            # cannot double-count. Non-stream body's usage is unchanged.
+            start_usage = {k: body["usage"][k] for k in
+                           ("input_tokens", "cache_creation_input_tokens",
+                            "cache_read_input_tokens")}
+            start_usage["output_tokens"] = 0
             yield ev("message_start", {"type": "message_start",
-                                       "message": {**body, "content": []}})
+                                       "message": {**body, "content": [],
+                                                   "usage": start_usage}})
             # Per block TYPE, not a tool/else pair: a thinking block carries
             # neither `text` nor `input`, and the two-way branch raised inside the
             # generator -- past the 200 header, so the client saw an incomplete
@@ -379,7 +389,8 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             yield ev("message_delta", {"type": "message_delta",
                                        "delta": {"stop_reason": body["stop_reason"],
                                                  "stop_sequence": body["stop_sequence"]},
-                                       "usage": body["usage"]})
+                                       "usage": {"output_tokens":
+                                                 body["usage"]["output_tokens"]}})
             yield ev("message_stop", {"type": "message_stop"})
 
         return StreamingResponse(sse(), media_type="text/event-stream", headers=headers)
