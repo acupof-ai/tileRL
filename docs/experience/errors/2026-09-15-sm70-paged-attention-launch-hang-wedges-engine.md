@@ -1,17 +1,41 @@
 # sm70 serve wedges under a simultaneous-SSE-hangup cancel storm (GIL spin), not a CUDA launch — 2026-09-15/16
 
-**Status:** root-caused and fixed 2026-09-16, merged as #658 (0cc82a36); device
-confirmation on the V100 (20/20 SSE overload storm, stable pid/boot, 128k
-sparse) is the only open step. The title's "paged_attention launch hang" was a
-misread: the engine thread is the *victim*, parked waiting for the GIL. The
-main event-loop thread busy-spins inside `stream_or_cancel`'s SSE final drain
-during a burst of simultaneous hangups.
+**Status:** CLOSED 2026-09-16 — root-caused, fixed in #658 (0cc82a36), and
+confirmed on the V100 (device evidence below). The title's "paged_attention
+launch hang" was a misread: the engine thread is the *victim*, parked waiting
+for the GIL. The main event-loop thread busy-spins inside `stream_or_cancel`'s
+SSE final drain during a burst of simultaneous hangups.
 **Arch:** V100 sm70, hybrid 27B serve (`--sparse-k 128 --draft … --decode-graph`),
-served shas ad0d3a1a → ff3e08e9.
+served shas ad0d3a1a → ff3e08e9 (wedged), fixed 0cc82a36.
 **Discovered:** P0 during ops late-frame SSE disconnect verification (≈16
 mid-stream cancellations). Evidence bundles on the card:
 `~/wedge_evidence_2026-09-15/` and `~/wedge_evidence_2026-09-16/`
-(`pyspy_*.txt`, `gdb_bt.txt`, `probe.log`, `free.log`).
+(`pyspy_*.txt`, `gdb_bt.txt`, `probe.log`, `free.log`); confirmation gate logs
+in `~/gate658_081919/`.
+
+## Device confirmation (2026-09-16, ops-cb, V100 0cc82a36 env-off boot 0)
+
+The decisive gate passed end to end, closing the P0:
+
+- serve child pid **346578 unchanged for 1h06m**, boot stayed **0**, **zero**
+  exit-10/exit-11, restarts or fuse trips;
+- **20/20** SSE and **3/3** non-stream disconnects cancelled and released clean
+  (release 0.053–1.748 s);
+- the fixed shape — an 8-socket simultaneous-hangup storm
+  (`Pool(cap=8).shutdown()`) — drained with no leaked rows and no loop spin; a
+  subprocess sampler got **146/146 HTTP 200** through the storm, worst in-flight
+  answer **0.003 s**;
+- **causal vs memory discriminator:** during the storm physical free bottomed
+  at **48 MiB — below the 98 MiB free at which the pre-fix server wedged** — and
+  it did not wedge, confirming the GIL-spin cause over the refuted VRAM/allocator
+  hypothesis;
+- a **128k cold sparse** request (`prefix_hits=0`) streamed 200/`finish=stop` in
+  **1037 s (~118 prefill tok/s)** with a **333 MiB** SSD spill.
+
+A non-blocking limit found by the same gate is tracked separately
+(OPEN): a *non-stream* 128k request 504s on the fixed 30-min completion timeout;
+streaming (used above) has no such deadline.
+
 
 ## Actual root cause (2026-09-16)
 
