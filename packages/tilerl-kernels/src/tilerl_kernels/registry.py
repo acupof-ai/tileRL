@@ -113,6 +113,12 @@ _SM90_KERNELS = {  # WGMMA schedules; the backend pads M/N to 16 and K to 32
     "gdn_chunk_o": kernels_gdn.make_gdn_chunk_o,
     "paged_attention": kernels_attn.make_paged_attention_mma,
     "paged_attention_decode": kernels_attn.make_paged_attention_decode,
+    # sparse KV (Quest): sm90 keeps f32 bounds (its IO is f32; f16 bounds are
+    # the sm70 index-halving optimization). page_bound_scores widens bounds to
+    # f32 internally, so the stored bounds dtype does not change downstream
+    # select_pages top-k. Parity-gated in tests/test_quest_parity.py.
+    "page_bounds": lambda t: kernels.make_page_bounds(t, out_dtype="float32"),
+    "page_bound_scores": kernels.make_page_bound_scores,
     # fp8-pool twins: same schedule, one multiply at the gather, bf16 tile
     "paged_attention_fp8": lambda t: kernels_attn.make_paged_attention_mma(t, kv_fp8=True),
     "paged_attention_decode_fp8": lambda t: kernels_attn.make_paged_attention_decode(
