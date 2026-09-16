@@ -19,7 +19,9 @@ export interface ToolCall {
  * names here so a reader of either transport learns one vocabulary.
  *
  * `tool_calls` is additive: emitted once before the terminal frame when the
- * model asked for a tool. */
+ * model asked for a tool. The playground sends no tool definitions, so its own
+ * server never emits this today; the parse + render is forward compatibility for
+ * when it does (the OpenAI-compatible routes already serve hosted tools). */
 export type Frame =
   | { readonly t: "delta"; readonly reasoning_content?: string; readonly content?: string }
   | { readonly t: "tool_calls"; readonly tool_calls: ReadonlyArray<ToolCall> }
