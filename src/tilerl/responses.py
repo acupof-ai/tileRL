@@ -35,7 +35,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .messages import _COMPLETION_TIMEOUT_S, _parse_tool_calls
+from .messages import DEFAULT_COMPLETION_TIMEOUT_S, _parse_tool_calls
 from .prompt import (
     await_completion,
     bad_effort,
@@ -119,7 +119,8 @@ def _to_messages(inp: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
-                    model_name: str) -> FastAPI:
+                    model_name: str,
+                    completion_timeout_s: float = DEFAULT_COMPLETION_TIMEOUT_S) -> FastAPI:
     """Add POST /v1/responses to an existing app, sharing its engine."""
     from .server import ClientDisconnected, await_or_cancel
 
@@ -157,7 +158,7 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         rid = engine.submit(input_ids, params)
         if rid_box is not None:
             rid_box[0] = rid
-        out = await_completion(engine, rid, _COMPLETION_TIMEOUT_S)
+        out = await_completion(engine, rid, completion_timeout_s)
         reasoning, text = split_think(tokenizer.decode(out), bool(thinking))
         stopped = engine.stop_text(rid)
         text, calls = _parse_tool_calls(cut_at_stop(text, stopped), tools)

@@ -71,6 +71,22 @@ _ROLLOUT_HEADER = "x-tilerl-rollout"
 #: (errors/2026-09-07-a-prompt-that-does-not-fit-yet-is-queued.md).
 _COMPLETION_TIMEOUT_S = 1800.0
 
+#: Non-stream routes (chat/messages/responses) wait on the whole reply, so a cold
+#: long-context sparse prefill legitimately crosses 30 min while the loop stays
+#: healthy (errors/2026-09-16-nonstream-128k-hits-fixed-completion-timeout-504.md).
+#: Their cap is configurable; the streamed `_deltas` guard stays the fixed constant.
+DEFAULT_COMPLETION_TIMEOUT_S = _COMPLETION_TIMEOUT_S
+_COMPLETION_TIMEOUT_ENV = "TILERL_COMPLETION_TIMEOUT_S"
+
+
+def completion_timeout_from_env() -> float:
+    """Resolve the non-stream completion cap: env override, else the 1800 s default.
+
+    0 (or negative) means no deadline — long-context server mode; the ASGI
+    disconnect watcher in `server.await_or_cancel` still drops a hung client.
+    """
+    return float(os.environ.get(_COMPLETION_TIMEOUT_ENV, str(DEFAULT_COMPLETION_TIMEOUT_S)))
+
 
 def record_path() -> str:
     return os.environ.get(_RECORD_ENV, "runs/messages_requests.jsonl")
@@ -183,7 +199,8 @@ def _effort_raw(req: MessagesRequest) -> str | None:
     return e or None
 
 
-def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: str) -> FastAPI:
+def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: str,
+                   completion_timeout_s: float = DEFAULT_COMPLETION_TIMEOUT_S) -> FastAPI:
     """Add POST /v1/messages to an existing app, sharing its engine."""
     from .server import ClientDisconnected, await_or_cancel
     # For the recorder row only: a `budget` below `engine_limit - prompt_len` was pool-capped.
@@ -222,7 +239,7 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         rid = engine.submit(input_ids, params)
         if rid_box is not None:
             rid_box[0] = rid
-        out = await_completion(engine, rid, _COMPLETION_TIMEOUT_S)
+        out = await_completion(engine, rid, completion_timeout_s)
         scores = engine.logprobs(rid)  # single reader; a second one raises
         reasoning, text = split_think(tokenizer.decode(out), opened=_thinking(req))
         stopped = engine.stop_text(rid)

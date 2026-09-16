@@ -3780,3 +3780,79 @@ def test_detached_drains_are_awaited_at_shutdown_while_a_close_is_still_running(
         assert not srv_mod._draining
 
     asyncio.run(main())
+
+
+class _GatedTakeEngine(_ScriptedEngine):
+    """A row that is not ready until a timer fires (or never).
+
+    take() returns None while ``_ready`` is unset, so await_completion's poll
+    loop crosses a short deadline the way an unfinished long prefill does; once
+    set, take() pops the canned reply. ``ready_after=None`` never finishes.
+    """
+
+    def __init__(self, tokenizer, replies, ready_after: float | None = 0.25):
+        super().__init__(tokenizer, replies)
+        self._ready = threading.Event()
+        self.cancelled: list[int] = []
+        self._timer = (
+            threading.Timer(ready_after, self._ready.set) if ready_after is not None else None
+        )
+
+    def submit(self, input_ids, params=None) -> int:
+        rid = super().submit(input_ids, params)
+        if self._timer:
+            self._timer.start()
+        return rid
+
+    def take(self, request_id: int):
+        return self._done.pop(request_id, None) if self._ready.is_set() else None
+
+    def cancel(self, request_id: int) -> bool:
+        self.cancelled.append(request_id)
+        return True
+
+
+def test_completion_timeout_resolver_is_three_state(monkeypatch):
+    from tilerl.messages import completion_timeout_from_env
+
+    monkeypatch.delenv("TILERL_COMPLETION_TIMEOUT_S", raising=False)
+    assert completion_timeout_from_env() == 1800.0
+    monkeypatch.setenv("TILERL_COMPLETION_TIMEOUT_S", "7200")
+    assert completion_timeout_from_env() == 7200.0
+    monkeypatch.setenv("TILERL_COMPLETION_TIMEOUT_S", "0")
+    assert completion_timeout_from_env() == 0.0
+
+
+def test_await_completion_zero_means_no_deadline():
+    from tilerl.prompt import await_completion
+
+    eng = _GatedTakeEngine(_ByteTokenizer(), ["ok"], ready_after=0.05)
+    rid = eng.submit([1, 2, 3])
+    assert await_completion(eng, rid, 0.0, poll_s=0.01)  # 0 would otherwise raise at once
+
+    class _Never:
+        def take(self, rid):
+            return None
+
+    # A positive deadline still raises TimeoutError past a non-ready row.
+    with pytest.raises(TimeoutError):
+        await_completion(_Never(), 1, 0.05, poll_s=0.01)
+
+
+def test_nonstream_request_504s_past_a_short_completion_timeout():
+    engine = _GatedTakeEngine(_ByteTokenizer(), ["late"], ready_after=None)  # never finishes
+    with TestClient(create_app(engine, _ByteTokenizer(), completion_timeout_s=0.1)) as c:
+        r = c.post("/v1/chat/completions",
+                   json={"messages": [{"role": "user", "content": "hi"}], "stream": False})
+    assert r.status_code == 504, r.text
+    assert r.json()["error"]["type"] == "api_error"
+    assert engine.cancelled, "the timed-out row must be cancelled to free its slot"
+
+
+def test_nonstream_request_waits_through_zero_completion_timeout():
+    engine = _GatedTakeEngine(_ByteTokenizer(), ["late-but-ok"], ready_after=0.15)
+    with TestClient(create_app(engine, _ByteTokenizer(), completion_timeout_s=0.0)) as c:
+        r = c.post("/v1/chat/completions",
+                   json={"messages": [{"role": "user", "content": "hi"}], "stream": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["choices"][0]["message"]["content"] == "late-but-ok"

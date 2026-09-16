@@ -32,7 +32,12 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from .messages import _COMPLETION_TIMEOUT_S, _parse_tool_calls, mount_messages
+from .messages import (
+    _COMPLETION_TIMEOUT_S,
+    _parse_tool_calls,
+    completion_timeout_from_env,
+    mount_messages,
+)
 from .prompt import (
     POLL_INTERVAL_S,
     await_completion,
@@ -376,13 +381,21 @@ async def stream_or_cancel(request: Request, engine: Any, request_id: int,
 # ---------------------------------------------------------------------------
 
 
-def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") -> FastAPI:
+def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
+               completion_timeout_s: float | None = None) -> FastAPI:
     """Build the FastAPI app around a running engine and a tokenizer.
 
     ``engine`` must implement the tileRL contract: ``submit``, ``poll``,
     ``stats``. The engine loop is expected to run in its own thread (the CLI
     starts it); request handlers only submit and poll.
+
+    ``completion_timeout_s`` caps how long the non-stream routes wait on a whole
+    reply; None reads ``TILERL_COMPLETION_TIMEOUT_S`` (default 1800, 0 = no
+    deadline). Streamed SSE and /ws keep the fixed ``_COMPLETION_TIMEOUT_S``
+    frame guard.
     """
+    completion_timeout_s = (
+        completion_timeout_from_env() if completion_timeout_s is None else float(completion_timeout_s))
     app = FastAPI(title="tilerl", version="0.1.0", lifespan=_lifespan)
     app_started = int(time.time())
 
@@ -449,7 +462,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                 bool(thinking), tools)
 
     def _await_completion(request_id: int,
-                          timeout_s: float = _COMPLETION_TIMEOUT_S) -> list[int]:
+                          timeout_s: float = completion_timeout_s) -> list[int]:
         return await_completion(engine, request_id, timeout_s)
 
     @app.get("/health")
@@ -814,11 +827,11 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
     # Anthropic Messages: what Claude Code speaks. Same engine, same tokenizer;
     # it records token ids per request, which the OpenAI route does not.
-    mount_messages(app, engine, tokenizer, model_name)
+    mount_messages(app, engine, tokenizer, model_name, completion_timeout_s)
 
     # OpenAI Responses: the same engine again, differing only in wire shape --
     # a flat typed `output` list instead of `choices`.
-    mount_responses(app, engine, tokenizer, model_name)
+    mount_responses(app, engine, tokenizer, model_name, completion_timeout_s)
 
     @app.websocket("/ws/chat")
     async def ws_chat(ws: WebSocket) -> None:

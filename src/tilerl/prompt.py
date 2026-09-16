@@ -371,11 +371,14 @@ def await_completion(engine: Any, request_id: int, timeout_s: float,
     The single wait body every non-stream route runs (inside asyncio.to_thread
     via server.await_or_cancel, which owns disconnect polling and cancellation).
     take() pops only this request — poll() would steal another row's completion.
+    ``timeout_s <= 0`` removes the deadline (long-context server mode); the
+    ASGI disconnect watcher still interrupts the wait, so a hung client is not
+    waited on forever.
     """
     import time
 
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
+    deadline = None if timeout_s <= 0 else time.monotonic() + timeout_s
+    while deadline is None or time.monotonic() < deadline:
         out = engine.take(request_id)
         if out is not None:
             return out
