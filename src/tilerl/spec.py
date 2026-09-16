@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -337,57 +338,110 @@ class DraftHead:
         # window before deciding the production sliding window.
         self.attn_window_tokens = int(os.environ.get("TILERL_DRAFT_ATTN_WINDOW_TOKENS", "0"))
         self.forwards = 0  # cumulative draft forwards; a probe divides its own timing by this
+        # Last engaged window view, exposed by read_window_stats() for a device
+        # self-proof (the V100 sweep confirms the view really truncates). None when
+        # the window is off, a prefill row bailed the batch, or no row truncated.
+        self._read_window_stats = None
 
-    def _windowed_read_kv(self, kv, sl, sq, dblocks):
-        """Diagnostic trailing-window READ view for a decode batch, or None.
+    def _log_read_window(self) -> None:
+        """Self-proof stderr line when the trailing READ window actually engages
+        (env TILERL_DRAFT_ATTN_WINDOW_TOKENS > 0). Silent in normal serving (W=0).
+        Logged once per distinct (batch size, per-row first-page) shape so a sweep
+        sees, per engaged shape, the windowed seq_len the attention kernel reads:
+        that number shrinking with W is the visible confirmation that the view —
+        not the full prefix — is on the device before acceptance is trusted."""
+        st = self._read_window_stats
+        if st is None:
+            return
+        key = (len(st["sq"]), tuple(st["first"]))
+        seen = getattr(self, "_read_window_logged", None)
+        if seen is None:
+            seen = self._read_window_logged = set()
+        if key in seen:
+            return
+        seen.add(key)
+        print(
+            f"[draft-window] W={st['window_tokens']} sq={st['sq']} "
+            f"first={st['first']} windowed_seq_len={st['seq_len']}",
+            file=sys.stderr, flush=True)
 
-        None when the window is off; when ANY row is a prefill/multi-token forward
-        (sq != 1, the remap is single-token-decode only); or when no row is past
-        the window (read the real descriptor, no allocation). Otherwise a single
-        per-batch descriptor of fixed width wp+1: a row past the window reads
-        from first page ``(hi-W)//BLOCK`` (FLOOR — the page holding the oldest
-        wanted token hi-W, so a recent token is never dropped; it reads up to
-        BLOCK-1 extra prefix tokens and an aligned hi degenerates to exactly wp
-        pages), and a row at/inside the window keeps ALL its pages and true
-        seq_len (never a zeroed/page-0 row).
+    def read_window_stats(self):
+        """Self-proof observability for the trailing-window READ probe.
+
+        Returns the last engaged view as ``{window_tokens, sq, seq_len, pages,
+        first}`` (per-row windowed seq_len / kept physical pages / floor first
+        page), or None when the window is off, a prefilling row bailed the batch,
+        or no row truncated. Read externally (or via /health) to confirm the view
+        really truncates on device before trusting a W sweep."""
+        return self._read_window_stats
+
+    def _windowed_read_kv(self, kv, sl, sq, dblocks, decode=None):
+        """Per-row trailing-window READ view for a decode batch, or None.
+
+        None when the window is off; when ANY row is still PREFILLING / catching up
+        (v1 keeps the conservative full prefix for the whole batch — a chunked
+        prefill row legitimately reads its whole growing prefix); or when no row is
+        past the window (read the real descriptor, no allocation). Every DECODE row
+        is windowed independently — including a verify tick that re-drafts the
+        bonus token plus the new chain in one forward (q = n_ok + 1, e.g. 2 on
+        accept): a single sq==1 guard used to return None on those, which are the
+        common ticks, so the probe never engaged on device (#668 follow-up).
+
+        The returned descriptor has the SAME width as the full table
+        (``kv.block_table.shape[1]`` == num_blocks, the kernel's compiled-in Mb):
+        each row's kept pages are packed from column 0 and the rest are zero, so
+        engaging the window causes no Mb recompile. A truncated row reads from floor
+        first page ``(sl-W)//BLOCK`` (the page holding the oldest wanted token
+        sl-W, so a recent token is never dropped; aligned length degenerates to
+        exactly wp pages); a row at/inside the window keeps ALL its pages and true
+        seq_len (never a zeroed/page-0 row). If a window were shorter than a decode
+        row's own tail-query span (not reachable at the production W) that row is
+        kept full rather than dropping its queries' context.
 
         Correctness (the read/write separation):
         - WRITE still goes through the full ``kv`` (model.write_tokens), writing
           the new token at its absolute tail page; this view is read-only.
-        - The windowed table lists trailing physical blocks in logical order, so
-          column j == logical window page j. A truncated row's windowed seq_len
-          is ``hi+1 - first_logical*BLOCK``; its last query write index maps to
-          the SAME physical block and in-page offset as the full table, so the
-          retained full-prefix KV is untouched.
-        - RoPE is unaffected: K/V in the pool already carry absolute-position
-          rotary encoding (applied before write_tokens); attention only gathers
-          them in window order, so no position is renumbered.
+        - Kept physical blocks are listed in logical order from column 0, so a
+          truncated row's windowed seq_len ``sl - first*BLOCK`` renumbers positions
+          by exactly -first*BLOCK; its last query maps to the SAME physical block
+          and in-page offset, and the multi-query causal history length
+          (wsl - sq) is preserved, so the retained full-prefix KV is untouched.
+        - RoPE is unaffected: pooled K/V already carry absolute-position rotary
+          encoding (applied before write_tokens); attention only gathers them in
+          window order — it never renumbers a position.
         """
         W = getattr(self, "attn_window_tokens", 0)
+        self._read_window_stats = None
         if W <= 0:
             return None
-        # The view is one per-BATCH descriptor: every row in the shared draft
-        # forward must read through it. A prefill/multi-token row (sq != 1) does
-        # not fit the single-token decode remap, so leave the whole batch full
-        # (a zeroed windowed seq_len on one row would point attention at page 0
-        # and silently corrupt that row's draft logits).
-        if any(int(q) != 1 for q in sq):
-            return None
-        wp = (W + BLOCK_TOKENS - 1) // BLOCK_TOKENS  # window pages
-        width = wp + 1          # floor start can span wp or wp+1 pages
         n = len(sl)
-        # Per-row kept span. The window MUST contain the trailing W tokens
-        # [hi-W, hi); at an unaligned boundary "last wp pages" would drop the
-        # most recent 1..BLOCK-1 tokens (e.g. hi=40, W=32 wants token 8 but
-        # last-wp starts at page 1 = token 16). Floor the first page so the page
-        # holding token hi-W is included — reads 0..BLOCK-1 extra prefix tokens,
-        # never loses a recent one; an aligned hi degenerates to exactly wp pages.
+        if decode is None:
+            decode = [True] * n
+        # A per-BATCH descriptor serves every row in the shared forward. v1 is
+        # conservative: only a DECODE-phase VERIFY TAIL is windowed — the row that,
+        # right after a commit, re-drafts the bonus token plus the new chain
+        # (q = n_ok + 1 <= draft.width). Two kinds of rows stay on the full prefix
+        # and any one of them leaves the whole batch unwindowed (read the real
+        # descriptor — never a zeroed/page-0 row):
+        #  - a row still PREFILLING (decode=False);
+        #  - a decode-phase CATCH-UP row replaying positions chunked prefill
+        #    advanced without drafting (q > draft.width; the hidden-gap case).
+        # sq alone is not enough (a catch-up row is phase=DECODE yet carries q>1),
+        # and phase alone is not enough either.
+        if not all(d and int(q) <= self.width for d, q in zip(decode, sq)):
+            return None
+        width = kv.block_table.shape[1]      # == num_blocks: same compiled-in Mb
         firsts: list[int] = []
         pages_all: list[list[int]] = []
         for i in range(n):
-            hi = int(sl[i])
-            tot = (hi + BLOCK_TOKENS - 1) // BLOCK_TOKENS
-            first = 0 if hi <= W else (hi - W) // BLOCK_TOKENS
+            length = int(sl[i])              # seq_len (count); last index is length-1
+            q = int(sq[i])
+            lo = length - q                  # global index of this row's oldest query
+            tot = (length + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+            first = 0 if length <= W else (length - W) // BLOCK_TOKENS
+            # Never start the window after the row's own oldest tail query.
+            if first * BLOCK_TOKENS > lo:
+                first = 0
             firsts.append(first)
             pages_all.append(list(dblocks[i])[first:tot])
         if not any(f > 0 for f in firsts):
@@ -396,11 +450,17 @@ class DraftHead:
         wbt = torch.zeros(n, width, dtype=torch.long, device=dev)
         wsl = torch.zeros(n, dtype=torch.long, device=dev)
         for i, pages in enumerate(pages_all):
-            hi = int(sl[i])
             if not pages:
                 continue
             wbt[i, : len(pages)] = torch.tensor(pages, dtype=torch.long, device=dev)
-            wsl[i] = hi - firsts[i] * BLOCK_TOKENS
+            wsl[i] = int(sl[i]) - firsts[i] * BLOCK_TOKENS
+        self._read_window_stats = {
+            "window_tokens": W,
+            "sq": [int(q) for q in sq],
+            "seq_len": [int(x) for x in wsl.tolist()],
+            "pages": [list(p) for p in pages_all],
+            "first": list(firsts),
+        }
         return BatchKv(
             block_table=wbt,
             seq_len=wsl,
@@ -537,8 +597,13 @@ class DraftHead:
             seq_q_lens=torch.tensor(sq, device=dev),
         )
         # Diagnostic trailing-window READ view (write/retain stay on the full kv).
+        # Per-row decode gating: a step can mix chunked-prefill catch-up rows with
+        # decode rows; any prefilling row keeps the whole batch on the full prefix.
         kv.read_kv = self._windowed_read_kv(
-            kv, sl, sq, [dblocks for _, _, _, dblocks in plan])
+            kv, sl, sq, [dblocks for _, _, _, dblocks in plan],
+            decode=[bool(getattr(r, "decoding", True)) for r, *_ in plan])
+        if kv.read_kv is not None:
+            self._log_read_window()
         dh: list = []
         # last_only, or the vocab readout runs over every position of a prefill chunk and
         # one row is read: 512 x 248320 f32 = 485 MiB, which is the allocation that OOMed
@@ -580,6 +645,15 @@ class DraftHead:
                 kv_pool=self.kv, state_pool=None,
                 seq_q_lens=torch.ones(len(live), dtype=torch.long, device=dev),
             )
+            # Depth>=2 chain continuation: one single-token query per live decode
+            # row. Apply the same trailing READ window (gated per plan row); a
+            # prefilling plan row keeps this continuation on the full prefix too.
+            kv.read_kv = self._windowed_read_kv(
+                kv,
+                [plan[i][2] + 1 + j for i in live],
+                [1] * len(live),
+                [plan[i][3] for i in live],
+                decode=[bool(getattr(plan[i][0], "decoding", True)) for i in live])
             dh = []
             logits = self.forward(
                 h[li], np.array([[chains[i][-1]] for i in live], dtype=np.int64),
