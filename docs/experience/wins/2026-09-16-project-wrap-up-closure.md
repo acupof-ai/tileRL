@@ -41,9 +41,10 @@ fix that made `benchrec` importable from a wheel is #638.
 ### 1.2 Quality audit — 32/32 executed + F6 device arm closed; F21/F22 deferred
 
 The 2026-09-14 audit ([`docs/quality-audit-2026-09-14.md`](../../quality-audit-2026-09-14.md))
-confirmed **35 findings, 11 refuted**. Of the 35, two are sm90/H20-only (F21, F22) and
-wait on a card; the other **32 executable findings are 32/32 closed**, and **F6's sm90
-verification arm has now run green on an H20** (2026-09-16) — only F21/F22 remain
+confirmed **35 findings, 11 refuted**. Of the 35, one is sm90/H20-only (F22) and
+waits on a card; the other **32 executable findings are 32/32 closed**, and both sm90
+verification arms **F6 and F21 have now run green on an H20** (2026-09-16; F21 verdict
+[here](2026-09-16-kvfp8-27b-sm90-device-verdict.md)) — only **F22** remains
 device-deferred. Every executable finding is fixed and on main:
 
 | finding | fix | PR |
@@ -86,12 +87,19 @@ Device arms:
   `python -m pytest`, not `uv run` — the fresh `.venv` carries a cu130 torch the 12.9
   driver cannot load; runbook:
   [`errors/2026-09-16-h20-pod-uses-tl013-cu129-not-uv-run-cu130.md`](../errors/2026-09-16-h20-pod-uses-tl013-cu129-not-uv-run-cu130.md).
-- **F21** KV fp8 quant/dequant framework code has no sm90 parity gate for its kernel twin.
+- **F21 — CLOSED 2026-09-16 (sm90 device arm).** KV fp8 verified on the 27B/H20:
+  next-token agreement 24/24 (1.0, first divergence null), e4m3 per-token K/V
+  round-trip error 3.57% over row amax, 1.969x resident KV capacity (45338→89281
+  blocks @32k, 22→32 of B=32 resident). Per-tick decode is still 0.83–0.95x at
+  B≤8 (+~20% gather dequant, 24.4 GB weights dominate; KV ≤41% of a tick), so the
+  path is correct/usable but stays **default off** — a capacity lever, not a
+  speed-up. Full numbers:
+  [`2026-09-16-kvfp8-27b-sm90-device-verdict.md`](2026-09-16-kvfp8-27b-sm90-device-verdict.md).
 - **F22** Quest `page_bounds` cells are sm70-only with no target-neutral CPU twins and
   the Backend methods are unused by production.
 
-So: 32 CPU/route-executable findings **32/32 closed**, and the F6 sm90 verification arm
-ran green on H20; only the two sm90/H20 device arms **F21 and F22** wait on a named card.
+So: 32 CPU/route-executable findings **32/32 closed**; F6 and F21 sm90 verification
+arms both ran green on H20; only the one sm90/H20 device arm **F22** waits on a named card.
 
 ## 2. Online capability (V100 sm70)
 
@@ -179,8 +187,10 @@ the one P0, and it is closed rather than worked around.
   and the partial 5-of-8 NLL result. The sparse cold tier's mmap spill still lives
   behind `--cold-ssd-path`; the dense SSD KvTier was removed (1.65x worse at 12
   sessions).
-- **Two H20/sm90 device arms** (F21, F22) wait on a named H20 window; the F6 sm90 arm
-  closed green on card 0 (§1.2).
+- **One H20/sm90 device arm** (**F22**) waits on a named H20 window; the F6 sm90 arm
+  closed green on card 0 (§1.2) and **F21 closed 2026-09-16** on card 2 — KV fp8
+  correct (24/24 agreement), 1.969x capacity, default off (decode 0.83–0.95x at
+  B≤8); see [`2026-09-16-kvfp8-27b-sm90-device-verdict.md`](2026-09-16-kvfp8-27b-sm90-device-verdict.md).
 - **Slow periodic forward pair (unlogged observation).** On the device the forward
   time shows a recurring slow pair at roughly **~980 / ~1100 ms every ~50 ticks**
   against a normal ~10 ms baseline. This is an on-box observation only — it is not yet
