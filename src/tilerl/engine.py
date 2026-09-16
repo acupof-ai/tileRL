@@ -1845,6 +1845,12 @@ class Engine:
             self._sparse_process_offers(sparse_offers)
         if _tm is not None:
             _tm.mark("offers_pub", _t)
+            # Host-only page count (sparse_offers is a list of (row, [pages]));
+            # aligns offers_pub with the per-page D2H publish count, not seq_len,
+            # so a linear offers_pub (page-bound) is separable from a linear
+            # draft_step (prefix-bound). No device read.
+            if sparse and sparse_offers is not None:
+                _tm.note += f" offers_pages={sum(len(p) for _, p in sparse_offers)}"
 
     def _sparse_live_stats(self) -> dict:
         """Flat sparse residency counters for a hybrid engine. The memory ledger
