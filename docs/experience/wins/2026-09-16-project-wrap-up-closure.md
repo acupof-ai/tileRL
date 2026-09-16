@@ -38,13 +38,14 @@ production correctness bugs were found and fixed during the move (#605: sparse
 no-draft full-prefix hang + phantom final-tick block). The follow-on packaging
 fix that made `benchrec` importable from a wheel is #638.
 
-### 1.2 Quality audit — 32/32 executed + F6 device arm closed; F21/F22 deferred
+### 1.2 Quality audit — 32/32 executed + all sm90 device arms (F6/F21/F22) closed
 
 The 2026-09-14 audit ([`docs/quality-audit-2026-09-14.md`](../../quality-audit-2026-09-14.md))
-confirmed **35 findings, 11 refuted**. Of the 35, two are sm90/H20-only (F21, F22) and
-wait on a card; the other **32 executable findings are 32/32 closed**, and **F6's sm90
-verification arm has now run green on an H20** (2026-09-16) — only F21/F22 remain
-device-deferred. Every executable finding is fixed and on main:
+confirmed **35 findings, 11 refuted**. The other **32 executable findings are 32/32
+closed**, and **all three sm90/H20 verification arms have run green on an H20**
+(2026-09-16): F6, F21 (verdict
+[here](2026-09-16-kvfp8-27b-sm90-device-verdict.md)), and now **F22** — no audit
+finding remains device-deferred. Every executable finding is fixed and on main:
 
 | finding | fix | PR |
 |---|---|---|
@@ -86,12 +87,30 @@ Device arms:
   `python -m pytest`, not `uv run` — the fresh `.venv` carries a cu130 torch the 12.9
   driver cannot load; runbook:
   [`errors/2026-09-16-h20-pod-uses-tl013-cu129-not-uv-run-cu130.md`](../errors/2026-09-16-h20-pod-uses-tl013-cu129-not-uv-run-cu130.md).
-- **F21** KV fp8 quant/dequant framework code has no sm90 parity gate for its kernel twin.
-- **F22** Quest `page_bounds` cells are sm70-only with no target-neutral CPU twins and
-  the Backend methods are unused by production.
+- **F21 — CLOSED 2026-09-16 (sm90 device arm).** KV fp8 verified on the 27B/H20:
+  next-token agreement 24/24 (1.0, first divergence null), e4m3 per-token K/V
+  round-trip error 3.57% over row amax, 1.969x resident KV capacity (45338→89281
+  blocks @32k, 22→32 of B=32 resident). Per-tick decode is still 0.83–0.95x at
+  B≤8 (+~20% gather dequant, 24.4 GB weights dominate; KV ≤41% of a tick), so the
+  path is correct/usable but stays **default off** — a capacity lever, not a
+  speed-up. Full numbers:
+  [`2026-09-16-kvfp8-27b-sm90-device-verdict.md`](2026-09-16-kvfp8-27b-sm90-device-verdict.md).
+- **F22 — CLOSED 2026-09-16 (sm90 device arm).** The Quest `page_bounds` /
+  `page_bound_scores` kernels were sm70-only with no target-neutral parity gate
+  and the Backend methods silently fall back to the torch reference when a cell
+  lacks the key. #671 registers both on sm90 (f32 bounds; sm70 keeps its f16
+  index narrowing) and adds a **factory-direct** CI gate
+  (`tests/test_quest_parity.py`) that JIT-compiles the C target on a CPU host:
+  bounds bit-exact, scores within reduction-order rtol 1e-4 (with O(1)
+  half-dim/kmin-only red controls), plus the sm90 registry assertion. The sm90
+  arm ran **unskipped on H20 card 3** (`/work/tl013` torch 2.11.0+cu129,
+  `python -m pytest`): 2/2 PASSED, `page_bound_scores` maxrel **6.277e-7** vs
+  the rtol 1e-4 gate; the device run also fixed a test-only bug — the smoke
+  built K/Q on CPU while the sm90 backend expected cuda (#675).
 
-So: 32 CPU/route-executable findings **32/32 closed**, and the F6 sm90 verification arm
-ran green on H20; only the two sm90/H20 device arms **F21 and F22** wait on a named card.
+So: 32 CPU/route-executable findings **32/32 closed**, and all three sm90
+verification arms **F6, F21, F22 ran green on H20** — no audit finding remains
+device-deferred.
 
 ## 2. Online capability (V100 sm70)
 
@@ -179,8 +198,10 @@ the one P0, and it is closed rather than worked around.
   and the partial 5-of-8 NLL result. The sparse cold tier's mmap spill still lives
   behind `--cold-ssd-path`; the dense SSD KvTier was removed (1.65x worse at 12
   sessions).
-- **Two H20/sm90 device arms** (F21, F22) wait on a named H20 window; the F6 sm90 arm
-  closed green on card 0 (§1.2).
+- **No sm90/H20 device arm from the quality audit remains open** — the last one,
+  F22, closed 2026-09-16 on card 3 (§1.2). The OPEN rows below that still name
+  sm90 (the irreproducible B=8 cold spec wave, the 2.6x rollout gap) are
+  performance questions, not audit-finding correctness arms.
 - **Slow periodic forward pair (unlogged observation).** On the device the forward
   time shows a recurring slow pair at roughly **~980 / ~1100 ms every ~50 ticks**
   against a normal ~10 ms baseline. This is an on-box observation only — it is not yet
