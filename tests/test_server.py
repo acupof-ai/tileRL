@@ -2060,26 +2060,29 @@ def test_the_routes_cancel_when_the_client_hangs_up():
     # and the GeneratorExit teardown line stays as GC/process defense.
     assert "stream_or_cancel(request, engine, request_id," in src, (
         "the SSE body must run under the shared disconnect watcher")
-    # Every cancel that runs ON the event loop (route handlers, watchers, ws)
-    # must go through to_thread: engine.cancel takes engine._lock across
-    # _release, and a synchronous call freezes /health during a long tick.
-    # The detached SSE drain's backstop cancel (2026-09-16: a GeneratorExit at
-    # the yield skips the in-scope cancels) runs through to_thread as well. The
-    # two SSE generator-internal cancels are off-loop and stay plain.
+    # Every cancel that runs ON the event loop (route handlers, watchers) must go
+    # through to_thread: engine.cancel takes engine._lock across _release, and a
+    # synchronous call freezes /health during a long tick. The detached drain's
+    # backstop cancel (GeneratorExit-at-yield skips in-scope cancels) runs through
+    # to_thread as well. #667 moved the WS handler's own cancel into that shared,
+    # transport-neutral drain (one site serving SSE and WS), so there is no longer
+    # a ws-specific line. The three generator-internal cancels are off-loop and
+    # stay plain (SSE error frame + SSE/WS GeneratorExit teardown).
     on_loop = src.count("asyncio.to_thread(engine.cancel, request_id)")
-    assert on_loop == 8, (
-        f"8 to_thread cancel sites (3 stream_or_cancel: CancelledError, "
+    assert on_loop == 7, (
+        f"7 to_thread cancel sites (3 stream_or_cancel: CancelledError, "
         f"fetch-finished-while-disconnected, the poll-wait disconnect; chat "
-        f"Cancelled/timeout/RuntimeError; ws; the detached drain backstop); "
-        f"found {on_loop}")
+        f"Cancelled/timeout/RuntimeError; the shared detached drain backstop used "
+        f"by both SSE and WS after #667); found {on_loop}")
     for mod in (messages, responses):
         msrc = inspect.getsource(mod)
         assert msrc.count("asyncio.to_thread(engine.cancel, rid_box[0])") == 2, (
             f"{mod.__name__}: both on-loop cancels (CancelledError and the "
             f"timeout/503 handler) must run through to_thread")
-    assert src.count("engine.cancel(request_id)") == 2, (
-        "only the two sync SSE-generator sites (error frame, GeneratorExit "
-        "teardown) may still call cancel directly; they run in worker threads")
+    assert src.count("engine.cancel(request_id)") == 3, (
+        "only the three sync generator-internal sites may call cancel directly "
+        "(SSE error frame, SSE GeneratorExit teardown, and the WS _deltas "
+        "GeneratorExit teardown added in #667); they run in worker threads")
     assert "except GeneratorExit:" in src, (
         "the SSE route keeps GeneratorExit as GC/teardown defense: the live "
         "watcher is the client hang-up path, but a finalized generator must "
@@ -3732,8 +3735,11 @@ def test_stream_or_cancel_final_drain_is_detached_not_awaited_in_cancel_scope():
     # release is not best-effort); the drain's cancel is only the backstop
     fsrc = src
     assert fsrc.count("to_thread(engine.cancel, request_id)") >= 2
-    # a skipped body.close (worker timeout or raise) must be logged, not silent
-    assert dsrc.count("logging.warning") == 2 and "body.close() skipped" in dsrc
+    # a skipped body.close (worker timeout or raise) must be logged, not silent;
+    # a cancel that raises before the join is logged too (#667: it must not abort
+    # the worker join / body.close).
+    assert dsrc.count("logging.warning") == 3 and "body.close() skipped" in dsrc
+    assert "engine.cancel raised" in dsrc
     # graceful shutdown joins in-flight drains through the app lifespan, bounded
     assert "lifespan=_lifespan" in full
     jsrc = inspect.getsource(srv_mod._await_drains)
