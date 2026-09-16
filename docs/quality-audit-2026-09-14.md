@@ -44,7 +44,12 @@ Legend: 🔴 correctness in production · 🟠 gate/test that cannot see the def
    delayed/at-start/spin gates) — the residual coverage gaps are #3 and #4
    (timeout path, SSE/ws), keep this class in mind.
 6. **sm90 fused-prelude "gate" prints instead of asserting** and skips on
-   every CI runner: it can never go red.
+   every CI runner: it can never go red. — **CLOSED 2026-09-16.** #663 made the
+   sm90 test build both preludes and assert (by mean error) that the fused
+   `attn_prep` is strictly closer to the f64 oracle than the discrete chain, with
+   non-vacuity guards; the sm90 arm then ran unskipped green on H20 card 0
+   (`/work/tl013`, torch 2.11.0+cu129): discrete/fused mean-error ratio **1.9527**
+   over 3579 differing elements. See the wrap-up closure §1.2.
 7. **`/health` lock gates are wall-clock pass/fail with no skip** on a live
    round trip — contradicts the flaky-test inventory.
 8. **Distributed `*_world*` gates never run their negative-control flags**;
