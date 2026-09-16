@@ -200,6 +200,18 @@ class SparseDecodeGraph:
             page_base=sf.page_base,
             sparse=sf,
         )
+        # Pinned host staging for the per-tick ids/pos/scalars. Filling a pinned
+        # tensor and one non_blocking copy_ replaces a torch.tensor(list,
+        # device=) per field per row, which allocates and forces a synchronous
+        # H2D each tick (part of the residual post-#678 out-of-graph stalls).
+        # Long here, not int32: sparse packed tables still index long; int32 is
+        # a later lever gated on a sparse-kernel dtype pass. CUDA-only class.
+        pin = str(device) == "cuda"
+        self._ids_h = torch.zeros(B, W, dtype=torch.long, device="cpu", pin_memory=pin)
+        self._pos_h = torch.zeros(B, W, dtype=torch.long, device="cpu", pin_memory=pin)
+        self._sl_h = torch.zeros(B, dtype=torch.long, device="cpu", pin_memory=pin)
+        self._slots_h = torch.zeros(B, dtype=torch.long, device="cpu", pin_memory=pin)
+        self._sql_h = torch.full((B,), W, dtype=torch.long, device="cpu", pin_memory=pin)
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -228,31 +240,58 @@ class SparseDecodeGraph:
         """Fill every static input and the sparse staging buffers, then replay.
         ``srows`` are the decode geometry dicts (carry ``req``); pad slots past
         n use ``(slot, block)``."""
-        B, W = self._b, self._w
+        W = self._w
         sf = self.sf
         sf.fill(srows)
+        self.fill_staging(
+            srows,
+            chains,
+            W,
+            self._ids_h,
+            self._pos_h,
+            self._sl_h,
+            self._slots_h,
+            self._sql_h,
+            sf,
+            pad,
+        )
+        self._ids.copy_(self._ids_h, non_blocking=True)
+        self._pos.copy_(self._pos_h, non_blocking=True)
+        self._sl.copy_(self._sl_h, non_blocking=True)
+        self._slots.copy_(self._slots_h, non_blocking=True)
+        self._sql.copy_(self._sql_h, non_blocking=True)
+        self._graph.replay()
+        return self._logits
+
+    @staticmethod
+    def fill_staging(srows, chains, W, ids_h, pos_h, sl_h, slots_h, sql_h, sf, pad=None):
+        """Write one decode tick's inputs into the pinned host staging tensors.
+        Pure host indexing (no device), so it is unit-tested on CPU: ids are the
+        per-row chains, pos the [seq_len-1 ..] range, scalars the slot/logical
+        length/chain width; rows past len(srows) take the pad frame. The device
+        buffers then receive one non_blocking copy_. Kept free of CUDA so the
+        fill values are byte-for-byte checkable without a card."""
+        B = ids_h.shape[0]
+        ids_h.zero_()
+        pos_h.zero_()
         for i, rw in enumerate(srows):
             r = rw["req"]
             chain = chains[i] if chains else (r.output[-1],)
-            self._ids[i, : len(chain)] = torch.tensor(chain, device=self._ids.device)
-            self._pos[i, : len(chain)] = torch.arange(
-                r.seq_len - 1, r.seq_len - 1 + len(chain), device=self._ids.device
-            )
-            self._sl[i] = r.seq_len - 1 + W
-            self._slots[i] = r.state_slot
-            self._sql[i] = len(chain)
+            for j, tok in enumerate(chain):
+                ids_h[i, j] = tok
+                pos_h[i, j] = r.seq_len - 1 + j
+            sl_h[i] = r.seq_len - 1 + W
+            slots_h[i] = r.state_slot
+            sql_h[i] = len(chain)
         n = len(srows)
         if pad is not None and n < B:
             pad_slot, pad_block = pad
             for i in range(n, B):
-                self._ids[i, :] = 0
-                self._pos[i, :] = 0
-                self._sl[i] = W
-                self._slots[i] = pad_slot
-                self._sql[i] = W
-                sf.own_table[i, 0] = pad_block
-        self._graph.replay()
-        return self._logits
+                sl_h[i] = W
+                slots_h[i] = pad_slot
+                sql_h[i] = W
+                if sf is not None:
+                    sf.own_table[i, 0] = pad_block
 
 
 class CpuSparseGraph:
@@ -343,8 +382,9 @@ class GraphCapture:
         return None if self.pad_slot is None else (self.pad_slot, self.pad_block)
 
 
-def make_decode_graph(model, backend, kv_pool, state_pool, B, W, keep,
-                      aux_layers, pool) -> tuple[DecodeGraph | None, Any, str | None]:
+def make_decode_graph(
+    model, backend, kv_pool, state_pool, B, W, keep, aux_layers, pool
+) -> tuple[DecodeGraph | None, Any, str | None]:
     """Capture one dense (B, W) decode graph. Returns (graph, pool, error).
     On success error is None and pool is the (possibly freshly created) shared
     CUDA graph pool; on capture failure graph is None and error is the message
@@ -353,16 +393,24 @@ def make_decode_graph(model, backend, kv_pool, state_pool, B, W, keep,
         if pool is None:
             pool = torch.cuda.graph_pool_handle()
         g = DecodeGraph(
-            model, backend, kv_pool, state_pool, B, width=W, pool=pool,
-            keep=W if keep else 0, aux_layers=aux_layers,
+            model,
+            backend,
+            kv_pool,
+            state_pool,
+            B,
+            width=W,
+            pool=pool,
+            keep=W if keep else 0,
+            aux_layers=aux_layers,
         )
     except Exception as exc:  # capture is best-effort: eager fallback always works
         return None, pool, f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback"
     return g, pool, None
 
 
-def make_sparse_graph(model, backend, kv_pool, state_pool, tracker, sf,
-                      B, W, aux_layers, pool) -> tuple[Any, Any, str | None]:
+def make_sparse_graph(
+    model, backend, kv_pool, state_pool, tracker, sf, B, W, aux_layers, pool
+) -> tuple[Any, Any, str | None]:
     """Capture/replay one sparse decode graph. A real CUDAGraph on cuda; on CPU
     a plain recorded forward (CpuSparseGraph) so the staging math is testable
     without a card. Returns (graph, pool, error)."""
@@ -371,12 +419,23 @@ def make_sparse_graph(model, backend, kv_pool, state_pool, tracker, sf,
             if pool is None:
                 pool = torch.cuda.graph_pool_handle()
             g = SparseDecodeGraph(
-                model, backend, kv_pool, state_pool, tracker, sf, B, W,
-                pool=pool, aux_layers=aux_layers,
+                model,
+                backend,
+                kv_pool,
+                state_pool,
+                tracker,
+                sf,
+                B,
+                W,
+                pool=pool,
+                aux_layers=aux_layers,
             )
         else:
             g = CpuSparseGraph(model, backend, kv_pool, state_pool, sf, B, W)
     except Exception as exc:
-        return None, pool, (f"sparse decode graph capture failed for "
-                            f"B={B} W={W} ({exc}); eager fallback")
+        return (
+            None,
+            pool,
+            (f"sparse decode graph capture failed for B={B} W={W} ({exc}); eager fallback"),
+        )
     return g, pool, None
