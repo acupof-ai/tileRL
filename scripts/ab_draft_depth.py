@@ -1,6 +1,6 @@
 """How much of a speculative tick is the DRAFT, without instrumenting the tick?
 
-The direct approach fails: prof_spec_tick.py syncs around each wrapped method,
+The direct approach fails: the since-deleted prof_spec_tick.py synced around each wrapped method,
 which breaks CUDA-graph replay — it read 0.4 tok/s against a real 48.4 and put
 4972 ms in a 20 ms draft. Any probe inside a captured graph measures the probe.
 

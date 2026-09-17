@@ -7,7 +7,7 @@ With the packed-f16 GEMV in, `--draft --depth 3` served **1.3 tok/s** against a
 matching its own replay. So the trunk was fine and something in the speculative
 path looked 25x broken.
 
-`prof_spec_tick.py` agreed: 79% of the wall in `_draft_step`, 371 ms per depth
+`prof_spec_tick.py` (deleted; `ab_draft_depth.py` replaces it) agreed: 79% of the wall in `_draft_step`, 371 ms per depth
 step against 4.98 ms in isolation. That reads like a real defect in the draft.
 
 ## Root Cause
@@ -36,7 +36,7 @@ one produced 289 tok/s above a 64 tok/s roofline. Same bug, opposite sign: an
 unwarmed `lo` can make the rate absurdly high (compile in `lo` only) or absurdly
 low (compile dominating `lo`).
 
-`prof_spec_tick.py`'s 371 ms/step was the same three ticks averaged over a
+The deleted `prof_spec_tick.py`'s 371 ms/step was the same three ticks averaged over a
 15-tick run.
 
 ## Fix
