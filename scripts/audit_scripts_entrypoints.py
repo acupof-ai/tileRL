@@ -1,8 +1,8 @@
-"""Phase 1 of the scripts/ audit: classify all 200 files against six entry-point sets.
+"""Phase 1 of the scripts/ audit: classify all 219 files against seven entry-point sets.
 
 The evidence standard is ENUMERATION, not search. For each set we build the set of scripts
 it reaches, then a file's classification is set membership -- so a file is DEAD only when it
-is absent from all six *enumerated* sets, and the zeros are reported. A keyword search would
+is absent from all seven *enumerated* sets, and the zeros are reported. A keyword search would
 only prove what I thought to search for.
 
 Two traps this is built to avoid:
@@ -101,6 +101,11 @@ def _files(globs: list[str], skip_scripts: bool = False) -> list[pathlib.Path]:
     for g in globs:
         for p in ROOT.glob(g):
             if p.is_file() and ".git/" not in str(p):
+                # Sibling checkouts under .claude/worktrees/ are not repo sources: a
+                # script there is named by another branch, which would make it read
+                # LIVE in this tree. Excluded so reachability is about this tree only.
+                if p.relative_to(ROOT).parts[:2] == (".claude", "worktrees"):
+                    continue
                 if skip_scripts and p.parent.name == "scripts" and p.suffix == ".py":
                     continue
                 out.append(p)
@@ -226,7 +231,7 @@ def set4b_other_docs() -> set[str]:
 def set5_invocation() -> set[str]:
     """Shell, Makefile, POD-VERIFY.md -- a script invoked by another script."""
     hits = set()
-    for p in _files(["scripts/*.sh", "*.sh", "Makefile", "POD-VERIFY.md", "**/*.sh"]):
+    for p in _files(["scripts/*.sh", "*.sh", "Makefile", "scripts/POD-VERIFY.md", "**/*.sh"]):
         hits |= _mentions(_read(p))
     return hits
 

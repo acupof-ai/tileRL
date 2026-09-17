@@ -8,7 +8,8 @@ Durable tools — run from a checkout, documented in their docstrings:
 | `baseline.py` | pull / commit the snapshot the harness gates against |
 | `mmlu.py`, `gsm8k_jsonl.py` | accuracy: MMLU through tileRL or sglang; GSM8K → `tilerl train --data` JSONL |
 | `rl_compare.sh` | roadmap P5: same pod, same task, tileRL vs verl+sglang |
-| `pod_sync.sh`, `pod.sh`, `pod_fan.sh` | sync this checkout to the H20 pod and run there |
+| `pod_sync.sh`, `pod_fan.sh` | sync this checkout to the H20 pod and run there |
+| `pod.sh` | build/deploy/tail the tilerl k8s pod (`build\|load\|apply\|logs\|forward\|all`) |
 | `hf_reference.py`, `health_probe.py`, `verify_h20_fp4.py` | external ground truth and the 27B verify checks |
 | `probe_served_rate.py` | the served rate over HTTP, from /health's forward counters — three clock-based instruments got it wrong |
 | `cuda_codegen.py`, `op_parity.py`, `parity_*.py` | kernel codegen inspection and parity gates |
