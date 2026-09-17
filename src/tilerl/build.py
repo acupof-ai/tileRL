@@ -30,13 +30,7 @@ from .kv_cache import (
 )
 from .kv_tiers import DramSnapshots, HostKvPages, KvBootStore
 from .sparse_index import DEFAULT_SPARSE_K
-
-QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")
-
-NO_WEIGHTS = (
-    "hint: download the checkpoint (or set TILERL_QWEN38_SOURCE to a\n"
-    "      local safetensors directory), or use --model tiny."
-)
+from .tokenizer import NO_WEIGHTS, QWEN38_SOURCE  # re-export: scripts set build.QWEN38_SOURCE
 
 #: Every name build_model builds. The single source the argparse choices import.
 MODEL_NAMES = ("tiny", "tiny-agent", "qwen38-27b")
