@@ -43,7 +43,12 @@ grant. If the pod was recreated, do this sequence first (read-only recon on
 
    `POD_SESSION=h20` is what pins the remote tree to `/work/tilerl-s-h20` for
    both `pod_sync.sh` and `pod_run.sh` (the tree name derives from it, not a
-   `--session` flag — pod_run has none). PyPI stalls on large wheels from this
+   `--session` flag — pod_run has none). On the laptop, sessions use one git
+   worktree per branch under `.claude/worktrees/`;
+   [`scripts/prune_worktrees.sh`](../scripts/prune_worktrees.sh) dry-runs
+   (default) the worktrees sitting exactly on a merged PR head and deletes only
+   with `--apply`, keeping a dirty tree (a peer's work in progress) by design.
+   PyPI stalls on large wheels from this
    pod; the setup defaults to the `mirrors.aliyun.com` index (the ivolces mirror
    lacks huggingface-hub 1.28.0). Override with `PIP_INDEX_URL` /
    `TL013_TORCH_INDEX` if the network differs.
@@ -79,6 +84,13 @@ The launcher returns as soon as the job is claimed; tail `/work/h20serve.log`
 (the pod_run job log) and `/work/serve_h20.log` (the server log). Pass `--wait`
 to block on it. Stop by killing the pod_run job; the supervisor trap releases
 the GPU.
+
+To watch a `/work` pod log as an event stream from the laptop (a `tn exec`
+compound command that a `Monitor` prompt cannot carry), use
+[`scripts/pod_tail.sh`](../scripts/pod_tail.sh)
+(`scripts/pod_tail.sh <log-basename> [grep-ere] [poll-s] [rounds]`); it prints
+only new lines and defaults to a pattern that stays loud through a crash, so
+silence means still-running.
 
 ## What it serves
 
