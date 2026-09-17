@@ -1,5 +1,7 @@
 # Roadmap
 
+> **Project wrapped 2026-09-13: "Active development stops in favour of ecosystem engines" (ckl, 2026-09-13); the V100 serve endpoint stays up.** No new framework feature work follows; the open PRs landed and the closing state was sealed 2026-09-16 in [wins/2026-09-16-project-wrap-up-closure.md](experience/wins/2026-09-16-project-wrap-up-closure.md). The phases below are the pre-wrap-up plan, kept as history, not a forward queue. Decision record: [CHANGELOG](../CHANGELOG.md), 2026-09-14 section, "phase exit — project wrap-up"; [README](../README.md), "Status (2026-09-13)".
+
 **North star.** Serve and RL-train Qwen3.8-27B (NVFP4) on one Hopper card in
 one process. What exists: the engine that samples is the model that trains,
 LoRA on the frozen fp4 base, so there is no weight sync between rollout and
@@ -154,6 +156,21 @@ drifts into the cap before 100 steps
 (`errors/2026-09-06-the-rollouts-grew-into-the-cap.md`).
 
 ## P2 — the speculative tick is captured, and the head stays on-policy — needs the pod
+
+**Status (2026-09-17): step 0 shipped by a different mechanism; steps 1–3 are
+cancelled.** The decode graph is kept across each in-place optimizer step and the
+cached f32 casts are refilled in `invalidate_weights()`, not re-recorded; the
+shipped `--rl` path builds with `decode_graph=True` and passes the
+`recapture_graph=True` waiver (`train.py:2112`, `train.py:2439`). The 27B LoRA
+card exit ran 2026-09-11: post-step greedy tokens bit-equal to a fresh eager
+engine, 24.4 ms vs 158.2 ms/tick
+([wins/2026-09-11-lora-recapture-after-update-kept-graph-27b.md](experience/wins/2026-09-11-lora-recapture-after-update-kept-graph-27b.md);
+mechanism [wins/2026-09-07-an-update-keeps-the-decode-graphs.md](experience/wins/2026-09-07-an-update-keeps-the-decode-graphs.md)).
+The group-8 "within 5% of plain captured decode" clause was not demonstrated —
+the training-vs-serving tick gap stays on [OPEN.md](experience/OPEN.md). Steps
+1–3 below are superseded by the 2026-09-13 wrap-up decision: no new framework
+work ([closure](experience/wins/2026-09-16-project-wrap-up-closure.md)). The
+plan text below is unchanged.
 
 Rollout is the RL cost, rollout is decode, speculation is the decode lever at
 B ≤ 8. Today any draft head loses 4.9× (86.2 → 17.6 tok/s) because the

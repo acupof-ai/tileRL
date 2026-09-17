@@ -11,7 +11,7 @@ unchanged — they are the contract.
 | Scheduling | `engine.py` | `submit(input_ids, params) -> req_id`, `poll() -> {req_id: tokens}`, `StepLimits`. Continuous batching, one forward per tick. |
 | Model | `model.py` | `load_hf` (every checkpoint format) + forward. Calls backend ops only. |
 | Adapter | `packages/tilerl-kernels/src/tilerl_kernels/backend.py` | `(precision, arch) → kernels` registry — see [design-kernels.md](design-kernels.md). |
-| Storage | `kv_cache.py`, `sparse_engine.py` | `PagedKvPool` (paged blocks, COW on shared prefix) + `LinearStatePool` (GDN recurrent state) + rolling-hash prefix cache. The sparse cold path adds `HostKvPages` (pinned-host KV tier), `ColdSsdFile` (mmap spill, `--cold-ssd-path`/`--cold-ssd-bytes`) and `DramSnapshots` (demoted GDN state, `--dram-bytes`). |
+| Storage | `kv_cache.py`, `kv_tiers.py`, `sparse_engine.py` | `PagedKvPool` (paged blocks; shared-prefix blocks stay read-only, no copy-on-write) + `LinearStatePool` (GDN recurrent state) + rolling-hash prefix cache. The sparse cold path adds `HostKvPages` (pinned-host KV tier), `ColdSsdFile` (mmap spill, `--cold-ssd-path`/`--cold-ssd-bytes`) and `DramSnapshots` (demoted GDN state, `--dram-bytes`). |
 
 Training shares the stack: `train.py` drives the same `model.py` forward
 through the hand-written tape (`autograd.py`), same backend ops. One runtime.

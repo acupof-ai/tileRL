@@ -35,7 +35,7 @@ phase exits, default flips, accept-or-reject verdicts.
 
 [experience/](experience/) — 605 dated entries, one measurement each, wins and
 rejections both. Start at [experience/README.md](experience/README.md), which
-picks the ~24 that carry the findings the rest of the repo rests on.
+picks the ~27 that carry the findings the rest of the repo rests on.
 
 [analysis/](analysis/) — the cross-cutting write-ups, where a question is asked
 of the whole system rather than one change: the [sglang
@@ -60,5 +60,5 @@ non-zero means SUPERSEDED, not delete.
 | [serve-v100.md](serve-v100.md) | Running the 27B on the pod with the chat UI on a laptop — the SSH tunnel, the exact server command, and why warmup captures the decode graphs up front. |
 | [serve-h20.md](serve-h20.md) | The sm90 sparse+d1+decode-graph supervisor run through `pod_run.sh` — the `/work/tl013` cu129 interpreter (not `uv run`), the in-checkpoint draft, and the parameterized cold-spill path. Awaits a real-serve window. |
 | [serve-cold-prefill-cap.md](serve-cold-prefill-cap.md) | When to raise the sparse prefill chunk from the shared-server default 192 to 512 (dedicated/offline long-context cold fill), the two zero-code ways to do it, and why concurrent serving must keep 192. First-token latency only. |
-| [lessons/](lessons/) | Two measured Q&A notes on driving Claude Code against tileRL's own server: the Messages shim, and the rollout launcher's sandbox. (historical — both shims are built and gated by tests) |
+| [lessons/](lessons/) | Two measured Q&A notes on driving Claude Code against tileRL's own server: the Messages shim, and the rollout launcher's sandbox. (historical — the Messages shim survives as `src/tilerl/messages.py` gated by `tests/test_server.py`; the launcher and `tests/test_rollout.py` were deleted 2026-09-14, #594) |
 | [tick-anatomy.html](tick-anatomy.html) | A rendered page: every layer of one V100 speculative decode tick against its byte floor. |

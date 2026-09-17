@@ -37,7 +37,7 @@ moment the condition moves, these scripts rerun first.
 |---|---|
 | `bench_tp.py` | TP loses to DP **until a capturable all-reduce exists** — a named, planned change |
 | `ab_draft_depth.py` + `ab_w1_baseline.py` | spec depth verdict has flipped three times (V100 depth 1 wins, H20 every depth loses, eager build every depth wins 1.8x) — a live question, not a verdict |
-| `_sweep_fp8_prefill.py` | sole source for `_FP4_BLOCK_N = 64` in `kernels_linear.py:146` — keep until the prefill tile size is retuned |
+| `_sweep_fp8_prefill.py` | sole source for `_FP4_BLOCK_N = 64` (`_FP4_BLOCK_N` in `kernels_linear.py`) — keep until the prefill tile size is retuned |
 
 ## sm70 investigation series — keep until the sm70 prefill work closes
 

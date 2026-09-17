@@ -23,7 +23,7 @@ is the M > 1 kernel and carries prefill and batched decode.
 
 ## Status (2026-09-13)
 
-**Development stops here in favour of ecosystem engines (ckl, 2026-09-13); the V100 serve endpoint stays up** (host:port to follow in a one-line edit). This is the state at wrap-up.
+**Development stops here in favour of ecosystem engines (ckl, 2026-09-13); the V100 serve endpoint stays up at `n37-002-027:8000`.** This is the state at wrap-up.
 
 What runs today (H20 unless noted; every number links its entry):
 - **Dense serve**: the table above — 92.4 d512 decode / 2689.8 prefill tok/s, 74.6% MMLU
@@ -85,7 +85,7 @@ generations before NVFP4: 50.0 tok/s decode-only, 19 GB of weights off disk.
 Not the perf target; evidence the kernels are not bound to one arch.
 
 ```
-curl http://10.37.2.27:8000/v1/chat/completions -H 'Content-Type: application/json' \
+curl http://n37-002-027:8000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"qwen38-27b","messages":[{"role":"user","content":"hi"}]}'
 ```
 

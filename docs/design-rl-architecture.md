@@ -215,8 +215,13 @@ follow from the survey and cost nothing architecturally:
    > `scripts/probe_fp4_decode_gemm.py`; the matched-pair 73.5 vs 66.9 MB rates
    > came from `scripts/probe_fp8_decode_gemm.py`. All three were deleted when
    > their byte arithmetic moved to `precision.nbytes` / `kernel_cost.py`; the
-   > achieved rates are card measurements with no code replacement. Rerun by
-   > hand: `scripts/pod_run.sh --wait bf16cmp|fp4gemm|fp8rate <card> -- python3 scripts/<name>.py`.
+   > achieved rates are card measurements with no code replacement and no
+   > rerunnable path: the three deleted probes timed an M=8 fp4/fp8 linear and
+   > nothing in the tree does now; the figures survive in this paragraph and the
+   > 2026-09-08 errors entries. The byte half reproduces with `uv run tilerl
+   > bench --model qwen38-27b --kernels --checkpoint <27b-checkpoint-dir>`
+   > (per-key bytes via precision.nbytes / kernel_cost.py, no GPU; omit
+   > --checkpoint for the all-nvfp4 config face).
 
 **A third method result, and the reason the utilisation figure above moved twice
 in one afternoon (21.8%, then 19.1%, now 20.4%).** Two sessions derived the weight

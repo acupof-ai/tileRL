@@ -1,7 +1,7 @@
-> **SUPERSEDED (2026-09-10):** The shim is built and gated by `tests/test_server.py`
-> and `tests/test_rollout.py`. Kept because CHANGELOG:477 (and :160) cites it as
-> evidence for the phase-exit verdict. Current answer: the server and rollout code,
-> plus `wins/2026-09-06-accepted-and-ignored-is-a-format-lie.md`.
+> **SUPERSEDED (2026-09-10):** The shim is built and gated by `tests/test_server.py`.
+> Kept because CHANGELOG cites it as evidence for the phase-exit verdict (`git grep
+> messages_shim_stage1.md CHANGELOG.md`). Current answer: the server code, plus
+> `wins/2026-09-06-accepted-and-ignored-is-a-format-lie.md`.
 
 ---
 question: What does an Anthropic Messages shim in front of tileRL's server actually have to implement, and can the tiny model on CPU complete a `claude -p` tool loop?
