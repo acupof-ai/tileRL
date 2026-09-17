@@ -914,19 +914,18 @@ def test_batchkv_inputs_for_fp8_scales():
     os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true",
     reason="wall-duration ratio of a GIL yield is machine load, not code: measured "
     "29x/2.92x/1.47x across runners and went red at 1.47 on a healthy macos-14 CI "
-    "(errors/2026-09-11-flaky-wallclock-test-inventory.md). Run locally/dedicated; "
-    "the SSD reader uses the Event-controlled hold_fetches_for_test seam in CI.",
+    "(errors/2026-09-11-flaky-wallclock-test-inventory.md). Run locally/dedicated.",
 )
 def test_a_yielded_gil_runs_a_background_load_promptly(tmp_path):
-    """The SSD prefetch fix's premise: yielding the GIL hands the reader thread a
-    prompt time slice, so a background torch.load runs at near-uncontended speed.
+    """A CPython premise, checked directly: yielding the GIL hands a background
+    reader thread a prompt time slice, so a ``torch.load`` running behind a busy
+    loop finishes at near-uncontended speed.
 
-    Guards the premise itself, not the once-per-tick yield #444 shipped: N=1
-    leaves the reader starving on slow ticks (1.5s on CPU), closed by the
-    spin-until-ready loop (72d83303). What must not silently break is the
-    environmental assumption -- that sleep(0) in a busy loop lets a bg load
-    finish promptly. Red when a CPython/torch upgrade changes GIL behavior so
-    it stops holding
+    This guards the interpreter assumption, not any engine code: it is a
+    standalone property test over ``sys.setswitchinterval`` and the GIL, kept
+    after the mechanism it once supported (the dense SSD prefetch tier) was
+    removed. Red when a CPython/torch upgrade changes GIL behavior so a
+    GIL-waiting thread no longer gets the lock promptly
     (docs/experience/errors/2026-09-10-prefetch-deadline-gil-contention.md).
     """
     if sysconfig.get_config_var("Py_GIL_DISABLED"):

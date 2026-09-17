@@ -37,11 +37,11 @@ jobs:
       - name: Ruff lint
         run: uv run ruff check
       - name: Ruff format
-        # Non-blocking until the tree is reformatted: 337 of 1017 files still
-        # differ (counted 2026-09-17), and a sweep that touches them all is a
-        # worse risk than an unformatted tree. CLAUDE.md has said this since day
-        # 1; the workflow just never implemented it, so main has been red on it
-        # since 2026-08-28.
+        # Non-blocking until the tree is reformatted: 339 of 1018 files still
+        # differ (ruff 0.16.4, counted 2026-09-17), and a sweep that touches them
+        # all is a worse risk than an unformatted tree. CLAUDE.md has said this
+        # since day 1; the workflow just never implemented it, so main has been
+        # red on it since 2026-08-28.
         continue-on-error: true
         run: uv run ruff format --check
       - name: CPU test suite
