@@ -64,7 +64,8 @@ class PagedKvPool:
 
     ``kv_fp8`` stores the planes in that fp8 dtype with an f32 ``k_scale``/``v_scale``
     per ``(plane, block, kv_head, token)`` — one scale over head_dim
-    (docs/design-fp8-kv.md). The write paths then QUANTIZE; a plain ``.to(fp8)``
+    (docs/experience/wins/2026-09-07-fp8-kv-pool-per-token-scales.md). The write paths
+    then QUANTIZE; a plain ``.to(fp8)``
     would drop the scale and store plausible garbage.
     """
 
