@@ -731,7 +731,8 @@ def test_gdn_chunk_rounding_bound(device):
     same structure, different arithmetic. The kernel path is unbounded.
 
     Device tiers: CPU runs always, three seeds, tight bound. CUDA runs only with a
-    card (default skip) and joins OPEN row 19's "CUDA tests with no runner" set —
+    card (default skip) and joins OPEN.md's "CUDA tests have no regular runner" set
+    (a recorded design decision, now in its "Closed by triage 2026-09-14" section) —
     this replaces a line of text with a red-capable assertion: the day a runner
     lands, it reports itself. The CUDA tight bound is unset: the errors entry
     records ``max|delta|=3.586e-4`` from the KERNEL path (e2e test, sm90, H20 card 1,

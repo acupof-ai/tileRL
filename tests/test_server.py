@@ -573,50 +573,6 @@ def test_the_stream_arrives_in_pieces_and_never_splits_a_character():
     assert content == json.loads(full)["choices"][0]["delta"]["content"]
 
 
-def _assert_stream_is_incremental(client, body) -> None:
-    streamed = client.post("/v1/chat/completions", json={**body, "stream": True})
-    assert streamed.status_code == 200, streamed.text
-    lines = [ln for ln in streamed.text.split("\n") if ln.startswith("data:")]
-    payloads = [json.loads(ln[len("data: ") :]) for ln in lines[:-1]]
-    deltas = [
-        p["choices"][0]["delta"]["content"]
-        for p in payloads
-        if p["choices"][0].get("delta", {}).get("content")
-    ]
-
-    # Correctness first, because it holds unconditionally: the pieces must reassemble
-    # into the same text the non-streamed path returns for the same request.
-    plain = client.post("/v1/chat/completions", json={**body, "stream": False})
-    assert plain.status_code == 200, plain.text
-    expected = plain.json()["choices"][0]["message"]["content"]
-    assert "".join(deltas) == expected, (
-        f"stream != non-stream:\n  joined  {''.join(deltas)!r}\n  expected {expected!r}"
-    )
-
-    # No incremental delta may END on U+FFFD: that is where a multi-byte character was
-    # cut in half, and holding the trailing replacement run until its bytes arrive is
-    # the whole point of the loop's rstrip.
-    #
-    # Deliberately not "contains no U+FFFD": tiny() has random weights, so its bytes
-    # are mostly not valid UTF-8 and the non-streamed reply carries interior
-    # replacement chars on all four model seeds measured -- an assertion against
-    # containment is unsatisfiable for any loop that actually streams, and the earlier
-    # one passed only because the loop emitted nothing until the end.
-    #
-    # How MUCH streamed is asserted by
-    # test_a_reply_that_arrives_over_many_polls_streams_over_many_deltas, against a
-    # stepped engine, and deliberately NOT here: the delta count off a live engine is
-    # a race between generation speed and the loop's 20 ms poll, and the tiny model
-    # can finish a 24-token reply inside one window. Measured 3 deltas at seeds
-    # 7/42/3 and 1 at 11/99. An assertion that the last delta is not the whole reply
-    # therefore fails on timing, not on a defect -- it did, 2 runs in 6 of this file,
-    # while passing every time the test ran alone. The stepped engine reveals one
-    # token per poll by construction and asserts the same invariant deterministically.
-    assert not any(d.endswith("�") for d in deltas[:-1]), (
-        f"an incremental delta ends mid-character: {deltas!r}"
-    )
-
-
 class _StepEngine:
     """An engine whose peek() reveals ONE more token per call. No race, no weights.
 

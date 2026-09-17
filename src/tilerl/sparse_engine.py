@@ -531,10 +531,8 @@ class SparseForward:
         the tracker's per-rid dicts: ``s_l2p`` [B,C] and per-source-plane
         ``s_bounds`` [B*n_src,C,Hkv,2,D], gathered in fill() (outside capture).
         Their shapes are fixed for the bucket and never change with context."""
-        if self.reuse:
-            cmax = cmax_cap
-        else:
-            cmax = max((len(r["cand"]) for r in self.rows), default=0)
+        cmax = (cmax_cap if self.reuse
+                else max((len(r["cand"]) for r in self.rows), default=0))
         self.cmax = cmax
         dev = self.device
         self.cand_idx = torch.zeros(self.b, cmax, dtype=torch.long, device=dev)

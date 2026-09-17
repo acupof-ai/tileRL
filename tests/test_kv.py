@@ -309,12 +309,21 @@ def test_a_partial_block_cannot_be_published():
 
 
 
-@pytest.mark.xfail(strict=True, reason="open: LRU evicts the shared prefix first, "
-                   "errors/2026-09-07-a-prompts-own-publishes-evict-its-shared-prefix.md")
-def test_a_prompts_own_publishes_evict_the_prefix_it_shares():
-    """One conversation publishes a nested family of keys -- 6 at prefill chunk ends plus
-    one per 16 generated tokens -- and LRU keeps the LONGEST, evicting the shared header its
-    own tail displaced. strict=True: this goes red the day it is fixed."""
+def test_lru_evicts_a_shared_header_under_a_direct_nested_flood():
+    """Store-only LRU characterization, not an open-bug tripwire.
+
+    Fed nested keys by direct ``insert`` with no tier, the store scores recency
+    alone, so once budget-1 longer publishes land behind a short shared header
+    the header is the LRU victim and a second session sharing it misses. Nothing
+    in the store protects short prefixes by design.
+
+    The served defect this used to mark (one conversation's own publishes
+    evicting its shared prefix) was fixed at the publish SITE, which direct
+    inserts never reach: a decode publish retires the row's previous decode
+    entry, gated end-to-end by
+    test_e2e.py::test_one_conversation_holds_one_decode_entry_at_every_point_in_time.
+    See errors/2026-09-07-a-prompts-own-publishes-evict-its-shared-prefix.md
+    (fixed)."""
     def run(entries: int) -> tuple[int | None, int]:
         pool = PagedKvPool(64, 1, 4, device=torch.device("cpu"))
         snap = (torch.zeros(8, 8, 8), None)
@@ -331,20 +340,21 @@ def test_a_prompts_own_publishes_evict_the_prefix_it_shares():
         return (None if hit is None else hit.length), store.stats()["evictions"]
 
     # The control first: with room for every publish the second session HITS, so the header
-    # entry is published correctly and the failure below is eviction, not absence.
+    # entry is published correctly and the miss below is eviction, not absence.
     length, evictions = run(99)
     assert (length, evictions) == (2 * BLOCK_TOKENS, 0), (
         f"control: an ample budget must serve the shared header, got {length} with "
         f"{evictions} evictions -- if this fails the probe is wrong, not the store"
     )
 
+    # Real store behavior under a tight budget: the direct nested flood evicts
+    # the shared header and a second session misses.
     length, evictions = run(3)
     assert evictions > 0, "fixture: a 3-entry budget evicted nothing, so nothing is under test"
-    assert length == 2 * BLOCK_TOKENS, (
-        f"a second session sharing the {2 * BLOCK_TOKENS}-token header got "
-        f"{'a miss' if length is None else f'length {length}'} after one conversation's own "
-        f"{evictions} evictions: LRU ranked this prompt's tail above a prefix another "
-        "session can use"
+    assert length is None, (
+        f"direct nested inserts kept the {2 * BLOCK_TOKENS}-token shared header under a "
+        f"3-entry budget (hit length {length}): the store now protects short prefixes itself "
+        "-- update this characterization and confirm the engine retire gate still earns its place"
     )
 
 
