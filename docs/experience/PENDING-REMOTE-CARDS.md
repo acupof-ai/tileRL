@@ -19,17 +19,25 @@ dissolves. Per-card commands bind one physical card per run; multi-rank gates
 pin `CUDA_VISIBLE_DEVICES` to two of them. Never assume 6/7 — that grant
 expired.
 
+**Status 2026-09-17 — every H20/sm90 gate below is deferred; V100/sm70 gates run.** ckl stopped H20 a second time on 2026-09-16 20:40: the `sglang-test` pod object was deleted and its emptyDir `/work` wiped — the four `/work/tilerl-s-*` trees, `/work/tl013`, and the 22 GB tileRL checkpoint are gone, so resuming also requires rebuilding the pod, re-syncing a tree, restoring `/work/tl013`, and re-uploading the checkpoint. Frozen: step 1 (cards 0/1/3/6 calibration), the step 3 timing remainder, steps 5 and 6, and the step 7 RL 5% arm, plus the three sm90 test tails. Shipped rows stand: steps 2 and 4, the step 3 main table, and the step 7 LoRA run. V100 needs no approval: `scripts/bench_api_routes.py` and `scripts/probe_sm70_graph_poison.py` (#545) run now.
+
 **Marker count (grep the reviewer used):**
 `grep -rn pending-remote src scripts tests docs --include='*.py' --include='*.md'`
-reports **141 on main**; this runbook adds two prose mentions (the phrase in
-this header and the step-3 column note), so the same grep reports **143 at this
-file's head** — no new gated code marker. The executable gates are the seven
-groups below; everything else the grep finds is dated wins/errors prose,
-roadmap text, or the "also pending" tail.
+reported **141 on main** when this file was written (2026-09-11; two of those
+hits were this header's prose). Recounted 2026-09-17 at main 220b3c95 the same
+grep reports **178**: wins 89, errors 15, other docs 40 (34 top-level files,
+5 in this file, 1 in OPEN.md), src 19, tests 12, scripts 3. Three more hits
+fall outside the include filter — `scripts/rl_compare.sh` ×2 and
+`docs/experience/prereg.jsonl` ×1 (181 with no filter). The executable gates
+are the seven groups below and the "also pending" tail; executable markers
+added since 2026-09-11 outside both are `scripts/probe_sm70_graph_poison.py`
+(#545, sm70/V100) and the cuda arm in `tests/test_server.py` (tiny cell, any
+cuda card). Everything else the grep finds is dated wins/errors prose or
+roadmap/support-matrix text.
 
 ---
 
-## 1 — Calibrate every card (one per card, first — every later gate reads these)
+## 1 — Calibrate every card (one per card, first — every later gate reads these)  ⏸ deferred — H20 paused 2026-09-16 (see status above)
 
 ```bash
 for c in 0 1 3 6; do
@@ -84,9 +92,9 @@ prefill S=4096, against measured bw/bf16/**fp8** floors. See
 [wins/2026-09-11-h20-kernel-roofline-step3.md](../wins/2026-09-11-h20-kernel-roofline-step3.md).
 Two rules that run established: the ceiling is the kernel's MMA-dtype peak
 (w4a8 prefill rides the fp8 peak, decode the bf16 one), and the timer times the
-priced launch M (decode M=b, not b·s). Still pending: timing fixtures for the
-fused attention/GDN/norm rows (ms `pending`; bounds already print) and a B=8
-prefill column.
+priced launch M (decode M=b, not b·s). Still pending — deferred with H20 (2026-09-16 shutdown, see status
+above): timing fixtures for the fused attention/GDN/norm rows (ms `pending`;
+bounds already print) and a B=8 prefill column.
 
 Timing resolves each row's kernel **by its weight face** (nvfp4 → linear_fp4,
 fp8 → linear_fp8; fused attention/GDN/norms have no timing fixture).
@@ -155,7 +163,7 @@ TILERL_TARGET=cuda uv run tilerl serve --model qwen38-27b --dry-run \
   No tolerance — a mismatch is a naming/repack regression.
 - **Writes:** nothing; change the recorded constant only after re-deriving it.
 
-## 5 — GDN context-parallel world2 gates on the CUDA cells
+## 5 — GDN context-parallel world2 gates on the CUDA cells  ⏸ deferred — H20 paused 2026-09-16 (see status above)
 
 Green on CPU gloo today; the card run drives the same tape through CUDA
 collectives. Unique per-gate gloo ports let them run back to back; never run two
@@ -181,7 +189,7 @@ CUDA_VISIBLE_DEVICES=0,1 python3 tests/gdn_halo_world2.py --no-halo   # control,
 - The future P6 exit (8 cards, 32K gradient match to 1e-3, 256K fwd+bwd) is a
   separate run — this batch's CP gates are world 2. **Writes:** nothing.
 
-## 6 — P1 judge recipe, two seeds, pre-registered acceptance
+## 6 — P1 judge recipe, two seeds, pre-registered acceptance  ⏸ deferred — H20 paused 2026-09-16 (see status above)
 
 ```bash
 for s in 0 1; do
@@ -219,15 +227,16 @@ Original spec:
   `step_one` broke.
 - **Card wall clock:** captured decode ms/token after the step vs eager on the
   same post-step weights (6.5× on LoRA; the captured-RL group-8 vs plain-decode
-  5% target remains a P1 run figure).
+  5% target remains a P1 run figure, deferred with H20 on 2026-09-16).
 
 ---
 
 ## Also pending-remote in the grep (pre-existing, not created by this batch)
 
-- `tests/test_ops_parity.py` — fp8 sm90 kernel parity (C backend has no fp8).
-- `tests/test_fp4_scale_e4m3_parity.py` — e4m3 scale path on sm90.
-- `tests/test_rmsnorm_f32_tape.py` — skipped sm90 bring-up arms (no kernels yet).
-- `scripts/bench_api_routes.py` — request-overhead real number on the V100.
+- `tests/test_ops_parity.py` — fp8 sm90 kernel parity (C backend has no fp8). ⏸ deferred — H20 paused 2026-09-16.
+- `tests/test_fp4_scale_e4m3_parity.py` — e4m3 scale path on sm90. ⏸ deferred — H20 paused 2026-09-16.
+- `tests/test_rmsnorm_f32_tape.py` — skipped sm90 bring-up arms (no kernels yet). ⏸ deferred — H20 paused 2026-09-16.
+- `scripts/bench_api_routes.py` — request-overhead real number on the V100. ✅ runs now — V100 pre-authorized, no approval needed.
+- `scripts/probe_sm70_graph_poison.py` — #545 sm70 decode-graph allocator-poison, two process-isolated arms on the V100. ✅ runs now — V100 pre-authorized (found in the 2026-09-17 recount).
 - `src/tilerl/recipes.py` — four recipe status strings flip as the P1/P3 runs
-  above land.
+  above land (deferred with those H20 runs).

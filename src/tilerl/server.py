@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import __version__
 from .messages import (
     _COMPLETION_TIMEOUT_S,
     _parse_tool_calls,
@@ -453,7 +454,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
     """
     completion_timeout_s = (
         completion_timeout_from_env() if completion_timeout_s is None else float(completion_timeout_s))
-    app = FastAPI(title="tilerl", version="0.1.0", lifespan=_lifespan)
+    app = FastAPI(title="tilerl", version=__version__, lifespan=_lifespan)
     app_started = int(time.time())
 
     @app.exception_handler(RequestValidationError)

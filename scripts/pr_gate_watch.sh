@@ -2,6 +2,10 @@
 # Emit one line per change in a PR's gate state, then exit when it settles. For Monitor,
 # which cannot carry a compound command.
 #
+# BACKUP poller: the primary merge guard runs outside this repo (coordinator's gate.sh,
+# in a /private/tmp worktree that does not survive a restart). This in-repo copy is kept so
+# the gate can be polled without that local checkout; it is not the primary guard.
+#
 #   scripts/pr_gate_watch.sh <pr> [poll-s] [rounds]
 #
 # Two instrument bugs already paid for here. (1) The first version parsed the human table with

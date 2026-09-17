@@ -364,7 +364,7 @@ def test_responses_non_stream(oa):
     assert r.usage.total_tokens == r.usage.input_tokens + r.usage.output_tokens
 
 
-def test_responses_carries_the_fields_the_model_declares_required(oa, base_url):
+def test_responses_carries_the_fields_the_model_declares_required(base_url):
     """`Response` declares parallel_tool_calls / tool_choice / tools required.
 
     Asserted by name because the SDK will NOT catch their absence: measured,

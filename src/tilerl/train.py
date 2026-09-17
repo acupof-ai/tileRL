@@ -31,6 +31,7 @@ from .engine import RequestFailed, SamplingParams
 from .eval import MATCHERS
 from .kv_cache import BLOCK_TOKENS, LinearStatePool, NoPrefixStore, PagedKvPool
 from .model import save_hf
+from .tokenizer import qwen38_tokenizer as _qwen38_tokenizer
 
 _MAX_TICKS = 10000
 
@@ -1266,21 +1267,6 @@ def _progress(as_json: bool):
     if not as_json:
         return print
     return lambda *a, **k: print(*a, **{**k, "file": sys.stderr, "flush": True})
-
-
-def _qwen38_tokenizer():
-    from .tokenizer import get_tokenizer
-
-    try:
-        return get_tokenizer(_QWEN38_SOURCE)
-    except Exception as exc:
-        first = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
-        sys.exit(f"error: could not load the Qwen3-27B tokenizer from "
-                 f"{_QWEN38_SOURCE!r}: {first}")
-
-
-
-
 
 
 def _train_dry_run(args: argparse.Namespace) -> None:

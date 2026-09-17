@@ -37,20 +37,51 @@ exact-compare; there is no tolerance story here, the ids differ outright.
 
 ## Root cause
 
-Mechanism unproven (hypothesis only — do not cite as established). Measured
-pattern:
+Localised to the captured replay, not the staging. Two layers are now
+separated:
 
-- At buckets 512 and 1024 the graph token equals prompt length + 6
-  (8311 → 8317; 16503 → 16509). A vocab id that tracks the input position
-  points at the replay reading a position/index-correlated field as logits,
-  not at a near-tie in a real distribution.
-- At bucket 2048 the two ids differ by one (1894 vs 1895), consistent with a
-  near-tie argmax flipped by a small perturbation.
-- W=1 and W=2 are identical to the token, so the draft head is not the
-  corrupting component.
+**What is excluded.** The sparse decode graph's scalar inputs (`ids/pos/sl/
+slots/sql`) are refilled into pinned staging and `copy_`-d every replay, and
+the persistent `SparseForward` candidate staging (`s_l2p/s_bounds/cand_idx/
+own_table/own_len`) is rebuilt by `fill()` every tick. The decisive control is
+the CPU seam `CpuSparseGraph`: it fills the *same* persistent `SparseForward`
+with the same selection and packed-table geometry and runs `model.forward`
+EAGERLY — and it is token-correct 6/6. So `fill()`, candidate selection,
+resolve/l2p, and the packed `[selected; own]` geometry are all correct on the
+exact path the graph replays. The wrong token is produced by the part the CPU
+seam does not execute: the forward baked inside `torch.cuda.graph` capture and
+replayed on device. A static capture-shape buffer that is shorter than the live
+KV is therefore not the cause in the staging layer; it is inside the baked
+forward itself.
 
-This is the first replay of a graph freshly captured at a new cmax bucket on
-a live-traffic shape — the H2 mechanism. The 2026-09-14 H1 (warmup scribbling
+**Observed symptom (measured, not a mechanism).** The corrupted graph argmax
+is the last **input** token id, not a generic position value. The default
+probe prompt is `ids[t]=(t%31000)+7`, so at bucket 512 (n=8311) the final
+input id is exactly 8317 and at bucket 1024 (n=16503) it is 16509 — the graph
+returns those ids verbatim. At offset 0 the last input id also happens to
+equal `n+6`, which is why this first read as position-correlated. The echo is
+NOT universal: at bucket 2048 the last input id is 32893 but the graph returns
+1894, one off the eager 1895 (a near-tie flip). W=1 and W=2 are identical to
+the token, so the draft head is not the component. The pattern "last-column
+logits echo the input embedding, strongly at 512/1024 and only a one-token
+perturbation at 2048" is consistent with a seq/position-indexed buffer the
+capture baked (RoPE position, KV write offset, or the `last_only` logit
+column), but the exact buffer is unproven.
+
+**Discriminator for the remaining fork (pending device).** The probe gained
+`H2_ID_OFFSET=K` (#708): it adds a constant to every prompt id while holding
+positions and n fixed, splitting "input echo" from "baked position buffer" —
+which coincide at offset 0. On a future device graph arm at bucket 512/1024:
+
+- graph token tracks the *shifted* last-input id `(8317+K) mod vocab` → the
+  replay echoes the INPUT/embedding (a `last_only`/`copy_` artifact);
+- graph token stays `n+6` regardless of the id offset and moves only with n →
+  a POSITION/seq static buffer is baked into the captured forward.
+
+CPU tiny stays graph=eager at any offset, so this only runs on device.
+
+This is the first replay of a graph freshly captured at a new cmax bucket on a
+live-traffic shape — the H2 mechanism. The 2026-09-14 H1 (warmup scribbling
 live block/slot 0, fixed against the reserved pad frame in #585) is
 orthogonal and stays disproved; pad-frame capture did not remove this.
 

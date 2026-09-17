@@ -123,7 +123,7 @@ def test_an_off_grid_scale_is_not_bit_exact_through_e4m3():
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="sm90 arm")
+@pytest.mark.skipif(get_backend().arch != "sm90", reason="sm90 arm")
 def test_the_sm90_fp4_arms_agree_with_the_cpu_reference_on_an_e4m3_scale():
     """pending-remote until run on sm90: the CPU cell and the sm90 cells are
     different kernels (registry.py registers make_linear_fp4 for cpu and

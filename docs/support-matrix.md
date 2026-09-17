@@ -23,7 +23,7 @@ two cells share is only an override when the maker differs:
 | sm70 | 27 | 2 (`silu_mul`, `gdn_prep`) | 11 | 14 |
 
 **sm70 reuses the CPU source more than any other accelerated cell**: 14 of its
-26 entries are the same maker object CPU runs, and only `silu_mul` and
+27 entries are the same maker object CPU runs, and only `silu_mul` and
 `gdn_prep` are replaced (the sparse `page_bounds` narrows to f16 via a lambda
 around the same `make_page_bounds` factory, so it is an addition, not an
 override). `gdn_prep` became an override because the CPU source
@@ -32,15 +32,15 @@ loops `T.serial(DK)` in every thread while the launch passes `threads=DK`, so al
 264.33 ms against 54.04 ms for the same work at `threads=1`, and `gdn_prep` was
 53.5% of a prefill tick's GPU time. sm70 now takes sm90's one-thread-per-column
 schedule at f32 rather than a third copy of the kernel.
-Its 10 additions are the sm70-specific decode path — `linear_fp4_gemv`,
-`linear_fp4_gemv_sm70_m`, `paged_attention_split`,
+Its 11 additions are the sm70-specific paths — `linear_fp4_gemv`,
+`linear_fp4_gemv_sm70_m`, `linear_fp4_f16_mma` (M>8 prefill), `paged_attention_split`,
 `paged_attention_split_combine`, `gdn_chunk_fused`, `gdn_decode_fused`,
 `rmsnorm_apply_narrow`, `write_tokens`, plus the sparse-KV pair
 `page_bounds` (f16 index bounds) and `page_bound_scores` (f32 scorer).
 
-Line partition of `kernels*.py` (**4,218** lines: `kernels_linear.py` 1813,
-`kernels.py` 1019, `kernels_gdn.py` 939, `kernels_attn.py` 290,
-`kernels_mma.py` 157). Counted with `wc -l`, not carried forward: the previous
+Line partition of `kernels*.py` (**4,604** lines: `kernels_linear.py` 1883,
+`kernels.py` 1082, `kernels_gdn.py` 939, `kernels_attn.py` 334,
+`kernels_mma.py` 366). Counted with `wc -l`, not carried forward: the previous
 figures (4,037 / 1750 / 929 / 911) were already stale by 181 lines before
 `linear_fp8_bwd` added 63 of them, so three of the five were wrong.
 
@@ -53,8 +53,8 @@ figures (4,037 / 1750 / 929 / 911) were already stale by 181 lines before
 > attribute it. Re-deriving it needs a per-function span walk keyed on which
 > `_register` set reaches each maker.
 
-`kernels.py` defines 26 `make_*` functions. cpu and metal reach 16 each, sm70
-reaches 18, sm90 reaches 12 — sm90 is the cell that replaces the most of the
+`kernels.py` defines 28 `make_*` functions. cpu and metal reach 16 each, sm70
+reaches 20, sm90 reaches 14 — sm90 is the cell that replaces the most of the
 shared source, not the one that shares the most.
 
 ## Dispatch model
@@ -93,7 +93,7 @@ sm70 is the served arch (27B NVFP4 on a V100), so its **fwd** column is
 evidenced end to end; **bwd** on sm70 has never been run and is marked
 accordingly rather than inferred from the registry. A cell with no sm70 entry
 resolves through the fallback chain to the CPU maker, which is how sm70 runs 14
-of its 24 entries — reached, not reimplemented.
+of its 27 entries — reached, not reimplemented.
 
 | Op | cpu | sm70 | sm90 | sm100 | metal |
 | --- | --- | --- | --- | --- | --- |

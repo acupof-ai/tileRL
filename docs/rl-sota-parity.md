@@ -34,21 +34,18 @@ was defective.
 
 | | TRL | AReaL | tileRL |
 |---|---|---|---|
-| rollout engine | vLLM, `vllm_mode="colocate"`, `use_vllm=False` (`grpo_config.py:583,587`) | SGLang, separate process | our own `Engine`, same process (`engine.py:253`) |
-| weight transfer | `sync_weights` one param at a time, PEFT merge/unmerge inside a full gather (`vllm_generation.py:481`) | `weight_update_mode="xccl"`, 1024 MB buckets (`cli_args.py:1337`) | **none.** `build_engine` stores the caller's `Model` (`engine.py:263`) and reads `model.params` at every tick (`engine.py:630`); optimizers write those tensors in place (`autograd.py:427`) |
+| rollout engine | vLLM, `vllm_mode="colocate"`, `use_vllm=False` (`grpo_config.py:583,587`) | SGLang, separate process | our own `Engine`, same process (`engine.py:Engine`) |
+| weight transfer | `sync_weights` one param at a time, PEFT merge/unmerge inside a full gather (`vllm_generation.py:481`) | `weight_update_mode="xccl"`, 1024 MB buckets (`cli_args.py:1337`) | **none.** `build_engine` stores the caller's `Model` (`build.py:build_engine`; kept as `self._model` in `engine.py:Engine.__init__`) and reads `model.params` at every tick (`engine.py:Engine._run_forward`); optimizers write those tensors in place (`autograd.py:AdamW.step_one`) |
 | staleness | one sync per optimizer step; `num_iterations=1`, so the stored old logprobs are `None` and the PPO ratio is exactly 1 | `max_head_offpolicyness=0` in the dataclass, `2` in `gsm8k_grpo.yaml:29`; admission control only — a finished-but-stale trajectory is never rejected | one update per rollout, always |
-| prefix cache | flushed unconditionally at the end of every sync (`vllm_generation.py:512-517`) | no application-level flush; relies on SGLang internals | `NoPrefixStore` never matches and never retains (`kv_cache.py:289-302`); `_require_on_policy` raises if you pass anything else (`train.py:171-176`) |
-| decode CUDA graphs | `enforce_eager` never passed in colocate — graphs stay captured across weight updates, nothing recaptures them | not addressed | `decode_graph=False` required; the same guard raises |
+| prefix cache | flushed unconditionally at the end of every sync (`vllm_generation.py:512-517`) | no application-level flush; relies on SGLang internals | `NoPrefixStore` never matches and never retains (`kv_cache.py:NoPrefixStore`); `_require_on_policy` raises if you pass anything else (`train.py:_require_on_policy`) |
+| decode CUDA graphs | `enforce_eager` never passed in colocate — graphs stay captured across weight updates, nothing recaptures them | not addressed | graphs kept across the update by `engine.py:Engine.invalidate_weights`; `_require_on_policy` requires the `recapture_graph` waiver, which the shipped `--rl` path passes |
 
 **Verdict: deliberate, and stricter than either.** TRL solves the cache problem
 by flushing and leaves the graph problem alone; AReaL does not treat staleness
 as a correctness problem at all. We removed the problem instead of correcting
 it: there is no second copy of the weights to go stale.
 
-The price is on the roadmap, not hidden: `# ponytail: recapture the graph and
-drop the prefix entries after each update instead of disabling both`
-(`train.py:199-200`), roadmap P2.0. Today an RL rollout decodes without a
-captured graph, which the spec-decode work measured at 86.2 tok/s captured vs
+What was the roadmap price (P2.0) is now the waiver path: `train.py:_require_on_policy` accepts `recapture_graph`/`clear_prefix`, and `grpo_loop` calls `engine.py:Engine.invalidate_weights` after each update, which keeps the captured graphs and clears the prefix store. The captured rollout is the shipped path now, which the spec-decode work priced at 86.2 tok/s captured vs
 17.6 uncaptured.
 
 ## 2. The behaviour policy is not the policy we differentiate
@@ -58,8 +55,8 @@ This is the sharpest gap and it is ours alone.
 `grpo_loop` samples with whatever `SamplingParams` the caller passes. For the
 27B recipe that is `prompt.sampling(...)`, which loads the model card's
 values — thinking off: `temperature=0.7, top_p=0.8, top_k=20`
-(`prompt.py:14-15`). `rl_step` then takes the causal cross-entropy gradient
-under the **full, untempered softmax** (`train.py:154`, `reference.py:812`).
+(`prompt.py:SAMPLING`, the `False` entry). `rl_step` then takes the causal cross-entropy gradient
+under the **full, untempered softmax** (`train.py:rl_step`, `reference.py:cross_entropy_loss_grad`).
 The samples come from π truncated to 20 tokens and renormalized at T=0.7; the
 score function is ∇log π. Nothing reweights one to the other.
 
@@ -70,8 +67,8 @@ score function is ∇log π. Nothing reweights one to the other.
 | tileRL | none |
 
 We had the ingredients and they were broken. `SamplingParams.logprobs` produces
-per-token log-probs (`engine.py:856-864`) and `Engine.logprobs()` returns them
-(`engine.py:420-432`), but `_restrict` applied `top_k` and not `top_p` while the
+per-token log-probs (`engine.py:SamplingParams.logprobs`) and `Engine.logprobs()` returns them
+(`engine.py:Engine.logprobs`), but `_restrict` applied `top_k` and not `top_p` while the
 sampler applied both, so the reported score was low by exactly
 `-log(kept top_p mass)` — +0.212 nats mean at this vocab, and a value of −0.054
 for draws whose true log q was 0.0. Fixed 2026-09-03
@@ -93,7 +90,7 @@ schedules mask transport expecting reward to improve. It will not.
 premise is that `E_q[A]` is the objective, because q is what we deploy. So train
 each arm and then score it by **generating with the deployed sampler**
 (`T=0.7/p=0.8/k=20`). Tiny cfg, 12 steps, group 6, `AdamW(lr=0.05)`, 48
-completions per eval, 5 model seeds, reward from `tests/test_rl.py:99`:
+completions per eval, 5 model seeds, reward from the nested `reward` in `tests/test_rl.py:test_grpo_loop_raises_reward`:
 
 | arm | run 1 | run 2 (independent) |
 |---|---|---|
@@ -194,7 +191,7 @@ noisy — structurally unusable for a truncated sampler. Measured at V=248320,
 The clip never fires because every weight sits far *below* 1. Both stacks' caps
 are upper bounds on a weight that collapses downward, so the guardrail is on the
 wrong side. A group of 8 becomes under 2 effective samples at the recipe's own
-length. This is why the ratio+clip marker at `train.py:146` is about rollout
+length. This is why the ratio+clip marker in `train.py:rl_step`'s docstring is about rollout
 reuse only — it was never going to carry this correction.
 
 **Recomputing the mask at train time is not the same as transporting it**, and
@@ -205,9 +202,9 @@ the difference is 96% of the steps:
 
 | | TRL | AReaL | tileRL |
 |---|---|---|---|
-| objective | `loss_type="dapo"`: `-min(r·A, clip(r,1-ε,1+ε)·A)`, `epsilon=0.2`, `importance_sampling_level="token"` | `max(-A·r, -A·clip(r))`, `eps_clip=0.2`, optional `c_clip`, optional rejection-sampling mask (`level="token"`, `upper=5.0`) | `-A · ∇log π`, no ratio, no clip (`train.py:152-168`) |
+| objective | `loss_type="dapo"`: `-min(r·A, clip(r,1-ε,1+ε)·A)`, `epsilon=0.2`, `importance_sampling_level="token"` | `max(-A·r, -A·clip(r))`, `eps_clip=0.2`, optional `c_clip`, optional rejection-sampling mask (`level="token"`, `upper=5.0`) | `-A · ∇log π`, no ratio, no clip (`train.py:rl_step`) |
 | rollout reuse | `num_iterations=1`, so the ratio is inert out of the box | `ppo_n_minibatches=4` — every rollout is reused four times | one update per rollout |
-| normalization | global active-token count over the whole generation batch, rescaled to one accumulation window | global per-token sum, denominator captured *before* rejection sampling narrows the mask, then all-reduced over the DP group | scored-token count over the whole batch, `n` at `train.py:164` |
+| normalization | global active-token count over the whole generation batch, rescaled to one accumulation window | global per-token sum, denominator captured *before* rejection sampling narrows the mask, then all-reduced over the DP group | scored-token count over the whole batch, `n` in `train.py:rl_step` |
 | KL | in the loss, k3 estimator, `beta=0.0` default → **the reference model is never loaded** | in the reward, k1, `kl_ctl=0.1` default but **0.0 in every math example** | none anywhere (`grep -i 'kl\|ref_model\|ref_logp' src/` is empty) |
 
 **Normalization: aligned, deliberately.** Both stacks converged on the same
@@ -220,7 +217,7 @@ running a KL penalty on verifiable-reward tasks. Ours being absent costs
 nothing today; it becomes a gap the day a run needs to be held near the base
 model.
 
-**Ratio and clip: omission, already marked.** `train.py:146-147` carries
+**Ratio and clip: omission, already marked.** `train.py:rl_step`'s docstring carries
 `# ponytail: single-update REINFORCE-with-baseline; add the PPO ratio+clip when
 a rollout is reused for more than one step.` That marker states the coupling
 correctly: no ratio ⟹ μ must be 1. What it does not say is that §2 makes the
@@ -229,12 +226,12 @@ policy. The clip is optional; the importance weight is not.
 
 ## 4. Advantage estimation
 
-| | TRL (`grpo_trainer.py:2777-2805`) | AReaL | tileRL (`train.py:122-128`) |
+| | TRL (`grpo_trainer.py:2777-2805`) | AReaL | tileRL (`train.py:group_advantages`) |
 |---|---|---|---|
 | baseline | group mean | group mean via `reward_norm` (YAML, `None` in the dataclass) | group mean |
 | scaling | `scale_rewards="group"` → divide by group std | `gsm8k_grpo.yaml`: mean group, std group | divide by group std |
 | std == 0 | no special case; numerator is exactly 0 so the advantage is 0. Logged as `frac_reward_zero_std` | `(x-mean)/(std+1e-5)` → 0 | `np.where(std > 1e-8, std, 1.0)` then `np.where(std > 1e-8, adv, 0.0)` — explicitly zero |
-| degenerate groups | **not filtered.** No DAPO dynamic sampling anywhere in `trl/trainer/` | **not filtered.** `drop_incomplete_group=False` drops on rollout failure, not on constant reward | not filtered, but **counted and gated**: `tied_group_fraction` is a run metric and `groups_untied` fails the run above 0.5 (`cli.py:254`) |
+| degenerate groups | **not filtered.** No DAPO dynamic sampling anywhere in `trl/trainer/` | **not filtered.** `drop_incomplete_group=False` drops on rollout failure, not on constant reward | not filtered, but **counted and gated**: `tied_group_fraction` is a run metric and `groups_untied` fails the run above 0.5 (`ledger.py:finish_run`) |
 | second whitening | none | every example adds `adv_norm: {mean batch, std batch}` on top | none |
 
 **Verdict: aligned, and one place we are ahead — with a caveat that may reverse
@@ -264,7 +261,7 @@ mitigate it. Our vocab is 248320, larger than either.
 | gradient checkpointing | `gradient_checkpointing=True` (TRL overrides HF's `False`) | `False` in the dataclass, `true` in every example | `autograd.checkpoint`, on by default; the MLP block only — attention and GDN advance their pools and cannot be replayed |
 | micro-batching | `gradient_accumulation_steps`; `auto_find_batch_size` **rejected outright** because halving the batch breaks prompt-group integrity | `max_tokens_per_mb=None` → 1e12, i.e. no split out of the box; every example sets 10240 | `rl_step(micro=N)`, `--micro`; the scored-token normalizer is the whole batch's, so the split is gradient-identical (`test_micro_batching_is_the_same_update`) |
 | logits handling | `_get_per_token_logps_and_entropies` chunks rows, still materializes `[b, C, V]`; `selective_log_softmax` loops row by row; the real fix is Liger's fused chunked LM head, which never materializes `[B,T,V]` | `logprobs_chunk_size=1024`; vocab-parallel custom autograd whose backward **overwrites the saved softmax in place** as `onehot - softmax`, allocating no new large tensor | `cross_entropy_loss_grad` writes `softmax - onehot` over the logits and `rl_step` scales that buffer in place — one `[B,T,V]` f32 tensor, where the shape-for-shape version held five |
-| optimizer state | HF defaults, 8-bit/paged available | `optimizer_dtype="float32"` | fp32 moments (`precision.py:12`), but only over LoRA adapters |
+| optimizer state | HF defaults, 8-bit/paged available | `optimizer_dtype="float32"` | fp32 moments (`precision.py:dtype`, role `optimizer_state`), but only over LoRA adapters |
 
 **Verdict: was the reason the recipe died; now aligned.**
 `tilerl train --recipe grpo-gsm8k-27b` (group 8, 256 new tokens, LoRA rank 16)
@@ -285,14 +282,14 @@ tensor.
 
 | | TRL | AReaL | tileRL |
 |---|---|---|---|
-| layout | prompts left-padded, completions right-padded; no packing path for GRPO | `pack_tensor_dict` → `[total_length, ...]` with `cu_seqlens`, padded to 256-token pages, FA-2 varlen | right-padded to `max(len(completion))` (`train.py:228-235`); no packing anywhere (`grep cu_seqlens src/` is empty) |
-| loss mask | prompt 0, completion 1 | same, plus prompt `version=-1` | scored iff `prompt_len <= i+1 < seq_len` (`train.py:157-163`) |
+| layout | prompts left-padded, completions right-padded; no packing path for GRPO | `pack_tensor_dict` → `[total_length, ...]` with `cu_seqlens`, padded to 256-token pages, FA-2 varlen | right-padded at the end of each row (`train.py:grpo_loop`); no packing anywhere (`grep cu_seqlens src/` is empty) |
+| loss mask | prompt 0, completion 1 | same, plus prompt `version=-1` | scored iff `prompt_len <= i+1 < seq_len` (`train.py:rl_step`) |
 | truncated completions | `mask_truncated_completions=False` — trained on; rate logged as `completions/clipped_ratio` | `mask_no_eos_with_zero=False` — reward zeroed, tokens still trained | trained on, **rate not measured** |
 | over-long prompts | `max_prompt_length` removed from `GRPOConfig` entirely — no truncation, pre-filter your dataset | filtered out of the dataset, not truncated | neither truncated nor filtered |
 
 **Padding vs packing: deliberate for now.** One prompt per step and a group of
 8 completions of similar length means padding waste is small; `seq_q_lens`
-exists on the engine path and `_training_kv` never sets it (`train.py:24-38`),
+exists on the engine path and `_training_kv` never sets it (`train.py:_training_kv`),
 so the training forward always sees full width. Packing becomes worth it when
 a step covers several prompts.
 
@@ -304,10 +301,10 @@ without the reward moving. We have `max_new_tokens=256` and no counter.
 
 | | TRL | AReaL | tileRL |
 |---|---|---|---|
-| optimizer | HF `adamw_torch_fused` | `adam`, `weight_decay=0.01`; `adam_bf16` variant with bf16 moments and Kahan summation | `AdamW(betas=(0.9,0.95), eps=1e-8, weight_decay=0.1)` (`cli.py:193`); `Adafactor` and `ISO` are full-parameter SFT only |
-| learning rate | **`1e-6`** — GRPO's only override of HF's `5e-5` | dataclass `1e-3`, **examples `6e-6`–`1.7e-5`** | **`1e-3`** (`cli.py:453`) |
-| schedule | linear decay | `constant`, `warmup_steps_proportion=0.001` | **none.** `cosine_warmup` exists (`autograd.py:512`) and the RL path never calls it |
-| grad clip | `max_grad_norm=1.0` | `gradient_clipping=1.0`; a non-finite grad norm drops the whole step | `clip_grad_norm(grads, 1.0)`, hardcoded (`train.py:103`); non-finite norm skips the update |
+| optimizer | HF `adamw_torch_fused` | `adam`, `weight_decay=0.01`; `adam_bf16` variant with bf16 moments and Kahan summation | `AdamW(betas=(0.9,0.95), eps=1e-8, weight_decay=0.1)` (`train.py:_train_adapters`); `Adafactor` and `ISO` are full-parameter SFT only |
+| learning rate | **`1e-6`** — GRPO's only override of HF's `5e-5` | dataclass `1e-3`, **examples `6e-6`–`1.7e-5`** | **`1e-3`** (`cli.py:_build_parser`, `--lr`) |
+| schedule | linear decay | `constant`, `warmup_steps_proportion=0.001` | **none.** `cosine_warmup` exists (`autograd.py:cosine_warmup`) and the RL path never calls it |
+| grad clip | `max_grad_norm=1.0` | `gradient_clipping=1.0`; a non-finite grad norm drops the whole step | `clip_grad_norm(grads, 1.0)`, hardcoded (`train.py:_step`); non-finite norm skips the update |
 | reference under LoRA | `beta==0` or `is_peft_model` → `ref_model=None`; adapter toggling stands in | a separate full model; `disable_adapter` appears nowhere | no reference at all |
 
 **The learning rate is the row to argue about.** We train rank-16 LoRA
@@ -331,7 +328,7 @@ the 27B recipe has never completed a run. Flag, not a verdict.
 | closed with numbers | importance weighting: 97.2% of π's mass outside q's support, ESS 1.74/8 at L=256, clips fire at 0.0% (§2) |
 | omission, blocks runs today | no gradient checkpointing, no micro-batching, five vocab-sized tensors per step (§5) |
 | omission, cheap | no LR schedule; no clipped-completion metric |
-| deferred with a marker | PPO ratio and clip for rollout reuse (`train.py:146`); graph recapture after update (`train.py:199`) |
+| deferred with a marker | PPO ratio and clip for rollout reuse (`train.py:rl_step` docstring); post-update graph keep + prefix clear (`engine.py:Engine.invalidate_weights`, waivers in `train.py:_require_on_policy`) |
 
 Every number in §2 is the tiny model (vocab 320) or synthetic at V=248320.
 Nothing here was read off the real checkpoint: `pending-remote`.

@@ -105,6 +105,17 @@ one more `grad_fn`. A 2B head with Adafactor is ~10 GB alongside the 27B.
 
 Order, forced by the measurement above:
 
+**Update (2026-09-17): step 0 shipped by the opposite mechanism.** The graph is
+kept across the in-place update and `invalidate_weights()` refills the cached
+f32 casts in place — the rollout no longer runs eager; the shipped `--rl` path
+builds `decode_graph=True` with the `recapture_graph=True` waiver. 27B LoRA card
+exit 2026-09-11: post-step tokens bit-equal to eager, 24.4 ms vs 158.2 ms/tick
+([wins/2026-09-11-lora-recapture-after-update-kept-graph-27b.md](experience/wins/2026-09-11-lora-recapture-after-update-kept-graph-27b.md);
+[mechanism](experience/wins/2026-09-07-an-update-keeps-the-decode-graphs.md)).
+Steps 1–3 below are superseded by the 2026-09-13 wrap-up decision — no new
+framework work
+([closure](experience/wins/2026-09-16-project-wrap-up-closure.md)).
+
 0. **Recapture after each update.** The RL rollout runs eager today because a
    captured graph bakes weights the optimizer moves; re-record the graph after
    every step and the rollout runs captured. Every later baseline is this.
@@ -140,12 +151,17 @@ tilerl serve   --run <id>                       # base + adapter (+ head) — NO
 tilerl ledger  [--lineage <id>] [--json]        # what exists, what it descends from
 ```
 
-Every flag above ships except `serve --run`: `serve` takes `--model/--draft/--blocks/
---slots/--max-batch/--max-ctx/--host/--port/--depth/--no-warmup` plus the
-tier flags `--dram-bytes`/`--cold-ssd-path`
-(`wins/2026-09-06-dram-bytes-flag-and-health-gate.md`), so an adapter
-is loaded by path, not by run id. Every flag in the list is real; the one exception is
-named in the sentence above.
+Every flag above ships except `serve --run`. `tilerl serve` currently takes 33 flags
+(the maintained list is `tilerl serve --help`; definitions in `src/tilerl/cli.py`):
+
+- model/speculation: `--model {tiny,tiny-agent,qwen38-27b}`, `--draft DIR` (MTP/NextN head safetensors), `--depth N`, `--draft-attn-window-tokens N`, `--decode-graph`/`--no-decode-graph`, `--no-warmup`
+- capacity: `--slots N` (GDN state slots), `--blocks N` (16-token KV blocks), `--max-ctx N`, `--max-batch N`, `--max-batched-tokens N`
+- KV/state tiers: `--state-bytes`, `--dram-bytes` (`wins/2026-09-06-dram-bytes-flag-and-health-gate.md`), `--kv-cold-bytes`, `--kv-store DIR`, `--cold-format {f16,native}`, `--cold-ssd-path FILE`, `--cold-ssd-bytes N`, `--kv-fp8 {e4m3,e5m2}`, `--device-reserve-mib N`
+- sparse KV: `--sparse-k PAGES` (default 0 = dense), `--sparse-min-tokens N`, `--sparse-prefill-tokens N`, `--scorer {index,bounds}`
+- HTTP: `--host` (default 127.0.0.1), `--port` (default 8000), `--completion-timeout-s S` (default 1800)
+- dry-run memory ledger: `--dry-run`, `--device-free BYTES`, `--checkpoint DIR` (header-only pricing, no card), `--json`, `--record-residency`
+
+Every flag in the list is real; the head loads by path (`--draft`), not by run id — serve has no run-id input and no adapter flag (`--load-adapter` is train-only). The one exception is `serve --run`, named in the sketch above.
 
 Command names stay as they are in the tree (`train`, `merge`, `serve`,
 `ledger`); `eval` is a flag on `train` until a run needs re-scoring alone.
