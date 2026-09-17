@@ -245,8 +245,9 @@ def run(args) -> list[dict]:
         prefix_store=NoPrefixStore(),
     )
     if args.time_draft:
+        # Direct assignment is what arms the seam on an already-built engine; the
+        # env is read only in Engine.__init__ (too late to set here).
         eng._draft_ms = []
-        os.environ.setdefault("TILERL_STEP_TIMING", "1")
 
     arch = getattr(be, "arch", "") or "sm70"
     print(f"# probe {_sha(__file__)}, engine tree {_engine_sha()}, arch {arch}")
