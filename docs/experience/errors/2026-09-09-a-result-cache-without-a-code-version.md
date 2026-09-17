@@ -6,8 +6,9 @@ Status: open (fix is a policy decision: sha in the key, or refuse-to-train on a 
 ## Context
 
 The before-arm eval (MMLU 1000 + GSM8K 500) is cached by content hash under
-`runs/eval-cache/<key>.json` (per-tree; `cli.py:792`). The key
-(`_before_eval_key`, `cli.py:360`) covers weights (path/size/mtime), sampling,
+`runs/eval-cache/<key>.json` (per-tree; the eval-cache write in `train.py`'s
+before-arm path). The key
+(`_before_eval_key`, `src/tilerl/train.py`) covers weights (path/size/mtime), sampling,
 eval_n, concurrency — **not the code sha**. A hit skips the eval entirely:
 zero requests, and the engine reaches step 1 clean. A miss runs all 1500
 problems first, so step 1 runs on an engine that has already served 1500

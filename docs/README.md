@@ -13,6 +13,12 @@ states a number it did not measure.
 | [design-engine.md](design-engine.md) | The four layers and the one seam each — frontend, scheduling, model, storage. Why the decode tick is a captured kernel sequence, why prefix sharing is read-only, and the physics the design has to satisfy. |
 | [design-kernels.md](design-kernels.md) | The kernel tree's file contracts, the registry rule (arch cell = CPU floor + overrides), the SOTA-copy provenance header, and the precision-before-tiles order a perf campaign follows. |
 | [design-rl-stack.md](design-rl-stack.md) | The three pieces of the RL product: the ISO optimizer and merger, the DFlash2 draft head and what keeps it on-policy, and the ledger CLI an agent drives. Marks what is settled and what is not. |
+| [design-rl-architecture.md](design-rl-architecture.md) | Why the RL training stack is shaped this way: what wall clock a given score costs and which architecture minimises it, under the objective set 2026-09-08. |
+| [design-cost-model.md](design-cost-model.md) | The one primitive that prices every byte and kernel, from which card, host and SSD occupancy derive, under the invariant `peak = sum(static rows, derived) + transient`. |
+| [design-sparse-kv.md](design-sparse-kv.md) | Converting a dense checkpoint so its full-attention layers attend to a selected page subset, with a per-token index key on device and the rest of the KV in host RAM or on SSD. |
+| [design-sparse-offgraph-staging.md](design-sparse-offgraph-staging.md) | Device-resident off-graph staging for the sparse captured decode (D-0 → D-3): D-0 shipped under CPU byte-equal coverage, D-1..D-3 pending device acceptance. |
+| [design-parallel.md](design-parallel.md) | Design only, reviewed before implementation: tensor parallelism first, context/sequence parallelism after, and what the tree already provides. |
+| [design-idempotency-key.md](design-idempotency-key.md) | A read-only, unscheduled proposal: a client-generated idempotency key that reattaches a retry to an in-flight request, dependent on the post-#672 server shape. |
 | [support-matrix.md](support-matrix.md) | Per-op, per-target status — cpu, sm90, sm100, metal — for bf16, fp4 and fp8. A cell is `done` only if it ran, never because it compiled. `registry.py` is the source of truth; this mirrors it. |
 
 ## Comparisons and assessments
@@ -35,7 +41,7 @@ phase exits, default flips, accept-or-reject verdicts.
 
 [experience/](experience/) — 606 dated entries, one measurement each, wins and
 rejections both. Start at [experience/README.md](experience/README.md), which
-picks the ~24 that carry the findings the rest of the repo rests on.
+picks the ~27 that carry the findings the rest of the repo rests on.
 
 [analysis/](analysis/) — the cross-cutting write-ups, where a question is asked
 of the whole system rather than one change: the [sglang
@@ -45,6 +51,24 @@ defect audit](analysis/2026-08-27-defect-audit.md) (historical), the [method rec
 decode 52.6 → 90.9](analysis/2026-08-28-decode-52-to-84.md) (historical), the [pod
 verification](analysis/2026-08-27-pod-verification.md) (historical), and [what closing the
 prefill gap would actually require](analysis/2026-08-29-what-sota-would-require.md).
+
+[bench-schema.md](bench-schema.md) — one measurement is one record: the
+append-only store `docs/experience/bench/measurements.jsonl`, one JSON object
+per line, and why a record missing a required field is rejected at write time.
+[bench-inventory.md](bench-inventory.md) — the collector map and the
+Keep/Delete triage, now consumed (its residue: what the registry cannot hold);
+`docs/bench-metrics.json` is the live collector map.
+
+## History
+
+Design docs and work-allocation tables that the live tree no longer needs but
+that later docs and CHANGELOG lines cite as provenance.
+
+| Doc | Answers |
+|---|---|
+| [arch-review-2026-09-09.md](history/arch-review-2026-09-09.md) | An architecture review against `fa1bcec` (2026-09-09): what to delete, what to build, and what "AI friendly" means, with line counts for scripts, src+kernels and tests. |
+| [design-ssd-read-path.md](history/design-ssd-read-path.md) | The SSD read path as designed (async-with-deadline) — SUPERSEDED 2026-09-09 (a daemon reader thread shipped instead) and REMOVED 2026-09-14 with the dense KV tier. |
+| [ownership-tables.md](history/ownership-tables.md) | Work-allocation tables that sat in the live design docs while the units were open; all units landed, kept for attribution. |
 
 **Docs cited by CHANGELOG cannot be deleted.** CHANGELOG is the central record;
 each line points to its evidence. Deleting the evidence leaves the verdict as a
@@ -60,5 +84,6 @@ non-zero means SUPERSEDED, not delete.
 | [serve-v100.md](serve-v100.md) | Running the 27B on the pod with the chat UI on a laptop — the SSH tunnel, the exact server command, and why warmup captures the decode graphs up front. |
 | [serve-h20.md](serve-h20.md) | The sm90 sparse+d1+decode-graph supervisor run through `pod_run.sh` — the `/work/tl013` cu129 interpreter (not `uv run`), the in-checkpoint draft, and the parameterized cold-spill path. Awaits a real-serve window. |
 | [serve-cold-prefill-cap.md](serve-cold-prefill-cap.md) | When to raise the sparse prefill chunk from the shared-server default 192 to 512 (dedicated/offline long-context cold fill), the two zero-code ways to do it, and why concurrent serving must keep 192. First-token latency only. |
-| [lessons/](lessons/) | Two measured Q&A notes on driving Claude Code against tileRL's own server: the Messages shim, and the rollout launcher's sandbox. (historical — both shims are built and gated by tests) |
+| [api-compat-surface.md](api-compat-surface.md) | The completion routes sharing one engine — OpenAI Chat Completions, Anthropic Messages, OpenAI Responses and the playground's own WS transport — the vendor shape each presents, and the named deviations. |
+| [lessons/](lessons/) | Two measured Q&A notes on driving Claude Code against tileRL's own server: the Messages shim, and the rollout launcher's sandbox. (historical — the Messages shim survives as `src/tilerl/messages.py` gated by `tests/test_server.py`; the launcher and `tests/test_rollout.py` were deleted 2026-09-14, #594) |
 | [tick-anatomy.html](tick-anatomy.html) | A rendered page: every layer of one V100 speculative decode tick against its byte floor. |

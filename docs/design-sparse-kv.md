@@ -125,8 +125,7 @@ output fidelity settle.
 **The SLO changes from mass to output fidelity.** The pre-registered
 "recall ≥ 0.9 at k=2048" mass gate is replaced by output fidelity — per-token
 KL(dense‖sparse), top-1 agreement and greedy-continuation agreement vs the
-dense forward (`scripts/output_fidelity.py`,
-`scripts/fidelity_checks.py`): diffuse mass can still yield token-equal
+dense forward (`scripts/fidelity_engine.py`): diffuse mass can still yield token-equal
 outputs, so mass fraction is the wrong acceptance quantity. The sm70 full-k
 continuity row landed in #546 (k=all is token-identical: KV writers had ignored
 `page_base`); the remaining pending item is the multi-span dense-vs-sparse
