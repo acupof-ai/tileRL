@@ -763,6 +763,70 @@ def test_device_reserve_is_recorded_in_stats_and_ledger_off_cuda():
         eng.shutdown()
 
 
+def test_sparse_headroom_fit_cuts_main_and_caps_greedy_draft():
+    """--device-headroom-mib's arithmetic. Without a draft the main pool just
+    shrinks; WITH the greedy 2/3 draft fit, sizing the main pool alone hands 2/3
+    of every removed byte to the draft pool, so the returned draft cap binds too.
+    The answer is the LARGEST feasible main count, the floor is the single-slot
+    hot ceiling, and an impossible headroom raises naming the floor's residual."""
+    from tilerl.memory import sparse_pool_fit_headroom as fit
+
+    # free 10000, 100-byte main blocks, no draft: ceiling 20 already leaves 8000.
+    assert fit(free_bytes=10_000, headroom_bytes=3000, main_block_bytes=100,
+               draft_block_bytes=0, draft_cap_blocks=99,
+               ceiling_blocks=20, floor_blocks=5) == (20, 0, 8000)
+    # Greedy draft = max(1, free_after_main*2/3)//100. n=13 -> draft 57, residual 2700
+    # (infeasible); n=12 -> draft 58, residual 3000 (feasible). Dropping to 11 is
+    # unnecessary, so the fit must keep 12 — checks exact-max, not any-feasible.
+    n, d, residual = fit(
+        free_bytes=10_000, headroom_bytes=3000, main_block_bytes=100,
+        draft_block_bytes=100, draft_cap_blocks=9999, ceiling_blocks=50, floor_blocks=5)
+    assert (n, d) == (12, 58) and residual == 3000
+    # A draft context cap below the greedy fit binds: the main pool keeps its ceiling.
+    assert fit(free_bytes=10_000, headroom_bytes=3000, main_block_bytes=100,
+               draft_block_bytes=100, draft_cap_blocks=10,
+               ceiling_blocks=50, floor_blocks=5) == (50, 10, 4000)
+    # pad blocks are main-pool bytes the fit must count: with pad=1 the ceiling's
+    # residual is 7900, so an 8000 floor forces one block off.
+    assert fit(free_bytes=10_000, headroom_bytes=8000, main_block_bytes=100,
+               draft_block_bytes=0, draft_cap_blocks=99,
+               ceiling_blocks=20, floor_blocks=5, pad_blocks=1) == (19, 0, 8000)
+    # Hard conflict: even the floor cannot hold the floor -> raises with the number.
+    with pytest.raises(ValueError, match="headroom"):
+        fit(free_bytes=1000, headroom_bytes=5000, main_block_bytes=100,
+            draft_block_bytes=0, draft_cap_blocks=99, ceiling_blocks=5, floor_blocks=2)
+    with pytest.raises(ValueError, match="must be > 0"):
+        fit(free_bytes=1000, headroom_bytes=0, main_block_bytes=100,
+            draft_block_bytes=0, draft_cap_blocks=99, ceiling_blocks=5, floor_blocks=2)
+
+
+def test_sparse_headroom_is_off_cuda_only_and_reported_off_cuda():
+    """Off cuda the headroom knob cannot measure free VRAM, so build ignores it
+    (pool stays the arithmetic ceiling) while the reporting fields still exist as
+    0 — same cuda-only contract as --device-reserve-mib. This also pins the no-op
+    default: headroom 0 must reach build as 0 and leave the pool at the ceiling."""
+    from tilerl.memory import sparse_pool_num_blocks
+
+    def build(headroom: int):
+        return build_engine(
+            cfg, model, RefBackend(), num_blocks=64, num_slots=3, max_batch=1,
+            max_total_tokens=4096, max_num_batched_tokens=512, sparse_k=4,
+            scorer="bounds", kv_cold_bytes=1 << 30, device_headroom_bytes=headroom)
+
+    cfg, model = build_model("tiny", seed=0)
+    for headroom in (0, 123 * 1024 * 1024):
+        eng = build(headroom)
+        try:
+            assert eng._kv.num_blocks == sparse_pool_num_blocks(cfg, 3, 4, 512) == 136
+            assert eng._sparse_headroom_bytes == 0  # cuda-only; never bound off card
+            assert eng._sparse_headroom_dropped_blocks == 0
+            stats = eng.stats()
+            assert stats["sparse_headroom_bytes"] == 0
+            assert stats["sparse_headroom_dropped_blocks"] == 0
+        finally:
+            eng.shutdown()
+
+
 def test_ledger_state_row_counts_the_spec_step_planes():
     """Regression: memory_rows hardcoded spec_steps=0 in plan(), so a d1 hybrid
     engine priced state_slots at 776 MiB while the LinearStatePool actually held

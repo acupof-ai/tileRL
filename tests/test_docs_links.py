@@ -292,6 +292,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--decode-graph',
         '--depth',
         '--device-free',
+        '--device-headroom-mib',
         '--device-reserve-mib',
         '--draft',
         '--draft-attn-window-tokens',
