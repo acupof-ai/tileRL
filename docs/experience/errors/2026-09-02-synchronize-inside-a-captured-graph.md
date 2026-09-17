@@ -4,7 +4,9 @@
 
 The question was what fraction of a speculative tick is drafting, because that
 number is the entire ceiling on block-parallel drafting (one draft forward
-instead of D). `scripts/prof_spec_tick.py` answers it directly: wrap
+instead of D). `scripts/prof_spec_tick.py` answered it directly (the script is
+since deleted for the reason this entry records; `scripts/ab_draft_depth.py` is
+its graph-safe replacement): wrap
 `_run_forward`, `_draft_step` and `_verify`, `cuda.synchronize()` around each,
 bucket the wall time.
 

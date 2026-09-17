@@ -194,7 +194,8 @@ Dense B=1 server: 32.7 tok/s @31 ctx, 27.4 @1K (was 25.8 / 23.1).
 Entry: `wins/2026-09-01-sm70-gemv-packed-x-f16.md`.
 
 **Speculation blocker moved to the draft head.** `--depth 3` serves 1.3 tok/s
-against a 41.6 ms W=2 replay. `prof_spec_tick.py`: `_draft_step` is 16.7 s of
+against a 41.6 ms W=2 replay. `prof_spec_tick.py` (since deleted — it synced
+around a captured graph; re-run with `ab_draft_depth.py`): `_draft_step` is 16.7 s of
 21.2 s (79%), 371 ms per depth step vs 4.98 ms in isolation; `decode_graph`
 636 ms/tick vs a 41.6 ms replay of the same graph. No capture-failure warning,
 so the graph replays — the cost is around it. Next target.
