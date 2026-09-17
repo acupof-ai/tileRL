@@ -38,6 +38,7 @@ import sys
 import threading
 import time
 import warnings
+import weakref
 from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -178,10 +179,22 @@ def _step_seed(seed: int, generated: int) -> int:
     return ((int(seed) * 2_654_435_761) ^ (generated * 2_246_822_519)) & _HASH_MASK
 
 
+#: Accumulator keys read from torch.cuda.memory_stats on the slow-tick tail.
+#: .get(k, 0) everywhere: the CPU box's memory_stats() is an EMPTY dict, and
+#: older wheels can omit keys. segment.all.* count cudaMalloc/cudaFree-backed
+#: segments; num_* count caching-allocator events; sync_all_streams is the
+#: cross-stream event sync a forced reclaim does.
+_MEM_KEYS = (
+    "num_sync_all_streams", "num_device_alloc", "num_device_free",
+    "num_alloc_retries", "num_ooms", "num_oom_rejections",
+    "segment.all.allocated", "segment.all.freed", "reserved_bytes.all.current",
+)
+
+
 class _StepTiming:
     """Env-gated wall-clock timing of the segments step() holds _lock across
     (the slow-tick investigation: 1-5.6 s). TILERL_STEP_TIMING=1 enables,
-    TILERL_STEP_TIMING_SLOW_MS sets the per-tick print threshold (1000).
+    TILERL_STEP_TIMING_SLOW_MS sets the per-tick print threshold (500).
 
     Wall-clock, not CUDA-event time: the question is where lock-held time goes,
     host stalls included. Every slow tick prints its segments to stderr at once;
@@ -192,12 +205,36 @@ class _StepTiming:
     "forward" is an ENVELOPE: on the eager path it equals prep + model + sample +
     draft_offers (+ sparse_select/sparse_finalize on sparse ticks); a graph tick
     carries "graph" alone. Do not sum it together with its inner segments.
+
+    Hollow-tick attribution: fwd_start/fwd_end bracket the whole _run_forward
+    call (all four returns: eager, dense graph, sparse graph, dead rows) from
+    step(). On top of the host envelope they capture an async CUDA-event device
+    span and allocator-counter deltas, and the slow-tick tail prints
+    fwd_host/fwd_gpu/stall + the counters plus a why= label:
+      alloc_reclaim — num_alloc_retries or num_sync_all_streams fired (a
+                      forced cache drain/reclaim near the VRAM edge),
+      dev_malloc    — a new driver segment without a retry,
+      finalize      — sparse_finalize wall dominates with flat counters,
+      gpu_drain     — flat counters and the GPU was busy ~the whole span,
+      sync_wait     — flat counters and the host waited with the device idle,
+      host/unknown/cpu.
+    stall = host-device is a LOWER bound on host-only wait: cudaEventElapsedTime
+    spans stream-idle bubbles too, and this engine drains the stream inside most
+    forwards (tolist/promotion/draft sync), so a mid-forward blocking wait usually
+    inflates fwd_gpu and the wall SEGMENTS (model/sample/finalize) carry the
+    localisation instead. A drainless tick (dense eager prefills-only mid-chunk,
+    no sampling/draft D2H) has an uncompleted end event and prints fwd_gpu=pending
+    why=unknown — that is honest, not a missed drain. No synchronize() ever: the
+    end event is read with non-blocking query(); a completed tick's own in-forward
+    drains already finished it.
     """
 
-    __slots__ = ("slow_s", "tot", "count", "cur", "t0", "n", "last_total", "note")
+    __slots__ = ("slow_s", "tot", "count", "cur", "t0", "n", "last_total", "note",
+                 "_eng", "cuda", "ev_s", "ev_e", "mem0", "fwd_t0", "fwd_host_ms",
+                 "fwd_gpu_ms", "fwd_path", "fwd_sparse", "last_why", "alloc_conf")
 
-    def __init__(self) -> None:
-        self.slow_s = float(os.environ.get("TILERL_STEP_TIMING_SLOW_MS", "1000")) / 1000.0
+    def __init__(self, engine=None) -> None:
+        self.slow_s = float(os.environ.get("TILERL_STEP_TIMING_SLOW_MS", "500")) / 1000.0
         self.tot: dict[str, float] = {}
         self.count: dict[str, int] = {}
         self.cur: dict[str, float] = {}
@@ -205,14 +242,80 @@ class _StepTiming:
         self.n = 0
         self.last_total = 0.0
         self.note = ""
+        self._eng = weakref.ref(engine) if engine is not None else lambda: None
+        # cuda is lazily resolved on the first tick (is_available, never
+        # torch.version.cuda): constructing an Event on a CPU wheel raises.
+        self.cuda: bool | None = None
+        self.ev_s = None
+        self.ev_e = None
+        self.mem0: dict[str, int] = {}
+        self.fwd_t0 = 0.0
+        self.fwd_host_ms = 0.0
+        self.fwd_gpu_ms: float | None = None
+        self.fwd_path = "eager"
+        self.fwd_sparse = False
+        self.last_why = ""
+        # Counter semantics change by allocator backend; printed so a reading is
+        # not made under the wrong assumption (cudaMallocAsync zeros these).
+        self.alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "default")
 
     def tick_start(self) -> None:
         self.cur.clear()
         self.note = ""
         self.t0 = time.perf_counter()
+        self.fwd_host_ms = 0.0
+        self.fwd_gpu_ms = None
+        self.fwd_path = "eager"
+        self.fwd_sparse = False
+        self.mem0 = {}
 
     def mark(self, seg: str, t: float) -> None:
         self.cur[seg] = self.cur.get(seg, 0.0) + time.perf_counter() - t
+
+    @staticmethod
+    def _mem_snap() -> dict[str, int]:
+        """Allocator counters (host-only mutex-guarded struct copy; the CPU box
+        returns {} — every read is .get(k, 0))."""
+        s = torch.cuda.memory_stats()
+        return {k: int(s.get(k, 0)) for k in _MEM_KEYS}
+
+    def fwd_start(self) -> None:
+        """Open the forward-envelope bracket: host anchor, an async start event
+        and a pre-forward allocator snapshot. record() is a non-blocking
+        cudaEventRecord; no sync, no per-tick event allocation."""
+        self.fwd_t0 = time.perf_counter()
+        if self.cuda is None:
+            self.cuda = torch.cuda.is_available()
+            if self.cuda:
+                self.ev_s = torch.cuda.Event(enable_timing=True)
+                self.ev_e = torch.cuda.Event(enable_timing=True)
+        if self.cuda:
+            self.ev_s.record()
+            self.mem0 = self._mem_snap()
+
+    def fwd_end(self) -> None:
+        """Close the host span and record the async end event. The device span is
+        NOT read here — that happens in tick_end via non-blocking query()."""
+        self.fwd_host_ms = (time.perf_counter() - self.fwd_t0) * 1000.0
+        if self.cuda:
+            self.ev_e.record()
+
+    def _classify(self, dt_ms: float, dev, d: dict[str, int]) -> str:
+        if not self.cuda:
+            return "cpu"
+        if d["num_alloc_retries"] > 0 or d["num_sync_all_streams"] > 0:
+            return "alloc_reclaim"
+        if d["num_device_alloc"] > 0 or d["segment.all.allocated"] > 0:
+            return "dev_malloc"
+        if dev is None:
+            return "unknown"
+        if self.cur.get("sparse_finalize", 0.0) * 1000 > 0.5 * dt_ms:
+            return "finalize"
+        if dev >= 0.85 * self.fwd_host_ms:
+            return "gpu_drain"
+        if dev < 0.5 * self.fwd_host_ms:
+            return "sync_wait"
+        return "host"
 
     def tick_end(self) -> None:
         self.last_total = time.perf_counter() - self.t0
@@ -224,8 +327,46 @@ class _StepTiming:
         if dt > self.slow_s:
             parts = " ".join(f"{k}={v * 1000:.0f}ms" for k, v in self.cur.items())
             extra = f" [{self.note}]" if self.note else ""
-            print(f"[step-timing] tick {self.n} total={dt * 1000:.0f}ms {parts}{extra}",
+            tail = self._slow_tail(dt * 1000)
+            print(f"[step-timing] tick {self.n} total={dt * 1000:.0f}ms {parts}{extra} {tail}",
                   file=sys.stderr, flush=True)
+
+    def _slow_tail(self, dt_ms: float) -> str:
+        """Device span + allocator deltas for one slow forward. Never syncs:
+        elapsed_time runs only when query() says the end event already completed
+        (the tick drained its stream inside the measured region)."""
+        base = f"path={self.fwd_path} sparse={int(self.fwd_sparse)} fwd_host={self.fwd_host_ms:.0f}ms"
+        if not self.cuda:
+            self.last_why = "cpu"
+            return f"{base} why=cpu"
+        dev = None
+        if self.ev_e is not None and self.ev_e.query():
+            dev = self.ev_s.elapsed_time(self.ev_e)
+        m1 = self._mem_snap()
+        # Cumulative counters -> tick deltas. reserved_bytes.all.current is a
+        # GAUGE (bytes held now), not cumulative: print its absolute post-forward
+        # level next to free=, not a delta.
+        d = {k: m1.get(k, 0) - self.mem0.get(k, 0)
+             for k in _MEM_KEYS if k != "reserved_bytes.all.current"}
+        seg_alloc = d["segment.all.allocated"]
+        seg_free = d["segment.all.freed"]
+        eng = self._eng()
+        free_mib = eng._device_free_limit().get("device_free_bytes", 0) >> 20 if eng else 0
+        reserved_mib = m1.get("reserved_bytes.all.current", 0) >> 20
+        why = self._classify(dt_ms, dev, d)
+        self.last_why = why
+        self.fwd_gpu_ms = dev
+        if dev is None:
+            gpu = "fwd_gpu=pending"
+            stall = ""
+        else:
+            gpu = f"fwd_gpu={dev:.0f}ms"
+            stall = f" stall={max(0.0, self.fwd_host_ms - dev):.0f}ms"
+        return (f"free={free_mib}MiB reserved={reserved_mib}MiB {base} {gpu}{stall} "
+                f"d_malloc={d['num_device_alloc']} d_free={d['num_device_free']} "
+                f"seg+={seg_alloc} seg-={seg_free} retries={d['num_alloc_retries']} "
+                f"sync_streams={d['num_sync_all_streams']} oom={d['num_ooms']} "
+                f"reject={d['num_oom_rejections']} alloc_conf={self.alloc_conf} why={why}")
 
     def report(self) -> None:
         if not self.n:
@@ -604,7 +745,7 @@ class Engine:
         #: Set by an unrecoverable device OOM; once set the loop terminates and
         #: submit() refuses new rows (the process is on its way to a restart).
         self._fatal: BaseException | None = None
-        self._step_timing = _StepTiming() if os.environ.get("TILERL_STEP_TIMING") else None
+        self._step_timing = _StepTiming(self) if os.environ.get("TILERL_STEP_TIMING") else None
         if self._step_timing is not None:
             atexit.register(self._step_timing.report)
         self._wake = threading.Event()
@@ -667,12 +808,14 @@ class Engine:
         self._keep_draft_logits = False
         self._trunk_logits = None
         self._verify_chains = None
-        #: Diagnostic only: populated when TILERL_STEP_TIMING is on, None keeps
+        #: Diagnostic only: populated when TILERL_DRAFT_TIMING is on, None keeps
         #: the path unchanged. Entries ``(forwards_delta, gpu_ms, max_seq_len)``
         #: — the seq_len dimension tests whether draft GPU time is a fixed cost or
-        #: scales with the dense prefix the one decode forward reads.
+        #: scales with the dense prefix the one decode forward reads. Split from
+        #: TILERL_STEP_TIMING: this probe synchronizes the device around every
+        #: draft step, so it must not arm together with the near-zero wall timer.
         self._draft_ms: list[tuple[int, float, int]] | None = (
-            [] if self._step_timing is not None else None)
+            [] if os.environ.get("TILERL_DRAFT_TIMING") else None)
         self._finished_logprobs: dict[int, list[float]] = {}
         self._taken_logprobs: set[int] = set()
         self._last_logprobs: list[float] | None = None
@@ -979,6 +1122,7 @@ class Engine:
                 if _tm is not None:
                     _tm.mark("stats", _t)
                     _t = time.perf_counter()
+                    _tm.fwd_start()
                 try:
                     self._hybrid_t0 = time.perf_counter()
                     self._run_forward(decodes, prefills, chunks)
@@ -996,6 +1140,7 @@ class Engine:
                     if _tm is not None:
                         _tm.mark("forward", _t)
                         _t = time.perf_counter()
+                        _tm.fwd_end()
                     # `_loop` stops calling `step` once nothing runs, so this carries the last
                     # tick's state -- including a failed forward's, hence `finally`.
                     self._stats_snapshot = self._build_stats()
@@ -1703,6 +1848,7 @@ class Engine:
         ):
             if _tm is not None:
                 _tm.mark("graph", _t)
+                _tm.fwd_path = "graph"
             self._hybrid_charge(False)
             return
         if (
@@ -1714,6 +1860,8 @@ class Engine:
         ):
             if _tm is not None:
                 _tm.mark("graph", _t)
+                _tm.fwd_path = "graph"
+                _tm.fwd_sparse = True
             self._hybrid_charge(True)
             return
         rows = decodes + prefills
@@ -1730,6 +1878,7 @@ class Engine:
             promote_ctx.__enter__()
             if _tm is not None:
                 _tm.mark("sparse_select", _t)
+                _tm.fwd_sparse = True
                 # Diagnostic: sparse geometry on the slow-tick line, to catch a
                 # cmax bucket recalc or a hot-selection slide that widens the
                 # attention table (the sporadic 1.3-1.5s 32k ticks). All three
@@ -2194,8 +2343,8 @@ class Engine:
         elif torch.cuda.is_available():
             self._draft_step_timed(rows)
         else:
-            # CPU/deviceless host with TILERL_STEP_TIMING on: wall-clock fallback,
-            # no CUDA event. The diagnostic target is the GPU serve only.
+            # CPU/deviceless host with TILERL_DRAFT_TIMING on: wall-clock
+            # fallback, no CUDA event. The diagnostic target is the GPU serve only.
             t0 = time.perf_counter()
             max_seq = max((r.seq_len for r in rows), default=0)
             self._draft.step(rows)
