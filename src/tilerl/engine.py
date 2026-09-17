@@ -588,6 +588,8 @@ class Engine:
         sparse_prefill_tokens: int = 0,
         device_reserve_bytes: int = 0,
         reserve_dropped_blocks: int = 0,
+        sparse_headroom_bytes: int = 0,
+        sparse_headroom_dropped_blocks: int = 0,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -739,6 +741,8 @@ class Engine:
         # a peak-live reduction, not a held reservation.
         self._device_reserve_bytes = int(device_reserve_bytes)
         self._reserve_dropped_blocks = int(reserve_dropped_blocks)
+        self._sparse_headroom_bytes = int(sparse_headroom_bytes)
+        self._sparse_headroom_dropped_blocks = int(sparse_headroom_dropped_blocks)
 
         self._pin = backend.device.type == "cuda"
         self._lock = threading.RLock()
@@ -1551,6 +1555,10 @@ class Engine:
                 # many KV blocks it trimmed; 0/0 means the reserve did not bind.
                 "device_reserve_bytes": self._device_reserve_bytes,
                 "reserve_dropped_blocks": self._reserve_dropped_blocks,
+                # Sparse --device-headroom-mib: floor kept by building a smaller hot
+                # pool, and how many blocks it cost; 0/0 = off (ceiling pool).
+                "sparse_headroom_bytes": self._sparse_headroom_bytes,
+                "sparse_headroom_dropped_blocks": self._sparse_headroom_dropped_blocks,
                 # In-process allocator view, NOT nvidia-smi: under a memory
                 # fraction these are capped to the process limit, so free is the
                 # reserve headroom the process actually has (physical card free

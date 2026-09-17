@@ -85,6 +85,23 @@ merits, and this is unrelated to the #695/#697 probes.
   state during a serve. The intended effect is flattening the type-1 ~629 ms
   finalize batch (the dominant, fullness-scaled term). Not decided: re-sizing
   versus concurrency limiting is the open design choice.
+  - **Landed, pending-remote: `--device-headroom-mib` (opt-in, default 0).**
+    Unlike the disproved reserve arms (the fraction fence does not shrink the
+    arithmetic-sized sparse pool and then OOMs at pool build; host `kv-cold-bytes`
+    does not raise device free), this builds the sparse main pool SMALLER and caps
+    the greedy 2/3 draft fit (`sparse_pool_fit_headroom`), so the target MiB is
+    free after both pools attach — reclaim headroom at the finalize edge rather
+    than a post-hoc fence. CPU-only gates: a pure-arithmetic fit test (exact-max
+    main count, draft-cap interaction, floor-conflict raise) and the off-cuda
+    no-op/reporting wiring. Capacity cost on the 27B (sm70 f32, main block
+    2.0 MiB, per-slot hot ceiling 554 blocks): the main pool is 1.08/2.16/4.32
+    GiB at 1/2/4 slots, and holding 768 MiB removes ≥384 main blocks (≥0.69 slot
+    peaks), more where the greedy dense draft pool re-grows; the single-slot
+    floor is the hard minimum, and an infeasible target raises at build naming
+    the floor's residual. NOT yet device-measured: whether 768 MiB flattens the
+    7–8x finalize batch, and the split of free bytes between the main and draft
+    pools on the live card. V100 window queued after #700; default stays 0 until
+    that read lands, so this is not yet a fix.
 - **Attribute mechanism 2 first**: add a per-tick device alloc/free + sync probe
   so the hollow-forward ticks are localised before treating them as the same
   allocator root cause.

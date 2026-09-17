@@ -241,6 +241,11 @@ def build_engine(
     #: EngineOverloaded.
     max_inflight=_INFLIGHT_AUTO,
     device_reserve_bytes: int = 0,
+    #: Sparse-only (ignored on dense and off cuda): keep this many VRAM bytes free by
+    #: building the device hot pool smaller and capping the greedy draft fit. 0 keeps
+    #: the arithmetic ceiling pool, the default. The point is headroom AT the card edge
+    #: so a finalize batch's block reclaim/demote does not run with ~200 MB free.
+    device_headroom_bytes: int = 0,
 ) -> Engine:
     """Wire a model + backend into an Engine; pool shapes come from ``cfg``.
     ``decode_graph`` None auto-enables the captured decode tick on CUDA.
@@ -360,6 +365,49 @@ def build_engine(
         from .memory import sparse_pool_num_blocks
 
         num_blocks = sparse_pool_num_blocks(cfg, num_slots, sparse_k, max_num_batched_tokens)
+        # Build the sparse hot pool smaller so free VRAM stays at this floor once both
+        # pools exist. Unlike --device-reserve-mib (a fraction fence that does not
+        # shrink the arithmetic-sized sparse pool and then OOMs at pool build), this
+        # cuts the pool itself; the joint fit also caps the greedy draft pool, which
+        # otherwise re-eats 2/3 of every main-pool byte. cuda-only: off-card builds
+        # ignore it, same as the reserve fraction.
+        sparse_headroom_dropped = 0
+        sparse_draft_cap: int | None = None
+        sparse_headroom_want = 0
+        if device_headroom_bytes and backend.device.type == "cuda":
+            from .memory import (
+                draft_per_block_bytes,
+                per_kv_block_bytes,
+                sparse_hot_pages_per_slot,
+                sparse_pool_fit_headroom,
+            )
+
+            torch.cuda.empty_cache()
+            free_at_build = int(torch.cuda.mem_get_info()[0])
+            draft_layers = 0 if draft is None else draft.cfg.num_layers
+            num_blocks, sparse_draft_cap, _pred_free = sparse_pool_fit_headroom(
+                free_bytes=free_at_build,
+                headroom_bytes=int(device_headroom_bytes),
+                main_block_bytes=per_kv_block_bytes(cfg, kv_io, kv_fp8),
+                draft_block_bytes=draft_per_block_bytes(cfg, kv_io, draft_layers),
+                draft_cap_blocks=num_slots * (max_total_tokens // BLOCK_TOKENS + 1),
+                ceiling_blocks=num_blocks,
+                floor_blocks=sparse_hot_pages_per_slot(
+                    cfg, sparse_k, max_num_batched_tokens) + 1,
+                pad_blocks=pad,
+            )
+            sparse_headroom_dropped = (
+                sparse_pool_num_blocks(cfg, num_slots, sparse_k, max_num_batched_tokens)
+                - num_blocks
+            )
+            sparse_headroom_want = int(device_headroom_bytes)
+            print(
+                f"serve: sparse device headroom target {sparse_headroom_want // 2**20} "
+                f"MiB: main pool {num_blocks} blocks (-{sparse_headroom_dropped}), "
+                f"draft cap {sparse_draft_cap} blocks, predicted free "
+                f"{_pred_free // 2**20} MiB after both pools attach",
+                flush=True,
+            )
     elif not num_blocks:
         num_blocks = fit_blocks(
             cfg,
@@ -412,6 +460,8 @@ def build_engine(
         from .memory import POOL_FRACTION, draft_per_block_bytes
 
         cap = num_slots * (max_total_tokens // BLOCK_TOKENS + 1)
+        if sparse_draft_cap is not None:
+            cap = min(cap, sparse_draft_cap)
         if backend.device.type == "cuda":
             torch.cuda.empty_cache()
             per = draft_per_block_bytes(cfg, kv_io, draft.cfg.num_layers)
@@ -500,6 +550,8 @@ def build_engine(
         sparse_prefill_tokens=sparse_prefill_tokens,
         device_reserve_bytes=device_reserve_bytes,
         reserve_dropped_blocks=reserve_dropped,
+        sparse_headroom_bytes=sparse_headroom_want if sparse_k else 0,
+        sparse_headroom_dropped_blocks=sparse_headroom_dropped if sparse_k else 0,
     )
 
 
@@ -529,6 +581,7 @@ def build_serving_engine(
     sparse_min_tokens=0,
     sparse_prefill_tokens=0,
     device_reserve_mib=0,
+    device_headroom_mib=0,
 ):
     """Serving-size engine on one card. Multi-card serving is one process per card
     under CUDA_VISIBLE_DEVICES (see generate.py for the process-per-device pattern);
@@ -583,6 +636,8 @@ def build_serving_engine(
     kw["sparse_prefill_tokens"] = sparse_prefill_tokens
     if device_reserve_mib:
         kw["device_reserve_bytes"] = int(device_reserve_mib) * 1024 * 1024
+    if device_headroom_mib:
+        kw["device_headroom_bytes"] = int(device_headroom_mib) * 1024 * 1024
     if sparse_k:
         # Cold pages need somewhere to demote: default the pinned host tier to the whole
         # written context at its per-block bytes if the caller gave no budget.

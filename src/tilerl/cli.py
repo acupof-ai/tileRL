@@ -183,7 +183,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            decode_graph=getattr(args, "decode_graph", None),
                            sparse_min_tokens=getattr(args, "sparse_min_tokens", 0),
                            sparse_prefill_tokens=getattr(args, "sparse_prefill_tokens", 0),
-                           device_reserve_mib=getattr(args, "device_reserve_mib", 0))
+                           device_reserve_mib=getattr(args, "device_reserve_mib", 0),
+                           device_headroom_mib=getattr(args, "device_headroom_mib", 0))
     except Exception as build_exc:
         # Startup OOM (e.g. a fraction too small for weights): exit fatally instead
         # of half-starting, so the supervisor's marker path restarts cleanly.
@@ -504,6 +505,15 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "fraction set before weights load; an over-fence cudaMalloc then "
                               "raises catchable OOM (supervisor restart) instead of blocking at "
                               "the edge (sm70 wedge headroom). 0 (default) = full card, no-op.")
+    p_serve.add_argument("--device-headroom-mib", type=int,
+                         default=int(os.environ.get("TILERL_DEVICE_HEADROOM_MIB", "0")),
+                         metavar="MIB",
+                         help="sparse only: build the device hot pool smaller and cap the "
+                              "greedy draft fit so this many MiB stays free after both pools "
+                              "attach, giving finalize batch demotes headroom at the card edge "
+                              "(the full-cold-tier long tail). Costs resident blocks; /health "
+                              "reports sparse_headroom_dropped_blocks. 0 (default) = arithmetic "
+                              "ceiling pool, no-op. Ignored on dense builds and off cuda.")
     p_serve.add_argument("--kv-fp8", choices=["e4m3", "e5m2"], default="",
                          help="store the KV planes in fp8: 65536 -> 33280 bytes per token at the "
                               "27B's 16 planes x 4 heads x 256, a 1.969x saving, the 0.031 being "

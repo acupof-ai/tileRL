@@ -118,6 +118,63 @@ def sparse_pool_num_blocks(cfg, num_slots: int, k_pages: int,
     return num_slots * sparse_hot_pages_per_slot(cfg, k_pages, max_num_batched_tokens) + 1
 
 
+def sparse_pool_fit_headroom(
+    *, free_bytes: int, headroom_bytes: int, main_block_bytes: int,
+    draft_block_bytes: int, draft_cap_blocks: int, ceiling_blocks: int,
+    floor_blocks: int, pad_blocks: int = 0,
+) -> tuple[int, int, int]:
+    """Largest sparse main-pool block count that leaves ``headroom_bytes`` free AFTER
+    the main pool and the draft pool are built. The draft fit is greedy
+    (``free_after_main * POOL_FRACTION`` capped at its context cap, build_engine's
+    own formula), so sizing the main pool alone hands 2/3 of every removed byte to
+    the draft pool: the returned ``draft_max_blocks`` bounds that fit as well.
+
+    Pure arithmetic — the caller measures ``free_bytes`` after the weights and GDN
+    pools are resident and passes byte-per-block values. Returns
+    ``(main_blocks, draft_max_blocks, predicted_free)``. Raises when even the
+    single-slot ``floor_blocks`` pool cannot hold the headroom; the error names the
+    most headroom that floor allows, which is the hard capacity conflict.
+    """
+    if headroom_bytes <= 0:
+        raise ValueError("headroom_bytes must be > 0; headroom 0 keeps the ceiling pool")
+
+    def greedy_draft(n_main: int) -> int:
+        free_after_main = free_bytes - (n_main + pad_blocks) * main_block_bytes
+        if draft_block_bytes <= 0 or free_after_main <= 0:
+            return 0
+        return min(
+            draft_cap_blocks,
+            max(1, int(free_after_main * POOL_FRACTION) // draft_block_bytes),
+        )
+
+    def residual_of(n_main: int) -> tuple[int, int]:
+        n_draft = greedy_draft(n_main)
+        return (
+            free_bytes
+            - (n_main + pad_blocks) * main_block_bytes
+            - n_draft * draft_block_bytes
+        ), n_draft
+
+    # Walk down one block: the greedy draft's integer floor makes residual(n) only
+    # mostly monotone, so a binary search could skip over a feasible n. The sparse
+    # pool is at most a few thousand blocks and this runs once at build, so pay the
+    # linear scan for the exact largest feasible count.
+    floor_residual, _ = residual_of(floor_blocks)
+    if floor_residual < headroom_bytes:
+        raise ValueError(
+            f"device headroom {headroom_bytes} bytes does not fit: the "
+            f"{floor_blocks}-block single-slot floor leaves at most "
+            f"{floor_residual} bytes free (free at build {free_bytes}, "
+            f"main block {main_block_bytes}, draft block {draft_block_bytes})"
+        )
+    n_main = ceiling_blocks
+    while True:
+        residual, n_draft = residual_of(n_main)
+        if residual >= headroom_bytes:
+            return n_main, n_draft, residual
+        n_main -= 1
+
+
 def sparse_rows(cfg, *, num_rows: int, num_slots: int, context_tokens: int,
                 k_pages: int, max_num_batched_tokens: int,
                 scorer: str, kv_io, kv_fp8=None) -> list[Row]:
