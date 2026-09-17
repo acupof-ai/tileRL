@@ -120,11 +120,30 @@ def _row(engine, rid: int, what: str):
     )
 
 
+#: Constant id OFFSET added to every prompt token (mod vocab), positions and n
+#: unchanged. Mechanism discriminator for a future device arm: the default
+#: prompt has ids[t]=(t%31000)+7, so its last input id at bucket 512 (n=8311)
+#: is 8317 and at 1024 (n=16503) is 16509 -- EXACTLY the corrupted graph
+#: argmax on V100. Rerun the graph arm with H2_ID_OFFSET != 0:
+#:   graph token == new last input id  -> the replay echoes the INPUT/embedding
+#:                                        token (a last-only / copy_ artifact);
+#:   graph token == n+6 regardless     -> it echoes a POSITION/seq static buffer
+#:                                        (capture baked seq_len into logits).
+#: Both arms use the same offset, so CPU graph=eager parity is unaffected.
+ID_OFFSET = int(os.environ.get("H2_ID_OFFSET", "0"))
+_ID_MOD = 31000
+_ID_BASE = 7
+
+
+def _prompt_id(t: int) -> int:
+    return ((t + ID_OFFSET) % _ID_MOD) + _ID_BASE
+
+
 def prime_to_decode(engine, n_tokens: int, tag: str):
     """Submit one row, advance ONLY to its first DECODE tick while it is live."""
     from tilerl.engine import SamplingParams
 
-    ids = [(t % 31000) + 7 for t in range(n_tokens)]
+    ids = [_prompt_id(t) for t in range(n_tokens)]
     rid = engine.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=MAX_NEW, seed=0))
     engine.step()  # admit
     for guard in range(40000):
@@ -373,7 +392,7 @@ def build_b4(source, draft_path):
     try:
         rids = []
         for k in range(4):
-            ids = [((t + 7919 * (k + 1)) % 31000) + 7 for t in range(n)]
+            ids = [(((t + 7919 * (k + 1) + ID_OFFSET) % _ID_MOD) + _ID_BASE) for t in range(n)]
             rids.append(
                 e.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=MAX_NEW, seed=100 + k))
             )
