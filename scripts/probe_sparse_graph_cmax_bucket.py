@@ -1,4 +1,14 @@
-"""H2 probe v4 — does a lazy sparse-graph capture at a cmax BUCKET boundary contaminate?
+"""H2 probe — does a lazy sparse-graph capture at a cmax BUCKET boundary contaminate?
+
+v5 (2026-09-17) fixes the B=4 arm. v4's B=4 child used 8311-token rows under
+the serve's 512-token prefill cap; the four rows staggered into decode, only
+B=1/B=2 graphs formed and the missing-B=4 guard exited rc12, so the
+sparse+d1 B=4 illegal-access question went untested. v5 admits four SHORT
+equal rows (H2_B4_N=135) under a cap that holds them in one prefill tick
+(H2_B4_PREFILL_CAP=1024, asserted 4*n <= cap); their first decode tick is a
+genuine B=4 wave capturing (B=4,W,64,own_w). CPU tiny now gates wave
+formation too. The bucket/W comparison arms are unchanged from v4, which
+measured H2_BAD on V100 (6/6 first-token contamination).
 
 v4 (2026-09-17) fixes two v3 (md5 202dcf3) defects that produced NO data on
 V100 and burned the window on test bugs, not an H2 result:
@@ -43,6 +53,12 @@ Both arms are built with sparse_min_tokens=0 and sparse_device_select=True so
 the graph gate can pass and graph/eager differ ONLY in decode_graph. The
 worker measures the first-decode cmax and corrects n by 16 tokens per unit
 cmax (resubmitting) until the target bucket is observed.
+
+The B=4 child uses SHORT equal rows (H2_B4_N=135) under a prefill cap that
+holds all four in one tick (H2_B4_PREFILL_CAP=1024, asserted 4*n <= cap) so
+the four rows enter decode together and a genuine B=4 sparse graph is captured
+(cmax clamps to floor bucket 64). The v4 B=4 arm used 8311-token rows under
+the serve's 512 cap; those staggered and never formed B=4 (rc12).
 
 Parent exit codes:
   0 H2_REFUTED   10 H2_BAD   11 H2_ILLEGAL
@@ -284,10 +300,23 @@ def _sparse_keys_after(engine):  # pragma: no cover - only used pre-exit
         return "?"
 
 
+#: B=4 needs all four rows to co-prefill in ONE tick and enter decode together.
+#: The serve's 512-token prefill cap staggers four long rows (the v4 rc12: only
+#: B=1/B=2 graphs formed). Size the rows to fit one tick instead of raising the
+#: cap to swallow four 8k prefills: n=135 -> 4*135=540 tokens in one ~1024 cap,
+#: cmax clamps to the floor bucket 64, and the illegal-access question is the
+#: B=4 concurrency, not the bucket depth. H2_B4_N / H2_B4_PREFILL_CAP override.
+B4_N = int(os.environ.get("H2_B4_N", "135"))
+B4_PREFILL_CAP = int(os.environ.get("H2_B4_PREFILL_CAP", "1024"))
+
+
 def build_b4(source, draft_path):
-    """B=4 concurrent sparse+d1 graph rows, a single child. H2_MODEL=tiny gives
-    a depth=0 four-row sparse graph structural dry-run (no 27B draft, cannot
-    exercise the d1 illegal-access risk but proves admit/lockstep/slot-free)."""
+    """B=4 concurrent sparse+d1 graph rows, a single child. The four rows are
+    short and equal so a single prefill tick admits them together and their first
+    decode tick is a genuine B=4 wave (key B=4 captured) — the v4 shape only ever
+    reached B=2. H2_MODEL=tiny is the depth=0 CPU structural dry-run (no 27B
+    draft, cannot exercise the d1 illegal risk but proves the B=4 wave forms and
+    frees its slots)."""
     import torch
     from tilerl_kernels.backend import get_backend
 
@@ -297,15 +326,22 @@ def build_b4(source, draft_path):
     from tilerl.spec import load_draft
 
     dry = os.environ.get("H2_MODEL", "qwen38-27b") == "tiny"
+    if 4 * B4_N > B4_PREFILL_CAP:
+        raise ProbeError(
+            f"B=4 prefill cap {B4_PREFILL_CAP} < 4*{B4_N}={4 * B4_N}; "
+            "the rows would stagger and no B=4 wave forms (the v4 rc12)"
+        )
     if not dry:
         build.QWEN38_SOURCE = source
     be = get_backend()
     cfg, model = build_model("tiny" if dry else "qwen38-27b", seed=0, fuse_projections=not dry)
     draft = None if dry else load_draft(model, draft_path)
-    n = tokens_for_bucket(512)
+    n = B4_N
     res = {
         "arm": "b4",
         "dry": dry,
+        "n_tokens": n,
+        "prefill_cap": B4_PREFILL_CAP,
         "ok": False,
         "finished": 0,
         "leaked_slots": None,
@@ -319,7 +355,7 @@ def build_b4(source, draft_path):
         num_slots=4,
         max_batch=4,
         max_total_tokens=131072,
-        max_num_batched_tokens=512,
+        max_num_batched_tokens=B4_PREFILL_CAP,
         sparse_k=128,
         sparse_min_tokens=0,
         sparse_device_select=True,
@@ -333,6 +369,7 @@ def build_b4(source, draft_path):
         spec_depth=0 if dry else 1,
     )
     expected_tokens = 4 * MAX_NEW
+    b4_width = 1 if dry else 2  # depth 0 -> W=1; real d1 -> W=2
     try:
         rids = []
         for k in range(4):
@@ -354,30 +391,32 @@ def build_b4(source, draft_path):
             res["captured_keys"] = [list(map(str, k)) for k in e._sparse_graphs]
         except Exception:
             res["captured_keys"] = "?"
-        # slots==0 alone passed v3 even when rows died early. A real d1 B=4 arm
-        # must have captured the (4, 2, 512, 9) graph AND generated every token;
-        # CPU tiny cannot capture CUDA graphs, so only the token count gates it.
-        if dry:
-            res["ok"] = res["finished"] == expected_tokens and res["leaked_slots"] == 0
-        else:
-            captured_b4 = any(k[0] == 4 for k in e._sparse_graphs)
-            res["ok"] = (
-                captured_b4 and res["finished"] == expected_tokens and res["leaked_slots"] == 0
+        # The gate is the WAVE, not the tokens. n=135 clamps cmax to the floor
+        # bucket 64; the key must be (B=4, W=dry1/real2, 64, own_w 8/9). CPU tiny
+        # captures the W=1 graph (the dry seam has no draft, so no W=2), which
+        # still proves the four rows co-decoded. Require the exact B=4 key in
+        # both modes: token==128 + slots==0 alone passed the v3 staggered shape.
+        own_w = 8 if dry else 9
+        expected_b4_key = (4, b4_width, 64, own_w)
+        captured_b4 = expected_b4_key in e._sparse_graphs
+        res["ok"] = captured_b4 and res["finished"] == expected_tokens and res["leaked_slots"] == 0
+        if not captured_b4:
+            # Not OOM poisoning (a B<=3 key may have captured) and not an illegal
+            # access: the harness failed to form a B=4 wave. Hard-exit 12 so the
+            # parent cannot read a token-only pass as the B=4 concurrency test.
+            print(
+                f"[FATAL b4] expected key {expected_b4_key} absent; keys={res['captured_keys']}",
+                file=sys.stderr,
+                flush=True,
             )
-            if not captured_b4:
-                print(
-                    f"[FATAL b4] no B=4 sparse graph captured; keys={res['captured_keys']}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                os._exit(12)
+            os._exit(12)
         if not res["ok"]:
             res["note"] = (
                 f"finished={res['finished']} expected={expected_tokens} "
-                f"slots_used={res['leaked_slots']}"
+                f"slots_used={res['leaked_slots']} key={expected_b4_key}"
             )
         else:
-            res["note"] = "clean"
+            res["note"] = f"clean key={expected_b4_key}"
     except Exception as exc:
         res["note"] = f"EXC {type(exc).__name__}: {exc}"
     finally:
