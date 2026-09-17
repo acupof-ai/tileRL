@@ -265,10 +265,8 @@ def _segment_sizes(cfg, names: tuple[str, ...]) -> tuple[int, ...]:
 
 
 def _check_align(stem: str, kind: str, n: int, world: int, fp8: bool) -> None:
-    if kind == "row":
-        need = _FP8_BLOCK if fp8 else _FP4_ROW_ALIGN
-    else:
-        need = _FP8_BLOCK if fp8 else 1
+    need = ((_FP8_BLOCK if fp8 else _FP4_ROW_ALIGN) if kind == "row"
+            else (_FP8_BLOCK if fp8 else 1))
     if need > 1 and (n // world) % need:
         raise ValueError(
             f"{stem}: {kind} shard {n}/{world} = {n // world} is not a multiple of the "

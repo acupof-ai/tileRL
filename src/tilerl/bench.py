@@ -126,10 +126,8 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
                 mm = b if r["name"] == "lm_head" else timed_s
                 ms = cal.time_row_ms(
                     {**r, "_spec": spec_by_name[r["name"]]}, backend, mm)
-            if bound_one is None:
-                bnd_col = f"{'pending':>9}ms"
-            else:
-                bnd_col = f"{bound_one * 1e3:9.3f}ms"
+            bnd_col = (f"{'pending':>9}ms" if bound_one is None
+                       else f"{bound_one * 1e3:9.3f}ms")
             if ms is None:
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {'pending':>11} {bnd_col:>11} {'pending':>11}")

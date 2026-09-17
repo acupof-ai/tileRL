@@ -1,6 +1,6 @@
 """The gate on storing the fp4 block scale as e4m3 instead of f32.
 
-Measured on the real Qwen3.8-27B-NVFP4 checkpoint (scripts/probe_scale_e4m3.py,
+Measured on the real Qwen3.8-27B-NVFP4 checkpoint (scripts/check_scale_f16.py,
 2026-09-03): of 936.6M f32 scale elements, **919.1M (98.14%) belong to 165
 tensors whose ``weight_scale`` shipped ``F8_E4M3`` on disk** and round-trip
 through e4m3 bit-exactly -- 0 of 919.1M change. Storing those as e4m3 saves

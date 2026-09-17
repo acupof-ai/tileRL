@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import os
-import time
 from dataclasses import replace
 
 os.environ.setdefault("TILERL_TARGET", "cpu")
@@ -1036,15 +1035,6 @@ def test_a_promotion_that_comes_back_empty_is_a_miss():
         "a hit came back with blocks and no snapshot; the caller would prefill the GDN "
         "layers from a zero state over non-zero KV"
     )
-
-
-def _flushed(tier, tries: int = 500) -> None:
-    """Wait for the flush daemon to land what is queued. Bounded, so a wedged writer
-    fails the assert that follows rather than hanging the suite."""
-    for _ in range(tries):
-        if not tier._pending and not tier._pending_st:
-            return
-        time.sleep(0.01)
 
 
 def test_the_fp8_kv_pool_generates_what_the_bf16_pool_does():
@@ -2807,17 +2797,6 @@ def test_the_draft_prefill_width_is_bucketed_like_the_trunks():
         f"draft block-table widths {sorted(set(tables))} vary: Mb is a compiled-in "
         "dimension, so each width is another kernel"
     )
-
-
-def _drain_clock(eng, secs=10.0):
-    """Step until the queues empty, bounded by the CLOCK: a tick budget bounds how long
-    the engine spins, not how long the reader thread takes."""
-    end = time.time() + secs
-    while time.time() < end:
-        eng.step()
-        if not (list(eng._running) + list(eng._waiting)):
-            break
-    eng.poll()
 
 
 def test_one_conversation_holds_one_decode_entry_at_every_point_in_time():

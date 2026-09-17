@@ -90,7 +90,6 @@ ignore = [
     "E702",   # multiple-statements-on-one-line-semicolon
     "E731",   # lambda-assignment
     "E741",   # ambiguous-variable-name
-    "SIM108", # if-else-block-instead-of-if-exp: its one site rewrites to a nested ternary
 ]
 
 [tool.ruff.lint.per-file-ignores]

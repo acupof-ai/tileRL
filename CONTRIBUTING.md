@@ -86,6 +86,8 @@ shipped a wrong number first.
 ## Commits
 
 Commitizen `<type>(<scope>): <subject>`, scopes `kv` `engine` `ops` `autograd`
-`train` `server` `docs` `bench`. Straight to `main`, small self-contained
-tranches. The body carries the measurement and the reasoning — a perf commit
-without a number in it is not reviewable.
+`train` `server` `docs`. Work on a named branch from a scratchpad worktree,
+push it, and open a PR; keep each PR a small, self-contained tranche that
+merges once CI is green and review comments are answered. The body carries the
+measurement and the reasoning — a perf commit without a number in it is not
+reviewable.
