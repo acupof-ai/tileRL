@@ -35,9 +35,14 @@ Modes:
   (default)        all bucket/W comparisons + B=4, one subprocess per engine
   --only-b4        just the B=4 child
   --skip-b4        only the bucket/W comparisons
-  --buckets …      sparse cmax buckets (n<=8192 dense buckets auto-skip)
+  --buckets …      sparse cmax buckets (default 512/1024/2048)
   --worker arm <source> <draft> <bucket> <depth> <graph|eager>
   --worker b4  <source> <draft>      (internal; spawned by the parent)
+
+Both arms are built with sparse_min_tokens=0 and sparse_device_select=True so
+the graph gate can pass and graph/eager differ ONLY in decode_graph. The
+worker measures the first-decode cmax and corrects n by 16 tokens per unit
+cmax (resubmitting) until the target bucket is observed.
 
 Parent exit codes:
   0 H2_REFUTED   10 H2_BAD   11 H2_ILLEGAL
@@ -53,11 +58,14 @@ import os
 import subprocess
 import sys
 
-CMAX_BUCKETS = [512, 1024, 2048]  # sparse-only; 64/128/256 land dense (n<=8192)
-SPARSE_MIN = 8192
+CMAX_BUCKETS = [512, 1024, 2048]  # all sparse; n = 8311 / 16503 / 32887
 MAX_NEW = 32  # v4: row survives many decode ticks so the first one is caught
 _PHASE_DECODE = 2
 _PHASE_DONE = 3
+# 27B load + up to 32.9k-token chunked prefill + 32 decodes per arm; the bucket
+# 2048 arm is the slow one. TimeoutExpired is a harness fault (rc 13), never
+# collapsed into capture-failed (12) or an H2 verdict.
+WORKER_TIMEOUT_S = 3000
 
 
 class ProbeError(RuntimeError):
@@ -65,23 +73,30 @@ class ProbeError(RuntimeError):
 
 
 def tokens_for_bucket(bucket: int) -> int:
-    """First decode candidate count at the bucket top.
+    """Prompt length whose FIRST decode tick sees candidate count == bucket.
 
-    own_first = q_lo//16 - (WINDOW_PAGES-1); own_first == bucket needs
-    q_lo//16 == bucket + 7; the row's last token is n = q_lo + 1.
+    First-decode cmax = n//16 - (WINDOW_PAGES-1) = n//16 - 7 (verified on CPU
+    tiny over n=8192..8400: cmax 512 holds for n in [8304,8319], 513 from
+    8320; linear 1 cmax per 16 tokens to n=16503->1024, 32887->2048). Take the
+    midpoint of the 16-wide window so a one-token scheduling slip cannot push
+    the tick into the next bucket; the worker asserts the observed bucket.
     """
-    return (bucket + 8 - 1) * 16 + 15 + 1
+    return (bucket + 7) * 16 + 7
 
 
 def _row(engine, rid: int, what: str):
     """Fetch a live row or raise ProbeError with a full dump (no bare
-    StopIteration — the v3 defect)."""
+    StopIteration — the v3 defect). poll() can itself raise RequestFailed on a
+    cold-spill error; that must not erase the _finished/_failed dump."""
     live = [r for r in engine._running if r.req_id == rid]
     if live:
         return live[0]
     finished = dict(getattr(engine, "_finished", {}))
     failed = dict(getattr(engine, "_failed", {}))
-    polled = engine.poll().get(rid, "<absent>")
+    try:
+        polled = engine.poll().get(rid, "<absent>")
+    except Exception as exc:  # cold-spill RequestFailed, etc.
+        polled = f"<poll raised {type(exc).__name__}: {exc}>"
     raise ProbeError(
         f"{what}: row {rid} not in _running; poll={polled}; "
         f"in_finished={rid in finished}; in_failed={rid in failed}: "
@@ -106,6 +121,38 @@ def prime_to_decode(engine, n_tokens: int, tag: str):
             raise ProbeError(f"{tag}: DONE before decode (output={len(row.output)})")
         engine.step()
     raise ProbeError(f"{tag}: prefill guard exhausted")
+
+
+def _cancel_and_drain(engine, rid: int, tag: str) -> None:
+    if not engine.cancel(rid):
+        raise ProbeError(f"{tag}: cancel({rid}) returned False")
+    for _ in range(1000):
+        if not any(r.req_id == rid for r in engine._running):
+            return
+        engine.step()
+    raise ProbeError(f"{tag}: cancelled row {rid} still live after 1000 steps")
+
+
+def prime_at_bucket(engine, n: int, bucket: int, depth: int, tag: str):
+    """Prime a row whose first-decode cmax lands in `bucket`, measuring the real
+    cmax and correcting n by 16 tokens per cmax before resubmitting. The closed
+    form n=(bucket+7)*16+7 lands mid-window on CPU tiny; this rescues the run if
+    a real-card scheduling detail shifts it instead of recording a next-bucket
+    verdict. No decode tick runs here, so the graph arm captures nothing during
+    the probes. Returns (rid, cmax, n_used)."""
+    from tilerl.sparse_engine import cmax_bucket
+
+    for attempt in range(4):
+        rid = prime_to_decode(engine, n, f"{tag} attempt{attempt}")
+        rows = engine._sparse.decode_rows([_row(engine, rid, "decode_rows")], [1 + depth])
+        cmax = max((len(r["cand"]) for r in rows), default=0)
+        if cmax_bucket(cmax) == bucket:
+            return rid, cmax, n
+        n += (bucket - cmax) * 16  # 16 tokens per candidate page/unit cmax
+        if n <= 0:
+            raise ProbeError(f"{tag}: cmax correction overshot to n={n}")
+        _cancel_and_drain(engine, rid, f"{tag} attempt{attempt}")
+    raise ProbeError(f"{tag}: cmax never landed in bucket {bucket}")
 
 
 def one_decode_tick(engine, rid: int, tag: str):
@@ -153,8 +200,6 @@ def build_engine_arm(source, draft_path, bucket, depth, decode_graph, model_name
     cfg, model = build_model(model_name, seed=0, fuse_projections=not dry)
     draft = None if dry else load_draft(model, draft_path)
     n = tokens_for_bucket(bucket)
-    if n <= SPARSE_MIN:
-        return {"arm": "dense-skip", "bucket": bucket, "W": depth + 1}
 
     if not dry:
         torch.cuda.reset_peak_memory_stats()
@@ -167,6 +212,7 @@ def build_engine_arm(source, draft_path, bucket, depth, decode_graph, model_name
         "decode_steps_to_token": None,
         "out_len_at_token": None,
         "observed_cmax": None,
+        "observed_bucket": None,
         "captured": None,
         "produced_token": False,
         "peak_mib": None,
@@ -180,7 +226,14 @@ def build_engine_arm(source, draft_path, bucket, depth, decode_graph, model_name
         max_total_tokens=131072,
         max_num_batched_tokens=512,
         sparse_k=128,
-        sparse_min_tokens=SPARSE_MIN,
+        # 0, not the serve's 8192: the sparse graph gate is `not
+        # _sparse_min_tokens`; 8192 would force every sparse tick eager and the
+        # graph arm would hard-exit after a full 33k prefill.
+        sparse_min_tokens=0,
+        # ON in BOTH arms: graph vs eager must differ ONLY in decode_graph, or
+        # a token mismatch is a different candidate set, not capture
+        # contamination.
+        sparse_device_select=True,
         scorer="bounds",
         kv_cold_bytes=0 if dry else int(os.environ.get("H2_COLD_BYTES", str(1 << 30))),
         cold_ssd_path="" if dry else os.environ.get("H2_COLD_SSD", ""),
@@ -190,11 +243,12 @@ def build_engine_arm(source, draft_path, bucket, depth, decode_graph, model_name
         draft=draft if depth else None,
         spec_depth=depth if depth else None,
     )
-    rid = prime_to_decode(e, n, tag=f"b{bucket}W{depth + 1}")
-    rows = e._sparse.decode_rows([_row(e, rid, "decode_rows")], [1 + depth])
-    res["observed_cmax"] = max((len(r["cand"]) for r in rows), default=0)
+    rid, cmax, n = prime_at_bucket(e, n, bucket, depth, f"b{bucket}W{depth + 1}")
+    res["n_tokens"] = n
+    res["observed_cmax"] = cmax
+    res["observed_bucket"] = cmax_bucket(cmax)
     own_w = WINDOW_PAGES + (1 if depth >= 1 else 0)
-    key = (1, 1 + depth, cmax_bucket(res["observed_cmax"]), own_w)
+    key = (1, 1 + depth, bucket, own_w)
     token, steps, out_len = one_decode_tick(e, rid, f"b{bucket}W{depth + 1}")
     captured = key in e._sparse_graphs if decode_graph else None
     res.update(
@@ -210,7 +264,7 @@ def build_engine_arm(source, draft_path, bucket, depth, decode_graph, model_name
     if decode_graph and not captured and not dry:
         print(
             f"[FATAL b{bucket} W{depth + 1}] expected key {key} absent; "
-            f"keys={list(e._sparse_graphs)}",
+            f"keys={_sparse_keys_after(e)}",
             file=sys.stderr,
             flush=True,
         )
@@ -249,7 +303,15 @@ def build_b4(source, draft_path):
     cfg, model = build_model("tiny" if dry else "qwen38-27b", seed=0, fuse_projections=not dry)
     draft = None if dry else load_draft(model, draft_path)
     n = tokens_for_bucket(512)
-    res = {"arm": "b4", "dry": dry, "ok": False, "finished": 0, "leaked_slots": None, "note": ""}
+    res = {
+        "arm": "b4",
+        "dry": dry,
+        "ok": False,
+        "finished": 0,
+        "leaked_slots": None,
+        "captured_keys": None,
+        "note": "",
+    }
     e = build_engine(
         cfg,
         model,
@@ -259,7 +321,8 @@ def build_b4(source, draft_path):
         max_total_tokens=131072,
         max_num_batched_tokens=512,
         sparse_k=128,
-        sparse_min_tokens=SPARSE_MIN,
+        sparse_min_tokens=0,
+        sparse_device_select=True,
         scorer="bounds",
         kv_cold_bytes=0 if dry else int(os.environ.get("H2_COLD_BYTES", str(1 << 30))),
         cold_ssd_path="" if dry else os.environ.get("H2_COLD_SSD", ""),
@@ -269,6 +332,7 @@ def build_b4(source, draft_path):
         draft=draft,
         spec_depth=0 if dry else 1,
     )
+    expected_tokens = 4 * MAX_NEW
     try:
         rids = []
         for k in range(4):
@@ -283,10 +347,37 @@ def build_b4(source, draft_path):
             e.step()
         if not dry:
             torch.cuda.synchronize()
-        res["finished"] = sum(len(e.poll().get(r, ())) for r in rids)
+        polled = e.poll()  # destructive: bind once, do not re-call per rid
+        res["finished"] = sum(len(polled.get(r, ())) for r in rids)
         res["leaked_slots"] = e.stats()["slots_used"]
-        res["ok"] = res["leaked_slots"] == 0
-        res["note"] = "clean" if res["ok"] else f"slots_used={res['leaked_slots']}"
+        try:
+            res["captured_keys"] = [list(map(str, k)) for k in e._sparse_graphs]
+        except Exception:
+            res["captured_keys"] = "?"
+        # slots==0 alone passed v3 even when rows died early. A real d1 B=4 arm
+        # must have captured the (4, 2, 512, 9) graph AND generated every token;
+        # CPU tiny cannot capture CUDA graphs, so only the token count gates it.
+        if dry:
+            res["ok"] = res["finished"] == expected_tokens and res["leaked_slots"] == 0
+        else:
+            captured_b4 = any(k[0] == 4 for k in e._sparse_graphs)
+            res["ok"] = (
+                captured_b4 and res["finished"] == expected_tokens and res["leaked_slots"] == 0
+            )
+            if not captured_b4:
+                print(
+                    f"[FATAL b4] no B=4 sparse graph captured; keys={res['captured_keys']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                os._exit(12)
+        if not res["ok"]:
+            res["note"] = (
+                f"finished={res['finished']} expected={expected_tokens} "
+                f"slots_used={res['leaked_slots']}"
+            )
+        else:
+            res["note"] = "clean"
     except Exception as exc:
         res["note"] = f"EXC {type(exc).__name__}: {exc}"
     finally:
@@ -299,12 +390,29 @@ def build_b4(source, draft_path):
 def spawn_worker(*worker_argv) -> dict:
     """Fresh subprocess running this script --worker ...; parse its JSON line."""
     cmd = [sys.executable, "-u", os.path.abspath(__file__), "--worker", *map(str, worker_argv)]
-    proc = subprocess.run(
-        cmd, env=dict(os.environ), capture_output=True, text=True, cwd=_repo_root()
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            env=dict(os.environ),
+            capture_output=True,
+            text=True,
+            cwd=_repo_root(),
+            timeout=WORKER_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        tail = exc.stderr or b""
+        tail = tail.decode()[-2000:] if isinstance(tail, bytes) else str(tail)[-2000:]
+        return {"arm": "worker-timeout", "timeout_s": WORKER_TIMEOUT_S, "stderr": tail}
     out = [ln for ln in proc.stdout.splitlines() if ln.startswith("{")]
     if proc.returncode == 12:
         return {"arm": "capture-failed", "child_rc": 12, "stderr": proc.stderr[-2000:]}
+    if proc.returncode == 11:
+        return {
+            "arm": "illegal-access",
+            "child_rc": 11,
+            "stdout": proc.stdout[-1000:],
+            "stderr": proc.stderr[-3000:],
+        }
     if proc.returncode != 0:
         return {
             "arm": "worker-error",
@@ -328,12 +436,24 @@ def _repo_root() -> str:
 
 def compare_bucket(source, draft, bucket, depth):
     g = spawn_worker("arm", source, draft, bucket, depth, "graph")
-    e = spawn_worker("arm", source, draft, bucket, depth, "eager")
-    if g.get("arm") in ("capture-failed", "worker-error") or e.get("arm") == "worker-error":
+    # First capture failure ends the sweep in main(): do not pay a 27B eager
+    # build here (v3 burned most of its window on engines past the first fault).
+    if g.get("arm") in ("capture-failed", "illegal-access", "worker-error", "worker-timeout"):
         return {
             "bucket": bucket,
             "W": depth + 1,
-            "verdict": "PROBE/CAPTURE",
+            "verdict": "ILLEGAL" if g.get("arm") == "illegal-access" else "PROBE/CAPTURE",
+            "graph": g,
+            "eager": None,
+            "token_ok": False,
+            "produced_ok": False,
+        }
+    e = spawn_worker("arm", source, draft, bucket, depth, "eager")
+    if e.get("arm") in ("illegal-access", "worker-error", "worker-timeout"):
+        return {
+            "bucket": bucket,
+            "W": depth + 1,
+            "verdict": "ILLEGAL" if e.get("arm") == "illegal-access" else "PROBE/CAPTURE",
             "graph": g,
             "eager": e,
             "token_ok": False,
@@ -345,6 +465,7 @@ def compare_bucket(source, draft, bucket, depth):
         "bucket": bucket,
         "W": depth + 1,
         "observed_cmax": g.get("observed_cmax"),
+        "observed_bucket": g.get("observed_bucket"),
         "captured": g.get("captured"),
         "graph_token": g.get("token"),
         "eager_token": e.get("token"),
@@ -374,27 +495,31 @@ def main() -> int:
             if kind == "arm":
                 _, source, draft, bucket, depth, mode = args.worker
                 model_name = os.environ.get("H2_MODEL", "qwen38-27b")
-                print(
-                    json.dumps(
-                        build_engine_arm(
-                            source,
-                            draft,
-                            int(bucket),
-                            int(depth),
-                            mode == "graph",
-                            model_name=model_name,
-                        )
-                    ),
-                    flush=True,
+                out = build_engine_arm(
+                    source,
+                    draft,
+                    int(bucket),
+                    int(depth),
+                    mode == "graph",
+                    model_name=model_name,
                 )
-                return 0
-            if kind == "b4":
+            elif kind == "b4":
                 _, source, draft = args.worker
-                print(json.dumps(build_b4(source, draft)), flush=True)
-                return 0
-            raise ProbeError(f"unknown worker kind {kind}")
+                out = build_b4(source, draft)
+            else:
+                raise ProbeError(f"unknown worker kind {kind}")
+            print(json.dumps(out), flush=True)
+            return 0
         except ProbeError as exc:
             print(json.dumps({"arm": "probe-error", "note": str(exc)}), flush=True)
+            return 13
+        except Exception as exc:
+            note = f"EXC {type(exc).__name__}: {exc}"
+            print(json.dumps({"arm": "worker-exc", "note": note}), flush=True)
+            # CUDA illegal memory access surfaces as a runtime error mid-tick;
+            # keep it distinct (11) from harness faults (13) and capture (12).
+            if "illegal" in note.lower():
+                return 11
             return 13
 
     # --- B=4 only ---
@@ -403,7 +528,9 @@ def main() -> int:
         print(json.dumps(r, indent=2))
         if r.get("arm") == "capture-failed":
             return 12
-        if "illegal" in str(r.get("note", "")).lower():
+        if r.get("arm") in ("worker-error", "worker-timeout"):
+            return 13
+        if r.get("arm") == "illegal-access" or "illegal" in str(r.get("note", "")).lower():
             return 11
         return 0 if r.get("ok") else 11
 
@@ -411,29 +538,39 @@ def main() -> int:
         print("source and --draft required", file=sys.stderr)
         return 13
 
-    results, bad, capture_fail = [], False, False
+    results: list = []
+    bad: list = []
+    capture_fail = illegal = False
+    probe_fault = None
     for depth in (0, 1):
         for b in args.buckets:
-            if tokens_for_bucket(b) <= SPARSE_MIN:
-                print(f"[bucket {b:5d} W={depth + 1}] DENSE-SKIP", flush=True)
-                continue
             r = compare_bucket(args.source, args.draft, b, depth)
             results.append(r)
             print(
                 f"[bucket {b:5d} W={depth + 1}] {r['verdict']} "
-                f"cmax={r.get('observed_cmax')} captured={r.get('captured')} "
+                f"cmax={r.get('observed_cmax')} bucket={r.get('observed_bucket')} "
+                f"captured={r.get('captured')} "
                 f"g_tok={r.get('graph_token')} e_tok={r.get('eager_token')} "
                 f"g_steps={r.get('graph_steps')} e_steps={r.get('eager_steps')} "
                 f"produced_ok={r.get('produced_ok')}",
                 flush=True,
             )
+            if r["verdict"] == "ILLEGAL":
+                illegal = True
+                break
             if r["verdict"] == "PROBE/CAPTURE":
-                capture_fail = True
-            elif not (r["token_ok"] and r["produced_ok"]):
+                fault = r["graph"] if r.get("graph") else r.get("eager")
+                if fault and fault.get("arm") == "capture-failed":
+                    capture_fail = True
+                else:
+                    probe_fault = r
+                break
+            if not (r["token_ok"] and r["produced_ok"]):
                 bad.append(r)
+        if illegal or capture_fail or probe_fault:
+            break
 
-    illegal = False
-    if not args.skip_b4 and not capture_fail:
+    if not (illegal or capture_fail or probe_fault) and not args.skip_b4:
         b4 = spawn_worker("b4", args.source, args.draft)
         print(
             f"[b4 d1] ok={b4.get('ok')} finished={b4.get('finished')} "
@@ -442,18 +579,25 @@ def main() -> int:
         )
         if b4.get("arm") == "capture-failed":
             capture_fail = True
-        elif "illegal" in str(b4.get("note", "")).lower():
+        elif b4.get("arm") in ("worker-error", "worker-timeout"):
+            probe_fault = {"b4": b4}
+        elif b4.get("arm") == "illegal-access" or "illegal" in str(b4.get("note", "")).lower():
             illegal = True
         elif not b4.get("ok"):
             bad.append({"bucket": "b4", **b4})
 
     print("=" * 60)
+    if probe_fault:
+        print("H2_PROBE_ERROR")
+        print(json.dumps(probe_fault, indent=2))
+        return 13
     if capture_fail:
         print("H2_CAPTURE_FAILED")
         print(json.dumps(results, indent=2))
         return 12
     if illegal:
         print("H2_ILLEGAL")
+        print(json.dumps(results, indent=2))
         return 11
     if bad:
         print(f"H2_BAD: {[(x.get('bucket'), x.get('W')) for x in bad]}")
