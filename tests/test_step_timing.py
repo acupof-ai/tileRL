@@ -50,7 +50,7 @@ def test_timer_absent_without_env(monkeypatch):
         eng.shutdown()
 
 
-def test_timing_on_segments_reconcile(monkeypatch):
+def test_timing_on_segments_reconcile(monkeypatch, capsys):
     monkeypatch.setenv("TILERL_STEP_TIMING", "1")
     monkeypatch.setenv("TILERL_STEP_TIMING_SLOW_MS", "0")  # print path exercised too
     eng = build_serving_engine(seed=1)
@@ -84,6 +84,22 @@ def test_timing_on_segments_reconcile(monkeypatch):
             inner = sum(cur[k] for k in _INNER if k in cur)
             assert abs(cur["forward"] - inner) < 2e-3 * cur["forward"] + 1e-3, cur
         assert tm.n == len(rows)
+
+        # Hollow-tick tail: the bracket wraps _run_forward. fwd_host_ms must track
+        # the "forward" envelope (same region), not seconds-since-epoch — that fails
+        # if fwd_start is dropped and fwd_t0 stays 0.0.
+        last_fwd = rows[-1][1].get("forward", 0.0) * 1000
+        assert last_fwd > 0.0
+        assert tm.fwd_host_ms > 0.0 and abs(tm.fwd_host_ms - last_fwd) < 5.0, (
+            tm.fwd_host_ms, last_fwd)
+        assert tm.cuda is False and tm.fwd_gpu_ms is None
+        assert tm.fwd_path == "eager"
+        assert tm.last_why == "cpu"
+        err = capsys.readouterr().err
+        slow = [ln for ln in err.splitlines() if ln.startswith("[step-timing] tick ")]
+        assert slow, "SLOW_MS=0 must print at least one slow tick line"
+        assert "fwd_host=" in slow[-1] and "why=cpu" in slow[-1]
+        assert "fwd_gpu=" not in slow[-1]  # device span omitted off CUDA
         tm.report()  # the atexit callback: must not crash with real data
     finally:
         eng.shutdown()
@@ -135,3 +151,70 @@ def test_added_perf_counter_reads_are_guarded():
     f = _Finder()
     f.visit(tree)
     assert not f.bad, f"unguarded perf_counter reads at lines {f.bad}"
+
+
+def test_hollow_tick_probe_is_sync_free_and_uses_async_reads():
+    """The hollow-tick tail must read the device span WITHOUT draining the queue:
+    memory_stats is a host counter read and the end event is read with non-blocking
+    query(); a synchronize() call would perturb the allocator reuse it measures.
+    Source-only (the CUDA branches never execute under the CPU RefBackend), so
+    assert on AST CALL nodes — substring presence would be satisfied by a comment
+    and stay green with the real call deleted."""
+    text = _ENGINE_PY.read_text()
+    tree = ast.parse(text)
+    timer = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                 and n.name == "_StepTiming")
+
+    calls: set[str] = set()
+
+    def _chain(n: ast.AST) -> str:
+        parts = []
+        while isinstance(n, ast.Attribute):
+            parts.append(n.attr)
+            n = n.value
+        if isinstance(n, ast.Name):
+            parts.append(n.id)
+        return ".".join(reversed(parts))
+
+    class _Walk(ast.NodeVisitor):
+        def visit_Call(self, node):
+            calls.add(_chain(node.func))
+            self.generic_visit(node)
+
+    _Walk().visit(timer)
+    # The real async reads are present as call nodes (not just comment text).
+    assert "torch.cuda.memory_stats" in calls
+    assert any(c.endswith(".query") for c in calls)
+    assert any(c.endswith(".elapsed_time") for c in calls)
+    # No device-draining synchronize call anywhere in the timer code.
+    assert not any(c.endswith(".synchronize") for c in calls), calls
+
+
+def test_hollow_tick_classifier_decisions():
+    """Pure decision table for the CUDA-only tail (never reached on the CPU cell,
+    so without this its branches are unexecuted in CI). Gauge keys use the same
+    names _slow_tail computes deltas under."""
+    from tilerl.engine import _MEM_KEYS, _StepTiming
+
+    t = _StepTiming(None)
+    t.cuda = True
+    t.fwd_host_ms = 1000.0
+    zero = {k: 0 for k in _MEM_KEYS if k != "reserved_bytes.all.current"}
+
+    def cls(dev, cur_finalize=0.002, **over):
+        d = dict(zero)
+        d.update(over)
+        t.cur = {"sparse_finalize": cur_finalize}
+        return t._classify(1000.0, dev, d)
+
+    assert cls(900, num_alloc_retries=1) == "alloc_reclaim"
+    assert cls(200, num_sync_all_streams=2) == "alloc_reclaim"
+    assert cls(900, **{"segment.all.allocated": 1}) == "dev_malloc"
+    assert cls(900, num_device_alloc=1) == "dev_malloc"
+    assert cls(None) == "unknown"                       # end event still queued
+    assert cls(900, cur_finalize=0.7) == "finalize"     # >half the span
+    assert cls(850) == "gpu_drain"                      # >=0.85 host
+    assert cls(499) == "sync_wait"                     # <0.5 host
+    assert cls(500) == "host"                          # ==0.5 host (strict <)
+    t.cuda = False
+    assert t._classify(1000.0, 900, zero) == "cpu"
