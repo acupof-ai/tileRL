@@ -211,7 +211,8 @@ def build_engine(
     #: fp8 dtype for the KV planes; None is off, the default. 65536 -> 33280 bytes per token
     #: at the 27B's 16x4x256, a 1.969x saving after one f32 scale per
     #: (plane, block, kv_head, token) -- the only grid a single-launch fused writer can
-    #: reduce (docs/design-fp8-kv.md). Off because the attention kernels still read a
+    #: reduce (docs/experience/wins/2026-09-07-fp8-kv-pool-per-token-scales.md).
+    #: Off because the attention kernels still read a
     #: dequantized plane, so this is capacity, not yet bandwidth.
     kv_fp8: torch.dtype | None = None,
     #: sparse-KV selection, now the DEFAULT. sparse_k>0 selects this many earlier pages
@@ -336,7 +337,8 @@ def build_engine(
                 f"kv_fp8 with the fused KV writers {blind} on arch "
                 f"{getattr(backend, 'arch', '?')}: they scatter into the plane `kv_layer` "
                 "returns, which is a dequantized copy under fp8, so every K/V write would be "
-                "silently lost, and this cell registers no fp8 twin (docs/design-fp8-kv.md)."
+                "silently lost, and this cell registers no fp8 twin "
+                "(docs/experience/wins/2026-09-07-fp8-kv-pool-per-token-scales.md)."
             )
     if sparse_k:
         if not kv_cold_bytes:

@@ -29,27 +29,6 @@ from .recipes import RECIPES, flags
 from .train import cmd_train
 
 
-def _progress(as_json: bool):
-    """The run's progress printer: stdout normally, STDERR under --json.
-
-    Not a no-op under --json, which is what it used to be. A `--json` eval-only run then
-    printed nothing at all until the manifest at the end, and with the eval arm writing
-    `eval-{tag}.jsonl` only on completion and the run directory holding just the
-    pre-written manifest, the log was the sole progress signal -- so a healthy 67-minute
-    27B eval was indistinguishable from a hung one for its whole duration, and two
-    sessions began treating one as dead (errors/2026-09-08-a-silence-with-no-writer.md).
-
-    stderr, not stdout, because `--json` exists so a caller can parse the manifest:
-    `tests/test_recipes.py:47` reads `out[out.index("{"):]`, so anything containing a
-    brace ahead of the manifest breaks it. stdout is already not a lone object -- the
-    same test records that TileLang writes kernel-cache warnings there from C++ -- which
-    is why the manifest is found by first brace rather than by parsing the whole stream,
-    and why moving OUR lines off stdout is what keeps that workable.
-    """
-    if not as_json:
-        return print
-    return lambda *a, **k: print(*a, **{**k, "file": sys.stderr, "flush": True})
-
 def _qwen38_tokenizer():
     """The 27B tokenizer, with the same hint as its weights: a bare hub id 401s."""
     from .tokenizer import get_tokenizer
@@ -532,7 +511,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "the pool and the writers are fp8 but the attention kernels still "
                               "read a dequantized plane, so this is correctness-complete and not "
                               "yet a bandwidth win, and no decode tok/s figure exists "
-                              "(docs/design-fp8-kv.md). Refused on sm70, whose fused write_tokens "
+                              "(docs/experience/wins/2026-09-07-fp8-kv-pool-per-token-scales.md). "
+                              "Refused on sm70, whose fused write_tokens "
                               "has no fp8 twin and would scatter into a dequantized copy. e4m3 is "
                               "the default choice on measurement, not analogy: it beats e5m2 "
                               "1.89x on the worst element with nothing underflowing on tiny")
@@ -756,7 +736,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
         "--suite",
         default=None,
         help="run the full harness (scripts/bench_harness.py) instead of the quick "
-        "tiny timer: comma list of decode-kv,prefill,kv-reuse,train,micro",
+        "tiny timer: comma list of decode-kv,prefill,kv-reuse,spec,train,train-full,"
+        "accuracy",
     )
     p_bench.add_argument("--source", default=None, help="27B checkpoint dir (harness GPU suites)")
     p_bench.add_argument("--gpu", type=int, default=None, help="GPU index (harness)")
