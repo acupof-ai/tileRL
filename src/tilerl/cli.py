@@ -17,31 +17,12 @@ from .build import (
     build_serving_engine,
 )
 from .build import (
-    NO_WEIGHTS as _NO_WEIGHTS,
-)
-from .build import (
-    QWEN38_SOURCE as _QWEN38_SOURCE,
-)
-from .build import (
     kv_fp8_dtype as _kv_fp8,
 )
 from .recipes import RECIPES, flags
+from .tokenizer import qwen38_tokenizer as _qwen38_tokenizer
 from .train import cmd_train
 
-
-def _qwen38_tokenizer():
-    """The 27B tokenizer, with the same hint as its weights: a bare hub id 401s."""
-    from .tokenizer import get_tokenizer
-
-    try:
-        return get_tokenizer(_QWEN38_SOURCE)
-    except Exception as exc:
-        # HF's 401 body is a dozen lines of auth advice; the first names the cause.
-        # Some exceptions (MemoryError) stringify empty, so splitlines() can be [].
-        first = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
-        print(f"error: could not load the Qwen3-27B tokenizer from {_QWEN38_SOURCE!r}: "
-              f"{first}\n{_NO_WEIGHTS}", file=sys.stderr)
-        sys.exit(1)
 
 def _device_free(args, backend) -> int:
     """--device-free bytes, or the CUDA card's free; off cuda without the flag refuse."""
