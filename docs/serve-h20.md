@@ -37,9 +37,15 @@ grant. If the pod was recreated, do this sequence first (read-only recon on
 
    ```
    POD_SESSION=h20 scripts/pod_sync.sh                       # tar main -> /work/tilerl-s-h20
-   POD_SESSION=h20 scripts/pod_sync.sh -- 'bash scripts/h20_tl013_setup.sh'
-   POD_SESSION=h20 scripts/pod_sync.sh -- 'bash scripts/serve_h20.sh --dry-run'  # expect exit 0
+   POD_SESSION=h20 scripts/pod_sync.sh 'bash scripts/h20_tl013_setup.sh'
+   POD_SESSION=h20 scripts/pod_sync.sh 'bash scripts/serve_h20.sh --dry-run'  # expect exit 0
    ```
+
+   `pod_sync.sh` takes the remote command as its first positional argument (it
+   parses only `--session`/`run`); there is NO `--` separator here — a bare `--`
+   would run as a literal command on the pod (exit 127) while the sync still
+   succeeds, silently skipping setup. (`pod_run.sh` is different and DOES use `--`
+   before its command.)
 
    `POD_SESSION=h20` is what pins the remote tree to `/work/tilerl-s-h20` for
    both `pod_sync.sh` and `pod_run.sh` (the tree name derives from it, not a
