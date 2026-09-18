@@ -135,7 +135,15 @@ def set1_project_scripts() -> set[str]:
 
 
 def set2_ci() -> set[str]:
-    """.github/workflows/*.yml"""
+    """`.github/workflows/*.yml` -- mentions only, not execution.
+
+    CI also runs `scripts/pod_*_selftest.sh`, and a shell it executes could reach a
+    `.py` this set never sees. Measured 2026-09-17: expanding that one level adds no
+    LIVE script -- the two stems those selftests name (`card_owner`, `baseline`) are
+    already reached by stronger sets (3_imports, 5_invocation, 1_pyproject). Recorded
+    rather than modelled: a CI->shell->mention fold would add a layer and change no
+    bucket, so re-measure before adding it.
+    """
     hits = set()
     for p in _files([".github/workflows/*.yml", ".github/workflows/*.yaml"]):
         hits |= _mentions(_read(p))
