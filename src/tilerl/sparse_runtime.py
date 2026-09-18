@@ -13,6 +13,7 @@ keeps its old surface.
 
 from __future__ import annotations
 
+import time
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,6 +45,9 @@ class SparseCtx:
     sample_commit: Callable
     draft_step: Callable
     bump_decode_forwards: Callable
+    #: The Engine's env-gated step timer (None unless TILERL_STEP_TIMING), so a
+    #: publish can attribute its own device costs without importing the Engine.
+    step_timing: Any = None
 
 
 def retier(pool, keep, running, waiting) -> tuple[int, int]:
@@ -431,20 +435,36 @@ class SparseRuntime:
         - on the private SSD: share_hold_kv lifts it into the prefix spill file;
         - still DEVICE-resident (in the own window, never dropped): build the host
           blob from its live physical frame here.
-        Returning without a blob would leave a lookup entry naming a dead key."""
+        Returning without a blob would leave a lookup entry naming a dead key.
+
+        Four device costs are charged separately below (bounds D2H, draft K/V
+        clone, SSD read+spill write, resident-frame D2H) because they have
+        different fixes; only the first two ever charge on the CPU cell."""
         ctx = self.ctx
         tr = self.tracker
+        tm = ctx.step_timing
+        t = time.perf_counter() if tm is not None else 0.0
         extra = {"bounds": tr.bounds_view(r.req_id)[page].cpu()}
+        if tm is not None:
+            tm.mark("pub_bounds_d2h", t)
+            t = time.perf_counter()
         if draft_block is not None and ctx.draft is not None:
             dpool = ctx.draft.kv
             # clone: .cpu() is a no-op on the CPU cell, so without it the blob
             # aliases a draft block that gets recycled and overwritten
             extra["dk"] = dpool.k_pool[:, draft_block].detach().cpu().clone()
             extra["dv"] = dpool.v_pool[:, draft_block].detach().cpu().clone()
+        if tm is not None:
+            tm.mark("pub_draft_clone", t)
+            t = time.perf_counter()
         tr.shared.setdefault(r.req_id, {})[page] = content_key
         if (r.req_id, page) in ctx.kv.cold:
             n = ctx.kv.cold.share_hold_kv(
                 (r.req_id, page), content_key, extra=extra)
+            if tm is not None:
+                # device-only: no SSD private spill on the CPU cell, so this
+                # mark is present but never charges there.
+                tm.mark("pub_ssd_transfer", t)
             if n:
                 return
             # private blob was past the host budget and consumed into the prefix
@@ -461,10 +481,15 @@ class SparseRuntime:
         # Device-resident: snapshot the frame directly (it stays live; the page
         # did not leave the union this tick). No pool block is freed.
         blob, n = ctx.kv._page_blob(phys)
+        if tm is not None:
+            tm.mark("pub_frame_d2h", t)
+            t = time.perf_counter()
         blob.update(extra)
         n += sum(t.numel() * t.element_size() for t in extra.values()
                  if torch.is_tensor(t))
         ctx.kv.cold.share_hold(content_key, blob, n)
+        if tm is not None:
+            tm.mark("pub_share_hold", t)
 
     def finalize(self, sf, rows, hidden=None) -> list:
         """After the forward: store Quest bounds of every now-complete page, then

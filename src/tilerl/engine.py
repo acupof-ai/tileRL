@@ -853,6 +853,7 @@ class Engine:
                 sample_commit=self._sample_commit,
                 draft_step=self._draft_step,
                 bump_decode_forwards=self._bump_decode_forwards,
+                step_timing=self._step_timing,
             )
 
     # ------------------------------------------------------------------ API
@@ -2631,7 +2632,7 @@ class Engine:
         for b in req.blocks:
             self._kv.free_block(b)
         if _tm is not None:
-            _tm.mark("release_free_block", _t)
+            _tm.mark("release_blocks", _t)
         self._blocks_used -= req.own_blocks
         req.pending_prefix = None  # a prefill that never completed still held a snapshot
         self._states.free_slot(req.state_slot)

@@ -25,6 +25,15 @@ from test_e2e import build_serving_engine
 
 from tilerl import engine as engine_mod
 from tilerl.engine import SamplingParams
+from tilerl.kv_cache import BLOCK_TOKENS
+
+#: The three release sub-segments every request end must charge.
+_RELEASE_SEGMENTS = ("release_close_request", "release_cold_forget", "release_blocks")
+
+#: The per-page publish costs, split by fix (see transfer_to_shared). Each has
+#: a different remedy, which is why one close_request bucket is not enough.
+_PUBLISH_SEGMENTS = ("pub_bounds_d2h", "pub_draft_clone", "pub_ssd_transfer",
+                     "pub_frame_d2h", "pub_share_hold")
 
 #: Every segment name the probe may emit. "forward" is an envelope (see its
 #: docstring); graph ticks carry "graph" instead of the eager inner set.
@@ -32,7 +41,9 @@ _SEGMENTS = {
     "plan", "stats", "forward", "charge", "graph",
     "sparse_select", "prep", "model", "sparse_finalize", "sample",
     "draft_blocks", "draft_step", "offers_pub",
-    "release_close_request", "release_cold_forget", "release_free_block",
+    "release_close_request", "release_cold_forget", "release_blocks",
+    "pub_bounds_d2h", "pub_draft_clone", "pub_ssd_transfer", "pub_frame_d2h",
+    "pub_share_hold",
 }
 _INNER = {
     "sparse_select", "prep", "model", "sparse_finalize", "sample",
@@ -124,20 +135,66 @@ def test_release_subsegments_are_inside_sample(monkeypatch):
         ended: list[dict[str, float]] = []
         for _ in range(64):
             done = eng.poll()
-            before = dict(tm.cur)
             eng.step()
-            if tm.cur.get("release_free_block", 0.0) > before.get("release_free_block", 0.0):
+            # tick_start cleared cur, so this dict IS this tick's segments.
+            if tm.cur.get("release_blocks", 0.0) > 0.0:
                 ended.append(dict(tm.cur))
             if rid in done and len(done[rid]) >= 12:
                 break
         else:
             raise AssertionError("request did not finish")
-        assert ended, "no tick charged a release_free_block: the end-tick split is gone"
-        sub = ("release_close_request", "release_cold_forget", "release_free_block")
+        assert ended, "no tick charged a release_blocks: the end-tick split is gone"
         for cur in ended:
-            assert cur.get("release_free_block", 0.0) > 0.0
-            assert all(cur.get(k, 0.0) >= 0.0 for k in sub)
-            assert sum(cur.get(k, 0.0) for k in sub) <= tm.last_total + 1e-3, cur
+            assert cur.get("release_blocks", 0.0) > 0.0
+            assert all(cur.get(k, 0.0) >= 0.0 for k in _RELEASE_SEGMENTS)
+            assert sum(cur.get(k, 0.0) for k in _RELEASE_SEGMENTS) <= tm.last_total + 1e-3, cur
+    finally:
+        eng.shutdown()
+
+
+def test_release_subsegments_charge_on_a_sparse_request_end(monkeypatch):
+    """Every release and publish sub-segment must charge on a real sparse end.
+
+    The dense test above only ever exercises `release_blocks`: with no sparse
+    row the `close_request`/`cold_forget` marks are never reached, so deleting
+    either one left the gate green. Two shapes are needed beyond that:
+
+    * a DRAFT row, or `pub_draft_clone` charges ~1 us of timer noise on the
+      skipped `if draft_block is not None` branch and the assertion passes
+      vacuously (measured 0.8 us without, 23.2 us with);
+    * at least 12 prompt pages, or the private blob is still under the host
+      budget and the SSD transfer branch never runs.
+    """
+    from test_sparse_engine import _sparse_engine
+
+    monkeypatch.setenv("TILERL_STEP_TIMING", "1")
+    monkeypatch.setenv("TILERL_STEP_TIMING_SLOW_MS", "0")
+    eng = _sparse_engine(2, draft=True)
+    try:
+        tm = eng._step_timing
+        prompt = (np.arange(16 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+        rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+        peak: dict[str, float] = {}
+        for _ in range(512):
+            done = eng.poll()
+            eng.step()
+            # Per-tick segments (tick_start cleared cur): a mark charges the
+            # release work of exactly the requests that ended in this tick.
+            for k, v in tm.cur.items():
+                peak[k] = peak.get(k, 0.0) + v
+            if rid in done and len(done[rid]) >= 2:
+                break
+        else:
+            raise AssertionError("sparse request did not finish")
+        missing = [k for k in _RELEASE_SEGMENTS if peak.get(k, 0.0) <= 0.0]
+        assert not missing, f"never charged on a sparse request end: {missing}"
+        assert eng._sparse.prefix.published == 1, eng._sparse.prefix.published
+        # Measured 2026-09-18, k=2, 16 pages, draft=True, 2 generated:
+        # bounds 39.5us, draft_clone 64.1, frame_d2h 121.5, share_hold 14.6,
+        # ssd_transfer 17.7.
+        missing = [k for k in _PUBLISH_SEGMENTS if peak.get(k, 0.0) <= 0.0]
+        assert not missing, f"publish sub-segment never charged: {missing}"
+        assert set(peak) <= set(_SEGMENTS)
     finally:
         eng.shutdown()
 
