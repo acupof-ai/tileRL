@@ -60,7 +60,9 @@ job owns, not the shared server.
 - It does **not** change steady decode tok/s — no decode path, KV layout,
   attention kernel, or page selection changes.
 - It is not the speculative-decode draft READ window (`--draft-attn-window-tokens`,
-  default 2048) or the verify width (`--depth`); keep all three separate when reporting.
+  default 0 = full prefix; 2048 is the measured opt-in candidate,
+  `spec.DRAFT_ATTN_WINDOW_TOKENS_RECOMMENDED`, pending live 32k) or the verify
+  width (`--depth`); keep all three separate when reporting.
 
 ## Verifying on a device window
 

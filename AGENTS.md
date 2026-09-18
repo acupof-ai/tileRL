@@ -266,12 +266,12 @@ on this machine that resolves to `cpu`).
 Dependencies: `uv add <pkg>` / `uv add --dev <pkg>` — never `pip install`.
 
 **Ruff rule set.** `select = ["E", "F", "I", "UP", "SIM"]`, line-length 100,
-target py311 (see `pyproject.toml [tool.ruff]`). Day-1 baseline: 4 categories
-(E501/E702/E731/E741) are `ignore`d
-because in-flight `src/`/`tests/` code violates them — re-enable one by one as
-the tree is cleaned, never grow the list. F821 stays on globally, suppressed
-per-file only for `src/tilerl/autograd.py` (selfcheck helpers); `reference.py`'s
-suppression was retired by importing `Any`.
+target py311 (see `pyproject.toml [tool.ruff]`). One global ignore is left:
+`E501` (line-too-long). `E702`/`E731`/`E741` were cleared out of `tests/` and
+`scripts/`, so they moved to `[tool.ruff.lint.per-file-ignores]` scoped to any
+`src/` tree (`**/src/**`) and regress the gate anywhere else; `F821` stays
+enabled globally, suppressed per-file only for `src/tilerl/autograd.py`
+(selfcheck helpers). Never grow the ignore list.
 
 **CI.** `.github/workflows/ci.yml` gates on `ubuntu-latest` + `macos-14`:
 `uv sync --dev` → `ruff check` → `TILERL_TARGET=cpu uv run pytest -v`. Only
