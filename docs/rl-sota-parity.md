@@ -295,7 +295,7 @@ a step covers several prompts.
 
 **The clipped-completion rate is an omission.** Both stacks measure it because
 a rising fraction of length-truncated rollouts is how a GRPO run degenerates
-without the reward moving. We have `max_new_tokens=256` and no counter.
+without the reward moving. We have `max_new_tokens=512` and no counter.
 
 ## 7. Optimizer and schedule
 

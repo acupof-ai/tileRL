@@ -100,14 +100,14 @@ of its 27 entries — reached, not reimplemented.
 | rmsnorm (fwd/bwd) | done | fwd done, bwd untested | done | pending-remote | done |
 | linear (fwd/bwd) | done | fwd done, bwd untested | done | pending-remote | done |
 | rope (fwd/bwd) | done | fwd done, bwd untested | done | pending-remote | done |
-| attention (dense, fwd/bwd) | done | via cpu maker, untested | done | pending-remote | done |
+| attention (dense, fwd/bwd) | eager reference | eager reference | eager reference | pending-remote | eager reference |
 | paged_attention (fwd) | done | done (split-KV) | done | pending-remote | done |
 | gdn_forward (full GDN layer) | done | done (fused) | done | pending-remote | done |
 | gdn_backward | done | untested | done | pending-remote | done |
 | silu_mul (fwd/bwd) | done | fwd done, bwd untested | done | pending-remote | done |
 | softmax | done | done | done | pending-remote | done |
 | embedding (fwd/bwd) | done | fwd done, bwd untested | done | pending-remote | done |
-| sample | done | via cpu maker | done | pending-remote | done |
+| sample | eager reference | eager reference | eager reference | pending-remote | eager reference |
 | add | done | via cpu maker | done | pending-remote | done |
 
 ## fp4 (OCP e2m1 weight format)

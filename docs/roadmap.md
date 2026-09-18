@@ -24,7 +24,7 @@ head, the ledger); TP, CP and the 128K–256K budget are under P6 below.
 | Speculation | correct, 1.87 committed tokens per trunk forward; **loses 4.9× on H20 because a draft disables graph capture**. On sm70 the draft runs eager, outside the captured tick, and costs 5.53 ms = 25% of a depth-3 tick; capturing it is rejected at a 1.14× ceiling (the tick is 88% GPU-bound). spec 49.7 tok/s at 1024 vs dense 37.6. **The 09657c0 baseline is void** — the pod tree was byte-identical to HEAD, so every 09657c0 number is run-to-run noise (`errors/2026-09-09-pod-09657c0-tree-was-head-contaminated.md`) | CHANGELOG 2026-08-29 verdict, `wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md`, `errors/2026-09-02-capturing-the-draft-is-rejected.md` |
 | Training | LoRA-AdamW and Adafactor full fine-tune run on one card (73.2 GiB); GRPO and self-OPD exist; real prompts, GSM8K reward, MMLU before/after wired | `wins/2026-08-29-full-finetune-fits.md`, `wins/2026-09-02-rl-real-task.md` |
 | RL on the 27B | **never moved a downstream metric**. GSM8K exhausts (0.87 tied at step 35); MATH run 2 was killed at step 45 of 100 because a correctness-only reward lengthens rollouts into the cap and every group then ties at the floor | same, `errors/2026-09-06-the-rollouts-grew-into-the-cap.md` |
-| Kernels | one TileLang tree; cpu (CI/parity), metal, sm90, sm70 executed it; 71% of kernel lines are sm90 schedules | `docs/support-matrix.md`, `wins/2026-08-29-sm70-volta-fp4-cell.md` |
+| Kernels | one TileLang tree; cpu (CI/parity), metal, sm90, sm70 executed it; the sm90 and sm70 schedules share `kernels_linear.py`, so no per-file sm90 share exists | `docs/support-matrix.md`, `wins/2026-08-29-sm70-volta-fp4-cell.md` |
 | sm70 (V100) | fp4 inference runs: decode 37.6 tok/s at 4096 ctx against a 56.1 tok/s weight-bandwidth ceiling, prefill 7.89 ms/prompt token, GEMV 746 GB/s = 83% of peak | `docs/experience/LOG-v100-sm70.md` |
 | Ledger | human-written `docs/experience/`; per-run manifests landing 2026-09-02 (P4). A run killed mid-training used to report `pass` — gates are written at the end and `all([])` is true — and now reports `killed` | `wins/2026-09-06-an-interrupted-run-reported-pass.md` |
 
@@ -94,13 +94,13 @@ one. Treat every claim here as dated to its sha, and prefer the tree.
   Adafactor with a fresh batch per step, and it is unmeasured. **P3's merger CPU exit is met
   by #299**, which also corrects a gate that read `iso[0] <= avg[0] or iso[1] <= avg[1]`
   where this document says *each*.
-- **P4 is not complete.** The manifest's id block (`cli.py:494-509`) records no
-  engine configuration — not `num_blocks`, `max_total_tokens`, `num_slots` or
-  `decode_graph`. Six card sessions on 2026-09-08 spent most of their cost
-  recovering two runs' pool sizes out of probe-script log lines, because no
-  manifest held them; and the effect that arm finally isolated was **build order
-  inside one process**, which is not expressible as a field at all. Both say the
-  same thing about P5: a run record that does not pin the engine it ran cannot
+- **P4 is partially closed.** The manifest now records the engine config
+  (`manifest["engine"] = engine.config` → blocks, slots, max_batch,
+  max_total_tokens, max_num_batched_tokens, decode_graph, prefix_store,
+  spec_width, memory), which is the field the 2026-09-08 sessions were missing.
+  What it still cannot express is **build order inside one process**, the effect
+  that arm finally isolated — not a field at all. That says the same thing about
+  P5: a run record that does not pin the engine it ran cannot
   support the run-to-run wall-clock comparison P5 is made of.
 
 
@@ -109,7 +109,7 @@ one. Treat every claim here as dated to its sha, and prefer the tree.
 Everything below is built on this claim, and it is unproven.
 
 Prerequisites, all code, all CPU-gated:
-- `--eval-gsm8k` on a held-out slice (P4 builds it): today only MMLU exists.
+- `--eval-gsm8k` and `--eval-n` on a held-out slice (landed; the slice is gated against `--data` contamination).
 - The OPD teacher engine is built with the decode graph and the prefix store
   ON, and the EMA adapter is swapped by `params.update`, which replaces the
   tensor objects a captured graph holds — on CUDA self-OPD samples from a
@@ -129,7 +129,7 @@ Prerequisites, all code, all CPU-gated:
   (`errors/2026-09-06-the-rollouts-grew-into-the-cap.md`).
 
 Run: `tilerl train --recipe grpo-gsm8k-27b --data gsm8k_train.jsonl
---eval-gsm8k gsm8k_test.jsonl` (the recipe is 100 steps, group 8, 256 tokens,
+--eval-gsm8k gsm8k_test.jsonl` (the recipe is 100 steps, group 8, rollout cap 512,
 LoRA rank 16, no thinking, MMLU 1000, GSM8K 500), one H20, `--seed 0` and `1`.
 
 Exit, both seeds: GSM8K held-out (500 q) after − before ≥ +5 pt (paired McNemar
@@ -175,7 +175,7 @@ plan text below is unchanged.
 Rollout is the RL cost, rollout is decode, speculation is the decode lever at
 B ≤ 8. Today any draft head loses 4.9× (86.2 → 17.6 tok/s) because the
 speculative tick runs eager. So does the RL rollout itself: `grpo_loop`
-requires `decode_graph=False` because a captured graph bakes weights the
+requires either `decode_graph=False` or the `recapture_graph=True` waiver, because a captured graph bakes weights the
 optimizer moves. Both need the same thing first:
 
 0. **Recapture after each update.** The captured decode graph, and later the
@@ -269,8 +269,9 @@ Recurring (1 d) once P1 lands; OpenRLHF and slime are the next arms after verl.
 
 Speculation and batch are substitutes: 3.43× at c=1 is 2.84× at c=8 and
 falls as the verify batch turns compute-bound. B ≥ 32 only happens when a
-step samples ≥ 32 rollouts — `grpo_loop` is one prompt per step today, so this
-lever needs multi-prompt steps first. Choose P2 or P6 after P1 by the group
+step samples ≥ 32 rollouts — `grpo_loop` steps one prompt by default
+(`--prompts-per-step 1`; the flag exists and sizes the group), so this
+lever needs the multi-prompt step sized for it first. Choose P2 or P6 after P1 by the group
 size the task needs.
 
 - Tensor-core decode GEMM MX 8 → 32/64. Exit: harness B=32 row at the

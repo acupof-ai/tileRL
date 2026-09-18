@@ -21,7 +21,7 @@ tensor. Count = leading dims × Π ceil(trailing/group): per-16 `(16,)`, per-row
 ```
 bf16      = Format(bits=16)
 f32       = Format(bits=32)
-fp8_kv    = Format(bits=8,  scales=((head_dim, f32),))         # one f32 per plane x head x token
+kv_format = Format(bits=8,  scales=((head_dim, f32),))         # one f32 per plane x head x token (precision.kv_format)
 nvfp4     = Format(bits=4,  scales=((16, e4m3), (None, f32)))  # disk: ModelOpt packing
 nvfp4_dev = Format(bits=4,  scales=((16, f32), ((None,), f32)))# device: f32 scales, f32/row
 nvfp4_dev_b32 = Format(bits=4, scales=((32, f32), ((None,), f32)))  # bf16 repacked at load (pack_fp4 block 32)
@@ -59,7 +59,7 @@ population.
 is a pure function laying the device rows out before anything is allocated:
 
 ```
-Row(tier, owner, bytes, note="")        # bytes already computed through nbytes
+Row(tier, owner, n, note="")           # n already computed through nbytes
 tier  in {device, host, ssd}
 owner: weights, state_slots, kv_pool, draft_pool (held), plus *_budget rules
 ```

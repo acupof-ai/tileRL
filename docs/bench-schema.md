@@ -38,7 +38,7 @@ watching.
 | `target` | str | `cpu` / `metal` / `sm90` / `sm70` |
 | `build` | str | `eager` / `fused` / `fused+graph` / `fused+graph+draft` |
 | `model` | str | config name, e.g. `27B-nvfp4`, `tiny` |
-| `shape` | object | non-empty; must contain the metric's registry-declared keys (decode → `batch`,`ctx`; eval → `cap`; reuse → `turn`) |
+| `shape` | object | non-empty; must contain the metric's registry-declared keys (decode → `batch`,`ctx`; reuse → `turn`; accuracy → `n` or `steps`) |
 | `warm` | object | `state` ∈ `cold`,`warm`; `compiles` int ≥ 0 or null — JIT compiles in the timed window. **The only legal source is the `len(backend._kernels)` delta** (engine-direct collectors). A server-log grep counts only INFO-logged kernels — an undefined lower bound, off by 8x on the first real comparison (16 vs 2) — so log-reading collectors record null and keep the count as a console-only lower bound. **null = unmeasured, never omitted**. Exception: metrics compile-invariant by construction (proportions, token counts) record 0 as "not applicable", not a measured count |
 | `n` | int | ≥ 1, the number of timed windows |
 | `spread` | number | relative dispersion (sd/mean or (max−min)/median); 0.0 when `n=1` |
@@ -144,7 +144,7 @@ adds targets covered) — an empty store must make noise, not read as a clean
 bill of health.
 
 - `tilerl bench --table` — four-target matrix; an empty cell says so, never a silent skip; the gap column carries its floor kind (`roof`/`bw`/`compute`/`base` = headroom, `best` = vs our own best)
-- `tilerl bench --readme` — the generated README rows (reuse, SSD restart); coverage as an HTML comment so the table stays paste-safe
+- `tilerl bench --readme` — the generated README rows (cross-turn reuse); coverage as an HTML comment so the table stays paste-safe
 - `tilerl bench --regress` — two sections: newest vs previous per key (`n>=2` only, no dispersion, no regression claim), and every `measured-best` row standing below its population's best (FAIL past 1.05x). The symmetric side: a new best that jumps more than 1.2x beyond the previous best is `IMPLAUSIBLE — explain or reject` (1.2x is ~10x the 1.7% run-to-run spread; a real jump gets the explain line it deserves)
 - `tilerl bench --questions` — headroom against **physical floors only**, by `gap × weight` desc; above it, `no measurement at all` (declared in the registry, never measured) and below it `no physical floor — needs a derivation` (measured, no physical floor) — both sorted by weight, both louder than any ranked row. A value that **beats a hard physical floor** (bandwidth/compute/roofline, not baseline — the null is meant to be beaten) is `IMPLAUSIBLE — explain or reject`, printed before everything else: a too-good number is the most common shape of bad measurement (a cost missed, the wrong population, a gate reading an always-true field), and the only alarm a first measurement has
 

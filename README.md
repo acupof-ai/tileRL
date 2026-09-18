@@ -32,7 +32,7 @@ What runs today (H20 unless noted; every number links its entry):
   questions, `--sparse-k 128` scores **0.863 vs dense 0.858** at **37.4 vs 187 tok/s**,
   so it stays opt-in on perf grounds
   ([errors/2026-09-12-sm90-fused-attn-prep-sparse-packed-prefill.md](docs/experience/errors/2026-09-12-sm90-fused-attn-prep-sparse-packed-prefill.md)).
-  Sparse decode is graph-captured and serves by default once opted in
+  Sparse decode is graph-captured once opted in on sm90 (pure sparse: `--sparse-k` without `--sparse-min-tokens`); hybrid sparse ticks and every sm70 sparse tick run eager
   ([#557](https://github.com/acupof-ai/tileRL/pull/557)); sparse B=1 eager at 32k is
   **88.23 ms/tick vs ~13 ms dense graph**, 256k pending
   ([#571](https://github.com/acupof-ai/tileRL/pull/571)).
@@ -54,7 +54,7 @@ What runs today (H20 unless noted; every number links its entry):
   ([errors/2026-09-08-the-training-rollout-tick-is-2.6x-serving.md](docs/experience/errors/2026-09-08-the-training-rollout-tick-is-2.6x-serving.md)).
 
 Unfinished (owners in [OPEN.md](docs/experience/OPEN.md), **14 open defects**): the sparse 256k
-decode number still waits on a named card lend — its 32k row shipped in
+decode number is frozen with the other H20/sm90 rows (H20 stopped 2026-09-16; not awaiting a lend) — its 32k row shipped in
 [#571](https://github.com/acupof-ai/tileRL/pull/571) (88.23 ms/tick vs ~13 ms dense graph); 32k
 teacher-forced sparse NLL closed partial at **5 of 8 windows** (k128 gap −0.1402 nats/token,
 [entry](docs/experience/errors/2026-09-13-sparse-nll-32k-partial-5of8.md)).
@@ -72,7 +72,8 @@ rows above compare kernels, not accuracy.
 the same shape; the speculation pair ran 200 real GSM8K problems, so 126.5 is
 read against its own 79.5 base (**1.591x**, derived), never against 54.2.
 Speculation is a B=1 lever: at B=8 it lands at 0.928x. Speculation and a real
-prefix cache cannot both be on: an adopted prefix skips the positions the
+prefix cache cannot both be on when the drafter taps the trunk's aux layers
+(the DFlash2 block drafter): an adopted prefix skips the positions the
 draft's context was built from, so the engine rejects the combination at build.
 
 This table read **135.5** for the speculation row until 2026-09-09: re-measured

@@ -23,8 +23,9 @@ through the hand-written tape (`autograd.py`), same backend ops. One runtime.
 - **One forward per tick, mixed batch.** Continuous batching with chunked
   prefill (vLLM/sglang pattern, mirrored through agent-infer's
   `build_forward_plan`): waiting/running queues, a per-tick token budget
-  (`StepLimits.max_num_batched_tokens`), decode rows first plus at most one
-  prefill chunk sharing the forward. No preemption/swap day-1.
+  (`StepLimits.max_num_batched_tokens`), decode rows first plus every prefill
+  that fits the remaining token budget and one width bucket, sharing the
+  forward. No preemption/swap day-1.
 - **The decode tick is a captured kernel sequence on the dense serving path.**
   Dense decode is memory-bound and static: the same ops, the same shapes, every
   token, for the life of the process. A static sequence repeated 10⁴+ times is
@@ -37,14 +38,17 @@ through the hand-written tape (`autograd.py`), same backend ops. One runtime.
   path below runs eager on purpose.
 - **Storage owns three things**: paged KV, GDN state, prefix cache. The engine
   asks for prefix hits and block tables; it never touches KV memory directly.
-- **The model is backend-neutral**: no TileLang/torch calls above `ops/`.
+- **The model is backend-neutral**: no TileLang/torch calls outside
+  `packages/tilerl-kernels/`.
 - **Prefix sharing is read-only, not COW**: shared blocks are never modified
   after publishing; `PrefixStore.insert` enforces that no block is written
   after sharing. Sparse builds use a second store, `SparsePrefixCache`
   (host-blob backed, content-hash namespaced): it holds published pages' host
   blobs and bounds, never the live device blocks, and the same read-only rule
-  applies. `NoPrefixStore` is now an explicit opt-out only (the RL path), not
-  the sparse default.
+  applies. A pure-sparse build auto-selects `NoPrefixStore` for the
+  block-retaining pool (it cannot retain pages sparse rows do not own); sparse
+  sharing is the tracker's `SparsePrefixCache`, and passing `NoPrefixStore`
+  explicitly disables that too (the RL path).
 
 ## Hybrid serve (#586)
 
