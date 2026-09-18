@@ -30,12 +30,16 @@ from tilerl.spec import DraftHead
 
 
 def _engine(window: int, monkeypatch):
-    monkeypatch.setenv("TILERL_DRAFT_ATTN_WINDOW_TOKENS", str(window))
+    # Injected as a constructor argument now (env used to be read inside
+    # DraftHead); clear the env too so the value is unambiguously the param.
+    monkeypatch.delenv("TILERL_DRAFT_ATTN_WINDOW_TOKENS", raising=False)
     cfg = tiny()
     model = build_random(cfg, seed=7)
+    draft = _random_draft(cfg, 7, model)
+    draft.attn_window_tokens = window
     eng = build_engine(
         cfg, model, get_backend(), num_blocks=32, num_slots=2, max_batch=2,
-        max_total_tokens=512, draft=_random_draft(cfg, 7, model),
+        max_total_tokens=512, draft=draft,
         spec_depth=1, sparse_k=0,
     )
     return eng, cfg
@@ -67,62 +71,81 @@ def test_window_off_builds_no_read_view(monkeypatch):
         eng.shutdown()
 
 
-def test_draft_window_default_is_2048_and_explicit_zero_disables(monkeypatch):
-    """Default flip (#product): with no env and no CLI flag the draft READ window is
-    DRAFT_ATTN_WINDOW_TOKENS_DEFAULT=2048. An explicit 0 (CLI/env) restores the full
-    prefix; an env value is honored; the CLI flag overrides all. This is the
-    output-gate on the combined default, not just the wiring."""
+def test_draft_window_default_is_zero_with_env_and_cli_injection(monkeypatch):
+    """Production default is 0 = full prefix; the window is opt-in, injected as a
+    constructor/loader argument rather than read from the env inside DraftHead.
+    Precedence at the loader boundary: explicit CLI value > env > module default
+    (0). The 2048 device candidate stays a named RECOMMENDED constant, not the
+    default, pending the live 32k confirmation."""
     import inspect
-
-    from test_e2e import _random_draft
-    from tilerl_kernels.backend import get_backend
 
     from tilerl import cli
     from tilerl.build import build_engine
-    from tilerl.config import tiny
     from tilerl.model import build_random
-    from tilerl.spec import DRAFT_ATTN_WINDOW_TOKENS_DEFAULT
+    from tilerl.spec import (
+        DRAFT_ATTN_WINDOW_TOKENS_DEFAULT,
+        DRAFT_ATTN_WINDOW_TOKENS_RECOMMENDED,
+        resolve_draft_attn_window_tokens,
+    )
 
-    assert DRAFT_ATTN_WINDOW_TOKENS_DEFAULT == 2048
+    assert DRAFT_ATTN_WINDOW_TOKENS_DEFAULT == 0
+    assert DRAFT_ATTN_WINDOW_TOKENS_RECOMMENDED == 2048
+    cfg = tiny()
 
+    # A head built by the loader/default constructor ignores the env (the env is
+    # read only at resolve/load time): env=4096 but the constructed head is 0.
+    monkeypatch.setenv("TILERL_DRAFT_ATTN_WINDOW_TOKENS", "4096")
+    cfg2 = tiny()
+    model2 = build_random(cfg2, seed=7)
+    head = _random_draft(cfg2, 7, model2)
+    assert head.attn_window_tokens == 0
+    # ... and the constructor arg is a plain int when injected.
+    head.attn_window_tokens = 0
+    assert head.attn_window_tokens == 0
+    monkeypatch.delenv("TILERL_DRAFT_ATTN_WINDOW_TOKENS", raising=False)
+
+    # Loader resolution precedence.
+    assert resolve_draft_attn_window_tokens(None) == 0          # no env -> default 0
+    assert resolve_draft_attn_window_tokens(0) == 0             # explicit wins
+    monkeypatch.setenv("TILERL_DRAFT_ATTN_WINDOW_TOKENS", "4096")
+    assert resolve_draft_attn_window_tokens(None) == 4096       # env honored
+    assert resolve_draft_attn_window_tokens(2048) == 2048       # explicit beats env
+    monkeypatch.delenv("TILERL_DRAFT_ATTN_WINDOW_TOKENS", raising=False)
+
+    # CLI surface: omitted -> None (loader falls to env/default); explicit passes.
     parser = cli._build_parser()
     assert parser.parse_args(["serve"]).draft_attn_window_tokens is None
     assert parser.parse_args(
         ["serve", "--draft-attn-window-tokens", "0"]).draft_attn_window_tokens == 0
     assert parser.parse_args(
         ["serve", "--draft-attn-window-tokens", "4096"]).draft_attn_window_tokens == 4096
-    assert "draft.attn_window_tokens = args.draft_attn_window_tokens" in inspect.getsource(
-        cli.cmd_serve)
+    # The flag is injected at load time, no longer a post-load head assignment.
+    assert "attn_window_tokens=window" in inspect.getsource(cli.cmd_serve)
+    assert "draft.attn_window_tokens = args" not in inspect.getsource(cli.cmd_serve)
 
-    def engine():
-        cfg = tiny()
+    def engine(window):
         model = build_random(cfg, seed=7)
+        draft = _random_draft(cfg, 7, model)
+        draft.attn_window_tokens = window
         return build_engine(cfg, model, get_backend(), num_blocks=32, num_slots=2,
                             max_batch=2, max_total_tokens=512,
-                            draft=_random_draft(cfg, 7, model), spec_depth=1, sparse_k=0)
+                            draft=draft, spec_depth=1, sparse_k=0)
 
-    # No env, no CLI -> production default engages.
-    monkeypatch.delenv("TILERL_DRAFT_ATTN_WINDOW_TOKENS", raising=False)
-    eng_def = engine()
+    # No env -> a directly built head reads the full prefix (default 0).
+    eng_def = engine(0)
     try:
-        assert eng_def._draft.attn_window_tokens == 2048
+        assert eng_def._draft.attn_window_tokens == 0
         assert eng_def._draft.read_window_stats() is None  # no forward yet
     finally:
         eng_def.shutdown()
-    # Explicit env 0 -> full prefix, the escape hatch.
-    eng_off, _ = _engine(0, monkeypatch)
+    # A nonzero injected window engages; assigning back to 0 restores full prefix.
+    eng_win = engine(4096)
     try:
-        assert eng_off._draft.attn_window_tokens == 0
+        assert eng_win._draft.attn_window_tokens == 4096
+        eng_win._draft.attn_window_tokens = 0
+        assert eng_win._draft.attn_window_tokens == 0
     finally:
-        eng_off.shutdown()
-    # A nonzero env is honored, and the CLI override is a plain head assignment.
-    eng_env, _ = _engine(4096, monkeypatch)
-    try:
-        assert eng_env._draft.attn_window_tokens == 4096
-        eng_env._draft.attn_window_tokens = 0
-        assert eng_env._draft.attn_window_tokens == 0
-    finally:
-        eng_env.shutdown()
+        eng_win.shutdown()
 
 
 def test_real_accept_tick_sq2_window_engages_in_engine(monkeypatch):

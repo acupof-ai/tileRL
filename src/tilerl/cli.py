@@ -137,13 +137,12 @@ def cmd_serve(args: argparse.Namespace) -> None:
     if args.draft:
         from .spec import load_draft
 
-        draft = load_draft(model, args.draft)
-        # An explicit flag overrides the DraftHead's env/module default; None (flag
-        # omitted) leaves what __init__ resolved. Meaningless without a draft.
-        if getattr(args, "draft_attn_window_tokens", None) is not None:
-            if args.draft_attn_window_tokens < 0:
-                raise SystemExit("--draft-attn-window-tokens must be >= 0 (0 = full prefix)")
-            draft.attn_window_tokens = args.draft_attn_window_tokens
+        # The explicit serve flag is injected at construction; None means the
+        # loader resolves env -> default (0 = full prefix). Meaningless w/o a draft.
+        window = getattr(args, "draft_attn_window_tokens", None)
+        if window is not None and window < 0:
+            raise SystemExit("--draft-attn-window-tokens must be >= 0 (0 = full prefix)")
+        draft = load_draft(model, args.draft, attn_window_tokens=window)
     # Before the engine: it takes the decode for stop sequences.
     tokenizer = _qwen38_tokenizer() if args.model == "qwen38-27b" else get_tokenizer(None)
     try:
@@ -439,12 +438,12 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "4-row rung exactly (spec.LADDER_WIDTHS) — 4 spills to the "
                               "8-row rung and measured slower than no speculation")
     p_serve.add_argument("--draft-attn-window-tokens", type=int, default=None,
-                         help="draft decode trailing READ window in tokens. Default "
-                              "2048 (spec.DRAFT_ATTN_WINDOW_TOKENS_DEFAULT; chosen from "
-                              "the V100 W-sweep); 0 = full prefix, restoring the "
-                              "pre-window behavior; the TILERL_DRAFT_ATTN_WINDOW_TOKENS "
-                              "env sits between them. Only the draft attention READ is "
-                              "windowed; KV write/retention is unchanged")
+                         help="draft decode trailing READ window in tokens. Omitted: "
+                              "TILERL_DRAFT_ATTN_WINDOW_TOKENS env, else 0 = full "
+                              "prefix (the default, pre-window behavior). 2048 is the "
+                              "V100 W-sweep candidate, opt-in pending the live 32k "
+                              "confirmation. Only the draft attention READ is windowed; "
+                              "KV write/retention is unchanged")
     p_serve.add_argument("--slots", type=int, default=8,
                          help="GDN state slots. A slot is held from submit to finish, so "
                               "this must be >= --max-batch or that concurrency is "
