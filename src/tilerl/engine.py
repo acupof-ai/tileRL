@@ -280,6 +280,12 @@ class _StepTiming:
     def mark(self, seg: str, t: float) -> None:
         self.cur[seg] = self.cur.get(seg, 0.0) + time.perf_counter() - t
 
+    def charge_ms(self, seg: str, ms: float) -> None:
+        """Add already-measured milliseconds to a segment. For a callee that
+        cannot reach the tick counter (the cold tier's mmap file) and accumulates
+        its own elapsed time instead."""
+        self.cur[seg] = self.cur.get(seg, 0.0) + ms / 1000.0
+
     @staticmethod
     def _mem_snap() -> dict[str, int]:
         """Allocator counters (host-only mutex-guarded struct copy; the CPU box
@@ -329,6 +335,14 @@ class _StepTiming:
         self.last_total = time.perf_counter() - self.t0
         self.n += 1
         dt = self.last_total
+        # The cold tier's mmap files measure themselves (a disk read or write has
+        # no tick counter to mark against) and the engine drains them here, so
+        # disk IO lands in the tick that paid it instead of hiding inside a RAM
+        # bucket. Before the totals below, so a slow tick's print includes it.
+        eng = self._eng()
+        cold = getattr(getattr(eng, "_kv", None), "cold", None) if eng is not None else None
+        if cold is not None:
+            self.charge_ms("ssd_mmap", cold.drain_ssd_ms())
         for k, v in self.cur.items():
             self.tot[k] = self.tot.get(k, 0.0) + v
             self.count[k] = self.count.get(k, 0) + 1
@@ -764,6 +778,11 @@ class Engine:
         self._step_timing = _StepTiming(self) if os.environ.get("TILERL_STEP_TIMING") else None
         if self._step_timing is not None:
             atexit.register(self._step_timing.report)
+            # The cold tier's spill files measure themselves; hand them the timer
+            # here, after build_engine created the tier without one.
+            cold = getattr(self._kv, "cold", None)
+            if cold is not None:
+                cold.step_timing = self._step_timing
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         #: Published by the loop so `stats()` never takes the lock a forward holds.

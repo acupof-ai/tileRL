@@ -462,9 +462,11 @@ class SparseRuntime:
             n = ctx.kv.cold.share_hold_kv(
                 (r.req_id, page), content_key, extra=extra)
             if tm is not None:
-                # device-only: no SSD private spill on the CPU cell, so this
-                # mark is present but never charges there.
-                tm.mark("pub_ssd_transfer", t)
+                # RAM dict/LRU work plus any mmap spill. The disk half is NOT
+                # charged here: ColdSsdFile measures its own mmap reads/writes
+                # and the engine drains them as "ssd_mmap" at the end of the
+                # tick, so this bucket means host RAM, not disk IO.
+                tm.mark("pub_cold_transfer", t)
             if n:
                 return
             # private blob was past the host budget and consumed into the prefix

@@ -21,6 +21,7 @@ from pathlib import Path
 os.environ.setdefault("TILERL_TARGET", "cpu")
 
 import numpy as np
+import torch
 from test_e2e import build_serving_engine
 
 from tilerl import engine as engine_mod
@@ -32,7 +33,7 @@ _RELEASE_SEGMENTS = ("release_close_request", "release_cold_forget", "release_bl
 
 #: The per-page publish costs, split by fix (see transfer_to_shared). Each has
 #: a different remedy, which is why one close_request bucket is not enough.
-_PUBLISH_SEGMENTS = ("pub_bounds_d2h", "pub_draft_clone", "pub_ssd_transfer",
+_PUBLISH_SEGMENTS = ("pub_bounds_d2h", "pub_draft_clone", "pub_cold_transfer",
                      "pub_frame_d2h", "pub_share_hold")
 
 #: Every segment name the probe may emit. "forward" is an envelope (see its
@@ -42,8 +43,8 @@ _SEGMENTS = {
     "sparse_select", "prep", "model", "sparse_finalize", "sample",
     "draft_blocks", "draft_step", "offers_pub",
     "release_close_request", "release_cold_forget", "release_blocks",
-    "pub_bounds_d2h", "pub_draft_clone", "pub_ssd_transfer", "pub_frame_d2h",
-    "pub_share_hold",
+    "pub_bounds_d2h", "pub_draft_clone", "pub_cold_transfer", "pub_frame_d2h",
+    "pub_share_hold", "ssd_mmap",
 }
 _INNER = {
     "sparse_select", "prep", "model", "sparse_finalize", "sample",
@@ -197,6 +198,58 @@ def test_release_subsegments_charge_on_a_sparse_request_end(monkeypatch):
         assert set(peak) <= set(_SEGMENTS)
     finally:
         eng.shutdown()
+
+
+def test_ssd_mmap_charges_only_when_the_spill_is_touched(monkeypatch, tmp_path):
+    """`ssd_mmap` is the disk half of the publish path and must reflect real mmap
+    traffic, not the presence of a spill file.
+
+    `pub_cold_transfer` covers the host RAM dict/LRU work; the spill file
+    measures itself and the engine drains it. A budget that never spills must
+    leave `ssd_mmap` at zero (otherwise the mark is a constant, and on device it
+    would report disk IO that never happened), and a budget under one page must
+    charge it."""
+    from test_sparse_engine import _draft, tiny
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl.build import build_engine
+    from tilerl.kv_cache import BLOCK_TOKENS as _BT
+    from tilerl.memory import per_cold_kv_block_bytes
+    from tilerl.model import build_random
+
+    monkeypatch.setenv("TILERL_STEP_TIMING", "1")
+    monkeypatch.setenv("TILERL_STEP_TIMING_SLOW_MS", "0")
+    cfg = tiny()
+    page = per_cold_kv_block_bytes(cfg, torch.float32, kv_fp8=None, cold_dtype=None)
+
+    def run(budget: int) -> float:
+        eng = build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=budget, cold_ssd_path=str(tmp_path / "spill.bin"),
+            draft=_draft(cfg, build_random(cfg, seed=11)), spec_depth=1)
+        try:
+            tm = eng._step_timing
+            prompt = (np.arange(16 * _BT, dtype=np.int64) % 300) + 7
+            rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+            total = 0.0
+            for _ in range(512):
+                done = eng.poll()
+                eng.step()
+                total += tm.cur.get("ssd_mmap", 0.0)
+                if rid in done and len(done[rid]) >= 2:
+                    break
+            else:
+                raise AssertionError("request did not finish")
+            return total
+        finally:
+            eng.shutdown()
+
+    # Budget well above the pages this run demotes: nothing spills, so the mark
+    # must stay silent rather than report the spill file's existence.
+    assert run(budget=page * 64) == 0.0, "ssd_mmap charged with no spill"
+    assert run(budget=page) > 0.0, "ssd_mmap never charged when the spill was used"
 
 
 def test_added_perf_counter_reads_are_guarded():
