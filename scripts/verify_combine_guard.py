@@ -48,22 +48,22 @@ def unguarded_combine(target: str, KVSPLIT: int = 16):
             m0 = row % (G * W)
             w = T.alloc_local((KVSPLIT,), "float32")
             m = T.alloc_local((1,), "float32")
-            l = T.alloc_local((1,), "float32")
+            loc = T.alloc_local((1,), "float32")
             acc = T.alloc_local((1,), "float32")
             m[0] = -T.infinity("float32")
             for sp in T.unroll(KVSPLIT):
                 m[0] = T.max(m[0], PM[bb, hkv, sp, m0])
-            l[0] = 0.0
+            loc[0] = 0.0
             for sp in T.unroll(KVSPLIT):
                 w[sp] = T.exp2(PM[bb, hkv, sp, m0] - m[0])
-                l[0] += w[sp] * PL[bb, hkv, sp, m0]
+                loc[0] += w[sp] * PL[bb, hkv, sp, m0]
             for i in T.unroll(T.ceildiv(D, 32)):
                 if i * 32 + lane < D:
                     acc[0] = 0.0
                     for sp in T.unroll(KVSPLIT):
                         acc[0] += w[sp] * PO[bb, hkv, sp, m0, i * 32 + lane]
                     Out[bb, m0 % W, hkv * G + m0 // W, i * 32 + lane] = T.cast(
-                        acc[0] / l[0], "bfloat16"
+                        acc[0] / loc[0], "bfloat16"
                     )
         return Out
 

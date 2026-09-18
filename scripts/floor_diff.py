@@ -15,7 +15,7 @@ import sys
 
 
 def load_gsm8k(path: str) -> list[dict]:
-    return [r for r in (json.loads(l) for l in open(path)) if r.get("dataset", "gsm8k") == "gsm8k"]
+    return [r for r in (json.loads(line) for line in open(path)) if r.get("dataset", "gsm8k") == "gsm8k"]
 
 
 def diff(a: str, b: str) -> None:
@@ -34,8 +34,10 @@ def diff(a: str, b: str) -> None:
 def _self_check() -> None:
     import tempfile
     from pathlib import Path
-    rows = lambda bits: [{"answer": "42", "correct": b, "tokens": 10} for b in bits]
-    write = lambda p, bits: Path(p).write_text("\n".join(json.dumps(r) for r in rows(bits)))
+    def rows(bits):
+        return [{"answer": "42", "correct": b, "tokens": 10} for b in bits]
+    def write(p, bits):
+        return Path(p).write_text("\n".join(json.dumps(r) for r in rows(bits)))
     with tempfile.TemporaryDirectory() as d:
         a, b = f"{d}/a.jsonl", f"{d}/b.jsonl"
         write(a, [1, 1, 0, 0, 1])

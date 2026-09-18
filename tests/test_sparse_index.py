@@ -48,7 +48,7 @@ def test_source_groups_split_full_layers_into_reused_groups():
     assert sources == [0, 4, 8, 12]
     assert groups == [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]]
     # every layer covered once; sources are first of their group
-    flat = [l for g in groups for l in g]
+    flat = [layer_id for g in groups for layer_id in g]
     assert flat == list(range(16))
     import pytest
     with pytest.raises(ValueError):
@@ -217,10 +217,10 @@ def test_warmup_records_one_tape_entry_and_only_the_two_weights_are_leaves():
 
     h, k_pages, iq_w, ik_w, target, n_pages = _warmup_inputs()
     with autograd.Tape() as tape:
-        l = indexer_warmup_loss(h, k_pages, iq_w, ik_w, target, n_pages)
+        loss = indexer_warmup_loss(h, k_pages, iq_w, ik_w, target, n_pages)
     assert len(tape._entries) == 1
     assert tape._entries[0].op_name == "indexer_warmup"
-    assert l.shape == ()  # scalar mean loss seeds the reverse with ones
+    assert loss.shape == ()  # scalar mean loss seeds the reverse with ones
     grads = tape.backward(torch.ones(()))
     assert set(grads) == {id(iq_w), id(ik_w)}
     assert grads[id(iq_w)].shape == iq_w.shape
@@ -478,17 +478,17 @@ def test_indexer_projections_take_bf16_activations_with_f32_weights():
     projections and the full warm-up loss must accept the dtype mix on a
     bf16-capable device (CPU torch supports bf16 compute)."""
     torch.manual_seed(0)
-    r, l, pages, ih, m, da, dh, di, win = 1, 1, 6, 2, 2, 8, 16, 8, 1
+    r, seq, pages, ih, m, da, dh, di, win = 1, 1, 6, 2, 2, 8, 16, 8, 1
     hk = ih * m
-    h = torch.randn(r, l, 4, dh, dtype=torch.bfloat16)
-    k_pages = torch.randn(r, l, pages, hk, da, dtype=torch.bfloat16)
+    h = torch.randn(r, seq, 4, dh, dtype=torch.bfloat16)
+    k_pages = torch.randn(r, seq, pages, hk, da, dtype=torch.bfloat16)
     iq_w = 0.1 * torch.randn(ih, dh, di)
     ik_w = 0.1 * torch.randn(ih, da, di)
     iq = project_indexer_queries(h, iq_w)
     ik = project_page_keys(k_pages, ik_w)
     assert iq.dtype == torch.float32 and ik.dtype == torch.float32
     n_pages = torch.full((r,), pages, dtype=torch.long)
-    mass = torch.softmax(torch.randn(r, l, 4, pages * 16), -1)
+    mass = torch.softmax(torch.randn(r, seq, 4, pages * 16), -1)
     target = page_mass_target(mass, n_pages, n_win_pages=win)
     loss = indexer_warmup_loss(h, k_pages, iq_w, ik_w, target, n_pages,
                                n_win_pages=win)

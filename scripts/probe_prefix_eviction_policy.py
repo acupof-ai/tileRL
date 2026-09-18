@@ -43,7 +43,8 @@ def run(budget_snapshots, sessions=6, plen=2048, shared=0):
             rid = eng.submit(toks, SamplingParams(max_new_tokens=4, temperature=0.0))
             t = 0
             while rid not in eng.poll() and t < 900:
-                eng.step(); t += 1
+                eng.step()
+                t += 1
                 one = eng._prefix._snapshot_bytes
                 if one:
                     eng._prefix.state_bytes = budget_snapshots * one

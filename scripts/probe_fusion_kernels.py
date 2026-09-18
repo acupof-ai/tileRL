@@ -179,7 +179,8 @@ def main() -> None:
               f"{'the comparison DOES detect a difference' if moved > 0 else 'BROKEN: it detects nothing, so 15/15 identical is meaningless'}")
         assert moved > 0, "the comparison cannot detect a changed weight; identical proves nothing"
     if a.out:
-        o = Path(a.out); o.mkdir(parents=True, exist_ok=True)
+        o = Path(a.out)
+        o.mkdir(parents=True, exist_ok=True)
         (o / "kernels.json").write_text(json.dumps({"xrms": a.xrms, "rows": rows}, indent=1))
         print(f"wrote {o / 'kernels.json'}")
 

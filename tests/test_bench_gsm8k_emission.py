@@ -44,7 +44,7 @@ def test_emit_eval_records(tmp_store, monkeypatch):
     # A rerun of the same arm: rollout_tokens has no monotonic direction, so its
     # floor is the measurement itself (reference), never the population's best.
     _emit_eval_records(190, 200, 22000, [110] * 200, 100, _Backend())
-    rows = [json.loads(l) for l in tmp_store.STORE.read_text().splitlines()]
+    rows = [json.loads(line) for line in tmp_store.STORE.read_text().splitlines()]
     assert len(rows) == 6
     by = {(r["metric"], r["shape"]["steps"], r["value"]): r for r in rows}
     assert by[("gsm8k_pct", 0, 95.0)]["spread"] > 0
@@ -72,7 +72,7 @@ def test_emit_eval_records_cpu(tmp_store, monkeypatch):
     """
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     _emit_eval_records(190, 200, 20000, [100] * 200, 0, _CPUBackend())
-    rows = [json.loads(l) for l in tmp_store.STORE.read_text().splitlines()]
+    rows = [json.loads(line) for line in tmp_store.STORE.read_text().splitlines()]
     assert len(rows) == 2
     for r in rows:
         assert r["device"] == {"name": "cpu", "card": None}

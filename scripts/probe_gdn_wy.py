@@ -127,7 +127,8 @@ def main() -> None:
     print("(b) Backend._gdn_wy_core vs reference.gdn_chunk_core / gdn_chunk_core_fla")
     # the unrepeated key heads, the shape gdn_prep emits: the kernels index the GQA group
     qh, kh_ = bk._c(qn.bfloat16()), bk._c(kn.bfloat16())
-    wy_core = lambda: bk._gdn_wy_core(qh, kh_, vb, gt, beta, st, C)
+    def wy_core():
+        return bk._gdn_wy_core(qh, kh_, vb, gt, beta, st, C)
     core, s, _ = wy_core()
     core_ref, s_ref = R.gdn_chunk_core(qn, kn, v, gt, bt, st, chunk=C)
     worst = max(err("core", core, core_ref), err("state", s, s_ref))
@@ -141,7 +142,8 @@ def main() -> None:
     # test_gdn_chunk_fused_parity_full_scale settled on -- a pipeline that passed at 0.1
     # was 26% wrong at 1.0 (errors/2026-08-25-gdn-chunked-gdr-rejected.md).
     qkvd = 2 * args.hk * args.dk + args.hv * args.dv
-    raw = lambda n: torch.randn(b, t, n, device=dev, dtype=torch.bfloat16)
+    def raw(n):
+        return torch.randn(b, t, n, device=dev, dtype=torch.bfloat16)
     lw = dict(
         conv1d_weight=torch.randn(qkvd, 4, device=dev) * 0.1,
         dt_bias=torch.randn(args.hv, device=dev),
@@ -175,11 +177,14 @@ def main() -> None:
 
     # (c) known-answer rows (one chunk, no cross-chunk carry): W=0 -> V_new = U, S' = e_last S
     print("(c) state-scan known answers")
-    z = lambda *sh, dt=torch.bfloat16: torch.zeros(*sh, device=dev, dtype=dt)
-    ones = lambda *sh, dt=torch.bfloat16: torch.ones(*sh, device=dev, dtype=dt)
+    def z(*sh, dt=torch.bfloat16):
+        return torch.zeros(*sh, device=dev, dtype=dt)
+    def ones(*sh, dt=torch.bfloat16):
+        return torch.ones(*sh, device=dev, dtype=dt)
     k0, w0, u0 = z(1, C, 1, args.dk), z(1, C, 1, args.dk), z(1, C, 1, args.dv)
     g0, s0 = z(1, C, 1, dt=torch.float32), z(1, 1, args.dk, args.dv)
-    scan = lambda kk, ww, uu, gg, ss: kern("gdn_state_scan")(kk, ww, uu, gg, ss, C)
+    def scan(kk, ww, uu, gg, ss):
+        return kern("gdn_state_scan")(kk, ww, uu, gg, ss, C)
     _, out, vn = scan(k0, w0, u0, g0, s0)
     print(
         f"  all zero      -> |vnew| {vn.float().abs().max():.3f} |state| {out.abs().max():.3f}"

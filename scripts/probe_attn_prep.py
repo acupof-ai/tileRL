@@ -271,7 +271,8 @@ def main() -> None:
               "settled by this probe -- both are approximations, and the next step "
               "is a dense f32 reference for norm+rope on the same input.")
     if a.out:
-        o = Path(a.out); o.mkdir(parents=True, exist_ok=True)
+        o = Path(a.out)
+        o.mkdir(parents=True, exist_ok=True)
         (o / "attn_prep.json").write_text(json.dumps(
             {"head_dim": d, "rotary_dim": rd, "rows": rows, "ranks": ranks}, indent=1))
         print(f"wrote {o / 'attn_prep.json'}")

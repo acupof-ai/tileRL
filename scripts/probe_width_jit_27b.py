@@ -138,7 +138,8 @@ def main() -> None:
           "whole fixed-width step, because the rollout is the other half.")
 
     if a.out:
-        o = Path(a.out); o.mkdir(parents=True, exist_ok=True)
+        o = Path(a.out)
+        o.mkdir(parents=True, exist_ok=True)
         (o / "width_jit_27b.json").write_text(json.dumps(
             {"group": a.group, "prompt_len": a.prompt_len, "gen": a.gen,
              "warm_s": warm, "novel_s": novel, "repeat_s": repeat,

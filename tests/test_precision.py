@@ -235,7 +235,8 @@ def test_on_policy_guard_refuses_cached_engines():
     from tilerl.train import grpo_loop
 
     cfg, model = build_model("tiny", seed=0, keep_master=True)
-    run = lambda e: list(grpo_loop(e, model, [[1, 2, 3]], lambda p, c: 0.0, 1, RefBackend()))
+    def run(e):
+        return list(grpo_loop(e, model, [[1, 2, 3]], lambda p, c: 0.0, 1, RefBackend()))
 
     # prefix cache on, graph off (dense: sparse turns both off and makes the guard vacuous)
     cached = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=4, sparse_k=0)

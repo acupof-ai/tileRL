@@ -12,7 +12,7 @@ CAP = 6144
 
 
 def load(path: str) -> list[dict]:
-    return [r for r in (json.loads(l) for l in open(path)) if r.get("dataset", "gsm8k") == "gsm8k"]
+    return [r for r in (json.loads(line) for line in open(path)) if r.get("dataset", "gsm8k") == "gsm8k"]
 
 
 def main() -> None:

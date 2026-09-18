@@ -394,7 +394,8 @@ def test_fused_projections_parity(tmp_path):
     positions = np.arange(16, dtype=np.int64)
     backend = RefBackend()
     with torch.no_grad():
-        kv = lambda m, be: _training_kv(m, 2, 16, device=be.device)
+        def kv(m, be):
+            return _training_kv(m, 2, 16, device=be.device)
         y0 = unfused.forward(batch, positions, kv(unfused, backend), backend)
         y1 = fused.forward(batch, positions, kv(fused, backend), backend)
         tl = get_backend()

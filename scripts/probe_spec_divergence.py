@@ -55,7 +55,7 @@ def instrument(engine):
     def w_sample(rows):
         toks = sample(rows)
         if rows:
-            lg = torch.stack([l for _, l, _ in rows]).float()
+            lg = torch.stack([logits for _, logits, _ in rows]).float()
             v, i = lg.topk(2, dim=-1)
             v, i = v.tolist(), i.tolist()
             for n, ((r, _, g), t) in enumerate(zip(rows, toks)):
@@ -92,9 +92,11 @@ def arm(name, cfg, model, backend, tok, draft_path, width, rows, params):
                           prefix_store=NoPrefixStore())
     rec, ids = instrument(engine)
     prompts = [render_chat([("user", r["prompt"])], False) for r in rows]
-    torch.cuda.synchronize(); t0 = time.perf_counter()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
     texts = generate(engine, tok, prompts, params, 8)
-    torch.cuda.synchronize(); secs = time.perf_counter() - t0
+    torch.cuda.synchronize()
+    secs = time.perf_counter() - t0
     s = engine.stats()
     ok = sum(answer_match(t, r["answer"]) for t, r in zip(texts, rows))
     print(f"[{name}] gsm8k {ok}/{len(rows)}  {secs:.1f}s  drafted {s['spec_drafted']} "
@@ -141,9 +143,10 @@ def main() -> None:
         row = {"q": i, "idx": k, "base_tok": b[k] if k < len(b) else None,
                "spec_tok": s[k] if k < len(s) else None, "base": br, "spec": sr}
         summary.append(row)
-        f = lambda r: ("-" if r is None else
-                       f"tok {r[0]} argmax {r[3]} top1 {r[1]:.6f} top2 {r[2]:.6f} "
-                       f"gap {r[1] - r[2]:.3e} W={r[4]} verify={r[5]}")
+        def f(r):
+            return ("-" if r is None else
+                               f"tok {r[0]} argmax {r[3]} top1 {r[1]:.6f} top2 {r[2]:.6f} "
+                               f"gap {r[1] - r[2]:.3e} W={r[4]} verify={r[5]}")
         print(f"q{i}: diverges at generated index {k} of ({len(b)},{len(s)})")
         print(f"     base  {f(br)}")
         print(f"     spec  {f(sr)}")
@@ -171,7 +174,8 @@ def main() -> None:
         for k, v in sr.items():
             nspec += 1
             notargmax += v[0] != v[3]
-    q = lambda xs, f: sorted(xs)[min(len(xs) - 1, int(f * len(xs)))]
+    def q(xs, f):
+        return sorted(xs)[min(len(xs) - 1, int(f * len(xs)))]
     print(f"\n=== arm-to-arm |delta top1| on identical history, n={len(delta)} ===")
     print(f"  median {st.median(delta):.3e}  p90 {q(delta, .9):.3e}  max {max(delta):.3e}")
     print(f"=== base-arm top-2 gap over the same {len(basegap)} positions ===")
@@ -188,7 +192,8 @@ def main() -> None:
         print(f"base-arm top-2 gap AT the divergences: {[f'{g:.3e}' for g in bg]}")
         print("committed != tile argmax count:",
               sum(1 for r in summary if r["spec"] and r["spec"][0] != r["spec"][3]))
-    o = Path(a.out); o.mkdir(parents=True, exist_ok=True)
+    o = Path(a.out)
+    o.mkdir(parents=True, exist_ok=True)
     (o / "divergence.json").write_text(json.dumps(
         {"summary": summary, "base_text": base["texts"], "spec_text": spec["texts"]}))
 

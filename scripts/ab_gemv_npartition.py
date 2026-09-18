@@ -56,7 +56,8 @@ def main() -> None:
         w_mb = (N * K / 2 + N * (K // BLK) * 2) / 1e6
         us, ref = {}, None
         for p in NPARTS:
-            f = lambda p=p: k(x, wq, sc, osc, res, 32, p, BLK)
+            def f(p=p):
+                return k(x, wq, sc, osc, res, 32, p, BLK)
             y = f()
             if ref is None:
                 ref = y.clone()

@@ -52,7 +52,7 @@ def main():
     out = {}
     for ctx in (8192, 16384, 32768):
         with open(CORPUS / f"held_{ctx}.jsonl") as fh:
-            rows = [json.loads(l) for l in fh][:NSPAN[ctx]]
+            rows = [json.loads(line) for line in fh][:NSPAN[ctx]]
         agg = {f"{s}_{win}": [] for s in
                ("random", "bounds", "bounds_per_head", "index", "oracle")
                for win in ("xwin", "iwin")}
@@ -75,23 +75,23 @@ def main():
                 sel_bnd = quest_bounds_scores(q_eval, bounds)
                 sel_bh = quest_bounds_scores_per_head(q_eval, bounds)
             rng = torch.Generator().manual_seed(SEED * 7919 + j)
-            for l in range(L):
+            for layer in range(L):
                 k_eff = min(K, len(indexable))
                 rnd = torch.tensor(indexable)[
                     torch.randperm(len(indexable), generator=rng)[:k_eff]].tolist()
                 orc = [indexable[int(i)] for i in
-                       tgt_x[l].sum(0)[torch.tensor(indexable)].topk(k_eff).indices]
+                       tgt_x[layer].sum(0)[torch.tensor(indexable)].topk(k_eff).indices]
                 sets = {
                     "random": rnd,
-                    "bounds": [int(i) for i in sel_bnd[0, l, :P - WINDOW_PAGES].topk(k_eff).indices],
-                    "bounds_per_head": [int(i) for i in sel_bh[0, l, :P - WINDOW_PAGES].topk(k_eff).indices],
-                    "index": [int(i) for i in sel_idx[0, l, :P - WINDOW_PAGES].topk(k_eff).indices],
+                    "bounds": [int(i) for i in sel_bnd[0, layer, :P - WINDOW_PAGES].topk(k_eff).indices],
+                    "bounds_per_head": [int(i) for i in sel_bh[0, layer, :P - WINDOW_PAGES].topk(k_eff).indices],
+                    "index": [int(i) for i in sel_idx[0, layer, :P - WINDOW_PAGES].topk(k_eff).indices],
                     "oracle": orc,
                 }
                 for name, pages in sets.items():
-                    agg[f"{name}_xwin"].append(cap(tgt_x[l][None], pages, False))
+                    agg[f"{name}_xwin"].append(cap(tgt_x[layer][None], pages, False))
                     agg[f"{name}_iwin"].append(
-                        cap(tgt_i[l][None], pages + winpages, True))
+                        cap(tgt_i[layer][None], pages + winpages, True))
             del H, k_pages, target, raw, q_eval, bounds, tgt_x, tgt_i
             if backend.device.type == "cuda":
                 torch.cuda.empty_cache()
