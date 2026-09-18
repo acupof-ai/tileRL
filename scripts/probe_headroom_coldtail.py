@@ -218,6 +218,17 @@ def parse_log(log_path: str, byte_offset: int = 0) -> dict:
 
 # --- the one-command arm -----------------------------------------------------
 
+def _cold_tier_gb(h: dict) -> tuple[float, float, float]:
+    # The full-tier condition is HOST cold occupancy = live-row private pages plus
+    # the shared pool accumulated across all fills. /health emits them as separate
+    # keys and stats() merges private over the shared name, so reading kv_cold_bytes
+    # alone under-counts (private resets toward 0 when a request ends) and a full
+    # tier falsely fails rc3. SSD spill is a different tier and is excluded.
+    priv = h.get("kv_cold_bytes", 0) / 2**30
+    shared = h.get("kv_cold_shared_bytes", 0) / 2**30
+    return priv, shared, priv + shared
+
+
 def cmd_arm(a) -> int:
     wait_ready(a.url, a.ready_trials)
     h0 = health(a.url)
@@ -232,10 +243,12 @@ def cmd_arm(a) -> int:
             print(f"WARN fill {i}: only {pt} prompt tokens (want ~{a.prompt_tokens})",
                   flush=True)
     hfill = health(a.url)
-    cold_gb = hfill.get("kv_cold_bytes", 0) / 2**30
+    cold_priv_gb, cold_shared_gb, cold_gb = _cold_tier_gb(hfill)
     if cold_gb < a.min_cold_gb:
-        print(f"FILL-INSUFFICIENT cold={cold_gb:.2f}GiB < {a.min_cold_gb}GiB; "
-              "refusing to measure a non-full tier", flush=True)
+        print(f"FILL-INSUFFICIENT cold_total={cold_gb:.2f}GiB "
+              f"(private={cold_priv_gb:.2f} shared={cold_shared_gb:.2f}) < "
+              f"{a.min_cold_gb}GiB; refusing to measure a non-full tier",
+              flush=True)
         return 3
 
     # Snapshot the log byte size right before the warm POST. step-timing lines
@@ -266,8 +279,10 @@ def cmd_arm(a) -> int:
     summary = {
         "arm_headroom_mib": a.headroom,
         "fill": {"n": a.fill_n, "prompt_tokens": pt_rows,
-                 "cold_gb": round(cold_gb, 3),
-                 "cold_bytes_before": h0.get("kv_cold_bytes", 0)},
+                 "cold_total_gb": round(cold_gb, 3),
+                 "cold_private_gb": round(cold_priv_gb, 3),
+                 "cold_shared_gb": round(cold_shared_gb, 3),
+                 "cold_total_before_gb": round(sum(_cold_tier_gb(h0)[0:2]), 3)},
         "warm32k": {"decode_tok_s": tok_s, "content_chunks": s["chunks"],
                     "first_to_last_s": round(s["decode_s"], 3),
                     "wall_s": round(s["wall_s"], 3)},
@@ -320,7 +335,7 @@ def cmd_compare(a) -> int:
             "dropped_blocks": h["sparse_headroom_dropped_blocks"],
             "process_free_mib": h["process_free_mib"],
             "physical_free_mib": h["physical_free_mib_nvidia"],
-            "cold_gb": s["fill"]["cold_gb"],
+            "cold_total_gb": s["fill"]["cold_total_gb"],
         }
     print(json.dumps({"baseline": base, "arms": rows}, indent=1))
     return 0
@@ -389,6 +404,16 @@ def _self_check(ns=None) -> int:
             return 0
     nschk = _NS()
     assert _dispatch(nschk) == 0 and nschk.got is nschk
+    # Cold fullness is private + SHARED host bytes: a full tier reads private low
+    # (it resets per request) while shared holds the accumulated pool. Gating on
+    # private alone false-fails rc3; the decision must be made on the total.
+    gb = 2**30
+    p, sh, tot = _cold_tier_gb({"kv_cold_bytes": int(1.2 * gb),
+                                "kv_cold_shared_bytes": int(6.0 * gb)})
+    assert p < 7 <= tot, (p, sh, tot)
+    _, _, tot_low = _cold_tier_gb({"kv_cold_bytes": int(1.0 * gb),
+                                   "kv_cold_shared_bytes": int(2.0 * gb)})
+    assert tot_low < 7
     print("probe_headroom_coldtail self-check ok")
     return 0
 
