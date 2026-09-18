@@ -4,11 +4,12 @@ Durable tools — run from a checkout, documented in their docstrings:
 
 | script | what |
 |---|---|
-| `bench_harness.py` | the perf gate: decode/prefill/train suites vs `docs/experience/wins/bench-baseline.json` |
-| `baseline.py` | pull / commit the snapshot the harness gates against |
+| `bench_harness.py` | the perf gate: `decode-kv`/`prefill`/`kv-reuse`/`spec`/`train`/`train-full`/`accuracy` suites vs `docs/experience/wins/bench-baseline.json` |
+| `baseline.py` | pull / show the snapshot the harness gates against (writing back is the gate's job) |
 | `mmlu.py`, `gsm8k_jsonl.py` | accuracy: MMLU through tileRL or sglang; GSM8K → `tilerl train --data` JSONL |
-| `rl_compare.sh` | roadmap P5: same pod, same task, tileRL vs verl+sglang |
-| `pod_sync.sh`, `pod_fan.sh` | sync this checkout to the H20 pod and run there |
+| `rl_compare.sh` | roadmap P5: same pod, same task, tileRL vs verl+sglang — arm A runs, arm B is pending-remote (verl is not installed on the pod) |
+| `pod_sync.sh` | sync this checkout to the H20 pod and run a command there (sync, run, wait) |
+| `pod_fan.sh` | fan-out: one command per GPU in parallel (`CUDA_VISIBLE_DEVICES=i` for argument i) |
 | `pod.sh` | build/deploy/tail the tilerl k8s pod (`build\|load\|apply\|logs\|forward\|all`) |
 | `hf_reference.py`, `health_probe.py`, `verify_h20_fp4.py` | external ground truth and the 27B verify checks |
 | `probe_served_rate.py` | the served rate over HTTP, from /health's forward counters — three clock-based instruments got it wrong |
