@@ -15,8 +15,8 @@ Design, carried over from ab_draft_depth.py:
   control; every ratio is relative to it.
 - SAME prompts for every W arm within a length (paired comparison: a between-W
   difference cannot be a between-passage difference). Prompts are disjoint
-  wikitext-103 test spans per length. Prefix sharing is off (NoPrefixStore), so
-  reusing the same text across arms never hits a cache.
+  wikitext-103 spans per length (--split, default test). Prefix sharing is off
+  (NoPrefixStore), so reusing the same text across arms never hits a cache.
 - Direct ``engine.submit(token_ids, ...)`` bypasses the chat template, so the run
   is think-off with no template knob; spec_depth=1.
 - COLD FILL is timed separately from decode (submit -> phase DECODE wall), and
@@ -225,7 +225,7 @@ def run(args) -> list[dict]:
     tok = get_tokenizer(args.source)
 
     # Resolve prompts per length BEFORE the timed loop, adapting n to the corpus.
-    stream = wikitext_ids_stream(tok)
+    stream = wikitext_ids_stream(tok, args.split, args.corpus_glob)
     corpus_plan = plan_corpus(stream, args.lengths, args.prompts)
     del stream
 
@@ -252,7 +252,7 @@ def run(args) -> list[dict]:
     arch = getattr(be, "arch", "") or "sm70"
     print(f"# probe {_sha(__file__)}, engine tree {_engine_sha()}, arch {arch}")
     print(
-        f"# one engine; W mutated in place; lengths={args.lengths}, "
+        f"# one engine; W mutated in place; split={args.split}, lengths={args.lengths}, "
         f"windows={args.windows}, requested prompts/len={args.prompts}, "
         f"out_tokens={args.out_tokens}, sparse_k={args.sparse_k}, prefix=off"
     )
@@ -260,9 +260,14 @@ def run(args) -> list[dict]:
     table = []
     for length in args.lengths:
         prompts, n_eff = corpus_plan[length]
-        print(f"# context={length}: n_eff={n_eff}/{args.prompts} independent prompts"
-              + ("  (corpus-limited; median still valid, sample size labelled)"
-                 if n_eff < args.prompts else ""))
+        print(
+            f"# context={length}: n_eff={n_eff}/{args.prompts} independent prompts"
+            + (
+                "  (corpus-limited; median still valid, sample size labelled)"
+                if n_eff < args.prompts
+                else ""
+            )
+        )
         if not prompts:
             print(f"# context={length}: corpus too small even for one span; skipping")
             continue
@@ -290,11 +295,15 @@ def run(args) -> list[dict]:
                 row["draft_ms_ratio_vs_W0"] = row["draft_ms_med"] / bd if bd else 0.0
             _print_length(length, per_arm, args.windows)
         except Exception as exc:  # one length failing must keep earlier lengths' JSON
-            print(f"# context={length}: ARM FAILED, keeping prior lengths: "
-                  f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            print(
+                f"# context={length}: ARM FAILED, keeping prior lengths: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
             table.append({"length": length, "error": f"{type(exc).__name__}: {exc}"})
         finally:
-            _write_json(args.json, table)   # incremental: flush after EVERY length
+            _write_json(args.json, table)  # incremental: flush after EVERY length
     draft.attn_window_tokens = 0
     if args.json:
         print(f"# wrote {args.json} ({len(table)} rows)")
@@ -353,13 +362,33 @@ def main() -> None:
         action="store_true",
         help="arm the CUDA-event draft_step seam (draft_ms columns)",
     )
-    ap.add_argument("--json", default="", help="optional JSON table path; written "
-                    "incrementally (tmp+replace) once per length, so a later-length "
-                    "crash keeps earlier lengths; always a full JSON array (overwritten "
-                    "atomically, not appended)")
-    ap.add_argument("--dry-run-corpus-tokens", type=int, default=297054,
-                    help="corpus token count used only to preview n_eff in --dry-run "
-                         "(wikitext-103 test split measured on V100)")
+    ap.add_argument(
+        "--json",
+        default="",
+        help="optional JSON table path; written "
+        "incrementally (tmp+replace) once per length, so a later-length "
+        "crash keeps earlier lengths; always a full JSON array (overwritten "
+        "atomically, not appended)",
+    )
+    ap.add_argument(
+        "--dry-run-corpus-tokens",
+        type=int,
+        default=297054,
+        help="corpus token count used only to preview n_eff in --dry-run "
+        "(wikitext-103 TEST split measured on V100); ignored for real runs",
+    )
+    ap.add_argument(
+        "--split",
+        default="test",
+        choices=("test", "train", "validation"),
+        help="wikitext-103 split (corpus.py); test default is unchanged. Train is "
+        "large enough for n>=30 disjoint 32k spans; test yields only 9.",
+    )
+    ap.add_argument(
+        "--corpus-glob",
+        default="",
+        help="expanded parquet glob fully overriding --split (corpus.py)",
+    )
     ap.add_argument(
         "--dry-run", action="store_true", help="resolve/validate the plan and exit; no model build"
     )
@@ -380,24 +409,37 @@ def main() -> None:
     need_blocks = -(-(max_len + args.out_tokens) // BLOCK_TOKENS) + 8
     print(f"[dry-run] probe {_sha(__file__) if __file__ else 'n/a'}")
     print(
-        f"[dry-run] lengths={args.lengths} windows={args.windows} "
+        f"[dry-run] split={args.split} lengths={args.lengths} windows={args.windows} "
         f"requested prompts/len={args.prompts} out_tokens={args.out_tokens} "
         f"sparse_k={args.sparse_k} time_draft={args.time_draft} "
-        f"corpus_tokens={args.dry_run_corpus_tokens}"
+        f"corpus_tokens={args.dry_run_corpus_tokens if args.split == 'test' else '<resolved at run>'}"
     )
     print(f"[dry-run] engine num_blocks~{need_blocks} (sized for {max_len}+{args.out_tokens})")
-    # Preview adaptive n_eff with a synthetic stream of the known corpus size (no
-    # parquet/model). n_eff=min(prompts,(corpus-512)//ctx): 30/18/9 at 9k/16k/32k.
-    preview = plan_corpus(list(range(args.dry_run_corpus_tokens)), args.lengths, args.prompts)
-    total_runs = 0
-    for length in args.lengths:
-        _, n_eff = preview[length]
-        total_runs += n_eff
-        limited = "  [corpus-limited]" if n_eff < args.prompts else ""
-        print(f"[dry-run]   ctx={length}: n_eff={n_eff}/{args.prompts} independent "
-              f"disjoint prompts{limited}")
-    print(f"[dry-run] total submit runs={total_runs} x {len(args.windows)} W-arms "
-          f"= {total_runs * len(args.windows)} measurements")
+    if args.split != "test":
+        # Train/validation token count is not hardcoded; n_eff is whatever the
+        # on-box parquet yields. Only bound it by --prompts here.
+        print(
+            f"[dry-run] split={args.split}: n_eff resolved at run from the on-box "
+            f"parquet (target {args.prompts}/length); verify the {args.split} "
+            "parquet is in the HF cache before the window"
+        )
+    else:
+        # Preview adaptive n_eff with a synthetic stream of the known test corpus
+        # size (no parquet/model). n_eff=min(prompts,(corpus-512)//ctx): 30/18/9.
+        preview = plan_corpus(list(range(args.dry_run_corpus_tokens)), args.lengths, args.prompts)
+        total_runs = 0
+        for length in args.lengths:
+            _, n_eff = preview[length]
+            total_runs += n_eff
+            limited = "  [corpus-limited]" if n_eff < args.prompts else ""
+            print(
+                f"[dry-run]   ctx={length}: n_eff={n_eff}/{args.prompts} independent "
+                f"disjoint prompts{limited}"
+            )
+        print(
+            f"[dry-run] total submit runs={total_runs} x {len(args.windows)} W-arms "
+            f"= {total_runs * len(args.windows)} measurements"
+        )
     print(
         "[dry-run] paired disjoint prompts across W arms; NoPrefixStore; direct "
         "submit=think-off, spec_depth=1; cold fill timed separately; JSON flushed "
