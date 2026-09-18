@@ -65,13 +65,18 @@ def wikitext_ids_stream(tok, split: str = "test", glob_override: str = "") -> li
     Train is large enough for n>=30 disjoint 32k spans where the ~297k-token
     test split yields only 9."""
     pattern = os.path.expanduser(glob_override) if glob_override else wikitext_parquet_glob(split)
-    paths = glob.glob(pattern)
+    paths = sorted(glob.glob(pattern))
     if not paths:
         raise SystemExit(f"wikitext parquet not found: {pattern}")
     import pyarrow.parquet as pq
 
-    text = "\n".join(pq.read_table(sorted(paths)[0]).column("text").to_pylist())
-    return tok.encode(text)
+    # Consume EVERY matching shard, not only the first: the train split ships as
+    # multiple parquet files (two on the pod), and reading just paths[0] would
+    # silently use one shard. One shard (~70M tokens) already far exceeds a
+    # 32k n=30 run (~0.98M), but concat all so the corpus size is real and a
+    # short shard cannot cap n_eff.
+    parts = ["\n".join(pq.read_table(p).column("text").to_pylist()) for p in paths]
+    return tok.encode("\n".join(parts))
 
 
 def tiled_spans(ids: list[int], n: int, ctx: int, skip: int = 512):
