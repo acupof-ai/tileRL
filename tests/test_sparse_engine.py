@@ -77,19 +77,19 @@ def test_sparse_pins_selected_pages_across_ticks_and_demotes_what_leaves():
                    chosen only — a kept page is never re-fetched),
       demotions  == number of pages resident last tick that this tick dropped.
 
-    The promotion half of that invariant is NOT asserted here — this test observes
-    a run where nothing is ever promoted, so `promoted <= len(cold_before)` holds
-    trivially (0 <= n). Measured: a mutant that demotes the whole resident set every
-    tick and re-promotes it — the 6.6x V100 regression this docstring names — passes
-    this test and fails only
-    `test_sparse_a_stable_selection_promotes_nothing_after_the_first_tick`, whose
-    `promotions == 0` cycle assertion is where the pin is actually gated.
+    Both halves of that invariant are exercised here: the per-tick window over this
+    run is `(demoted, promoted)` = `(3,0) (1,1) (1,1) (2,2) (1,1) (1,1)`, so the
+    promotion bound is checked against real re-fetches, not a zero. Mutating the
+    drop set to the whole resident set (`dropped = list(live)`, the demote-every-tick
+    / repromote-6.6x-V100-shape) turns this test red as well as
+    `test_sparse_a_stable_selection_promotes_nothing_after_the_first_tick`, which is
+    the dedicated zero-cycle pin gate.
 
-    What this test uniquely holds is the DEVICE bounds mask: mutating
-    `SparseTracker.set_bounds` to stop setting `bounds_valid` fails here and nowhere
-    else in the suite. Uses a 12-page context so pages genuinely fall outside
-    k+window and cycle, while the per-tick counts must still match the residency
-    delta exactly."""
+    What this test UNIQUELY holds is the device bounds mask: mutating
+    `SparseTracker.set_bounds` to stop setting `bounds_valid` fails this test and
+    no other in `test_sparse_engine.py` + `test_kv.py` (98 pass). Uses a 12-page
+    context so pages genuinely fall outside k+window and cycle, while the per-tick
+    counts must still match the residency delta exactly."""
     prompt = np.arange(7, 7 + 12 * BLOCK_TOKENS, dtype=np.int64)  # 12 pages
     sparse = _engine(True, 2)
     rid = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))

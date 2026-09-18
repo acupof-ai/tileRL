@@ -586,10 +586,11 @@ def test_decode_growth_evicts_finished_prefix():
     expensive one and nothing else in the suite gates it: dropping the
     `_state_used` rollback in `PrefixStore._drop` leaves `evictions`, `entries`
     and every token correct, and only `test_kv.py`'s small unit gates fire —
-    measured across the whole CPU suite. `state_bytes` still sits at 1600 at the
-    end because a publish re-inserts before the pool pressure arrives, so the
-    eviction is observed as a peak that the run comes down from: 1600 -> 3200 ->
-    1600 unmutated, 1600 -> 6400 -> 6400 under the leak.
+    measured across the whole CPU suite. `state_bytes` is flat at 1600 between
+    ticks because a publish re-inserts before the pool pressure that evicts it
+    arrives, so the release is only visible as a peak the run comes down from:
+    `1600 -> 3200 -> 1600` unmutated, `1600 -> 3200 -> 3200` under the leak (the
+    one-entry budget here is 1600, so a leaked end equals the peak, not double it).
     """
     cfg = tiny()
     engine = build_engine(
