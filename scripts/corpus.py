@@ -53,7 +53,32 @@ def wikitext_ids(
     return got
 
 
-def wikitext_ids_stream(tok, split: str = "test", glob_override: str = "") -> list[int]:
+def bounded_join_encode(tok, rows, max_tokens: int) -> list[int]:
+    """Encode the prefix of ``rows`` needed to reach ``max_tokens`` ids without
+    materializing the whole corpus. Buffers raw rows and, at doubling char-budget
+    milestones, runs the SAME single ``"\\n".join`` + encode as the full path; if
+    the prefix under-produces (a denser corpus than the 4 chars/token first
+    guess) the budget doubles and the growing prefix is re-encoded. No per-row
+    encode, so no artificial separator id is injected. Memory stays <2x the
+    target; a corpus too short simply returns fewer ids (caller's n_eff gate
+    fails loudly). Pure (no pyarrow) so it is unit-tested without a parquet dep."""
+    buf: list[str] = []
+    used = 0
+    budget = max_tokens * 4
+    for row in rows:
+        buf.append(row)
+        used += len(row) + 1
+        if used >= budget:
+            ids = tok.encode("\n".join(buf))
+            if len(ids) >= max_tokens:
+                return ids
+            budget *= 2
+    return tok.encode("\n".join(buf))
+
+
+def wikitext_ids_stream(
+    tok, split: str = "test", glob_override: str = "", max_tokens: int = 0
+) -> list[int]:
     """One wikitext-103 split as one token stream (all rows concatenated).
 
     Lets a caller size/adapt spans against the actual corpus length instead of
@@ -62,13 +87,38 @@ def wikitext_ids_stream(tok, split: str = "test", glob_override: str = "") -> li
     ``wikitext-103-raw-v1/<split>-*.parquet`` under the hardcoded snapshot glob
     (the box sets no HF cache env, so the path is parameterized, not env-driven);
     ``glob_override`` is an expanded glob that fully replaces the split mapping.
+    Both are expanduser'd: the split glob embeds a literal ``~`` and
+    ``glob.glob`` does NOT expand it, so a split-only call returned no files.
     Train is large enough for n>=30 disjoint 32k spans where the ~297k-token
-    test split yields only 9."""
-    pattern = os.path.expanduser(glob_override) if glob_override else wikitext_parquet_glob(split)
+    test split yields only 9.
+
+    ``max_tokens>0`` bounds memory without tokenizing row-by-row (which injects an
+    artificial separator id the BPE stream lacks). It buffers raw rows in ONE
+    pass and, at doubling char-budget milestones, does the same single
+    ``"\\n".join`` + ``tok.encode`` as the full path and stops once the prefix has
+    at least ``max_tokens`` ids. The first budget is a conservative 4 chars/token;
+    if that under-produces (a denser corpus — measured test ~4.3 chars/token)
+    the budget doubles and the SAME growing prefix is re-encoded, so no density
+    constant has to be guessed and it is robust to code/chat corpora. Milestones
+    only double (~log2 ratio re-encodes), memory stays bounded near the target
+    (the overshoot is <2x). Required for train: encoding the full ~540M-char
+    split once materializes ~140M Python ints and OOMs a 31 GiB host
+    (observed SIGKILL rc137). A sweep needs only ``skip + n*ctx`` (~1M tokens for
+    n=30 at 32k). Returns fewer than ``max_tokens`` only if the corpus itself is
+    exhausted; the caller's n_eff gate then fails loudly."""
+    pattern = (
+        os.path.expanduser(glob_override)
+        if glob_override
+        else os.path.expanduser(wikitext_parquet_glob(split))
+    )
     paths = sorted(glob.glob(pattern))
     if not paths:
         raise SystemExit(f"wikitext parquet not found: {pattern}")
     import pyarrow.parquet as pq
+
+    if max_tokens > 0:
+        all_rows = [row for p in paths for row in pq.read_table(p).column("text").to_pylist()]
+        return bounded_join_encode(tok, all_rows, max_tokens)
 
     # Consume EVERY matching shard, not only the first: the train split ships as
     # multiple parquet files (two on the pod), and reading just paths[0] would
@@ -144,6 +194,45 @@ def _self_check() -> None:
     assert all(len(s) == 200 for s in got[200])
     flat = [t for s in got[100] + got[200] for t in s]
     assert len(flat) == len(set(flat)), "different-length spans share tokens"
+
+    # bounded_join_encode must not re-encode on every row: with a dense tokenizer
+    # whose first 4x char budget under-produces, the budget DOUBLES and the call
+    # returns after a handful of encodes; deleting `budget *= 2` makes it re-encode
+    # at EVERY later row (quadratic). The bounded ids are an exact prefix of the
+    # single-join full stream (no injected separator); a short corpus may
+    # under-produce. Pure — no pyarrow, so this runs in CI.
+    class _CountTok:
+        def __init__(self, chars_per_token: int):
+            self.cpt = chars_per_token
+            self.encodes = 0
+
+        def encode(self, text: str):
+            self.encodes += 1
+            return list(range(len(text) // self.cpt))
+
+    # Many TINY rows: need=100 at 6 chars/token wants 600 chars. The first 400-char
+    # budget under-produces (1-char rows never individually cross it), the budget
+    # doubles to 800, and the call returns — 2 encodes. Without doubling it
+    # re-encodes at every row after the first budget (~100 encodes): the failure.
+    rows = ["a"] * 2000
+    need = 100
+    dense = _CountTok(6)
+    bounded = bounded_join_encode(dense, rows, need)
+    full = _CountTok(6).encode("\n".join(rows))
+    assert len(bounded) >= need, len(bounded)
+    assert bounded == full[: len(bounded)], "bounded must be a single-join prefix"
+    assert dense.encodes == 2, (
+        f"dense must encode once + one doubling, got {dense.encodes} (quadratic without doubling?)"
+    )
+
+    sparse = _CountTok(1)  # 1 char/token: the first 400-char budget already >=100
+    s_bounded = bounded_join_encode(sparse, rows, need)
+    assert len(s_bounded) >= need
+    assert sparse.encodes == 1, f"sparse must encode once, encodes={sparse.encodes}"
+
+    short = bounded_join_encode(_CountTok(6), ["a"], 10**9)  # corpus exhausted
+    assert len(short) < 10**9, "an exhausted corpus may under-produce"
+
     print("corpus: spans OK")
 
 

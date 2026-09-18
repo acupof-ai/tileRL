@@ -222,7 +222,11 @@ def run(args) -> list[dict]:
     # Sample-size gate BEFORE building the 27B: the corpus read needs only the
     # tokenizer, so a half-present split fails fast instead of after a long load.
     tok = get_tokenizer(args.source)
-    stream = wikitext_ids_stream(tok, args.split, args.corpus_glob)
+    # Bound tokenization to what the largest length's n disjoint spans consume
+    # (skip=512 + n*ctx) plus one page margin. Without it the full train split
+    # (~540M chars) is one tok.encode -> ~140M Python ints -> host OOM (rc137).
+    need_tokens = 512 + args.prompts * max(args.lengths) + 4096
+    stream = wikitext_ids_stream(tok, args.split, args.corpus_glob, need_tokens)
     corpus_plan = plan_corpus(stream, args.lengths, args.prompts)
     del stream
     if args.min_prompts_per_length > 0:
