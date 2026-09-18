@@ -1,0 +1,32 @@
+[
+  {
+    "W": 0,
+    "cold_fill_s_med": 152.88120154757053,
+    "draft_ms_med": 117.75311088562012,
+    "accept_rate": 0.7816868350230551,
+    "accept_len": 1.774930859111092,
+    "tok_s_med": 6.012867487795418,
+    "proof": "ok",
+    "n_prompts": 30,
+    "shapes_sample": [],
+    "length": 32768,
+    "n_requested": 30,
+    "tok_s_ratio_vs_W0": 1.0,
+    "draft_ms_ratio_vs_W0": 1.0
+  },
+  {
+    "W": 0,
+    "cold_fill_s_med": 66.50947123626247,
+    "draft_ms_med": 59.28207969665527,
+    "accept_rate": 0.7409710091209338,
+    "accept_len": 1.73378241392344,
+    "tok_s_med": 7.538144748279267,
+    "proof": "ok",
+    "n_prompts": 30,
+    "shapes_sample": [],
+    "length": 16384,
+    "n_requested": 30,
+    "tok_s_ratio_vs_W0": 1.0,
+    "draft_ms_ratio_vs_W0": 1.0
+  }
+]
