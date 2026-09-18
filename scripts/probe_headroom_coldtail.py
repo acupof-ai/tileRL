@@ -326,7 +326,7 @@ def cmd_compare(a) -> int:
     return 0
 
 
-def _self_check() -> int:
+def _self_check(ns=None) -> int:
     l1 = ("[step-timing] tick 7 total=1259ms dec=1 pre=0 plan=1ms stats=2ms "
           "forward=1250ms sparse_select=3ms model=330ms sparse_finalize=629ms "
           "sample=1ms [offers_pages=132] free=210MiB reserved=30000MiB path=eager "
@@ -380,8 +380,25 @@ def _self_check() -> int:
     s0 = parse_log(logf0, 0)
     assert s0["decode_ticks"] == 0 and s0["frac_over_300"] == 0.0
     os.unlink(logf0)
+    # Dispatch arity: arm/compare run as fn(namespace). A regressed ns.fn() call
+    # only raises TypeError on the server arm (selfcheck never dispatches), so pin
+    # the one-arg call here without a server.
+    class _NS:
+        def fn(self, ns):
+            self.got = ns
+            return 0
+    nschk = _NS()
+    assert _dispatch(nschk) == 0 and nschk.got is nschk
     print("probe_headroom_coldtail self-check ok")
     return 0
+
+
+def _dispatch(ns) -> int:
+    # Every subcommand takes the parsed namespace; the bare-run default _self_check
+    # accepts it optionally. Passing ns here is the whole function -- calling ns.fn()
+    # raised TypeError only on the server arm (selfcheck never dispatches), so the
+    # assert in _self_check pins the one-arg call shape without a server.
+    return getattr(ns, "fn", _self_check)(ns)
 
 
 def main() -> int:
@@ -417,7 +434,7 @@ def main() -> int:
                    help="name=path per arm, e.g. control=/r/0.json target=/r/768.json")
     c.set_defaults(fn=cmd_compare)
     ns = ap.parse_args()
-    return getattr(ns, "fn", _self_check)()
+    return _dispatch(ns)
 
 
 if __name__ == "__main__":
