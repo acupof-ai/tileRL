@@ -118,10 +118,11 @@ Non-breaking strictness notes (recorded, no issue — none fails parsing):
    route does not get a typewriter effect; the client accumulates the block in
    one event. Marked `ponytail` at the SSE generator; a per-token forward is its
    own change.
-2. **`message_delta` carries the full four-field `usage`** instead of the
-   official convention's output-only increment (input usage is on
-   `message_start`). The SDK accepts the full object; left as-is. Follow-up only
-   if a client is observed double-counting.
+2. **Usage is split across the two events, not repeated.** `message_start`
+   carries `input_tokens` and the cache fields with `output_tokens: 0`;
+   `message_delta` carries only the final `output_tokens` (#694/#695 — before
+   that the same full usage sat on both events and a sum-across-events client
+   double-counted, measured live at 16→32 tokens).
 3. **`thinking.signature` is an empty string.** A block replayed to the real
    Anthropic API would be rejected, but this server terminates the request and
    never replays; the SDK parse does not fail.
@@ -181,8 +182,9 @@ a fix issue **only if one goes red** (no speculative issues):
 1. ~~openai-python **Responses** client reasoning shape~~ — done 2026-09-16:
    live RED (#687), fixed #690; rerun `scripts/probe_responses_reasoning_shape.py`
    against the deployed serve once to confirm GREEN.
-2. **Claude Code** against `/v1/messages`: is token usage double-counted given
-   usage is present at both `message_start` and `message_delta`?
+2. **Claude Code** against `/v1/messages`: does the client read the split usage
+   correctly — `input_tokens` on `message_start` (with `output_tokens: 0`) and
+   the final `output_tokens` on `message_delta` (#694/#695)?
 3. **Cold long-prefill SSE** (tens of seconds of silence, no `ping`): do the
    Anthropic and Responses clients tolerate the wait, and does the replay-not-
    stream behaviour cause any client-visible stall or timeout?

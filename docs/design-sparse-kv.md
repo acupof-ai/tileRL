@@ -160,7 +160,7 @@ near one second.
 
 `BLOCK_TOKENS = 16`. The indexer scores tokens; the selector max-pools scores
 over each page and returns the top-k_pages blocks. The page table gains
-one field, `location in {device, host, ssd}`, and the block ids in a
+one accessor, `page_location(...) -> {device, host, free}`, and the block ids in a
 `block_table` row are the selected pages. `paged_attention` does not change:
 it receives a block table whose length is the selected set, not the context.
 With `k >= context` the block table is the full one and the output equals dense

@@ -78,16 +78,20 @@ never imports Engine. The tracker attributes the tree reads are proxied through 
 
 | Call | Replaces | When the loop calls it |
 |---|---|---|
-| `route(req)` | the `sparse_on` decision and dense-too-big reroute in `submit` | submit |
-| `attach(req, hit)` | the prefix adoption block in `_admit`: `SparseTracker.attach`, `SparsePrefixCache.lookup`/`set_bounds`, `_sparse_warm_draft` | admit |
-| `admit_headroom()` | `_sparse_hot_headroom` | admit |
-| `rows(plan)` | `_sparse_rows`, `_sparse_decode_rows`, the `do_refresh` / `_sparse_device_select` / `_sparse_prefill_cap` decision | building a tick |
-| `run(plan)` | `_run_sparse_decode_graph` and the eager path | forward |
-| `process_offers()` | `_sparse_process_offers` | mid-loop |
-| `release(req)` | `_sparse_finalize`, offers, `SparsePrefixCache.close_request`, `_sparse_transfer_to_shared` and its freeze/share refs | release |
-| `stats()` | `_sparse_live_stats` | stats |
-| `retier(keep)` | `Engine.sparse_retier` | public #500 manual seam; thin delegation, kept |
-| `selection_recall()` | `sparse_selection_recall` | test/observability surface; kept |
+| `attach(req)` | the prefix adoption block in `_admit`: `SparseTracker.attach`, `SparsePrefixCache.lookup`/`set_bounds`, `_sparse_warm_draft` | admit |
+| `recall(req, target_mass)` | `sparse_selection_recall` | admit |
+| `build_rows(rows, seq_q, decodes)` | `_sparse_rows`, `_sparse_decode_rows`, the `do_refresh` / `_sparse_device_select` / `_sparse_prefill_cap` decision | building a tick |
+| `decode_rows(decodes, q_dec)` | the eager sparse decode rows | forward |
+| `run_decode_graph(reqs, chains)` | `_run_sparse_decode_graph` and the eager fallback | forward |
+| `process_offers(dropped_offers)` | `_sparse_process_offers` | mid-loop |
+| `finalize(sf, rows, hidden)` | `_sparse_finalize`, offers, `SparsePrefixCache.close_request` | release |
+| `transfer_to_shared(...)` | `_sparse_transfer_to_shared` and its freeze/share refs | release |
+| `warm_draft(r, entry, matched)` | `_sparse_warm_draft` | admit |
+| `offer_drop(r, page, draft_pages)` | the sparse offer/drop bookkeeping | mid-loop |
+| `sparse_retier(keep)` | `Engine.sparse_retier` | public #500 manual seam; thin delegation, kept |
+
+`route`/`sparse_on`, the `--sparse-min-tokens` regime split, `_sparse_hot_headroom`
+and `_sparse_live_stats` stayed on `Engine`.
 
 A dense-only engine holds `None`, and the dense path contains no sparse branch. This is the
 largest move and runs last, behind a device gate.

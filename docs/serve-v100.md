@@ -89,5 +89,5 @@ and the fix is verified on the live sm70 serve. Retrying `/health` remains the
 correct handling for an ordinary network hiccup.
 
 Sparse long context is a separate, limited path: 64k serves only at B=1 and
-256k prefills are OOM-killed — see
+256k prefills were OOM-killed by unbounded per-chunk GDN snapshots, fixed 2026-09-14 (device RSS re-confirmation still pending-remote) — see
 [errors/2026-09-13-v100-256k-sparse-prefill-host-oom](experience/errors/2026-09-13-v100-256k-sparse-prefill-host-oom.md).

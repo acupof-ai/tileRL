@@ -14,6 +14,10 @@ kernel lane against its load window. Dev-only tooling — no bench entry for the
 harness itself, but the numbers it prints are what the wins entry gets updated
 with.
 
+> **Grant updated 2026-09-08 (ckl): tileRL's cards are 0, 1, 3, 6**
+> (`scripts/pod_run.sh`); H20 was stopped 2026-09-16. The 6-and-7 rule below is
+> the 2026-08 record, kept for provenance.
+
 **Non-negotiable:** GPUs 0-5 are the user's own training run, 100% util and
 ~94 GiB each. Only **6 and 7** are ours. The script refuses to start on
 anything else and refuses a GPU that is busy — do not talk it out of that.

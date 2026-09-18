@@ -59,8 +59,8 @@ job owns, not the shared server.
   prefill ticks.
 - It does **not** change steady decode tok/s — no decode path, KV layout,
   attention kernel, or page selection changes.
-- It is not the speculative-decode W-window (draft verify width) line; keep the
-  two separate when reporting.
+- It is not the speculative-decode draft READ window (`--draft-attn-window-tokens`,
+  default 2048) or the verify width (`--depth`); keep all three separate when reporting.
 
 ## Verifying on a device window
 

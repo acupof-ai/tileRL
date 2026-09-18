@@ -55,7 +55,7 @@ How it lands on the tape — optimizer-side only, no new backward:
   (served fp4) + one matrix in flight + activations ≈ 60–70 GB. Fits only
   under that streaming.
 - As built (`src/tilerl/iso.py`), frames default to fp32 (`frame_dtype`):
-  correct on the tiny model, ~200 GiB on the 27B. The 27B must pass bf16
+  correct on the tiny model, ~136.5 GiB on the 27B (`memory.iso_frame_row`). The 27B must pass bf16
   frames, and whether Newton-Schulz holds ‖UᵀU − I‖ < 1e-4 in bf16 is an
   open pod question — measure it before the SFT gate, not after.
 - ISO has no LoRA variant. LoRA + AdamW stays the day-1 adapter path; ISO is
@@ -151,12 +151,12 @@ tilerl serve   --run <id>                       # base + adapter (+ head) — NO
 tilerl ledger  [--lineage <id>] [--json]        # what exists, what it descends from
 ```
 
-Every flag above ships except `serve --run`. `tilerl serve` currently takes 33 flags
+Every flag above ships except `serve --run`. `tilerl serve` currently takes 34 flags
 (the maintained list is `tilerl serve --help`; definitions in `src/tilerl/cli.py`):
 
 - model/speculation: `--model {tiny,tiny-agent,qwen38-27b}`, `--draft DIR` (MTP/NextN head safetensors), `--depth N`, `--draft-attn-window-tokens N`, `--decode-graph`/`--no-decode-graph`, `--no-warmup`
 - capacity: `--slots N` (GDN state slots), `--blocks N` (16-token KV blocks), `--max-ctx N`, `--max-batch N`, `--max-batched-tokens N`
-- KV/state tiers: `--state-bytes`, `--dram-bytes` (`wins/2026-09-06-dram-bytes-flag-and-health-gate.md`), `--kv-cold-bytes`, `--kv-store DIR`, `--cold-format {f16,native}`, `--cold-ssd-path FILE`, `--cold-ssd-bytes N`, `--kv-fp8 {e4m3,e5m2}`, `--device-reserve-mib N`
+- KV/state tiers: `--state-bytes`, `--dram-bytes` (`wins/2026-09-06-dram-bytes-flag-and-health-gate.md`), `--kv-cold-bytes`, `--kv-store DIR`, `--cold-format {f16,native}`, `--cold-ssd-path FILE`, `--cold-ssd-bytes N`, `--kv-fp8 {e4m3,e5m2}`, `--device-reserve-mib N`, `--device-headroom-mib N` (sparse only: build the hot pool smaller and cap the draft fit so this much stays free)
 - sparse KV: `--sparse-k PAGES` (default 0 = dense), `--sparse-min-tokens N`, `--sparse-prefill-tokens N`, `--scorer {index,bounds}`
 - HTTP: `--host` (default 127.0.0.1), `--port` (default 8000), `--completion-timeout-s S` (default 1800)
 - dry-run memory ledger: `--dry-run`, `--device-free BYTES`, `--checkpoint DIR` (header-only pricing, no card), `--json`, `--record-residency`

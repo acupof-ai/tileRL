@@ -61,7 +61,7 @@ bandwidth/MMA balance differs from prefill.
 4. **PARITY** — same `tests/test_ops_parity.py`, no new machinery: on CPU it
    tests the floor; on the pod it tests whatever the cell resolves. Gate:
    `allclose(rtol=1e-2)` vs torch-eager.
-   `scripts/v100.sh 'PYTHONPATH=src TILERL_TARGET=cuda python3 -m pytest tests/test_ops_parity.py -x'`
+   `scripts/v100.sh 'python3 -m pytest tests/test_ops_parity.py -x'` — v100.sh's ENV already carries PYTHONPATH (both trees) and TILERL_TARGET=cuda
 5. **BENCH** — A/B the variant against the default in one process (the ratio
    is contention-independent): a `scripts/bench_<family>.py` that builds
    inputs at canonical shapes and calls `benchkit.ab(...)`, run via

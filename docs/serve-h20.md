@@ -5,9 +5,13 @@ supervisor is [`scripts/serve_h20.sh`](../scripts/serve_h20.sh); it is the sm90
 analogue of the V100 hybrid supervisor, run **through `scripts/pod_run.sh`**,
 never launched by hand.
 
-Status: **written and hermetically gated, awaiting a real serve window.** The
-script and its fuse/dry-run gates are on main; an actual boot on a named H20
-card is scheduled after the in-flight serve PRs land.
+Status: **written and hermetically gated, but not runnable today.** The
+script and its fuse/dry-run gates are on main. H20 was stopped by decision on
+2026-09-16 20:40: the `sglang-test` pod object was deleted and its `emptyDir`
+`/work` wiped (the `/work/tilerl-s-*` trees, `/work/tl013`, the 27B checkpoint),
+so no boot is scheduled until the pod is rebuilt, a tree re-synced, `/work/tl013`
+restored and the checkpoint re-uploaded. See
+[experience/PENDING-REMOTE-CARDS.md](experience/PENDING-REMOTE-CARDS.md).
 
 ## From a fresh pod (one-time bootstrap)
 
@@ -118,7 +122,8 @@ separate `mmlu-assets` path as on the V100 host.
 
 The default spill file is `/work/sparse_cold_h20.bin` (8 GiB host budget +
 8 GiB spill). `/work` is the pod's writable 2 TB scratch that survives a
-container restart and already holds the cold-tier probes — the V100
+container restart, but not a pod deletion: the 2026-09-16 20:40 shutdown took
+`/work` wholesale, so the cold-tier probes must be re-run, not reused. The V100
 host-specific SSD paths do not apply. The mounted NVMe `/mnt/data02` (3.5 TB) is
 root-0755 at the mount point; set `SERVE_COLD_SSD` to a writable subdirectory
 there to use it. Set `SERVE_COLD_SSD=""` to run sparse with a host-only cold
