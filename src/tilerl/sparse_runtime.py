@@ -437,9 +437,11 @@ class SparseRuntime:
           blob from its live physical frame here.
         Returning without a blob would leave a lookup entry naming a dead key.
 
-        Four device costs are charged separately below (bounds D2H, draft K/V
-        clone, SSD read+spill write, resident-frame D2H) because they have
-        different fixes; only the first two ever charge on the CPU cell."""
+        Charged in five segments because they have different fixes: bounds D2H,
+        draft K/V clone, the cold tier's host-RAM transfer, the live-frame
+        snapshot, and the shared-namespace hold. Disk IO is NOT here — the spill
+        file measures itself and the engine reports it as ``ssd_mmap``, so a
+        profile attributing disk time to any of these five is misreading."""
         ctx = self.ctx
         tr = self.tracker
         tm = ctx.step_timing

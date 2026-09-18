@@ -160,11 +160,11 @@ def test_release_subsegments_charge_on_a_sparse_request_end(monkeypatch):
     row the `close_request`/`cold_forget` marks are never reached, so deleting
     either one left the gate green. Two shapes are needed beyond that:
 
-    * a DRAFT row, or `pub_draft_clone` charges ~1 us of timer noise on the
-      skipped `if draft_block is not None` branch and the assertion passes
-      vacuously (measured 0.8 us without, 23.2 us with);
+    * a DRAFT row: without one `pub_draft_clone` charges only timer noise on the
+      skipped `if draft_block is not None` branch, so the assertion passes
+      vacuously. The branch is what must charge;
     * at least 12 prompt pages, or the private blob is still under the host
-      budget and the SSD transfer branch never runs.
+      budget and the cold-transfer branch's spill arm never runs.
     """
     from test_sparse_engine import _sparse_engine
 
@@ -190,9 +190,10 @@ def test_release_subsegments_charge_on_a_sparse_request_end(monkeypatch):
         missing = [k for k in _RELEASE_SEGMENTS if peak.get(k, 0.0) <= 0.0]
         assert not missing, f"never charged on a sparse request end: {missing}"
         assert eng._sparse.prefix.published == 1, eng._sparse.prefix.published
-        # Measured 2026-09-18, k=2, 16 pages, draft=True, 2 generated:
-        # bounds 39.5us, draft_clone 64.1, frame_d2h 121.5, share_hold 14.6,
-        # ssd_transfer 17.7.
+        # Asserted >0, never against a magnitude: these are wall-clock samples on
+        # a shared CPU box and vary run to run. Illustrative only, one 2026-09-18
+        # run at k=2 / 16 pages / draft=True: bounds 39.5us, draft_clone 64.1,
+        # frame_d2h 121.5, share_hold 14.6, cold_transfer 20.1.
         missing = [k for k in _PUBLISH_SEGMENTS if peak.get(k, 0.0) <= 0.0]
         assert not missing, f"publish sub-segment never charged: {missing}"
         assert set(peak) <= set(_SEGMENTS)

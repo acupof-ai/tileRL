@@ -200,7 +200,9 @@ class _StepTiming:
     host stalls included. Every slow tick prints its segments to stderr at once;
     exit prints per-segment averages. perf_counter reads stay unconditional at
     the call sites (tens of ns against a 100+ ms tick); with the env off no
-    instance exists and the marks themselves are skipped.
+    instance exists and the marks themselves are skipped. The figures quoted in
+    these comments are illustrative of one machine and run, not expectations to
+    compare a reading against.
 
     "forward" is an ENVELOPE: on the eager path it equals prep + model + sample +
     draft_offers (+ sparse_select/sparse_finalize on sparse ticks); a graph tick
@@ -2615,6 +2617,11 @@ class Engine:
             # live: pages a hot pool never dropped get snapshotted from the live
             # frame here, so a same-prompt follower can still adopt the prefix.
             if self._sparse.prefix is not None and req.sparse_matched == 0 and not req.failed:
+                # This segment is a SUPERSET of the five pub_* marks its callees
+                # charge: close_request's own index accounting and the
+                # take_freeze_refs/share_ref loop below carry no mark, so roughly
+                # a third of this bucket is unmarked. A profile that reads a
+                # leftover here as a per-page cost is reading the index work.
                 keys = self._sparse.prefix.close_request(
                     req.req_id, req.tokens, self._sparse.bounds_view(req.req_id))
                 written_page = ((req.draft_pos + 1) // BLOCK_TOKENS
