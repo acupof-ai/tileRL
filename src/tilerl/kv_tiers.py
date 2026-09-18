@@ -69,6 +69,11 @@ class ColdSsdFile:
     """
 
     HEADER = 4096
+    #: The mapping and file grow one extent at a time, not one slot: every growth
+    #: remaps, and remapping per high-water slot rebuilt the whole mmap thousands
+    #: of times during a cold fill. Unused extent slots are at most one chunk of
+    #: tail space.
+    GROWTH_SLOTS = 64
 
     def __init__(self, path: str, spec: list[tuple[str, tuple, str, int]],
                  step_timing=None) -> None:
@@ -101,33 +106,29 @@ class ColdSsdFile:
             self._f.write(json.dumps(spec).encode().ljust(self.HEADER, b"\0"))
             self._f.flush()
         self._map = None
-        self._slots = 0
-        self._remap()
+        self._cap = (os.path.getsize(path) - self.HEADER) // self.stride
+        self._remap(self._cap)
 
-    def _remap(self) -> None:
+    def _remap(self, cap: int) -> None:
+        """Map exactly ``cap`` fixed-stride slots (the file already holds them)."""
         if self._map is not None:
             self._map.close()
-        self._slots = (os.path.getsize(self._path) - self.HEADER) // self.stride
-        if self._slots:
-            self._map = self._mmap.mmap(self._f.fileno(), 0)
-        else:
             self._map = None
+        self._cap = cap
+        if cap:
+            self._map = self._mmap.mmap(self._f.fileno(), self.HEADER + cap * self.stride)
 
     def _alloc_slot(self) -> int:
         if self._free_slots:
             return self._free_slots.pop()
         slot = self._next_slot
         self._next_slot += 1
-        if slot >= self._slots:
-            size = self.HEADER + (slot + 1) * self.stride
-            # ftruncate alone is not visible in this process's Python-side file size;
-            # flush to disk, seek to the new end and write a byte so getsize()/the
-            # next remap see the grown size before re-mapping.
-            self._f.flush()
-            self._f.seek(size - 1)
-            self._f.write(b"\0")
-            self._f.flush()
-            self._remap()
+        if slot >= self._cap:
+            # Grow one extent with a single ftruncate + one remap. ftruncate grows
+            # the shared file object in place; the next mapping spans the new size.
+            cap = self._cap + self.GROWTH_SLOTS
+            os.ftruncate(self._f.fileno(), self.HEADER + cap * self.stride)
+            self._remap(cap)
         return slot
 
     def _charge(self, t: float) -> None:
@@ -149,7 +150,13 @@ class ColdSsdFile:
             t = blob[k].detach()
             if t.is_cuda:
                 t = t.cpu()  # numpy/mmap needs a host tensor; bounds may arrive on device
-            self._map[off: off + n] = t.contiguous().view(torch.uint8).numpy().tobytes()
+            # Zero-copy write, mirroring _read: a numpy view of the WRITABLE mmap
+            # (offset, not a bytes copy) takes the bytes via copy_, with no
+            # t.numpy().tobytes() double copy or a per-page bytes allocation.
+            dst = torch.from_numpy(
+                self._np.frombuffer(self._map, dtype=self._np.uint8,
+                                    count=n, offset=off))
+            dst.copy_(t.contiguous().view(torch.uint8).reshape(-1))
             off += n
         self._slot_of[key] = slot
         # No per-page flush: the page cache writes this back; the serving spill
@@ -352,15 +359,26 @@ class HostKvPages:
         """Evict oldest RAM-resident pages (private AND shared prefix, one LRU)
         until pinned bytes fit the budget. A private page spills to the private
         file or is dropped; a shared (refcounted) page spills to the prefix file.
-        A shared page with no spill file stays — a store entry references it."""
+        A shared page with no spill file stays — a store entry references it.
+
+        Pops from the OrderedDict front: each RAM hold is one O(1) eviction
+        attempt, never an O(RAM entries) snapshot per hold. A record that no
+        longer matches RAM state (promoted/forgotten/shared-spilled between
+        enqueue and sweep) is popped here and gone, not skipped and re-scanned."""
         while self._used + self._shared_ram > self.budget_bytes:
-            for (ns, k), n in list(self._ram_order.items()):
+            # One circuit over the entries present when it began: a parked
+            # unspillable page is re-appended past the circuit counter, so it is
+            # examined at most once per pass, exactly the old snapshot-for-loop
+            # semantics. A circuit that evicts nothing returns.
+            remaining = len(self._ram_order)
+            while remaining > 0:
+                (ns, k), n = self._ram_order.popitem(last=False)
+                remaining -= 1
                 if ns == "p":
                     blob = self._blobs.pop(k, None)
                     if blob is None or self._held.get(k) != n:
                         continue  # promoted/forgotten between enqueue and sweep
                     self._held.pop(k)
-                    self._ram_order.pop(("p", k), None)
                     self._used -= n
                     if self._ssd_path:
                         self._write_ssd(k, blob, n)
@@ -369,18 +387,17 @@ class HostKvPages:
                     break
                 rec = self._shared.get(k)
                 if rec is None or rec[2] is None or rec[0] != n:
-                    self._ram_order.pop(("s", k), None)
-                    continue
-                # [n, refs, blob]: evict below
+                    continue  # stale shared LRU entry (spilled/released/changed)
                 if not self._ssd_path:
-                    continue  # cannot drop a refcounted shared page
+                    self._ram_order[(ns, k)] = n  # re-park; cannot drop a refcounted page
+                    continue
                 if self._shared_evict_ram(k):
                     break
-                # shared spill is disabled: the page stayed in RAM, keep scanning
-                # the LRU for a private page that can spill or drop.
-                continue
+                # shared spill is disabled: the page stays in RAM; park it at the
+                # back and keep looking from the front for a private page.
+                self._ram_order[(ns, k)] = n
             else:
-                return  # nothing evict-able remains in the LRU
+                return  # nothing evict-able remains in one LRU circuit
 
     def _write_ssd(self, key, blob: dict, nbytes: int) -> None:
         """Move a page already removed from host accounting onto the spill file.

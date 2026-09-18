@@ -379,9 +379,11 @@ def test_pages_past_the_host_budget_spill_to_ssd_and_promote_byte_equal(tmp_path
     st = pool.cold.stats()
     assert st["kv_cold_pages"] == 2 and st["kv_cold_ssd_pages"] == 2, st
     assert pool.cold.bytes_held == per * 2 and pool.cold.ssd_bytes == per * 2, st
-    # the file holds one stride-sized slot per spilled key, plus the header
-    assert os.path.getsize(ssd) == pool.cold._ssd.HEADER + per * len(pool.cold._ssd), \
-        os.path.getsize(ssd)
+    # each live key owns one stride-sized logical slot; the file is grown one
+    # extent at a time, so its size is the extent-rounded capacity, not n*stride
+    assert len(pool.cold._ssd) == 2
+    assert os.path.getsize(ssd) == pool.cold._ssd.HEADER + per * pool.cold._ssd._cap
+    assert pool.cold._ssd._cap >= 2 and pool.cold._ssd._cap < 2 + pool.cold._ssd.GROWTH_SLOTS
     for b in blocks:
         nb = pool.promote_page(b)
         assert torch.equal(pool.k_pool[:, nb], pages[b][0]), f"K page {b}"
@@ -447,7 +449,9 @@ def test_a_recycled_frame_spills_two_pages_to_ssd_under_distinct_keys(tmp_path):
     assert b1 == b0, "the freed physical frame must be recycled for the collision to bite"
     st = pool.cold.stats()
     assert st["kv_cold_ssd_pages"] == 2, st
-    assert os.path.getsize(ssd) == pool.cold._ssd.HEADER + per * 2
+    assert len(pool.cold._ssd) == 2
+    assert os.path.getsize(ssd) == pool.cold._ssd.HEADER + per * pool.cold._ssd._cap
+    assert pool.cold._ssd._cap >= 2 and pool.cold._ssd._cap < 2 + pool.cold._ssd.GROWTH_SLOTS
 
     for key in ((0, 0), (0, 1)):
         nb = pool.promote_keyed(key)
@@ -580,6 +584,111 @@ def test_batched_demotion_survives_frame_recycling():
         nb = pool.promote_keyed(key)
         assert torch.equal(pool.k_pool[:, nb], saved[key][1]), f"K {key}"
         assert torch.equal(pool.v_pool[:, nb], saved[key][2]), f"V {key}"
+
+
+def test_budget_enforcement_is_constant_work_per_hold(tmp_path):
+    """The O(1) LRU: once the host budget binds, a hold that evicts one page must
+    not snapshot/scan every RAM-resident entry. With the old list(_ram_order.items())
+    inner loop a 16k fill against a 32-page budget scanned ~n*budget dict items;
+    the OrderedDict-front implementation pops each page at most once and never
+    calls items() on the eviction path."""
+    from collections import OrderedDict
+
+    per = 256
+
+    class CountingOrder(OrderedDict):
+        def __init__(self):
+            super().__init__()
+            self.items_calls = 0
+            self.popitem_calls = 0
+
+        def items(self):  # noqa: D401
+            self.items_calls += 1
+            return super().items()
+
+        def popitem(self, last=True):  # noqa: D401
+            self.popitem_calls += 1
+            return super().popitem(last)
+
+    cold = HostKvPages(budget_bytes=per * 32, ssd_path=str(tmp_path / "o1.bin"))
+    cold._ram_order = CountingOrder()
+    n = 16384
+    for i in range(n):
+        blob = {"x": torch.arange(per, dtype=torch.uint8).reshape(2, -1)}
+        assert cold.hold(i, blob, per)
+        assert cold.bytes_held <= per * 32 + per
+    # exactly the evicted pages were popped, once each; the 32 survivors never are
+    assert cold._ram_order.popitem_calls == n - 32, cold._ram_order.popitem_calls
+    assert cold._ram_order.items_calls == 0, "eviction scanned a dict snapshot"
+    st = cold.stats()
+    assert st["kv_cold_pages"] == 32 and st["kv_cold_ssd_pages"] == n - 32, st
+    cold.close()
+
+
+def test_stale_lru_entries_are_popped_not_rescanned(tmp_path):
+    """A private LRU entry whose blob is already gone (promoted/forgotten between
+    enqueue and sweep) and a shared entry with no live record are removed from the
+    LRU on the next sweep. The old code `continue`d past them and left them in the
+    OrderedDict, so every later hold scanned the same dead records forever."""
+    per = 128
+    cold = HostKvPages(budget_bytes=per, ssd_path=str(tmp_path / "stale.bin"))
+    cold.hold("a", {"x": torch.zeros(per, dtype=torch.uint8)}, per)
+    # two dead records ahead of the live one: no blob / no shared record
+    cold._ram_order.clear()
+    cold._ram_order[("p", 999)] = per       # private: not in _blobs/_held
+    cold._ram_order[("s", 888)] = per       # shared: not in _shared
+    cold._ram_order[("p", "a")] = per
+    cold.hold("b", {"x": torch.zeros(per, dtype=torch.uint8)}, per)
+    assert ("p", 999) not in cold._ram_order and ("s", 888) not in cold._ram_order
+    assert cold.bytes_held == per
+    # the budget loop is genuinely settled, not wedged on a dead record
+    cold.hold("c", {"x": torch.zeros(per, dtype=torch.uint8)}, per)
+    assert cold.bytes_held == per and ("p", 999) not in cold._ram_order
+    cold.close()
+
+
+def test_spill_file_grows_one_extent_and_round_trips_bytes(tmp_path):
+    """Growth is one ftruncate+remap per extent (not per high-water slot), and the
+    zero-copy numpy-view write preserves every byte across a remap, including the
+    slots written before the file grew."""
+    from tilerl.kv_tiers import ColdSsdFile
+
+    spec = [("x", (64,), "float32", 256)]
+    f = ColdSsdFile(str(tmp_path / "ext.bin"), spec)
+    remaps = []
+    orig = f._remap
+    def counted(cap):
+        remaps.append(cap)
+        return orig(cap)
+    f._remap = counted
+    n_slots = ColdSsdFile.GROWTH_SLOTS + 5
+    blobs = {i: {"x": torch.arange(64, dtype=torch.float32) * (i + 1) * 0.5}
+             for i in range(n_slots)}
+    for i, blob in blobs.items():
+        f.write(i, blob)
+    # one ftruncate+remap per extent boundary (64, then 128), never per slot
+    assert remaps == [ColdSsdFile.GROWTH_SLOTS, 2 * ColdSsdFile.GROWTH_SLOTS], remaps
+    assert f._cap == 2 * ColdSsdFile.GROWTH_SLOTS
+    assert os.path.getsize(str(tmp_path / "ext.bin")) == f.HEADER + f._cap * 256
+    for i, blob in blobs.items():  # early slots survive the remap, byte-exact
+        assert torch.equal(f.read(i, False)["x"], blob["x"]), i
+    f.close()
+
+
+def test_unspillable_shared_pages_pin_in_ram_without_wedging_the_lru():
+    """No spill file: a refcounted shared page can neither spill nor drop, so under
+    budget pressure the LRU parks it and returns instead of looping on an entry it
+    already popped (the front-pop rewrite must re-insert, not move_to_end a missing
+    key). A later private hold still evicts the private page it can spill-drop."""
+    per = 128
+    cold = HostKvPages(budget_bytes=per)  # no ssd_path
+    blob = {"x": torch.zeros(per, dtype=torch.uint8)}
+    cold.share_hold(7, dict(blob), per)          # the only RAM page, pinned shared
+    # budget already bound; a private page forces the loop past the unspillable
+    # shared entry once and must return, not raise/loop forever
+    cold.hold(1, {"x": torch.zeros(per, dtype=torch.uint8)}, per)
+    assert cold.share_take(7) is not None        # shared page retained
+    assert cold.bytes_held >= per
 
 
 if __name__ == "__main__":
