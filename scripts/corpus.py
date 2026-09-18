@@ -18,10 +18,18 @@ from __future__ import annotations
 import glob
 import os
 
-WIKITEXT_GLOB = (
-    "~/.cache/huggingface/hub/datasets--Salesforce--wikitext/snapshots/*/"
-    "wikitext-103-raw-v1/test-*.parquet"
+WIKITEXT_DIR = (
+    "~/.cache/huggingface/hub/datasets--Salesforce--wikitext/snapshots/*/wikitext-103-raw-v1"
 )
+
+
+def wikitext_parquet_glob(split: str = "test") -> str:
+    """Parquet glob for one wikitext-103 raw split (test/train/validation)."""
+    return f"{WIKITEXT_DIR}/{split}-*.parquet"
+
+
+#: Default split (back-compat for importers of the old module constant).
+WIKITEXT_GLOB = wikitext_parquet_glob("test")
 
 
 def spans(ids: list[int], n: int, ctx: int, skip: int) -> list[list[int]]:
@@ -32,26 +40,34 @@ def spans(ids: list[int], n: int, ctx: int, skip: int) -> list[list[int]]:
     prompt starting there measures what the `range(10, 10+ctx)` prompt measured.
     """
     if len(ids) < skip + n * ctx:
-        raise SystemExit(
-            f"corpus has {len(ids)} tokens, need {skip + n * ctx} for {n} x {ctx}")
+        raise SystemExit(f"corpus has {len(ids)} tokens, need {skip + n * ctx} for {n} x {ctx}")
     return [ids[skip + i * ctx : skip + (i + 1) * ctx] for i in range(n)]
 
 
-def wikitext_ids(tok, n: int, ctx: int, skip: int = 512) -> list[list[int]]:
-    """`n` prompts of `ctx` tokens each from wikitext-103's test split."""
-    ids = wikitext_ids_stream(tok)
+def wikitext_ids(
+    tok, n: int, ctx: int, skip: int = 512, split: str = "test", glob_override: str = ""
+) -> list[list[int]]:
+    """`n` prompts of `ctx` tokens each from one wikitext-103 split."""
+    ids = wikitext_ids_stream(tok, split, glob_override)
     got = spans(ids, n, ctx, skip)
     return got
 
 
-def wikitext_ids_stream(tok) -> list[int]:
-    """The wikitext-103 test split as one token stream (all rows concatenated).
+def wikitext_ids_stream(tok, split: str = "test", glob_override: str = "") -> list[int]:
+    """One wikitext-103 split as one token stream (all rows concatenated).
 
     Lets a caller size/adapt spans against the actual corpus length instead of
-    asking :func:`spans` for more ctx-blocks than the corpus holds (it raises)."""
-    paths = glob.glob(os.path.expanduser(WIKITEXT_GLOB))
+    asking :func:`spans` for more ctx-blocks than the corpus holds (it raises).
+    ``split`` is test (default), train, or validation, mapped to
+    ``wikitext-103-raw-v1/<split>-*.parquet`` under the hardcoded snapshot glob
+    (the box sets no HF cache env, so the path is parameterized, not env-driven);
+    ``glob_override`` is an expanded glob that fully replaces the split mapping.
+    Train is large enough for n>=30 disjoint 32k spans where the ~297k-token
+    test split yields only 9."""
+    pattern = os.path.expanduser(glob_override) if glob_override else wikitext_parquet_glob(split)
+    paths = glob.glob(pattern)
     if not paths:
-        raise SystemExit(f"wikitext-103 test parquet not in the HF cache: {WIKITEXT_GLOB}")
+        raise SystemExit(f"wikitext parquet not found: {pattern}")
     import pyarrow.parquet as pq
 
     text = "\n".join(pq.read_table(sorted(paths)[0]).column("text").to_pylist())
@@ -73,8 +89,9 @@ def tiled_spans(ids: list[int], n: int, ctx: int, skip: int = 512):
     return [ids[skip + i * ctx : skip + (i + 1) * ctx] for i in range(n_eff)], n_eff
 
 
-def long_doc_spans(ids: list[int], contexts: list[int], skip: int = 512,
-                   gap: int = 0) -> dict[int, list[list[int]]]:
+def long_doc_spans(
+    ids: list[int], contexts: list[int], skip: int = 512, gap: int = 0
+) -> dict[int, list[list[int]]]:
     """Cut one token stream into disjoint spans of each length in ``contexts``,
     starting at ``skip``. Returns ``{ctx: [spans]}``; spans of DIFFERENT lengths
     are disjoint (each length takes its own region of the stream), so a held-out
