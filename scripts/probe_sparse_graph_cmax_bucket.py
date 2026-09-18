@@ -60,6 +60,29 @@ the four rows enter decode together and a genuine B=4 sparse graph is captured
 (cmax clamps to floor bucket 64). The v4 B=4 arm used 8311-token rows under
 the serve's 512 cap; those staggered and never formed B=4 (rc12).
 
+Mechanism fork — H2_ID_OFFSET (device, sm70/sm90; needs no src change). The
+measured H2_BAD graph token is the last INPUT id, which at offset 0 also equals
+n+6, so "input/embedding echo" and "baked position/seq buffer" coincide.
+Separate them by holding positions/n fixed and shifting every token id, two
+short graph sweeps at the same bucket (no B=4, one engine per arm as usual):
+
+  H2_ID_OFFSET=0    ... <ckpt> --draft <mtp> --buckets 512 1024 --skip-b4
+  H2_ID_OFFSET=5000 ... <ckpt> --draft <mtp> --buckets 512 1024 --skip-b4
+
+Predicted last-input id is ((n-1+K) % 31000) + 7: bucket 512 (n=8311) gives
+8317 at K=0 -> 13317 at K=5000; bucket 1024 (n=16503) gives 16509 -> 21509.
+Read the GRAPH token per (bucket, K); the eager token is only the control that
+the shifted inputs changed the model (it is a genuine next-token, not n+6, and
+moves with K — already true on CPU tiny, 133 -> 188).
+
+  graph token at K=5000 == 13317 / 21509 (tracks the shifted last-input id)
+      -> the replay echoes the INPUT/embedding: a last_only / copy_ artifact.
+  graph token stays 8317 / 16509 (moves only with n, not the id offset)
+      -> a POSITION/seq static buffer is baked into the captured forward.
+  graph token equals the K=5000 EAGER token
+      -> contamination absent at that offset (content/bucket dependent); sweep
+         more K before concluding — do not assign either branch.
+
 Parent exit codes:
   0 H2_REFUTED   10 H2_BAD   11 H2_ILLEGAL
  12 H2_CAPTURE_FAILED   13 H2_PROBE_ERROR (a harness bug, not an H2 result)
