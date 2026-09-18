@@ -1,6 +1,13 @@
 # Draft decode trailing window W=2048 default — V100 sm70 sparse 27B, 2026-09-17
 
-> Status: Shipped behind `DRAFT_ATTN_WINDOW_TOKENS_DEFAULT=2048`; live post-deploy 32k confirmation (~9 tok/s) pending.
+> Status: The read-window is productionized as an injected constructor/loader
+> parameter (CLI `--draft-attn-window-tokens`, env `TILERL_DRAFT_ATTN_WINDOW_TOKENS`),
+> but the **default is held at 0 = full prefix**, not 2048. 2048 is the
+> device-measured candidate, exposed as `DRAFT_ATTN_WINDOW_TOKENS_RECOMMENDED`;
+> it becomes the default only after the live post-deploy 32k confirmation
+> (~9 tok/s) / the n≥30 read below. Earlier this shipped with
+> `DRAFT_ATTN_WINDOW_TOKENS_DEFAULT=2048`; that default flip was reverted pending
+> the confirmation — the window itself and all the measured gains stand.
 
 ## Context
 
