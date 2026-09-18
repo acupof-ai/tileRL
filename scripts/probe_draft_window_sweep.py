@@ -219,15 +219,28 @@ def run(args) -> list[dict]:
     os.environ.setdefault("TILERL_QWEN38_SOURCE", args.source)
     build.QWEN38_SOURCE = args.source
 
-    be = get_backend()
-    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
-    draft = load_draft(model, args.draft)
+    # Sample-size gate BEFORE building the 27B: the corpus read needs only the
+    # tokenizer, so a half-present split fails fast instead of after a long load.
     tok = get_tokenizer(args.source)
-
-    # Resolve prompts per length BEFORE the timed loop, adapting n to the corpus.
     stream = wikitext_ids_stream(tok, args.split, args.corpus_glob)
     corpus_plan = plan_corpus(stream, args.lengths, args.prompts)
     del stream
+    if args.min_prompts_per_length > 0:
+        short = {
+            length: n_eff
+            for length, (_, n_eff) in corpus_plan.items()
+            if n_eff < args.min_prompts_per_length
+        }
+        if short:
+            got = ", ".join(f"ctx={L}: {n}/{args.min_prompts_per_length}" for L, n in short.items())
+            raise SystemExit(
+                f"corpus split {args.split!r} yields too few disjoint prompts: {got}; "
+                "refusing to publish a W confirmation under --min-prompts-per-length"
+            )
+
+    be = get_backend()
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
+    draft = load_draft(model, args.draft)
 
     max_len = max(args.lengths)
     need_blocks = -(-(max_len + args.out_tokens) // BLOCK_TOKENS) + 8
@@ -390,6 +403,13 @@ def main() -> None:
         help="expanded parquet glob fully overriding --split (corpus.py)",
     )
     ap.add_argument(
+        "--min-prompts-per-length",
+        type=int,
+        default=30,
+        help="hard gate: fail nonzero before the model build if any scanned length "
+        "has fewer than this many disjoint prompts, naming the real n_eff (0 = off).",
+    )
+    ap.add_argument(
         "--dry-run", action="store_true", help="resolve/validate the plan and exit; no model build"
     )
     args = ap.parse_args()
@@ -415,6 +435,12 @@ def main() -> None:
         f"corpus_tokens={args.dry_run_corpus_tokens if args.split == 'test' else '<resolved at run>'}"
     )
     print(f"[dry-run] engine num_blocks~{need_blocks} (sized for {max_len}+{args.out_tokens})")
+    if args.min_prompts_per_length > 0:
+        print(
+            f"[dry-run] hard gate --min-prompts-per-length={args.min_prompts_per_length}: "
+            "a real run fails nonzero if any length has fewer disjoint prompts "
+            "(test split yields only 9 at 32k -> pass --min-prompts-per-length 0 for a test run)"
+        )
     if args.split != "test":
         # Train/validation token count is not hardcoded; n_eff is whatever the
         # on-box parquet yields. Only bound it by --prompts here.
