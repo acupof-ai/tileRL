@@ -2577,7 +2577,15 @@ class Engine:
         return published
 
     def _release(self, req: _Req) -> None:
-        """Give back the blocks and the slot. Here, not at poll, so capacity returns now."""
+        """Give back the blocks and the slot. Here, not at poll, so capacity returns now.
+
+        The sub-segments below split the request-end half of the step timer's
+        coarse "sample" bucket: a long request ending inside one tick is what
+        puts seconds there while ``model`` stays at its steady ~165 ms.
+        """
+        _tm = self._step_timing
+        if _tm is not None:
+            _t = time.perf_counter()
         req.phase = _PHASE_DONE
         if req.state_slot is None:
             return  # never admitted; blocks and slot are taken together in `_admit`
@@ -2597,6 +2605,9 @@ class Engine:
                     self._sparse.transfer_to_shared(req, p, content_key, draft_block)
                 for content_key in self._sparse.prefix.take_freeze_refs():
                     self._kv.cold.share_ref(content_key)
+            if _tm is not None:
+                _tm.mark("release_close_request", _t)
+                _t = time.perf_counter()
             # Sparse: drop this request's host-held cold blobs, keyed (req, logical
             # page) and never present in req.blocks, plus its bounds store.
             cold = self._kv.cold
@@ -2609,6 +2620,9 @@ class Engine:
             for _idx, b in req.cold_pages:
                 if b in self._kv.cold:
                     self._kv.cold.forget(b)
+        if _tm is not None:
+            _tm.mark("release_cold_forget", _t)
+            _t = time.perf_counter()
         if req.draft_blocks:
             # Sparse+spec: dense draft KV lives in the draft pool's own id space.
             dpool = self._draft.kv
@@ -2616,6 +2630,8 @@ class Engine:
                 dpool.free_block(b)
         for b in req.blocks:
             self._kv.free_block(b)
+        if _tm is not None:
+            _tm.mark("release_free_block", _t)
         self._blocks_used -= req.own_blocks
         req.pending_prefix = None  # a prefill that never completed still held a snapshot
         self._states.free_slot(req.state_slot)

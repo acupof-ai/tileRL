@@ -32,6 +32,7 @@ _SEGMENTS = {
     "plan", "stats", "forward", "charge", "graph",
     "sparse_select", "prep", "model", "sparse_finalize", "sample",
     "draft_blocks", "draft_step", "offers_pub",
+    "release_close_request", "release_cold_forget", "release_free_block",
 }
 _INNER = {
     "sparse_select", "prep", "model", "sparse_finalize", "sample",
@@ -101,6 +102,42 @@ def test_timing_on_segments_reconcile(monkeypatch, capsys):
         assert "fwd_host=" in slow[-1] and "why=cpu" in slow[-1]
         assert "fwd_gpu=" not in slow[-1]  # device span omitted off CUDA
         tm.report()  # the atexit callback: must not crash with real data
+    finally:
+        eng.shutdown()
+
+
+def test_release_subsegments_are_inside_sample(monkeypatch):
+    """A request ending must charge its release to a named sub-segment, and the
+    sub-segments must stay inside the tick they were charged in. Guards both
+    halves of the split: the marks exist at all, and a mark left outside the
+    tick's own accounting would show up as a sub-segment sum exceeding its
+    parent tick. Containment is asserted against the TICK total, not against
+    "sample": a prefill that ends also releases, and that path runs after the
+    sample mark (see _finish_prefills)."""
+    monkeypatch.setenv("TILERL_STEP_TIMING", "1")
+    monkeypatch.setenv("TILERL_STEP_TIMING_SLOW_MS", "0")
+    eng = build_serving_engine(seed=1)
+    try:
+        tm = eng._step_timing
+        prompt = np.random.default_rng(0).integers(3, 320, size=16).astype(np.int64)
+        rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=12))
+        ended: list[dict[str, float]] = []
+        for _ in range(64):
+            done = eng.poll()
+            before = dict(tm.cur)
+            eng.step()
+            if tm.cur.get("release_free_block", 0.0) > before.get("release_free_block", 0.0):
+                ended.append(dict(tm.cur))
+            if rid in done and len(done[rid]) >= 12:
+                break
+        else:
+            raise AssertionError("request did not finish")
+        assert ended, "no tick charged a release_free_block: the end-tick split is gone"
+        sub = ("release_close_request", "release_cold_forget", "release_free_block")
+        for cur in ended:
+            assert cur.get("release_free_block", 0.0) > 0.0
+            assert all(cur.get(k, 0.0) >= 0.0 for k in sub)
+            assert sum(cur.get(k, 0.0) for k in sub) <= tm.last_total + 1e-3, cur
     finally:
         eng.shutdown()
 
