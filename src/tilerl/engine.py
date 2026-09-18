@@ -200,7 +200,9 @@ class _StepTiming:
     host stalls included. Every slow tick prints its segments to stderr at once;
     exit prints per-segment averages. perf_counter reads stay unconditional at
     the call sites (tens of ns against a 100+ ms tick); with the env off no
-    instance exists and the marks themselves are skipped.
+    instance exists and the marks themselves are skipped. The figures quoted in
+    these comments are illustrative of one machine and run, not expectations to
+    compare a reading against.
 
     "forward" is an ENVELOPE: on the eager path it equals prep + model + sample +
     draft_offers (+ sparse_select/sparse_finalize on sparse ticks); a graph tick
@@ -280,6 +282,12 @@ class _StepTiming:
     def mark(self, seg: str, t: float) -> None:
         self.cur[seg] = self.cur.get(seg, 0.0) + time.perf_counter() - t
 
+    def charge_ms(self, seg: str, ms: float) -> None:
+        """Add already-measured milliseconds to a segment. For a callee that
+        cannot reach the tick counter (the cold tier's mmap file) and accumulates
+        its own elapsed time instead."""
+        self.cur[seg] = self.cur.get(seg, 0.0) + ms / 1000.0
+
     @staticmethod
     def _mem_snap() -> dict[str, int]:
         """Allocator counters (host-only mutex-guarded struct copy; the CPU box
@@ -329,6 +337,14 @@ class _StepTiming:
         self.last_total = time.perf_counter() - self.t0
         self.n += 1
         dt = self.last_total
+        # The cold tier's mmap files measure themselves (a disk read or write has
+        # no tick counter to mark against) and the engine drains them here, so
+        # disk IO lands in the tick that paid it instead of hiding inside a RAM
+        # bucket. Before the totals below, so a slow tick's print includes it.
+        eng = self._eng()
+        cold = getattr(getattr(eng, "_kv", None), "cold", None) if eng is not None else None
+        if cold is not None:
+            self.charge_ms("ssd_mmap", cold.drain_ssd_ms())
         for k, v in self.cur.items():
             self.tot[k] = self.tot.get(k, 0.0) + v
             self.count[k] = self.count.get(k, 0) + 1
@@ -764,6 +780,11 @@ class Engine:
         self._step_timing = _StepTiming(self) if os.environ.get("TILERL_STEP_TIMING") else None
         if self._step_timing is not None:
             atexit.register(self._step_timing.report)
+            # The cold tier's spill files measure themselves; hand them the timer
+            # here, after build_engine created the tier without one.
+            cold = getattr(self._kv, "cold", None)
+            if cold is not None:
+                cold.step_timing = self._step_timing
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         #: Published by the loop so `stats()` never takes the lock a forward holds.
@@ -853,6 +874,7 @@ class Engine:
                 sample_commit=self._sample_commit,
                 draft_step=self._draft_step,
                 bump_decode_forwards=self._bump_decode_forwards,
+                step_timing=self._step_timing,
             )
 
     # ------------------------------------------------------------------ API
@@ -2577,7 +2599,15 @@ class Engine:
         return published
 
     def _release(self, req: _Req) -> None:
-        """Give back the blocks and the slot. Here, not at poll, so capacity returns now."""
+        """Give back the blocks and the slot. Here, not at poll, so capacity returns now.
+
+        The sub-segments below split the request-end half of the step timer's
+        coarse "sample" bucket: a long request ending inside one tick is what
+        puts seconds there while ``model`` stays at its steady ~165 ms.
+        """
+        _tm = self._step_timing
+        if _tm is not None:
+            _t = time.perf_counter()
         req.phase = _PHASE_DONE
         if req.state_slot is None:
             return  # never admitted; blocks and slot are taken together in `_admit`
@@ -2587,6 +2617,11 @@ class Engine:
             # live: pages a hot pool never dropped get snapshotted from the live
             # frame here, so a same-prompt follower can still adopt the prefix.
             if self._sparse.prefix is not None and req.sparse_matched == 0 and not req.failed:
+                # This segment is a SUPERSET of the five pub_* marks its callees
+                # charge: close_request's own index accounting and the
+                # take_freeze_refs/share_ref loop below carry no mark, so roughly
+                # a third of this bucket is unmarked. A profile that reads a
+                # leftover here as a per-page cost is reading the index work.
                 keys = self._sparse.prefix.close_request(
                     req.req_id, req.tokens, self._sparse.bounds_view(req.req_id))
                 written_page = ((req.draft_pos + 1) // BLOCK_TOKENS
@@ -2597,6 +2632,9 @@ class Engine:
                     self._sparse.transfer_to_shared(req, p, content_key, draft_block)
                 for content_key in self._sparse.prefix.take_freeze_refs():
                     self._kv.cold.share_ref(content_key)
+            if _tm is not None:
+                _tm.mark("release_close_request", _t)
+                _t = time.perf_counter()
             # Sparse: drop this request's host-held cold blobs, keyed (req, logical
             # page) and never present in req.blocks, plus its bounds store.
             cold = self._kv.cold
@@ -2609,6 +2647,9 @@ class Engine:
             for _idx, b in req.cold_pages:
                 if b in self._kv.cold:
                     self._kv.cold.forget(b)
+        if _tm is not None:
+            _tm.mark("release_cold_forget", _t)
+            _t = time.perf_counter()
         if req.draft_blocks:
             # Sparse+spec: dense draft KV lives in the draft pool's own id space.
             dpool = self._draft.kv
@@ -2616,6 +2657,8 @@ class Engine:
                 dpool.free_block(b)
         for b in req.blocks:
             self._kv.free_block(b)
+        if _tm is not None:
+            _tm.mark("release_blocks", _t)
         self._blocks_used -= req.own_blocks
         req.pending_prefix = None  # a prefill that never completed still held a snapshot
         self._states.free_slot(req.state_slot)

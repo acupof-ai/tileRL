@@ -21,10 +21,20 @@ from pathlib import Path
 os.environ.setdefault("TILERL_TARGET", "cpu")
 
 import numpy as np
+import torch
 from test_e2e import build_serving_engine
 
 from tilerl import engine as engine_mod
 from tilerl.engine import SamplingParams
+from tilerl.kv_cache import BLOCK_TOKENS
+
+#: The three release sub-segments every request end must charge.
+_RELEASE_SEGMENTS = ("release_close_request", "release_cold_forget", "release_blocks")
+
+#: The per-page publish costs, split by fix (see transfer_to_shared). Each has
+#: a different remedy, which is why one close_request bucket is not enough.
+_PUBLISH_SEGMENTS = ("pub_bounds_d2h", "pub_draft_clone", "pub_cold_transfer",
+                     "pub_frame_d2h", "pub_share_hold")
 
 #: Every segment name the probe may emit. "forward" is an envelope (see its
 #: docstring); graph ticks carry "graph" instead of the eager inner set.
@@ -32,6 +42,9 @@ _SEGMENTS = {
     "plan", "stats", "forward", "charge", "graph",
     "sparse_select", "prep", "model", "sparse_finalize", "sample",
     "draft_blocks", "draft_step", "offers_pub",
+    "release_close_request", "release_cold_forget", "release_blocks",
+    "pub_bounds_d2h", "pub_draft_clone", "pub_cold_transfer", "pub_frame_d2h",
+    "pub_share_hold", "ssd_mmap",
 }
 _INNER = {
     "sparse_select", "prep", "model", "sparse_finalize", "sample",
@@ -103,6 +116,141 @@ def test_timing_on_segments_reconcile(monkeypatch, capsys):
         tm.report()  # the atexit callback: must not crash with real data
     finally:
         eng.shutdown()
+
+
+def test_release_subsegments_are_inside_sample(monkeypatch):
+    """A request ending must charge its release to a named sub-segment, and the
+    sub-segments must stay inside the tick they were charged in. Guards both
+    halves of the split: the marks exist at all, and a mark left outside the
+    tick's own accounting would show up as a sub-segment sum exceeding its
+    parent tick. Containment is asserted against the TICK total, not against
+    "sample": a prefill that ends also releases, and that path runs after the
+    sample mark (see _finish_prefills)."""
+    monkeypatch.setenv("TILERL_STEP_TIMING", "1")
+    monkeypatch.setenv("TILERL_STEP_TIMING_SLOW_MS", "0")
+    eng = build_serving_engine(seed=1)
+    try:
+        tm = eng._step_timing
+        prompt = np.random.default_rng(0).integers(3, 320, size=16).astype(np.int64)
+        rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=12))
+        ended: list[dict[str, float]] = []
+        for _ in range(64):
+            done = eng.poll()
+            eng.step()
+            # tick_start cleared cur, so this dict IS this tick's segments.
+            if tm.cur.get("release_blocks", 0.0) > 0.0:
+                ended.append(dict(tm.cur))
+            if rid in done and len(done[rid]) >= 12:
+                break
+        else:
+            raise AssertionError("request did not finish")
+        assert ended, "no tick charged a release_blocks: the end-tick split is gone"
+        for cur in ended:
+            assert cur.get("release_blocks", 0.0) > 0.0
+            assert all(cur.get(k, 0.0) >= 0.0 for k in _RELEASE_SEGMENTS)
+            assert sum(cur.get(k, 0.0) for k in _RELEASE_SEGMENTS) <= tm.last_total + 1e-3, cur
+    finally:
+        eng.shutdown()
+
+
+def test_release_subsegments_charge_on_a_sparse_request_end(monkeypatch):
+    """Every release and publish sub-segment must charge on a real sparse end.
+
+    The dense test above only ever exercises `release_blocks`: with no sparse
+    row the `close_request`/`cold_forget` marks are never reached, so deleting
+    either one left the gate green. Two shapes are needed beyond that:
+
+    * a DRAFT row: without one `pub_draft_clone` charges only timer noise on the
+      skipped `if draft_block is not None` branch, so the assertion passes
+      vacuously. The branch is what must charge;
+    * at least 12 prompt pages, or the private blob is still under the host
+      budget and the cold-transfer branch's spill arm never runs.
+    """
+    from test_sparse_engine import _sparse_engine
+
+    monkeypatch.setenv("TILERL_STEP_TIMING", "1")
+    monkeypatch.setenv("TILERL_STEP_TIMING_SLOW_MS", "0")
+    eng = _sparse_engine(2, draft=True)
+    try:
+        tm = eng._step_timing
+        prompt = (np.arange(16 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+        rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+        peak: dict[str, float] = {}
+        for _ in range(512):
+            done = eng.poll()
+            eng.step()
+            # Per-tick segments (tick_start cleared cur): a mark charges the
+            # release work of exactly the requests that ended in this tick.
+            for k, v in tm.cur.items():
+                peak[k] = peak.get(k, 0.0) + v
+            if rid in done and len(done[rid]) >= 2:
+                break
+        else:
+            raise AssertionError("sparse request did not finish")
+        missing = [k for k in _RELEASE_SEGMENTS if peak.get(k, 0.0) <= 0.0]
+        assert not missing, f"never charged on a sparse request end: {missing}"
+        assert eng._sparse.prefix.published == 1, eng._sparse.prefix.published
+        # Asserted >0, never against a magnitude: these are wall-clock samples on
+        # a shared CPU box and vary run to run. Illustrative only, one 2026-09-18
+        # run at k=2 / 16 pages / draft=True: bounds 39.5us, draft_clone 64.1,
+        # frame_d2h 121.5, share_hold 14.6, cold_transfer 20.1.
+        missing = [k for k in _PUBLISH_SEGMENTS if peak.get(k, 0.0) <= 0.0]
+        assert not missing, f"publish sub-segment never charged: {missing}"
+        assert set(peak) <= set(_SEGMENTS)
+    finally:
+        eng.shutdown()
+
+
+def test_ssd_mmap_charges_only_when_the_spill_is_touched(monkeypatch, tmp_path):
+    """`ssd_mmap` is the disk half of the publish path and must reflect real mmap
+    traffic, not the presence of a spill file.
+
+    `pub_cold_transfer` covers the host RAM dict/LRU work; the spill file
+    measures itself and the engine drains it. A budget that never spills must
+    leave `ssd_mmap` at zero (otherwise the mark is a constant, and on device it
+    would report disk IO that never happened), and a budget under one page must
+    charge it."""
+    from test_sparse_engine import _draft, tiny
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl.build import build_engine
+    from tilerl.kv_cache import BLOCK_TOKENS as _BT
+    from tilerl.memory import per_cold_kv_block_bytes
+    from tilerl.model import build_random
+
+    monkeypatch.setenv("TILERL_STEP_TIMING", "1")
+    monkeypatch.setenv("TILERL_STEP_TIMING_SLOW_MS", "0")
+    cfg = tiny()
+    page = per_cold_kv_block_bytes(cfg, torch.float32, kv_fp8=None, cold_dtype=None)
+
+    def run(budget: int) -> float:
+        eng = build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=budget, cold_ssd_path=str(tmp_path / "spill.bin"),
+            draft=_draft(cfg, build_random(cfg, seed=11)), spec_depth=1)
+        try:
+            tm = eng._step_timing
+            prompt = (np.arange(16 * _BT, dtype=np.int64) % 300) + 7
+            rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+            total = 0.0
+            for _ in range(512):
+                done = eng.poll()
+                eng.step()
+                total += tm.cur.get("ssd_mmap", 0.0)
+                if rid in done and len(done[rid]) >= 2:
+                    break
+            else:
+                raise AssertionError("request did not finish")
+            return total
+        finally:
+            eng.shutdown()
+
+    # Budget well above the pages this run demotes: nothing spills, so the mark
+    # must stay silent rather than report the spill file's existence.
+    assert run(budget=page * 64) == 0.0, "ssd_mmap charged with no spill"
+    assert run(budget=page) > 0.0, "ssd_mmap never charged when the spill was used"
 
 
 def test_added_perf_counter_reads_are_guarded():

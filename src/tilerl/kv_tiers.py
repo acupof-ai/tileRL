@@ -70,7 +70,8 @@ class ColdSsdFile:
 
     HEADER = 4096
 
-    def __init__(self, path: str, spec: list[tuple[str, tuple, str, int]]) -> None:
+    def __init__(self, path: str, spec: list[tuple[str, tuple, str, int]],
+                 step_timing=None) -> None:
         import json
         import mmap
 
@@ -78,6 +79,12 @@ class ColdSsdFile:
 
         self._np = np
         self._mmap = mmap
+        #: Optional env-gated step timer. Every path that touches the mmap adds
+        #: its wall time to `ssd_ms`, which the owning HostKvPages drains into
+        #: the step timer. Bracket here rather than at each call site so a new
+        #: reader cannot silently go uncounted.
+        self.step_timing = step_timing
+        self.ssd_ms = 0.0
         self._path = path
         self._spec = spec
         self.stride = sum(n for *_k, n in spec)
@@ -123,7 +130,19 @@ class ColdSsdFile:
             self._remap()
         return slot
 
+    def _charge(self, t: float) -> None:
+        self.ssd_ms += (time.perf_counter() - t) * 1000.0
+
     def write(self, key, blob: dict) -> None:
+        if self.step_timing is None:
+            return self._write(key, blob)
+        t = time.perf_counter()
+        try:
+            return self._write(key, blob)
+        finally:
+            self._charge(t)
+
+    def _write(self, key, blob: dict) -> None:
         slot = self._alloc_slot()
         off = self.HEADER + slot * self.stride
         for k, _shape, _dt, n in self._spec:
@@ -137,6 +156,15 @@ class ColdSsdFile:
         # is an in-process capacity tier, not a durability log (KvBootStore is).
 
     def read(self, key, pin: bool) -> dict:
+        if self.step_timing is None:
+            return self._read(key, pin)
+        t = time.perf_counter()
+        try:
+            return self._read(key, pin)
+        finally:
+            self._charge(t)
+
+    def _read(self, key, pin: bool) -> dict:
         slot = self._slot_of[key]
         off = self.HEADER + slot * self.stride
         blob = {}
@@ -155,6 +183,15 @@ class ColdSsdFile:
         return blob
 
     def read_field(self, key, field: str, pin: bool = False):
+        if self.step_timing is None:
+            return self._read_field(key, field, pin)
+        t = time.perf_counter()
+        try:
+            return self._read_field(key, field, pin)
+        finally:
+            self._charge(t)
+
+    def _read_field(self, key, field: str, pin: bool = False):
         """Read ONE tensor of a slot by its spec name (partial read: adopting a
         prefix needs the small bounds plane without pulling the slot's K/V)."""
         slot = self._slot_of[key]
@@ -208,7 +245,7 @@ class HostKvPages:
     """
 
     def __init__(self, budget_bytes: int = 4 << 30, ssd_path: str = "",
-                 ssd_capacity_bytes: int = 0) -> None:
+                 ssd_capacity_bytes: int = 0, step_timing=None) -> None:
         # Fail fast: both the private spill and its shared-prefix sibling must be
         # writable now, because the failure used to surface only after the host
         # budget bound mid-decode (V100 /data00 root-owned, 2026-09-14).
@@ -227,6 +264,9 @@ class HostKvPages:
         #: key (int phys for #500, (req, page) tuple for sparse); "" = SSD off.
         self._ssd_path = ssd_path
         self._ssd = None
+        #: Env-gated step timer, handed to each ColdSsdFile so mmap time lands
+        #: in its own segment rather than inside a RAM/LRU bucket.
+        self.step_timing = step_timing
         self._ssd_bytes = 0
         self._ssd_page_bytes: dict = {}
         #: Countable SSD spill capacity for admission. 0 with a path means "auto":
@@ -348,7 +388,8 @@ class HostKvPages:
         SpillWriteError the engine turns into a request failure (not a wedge)."""
         try:
             if self._ssd is None:
-                self._ssd = ColdSsdFile(self._ssd_path, _blob_spec(blob))
+                self._ssd = ColdSsdFile(self._ssd_path, _blob_spec(blob),
+                                        step_timing=self.step_timing)
             self._ssd.write(key, blob)
         except OSError as e:
             raise SpillWriteError(
@@ -511,7 +552,8 @@ class HostKvPages:
             return False
         try:
             if self._shared_ssd is None:
-                self._shared_ssd = ColdSsdFile(_shared_ssd_path(self._ssd_path), _blob_spec(blob))
+                self._shared_ssd = ColdSsdFile(_shared_ssd_path(self._ssd_path), _blob_spec(blob),
+                                               step_timing=self.step_timing)
             self._shared_ssd.write(("s", key), blob)
         except OSError as e:
             self.shared_spill_disabled = True
@@ -583,6 +625,17 @@ class HostKvPages:
 
     def share_keys(self) -> frozenset[int]:
         return frozenset(self._shared)
+
+    def drain_ssd_ms(self) -> float:
+        """Milliseconds spent touching the mmap'd spill files since the last
+        drain, across the private and shared files. The engine drains this into
+        the step timer at the end of the tick that paid it."""
+        ms = 0.0
+        for f in (self._ssd, self._shared_ssd):
+            if f is not None:
+                ms += f.ssd_ms
+                f.ssd_ms = 0.0
+        return ms
 
     def shared_bytes(self) -> int:
         """Pinned RAM held for shared prefix blobs (test/ledger diagnostic)."""
