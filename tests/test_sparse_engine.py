@@ -77,10 +77,19 @@ def test_sparse_pins_selected_pages_across_ticks_and_demotes_what_leaves():
                    chosen only — a kept page is never re-fetched),
       demotions  == number of pages resident last tick that this tick dropped.
 
-    This is the gate the demote-every-tick first cut failed: it re-promoted the
-    whole k every decode token (the 6.6x V100 slowdown). Uses a 12-page context so
-    pages genuinely fall outside k+window and cycle, while the per-tick counts must
-    still match the residency delta exactly."""
+    The promotion half of that invariant is NOT asserted here — this test observes
+    a run where nothing is ever promoted, so `promoted <= len(cold_before)` holds
+    trivially (0 <= n). Measured: a mutant that demotes the whole resident set every
+    tick and re-promotes it — the 6.6x V100 regression this docstring names — passes
+    this test and fails only
+    `test_sparse_a_stable_selection_promotes_nothing_after_the_first_tick`, whose
+    `promotions == 0` cycle assertion is where the pin is actually gated.
+
+    What this test uniquely holds is the DEVICE bounds mask: mutating
+    `SparseTracker.set_bounds` to stop setting `bounds_valid` fails here and nowhere
+    else in the suite. Uses a 12-page context so pages genuinely fall outside
+    k+window and cycle, while the per-tick counts must still match the residency
+    delta exactly."""
     prompt = np.arange(7, 7 + 12 * BLOCK_TOKENS, dtype=np.int64)  # 12 pages
     sparse = _engine(True, 2)
     rid = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))

@@ -579,6 +579,18 @@ def test_submit_rollback_and_terminal_failure():
 
 
 def test_decode_growth_evicts_finished_prefix():
+    """A finished request's PINNED prefix must yield to another request's growth,
+    and the store must not keep charging for the evicted entry's snapshot.
+
+    Boundary snapshots are 74.81 MiB each at 27B, so the second half is the
+    expensive one and nothing else in the suite gates it: dropping the
+    `_state_used` rollback in `PrefixStore._drop` leaves `evictions`, `entries`
+    and every token correct, and only `test_kv.py`'s small unit gates fire —
+    measured across the whole CPU suite. `state_bytes` still sits at 1600 at the
+    end because a publish re-inserts before the pool pressure arrives, so the
+    eviction is observed as a peak that the run comes down from: 1600 -> 3200 ->
+    1600 unmutated, 1600 -> 6400 -> 6400 under the leak.
+    """
     cfg = tiny()
     engine = build_engine(
         cfg,
@@ -594,29 +606,24 @@ def test_decode_growth_evicts_finished_prefix():
     rid_a = engine.submit([1, 2, 3], SamplingParams(max_new_tokens=20, seed=1))
     assert len(_drain(engine, [rid_a], 20)[rid_a]) == 20
     assert engine._kv.free_blocks == 1  # A's published block stays pinned
-    # B's prompt fits the last free block; its decode growth must evict A.
+    # B's prompt fits the last free block; its decode growth must evict A. The peak has
+    # to be sampled per tick: `_drain` returns only the tokens, and a publish inside it
+    # re-inserts a snapshot before the pressure that evicts it arrives.
     rid_b = engine.submit([4, 5, 6], SamplingParams(max_new_tokens=20, seed=2))
-    assert len(_drain(engine, [rid_b], 20)[rid_b]) == 20
-    assert engine._prefix.stats()["evictions"] >= 1
-
-
-def test_prefix_snapshots_die_with_their_store_entry():
-    """Boundary snapshots are 74.81 MiB each at 27B: eviction must free them."""
-    cfg = tiny()
-    engine = build_engine(
-        cfg,
-        build_random(cfg, seed=9),
-        get_backend(),
-        num_blocks=2,
-        num_slots=4,
-        max_batch=4,
-        max_total_tokens=512,
-        sparse_k=0,
+    peak_state, done = 0, {}
+    for _ in range(512):
+        peak_state = max(peak_state, engine._prefix.stats()["state_bytes"])
+        done.update(engine.poll())
+        if len(done.get(rid_b, "")) >= 20:
+            break
+        engine.step()
+    assert len(done.get(rid_b, "")) == 20
+    stats = engine._prefix.stats()
+    assert stats["evictions"] >= 1
+    assert stats["state_bytes"] < peak_state, (
+        f"state_bytes ended at {stats['state_bytes']} against a {peak_state} peak: the "
+        "evicted entry's snapshot bytes were never returned"
     )
-    for i in range(4):
-        rid = engine.submit([i + 1, i + 2, i + 3], SamplingParams(max_new_tokens=20, seed=i))
-        assert len(_drain(engine, [rid], 20)[rid]) == 20
-    assert engine._prefix.stats()["evictions"] >= 1
 
 
 def test_a_ragged_prompt_publishes_and_its_state_matches_no_store():
