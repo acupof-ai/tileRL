@@ -2344,7 +2344,8 @@ def test_sparse_decode_never_enters_the_dense_graph_when_graphs_are_on():
     sparse graph was never built. A sparse row must route through the sparse
     graph and never touch the dense graph; a dense row still uses it."""
     prompt = np.arange(7, 7 + 12 * BLOCK_TOKENS, dtype=np.int64)
-    params = lambda: SamplingParams(temperature=0.0, max_new_tokens=12, seed=0)
+    def params():
+        return SamplingParams(temperature=0.0, max_new_tokens=12, seed=0)
 
     # sparse engine forced into the CUDA state: BOTH graph flags on
     e = build_engine(
@@ -2589,7 +2590,8 @@ def test_hybrid_short_runs_dense_long_runs_sparse_token_exact_to_pure_modes():
     rng = np.random.default_rng(3)
     short = rng.integers(3, 300, 64).astype(np.int64)
     long = rng.integers(3, 300, 20 * BLOCK_TOKENS).astype(np.int64)
-    p = lambda: SamplingParams(temperature=0.0, max_new_tokens=6, seed=0)
+    def p():
+        return SamplingParams(temperature=0.0, max_new_tokens=6, seed=0)
 
     e = _hybrid_engine()
     rs = e.submit(short, p())
@@ -2625,7 +2627,8 @@ def test_hybrid_tick_is_never_mixed_and_short_ticks_use_the_dense_graph():
     rng = np.random.default_rng(3)
     short = rng.integers(3, 300, 64).astype(np.int64)
     long = rng.integers(3, 300, 20 * BLOCK_TOKENS).astype(np.int64)
-    p = lambda: SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+    def p():
+        return SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
 
     e = _hybrid_engine()
     # Hybrid never captures the sparse graph: sparse ticks run eager (token-exact),

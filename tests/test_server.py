@@ -2212,9 +2212,12 @@ def test_a_real_http_disconnect_event_cancels_without_task_cancellation():
             return 512
 
         limits = None
-        stats = lambda self: {}
-        stop_text = lambda self, rid: None
-        logprobs = lambda self, rid: []
+        def stats(self):
+            return {}
+        def stop_text(self, rid):
+            return None
+        def logprobs(self, rid):
+            return []
 
         def __getattr__(self, name):  # rendering runs only after completion
             raise AssertionError(f"unexpected engine call: {name}")

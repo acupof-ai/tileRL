@@ -92,7 +92,8 @@ def main():
         tok = get_tokenizer(None)
     prompts = [tok.encode("What is 17 times 23?")]
 
-    HIST.clear(); ELEMS.clear()
+    HIST.clear()
+    ELEMS.clear()
     for row in grpo_loop(engine, model, prompts, lambda p, c: float(len(c) > 0), 1,
                          backend, AdamW(lr=1e-4), group=args.group,
                          sampling=SamplingParams(max_new_tokens=args.gen),

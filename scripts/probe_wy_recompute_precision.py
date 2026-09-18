@@ -55,7 +55,8 @@ def _bf16_fwd(real, keys=_BF16_KEYS):
 def _inputs(seed: int):
     torch.manual_seed(seed)
     b, t, nkh, nvh, kd, vd, kern = 1, 128, 2, 4, 16, 16, 4
-    rnd = lambda *s: torch.randn(*s, dtype=torch.float32)
+    def rnd(*s):
+        return torch.randn(*s, dtype=torch.float32)
     q, k = rnd(b, t, nkh * kd), rnd(b, t, nkh * kd)
     v, z = rnd(b, t, nvh * vd), rnd(b, t, nvh * vd)
     g, beta = rnd(b, t, nvh), rnd(b, t, nvh)

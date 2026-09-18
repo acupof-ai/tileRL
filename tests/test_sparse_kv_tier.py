@@ -292,7 +292,8 @@ def test_engine_decode_tokens_equal_across_a_full_demote_promote_round_trip():
     assert st["kv_cold_pages"] == 0 and st["kv_cold_promotions"] == 6
     mem = [r for r in st["memory"] if r["owner"] == "kv_cold"]
     assert not mem, "a fully promoted tier leaves no host row"
-    dense.shutdown(); cold.shutdown()
+    dense.shutdown()
+    cold.shutdown()
 
 
 def test_narrow_f16_path_prices_half_and_decodes_like_dense():
@@ -349,7 +350,8 @@ def test_narrow_f16_path_prices_half_and_decodes_like_dense():
     cold.sparse_retier(frozenset(cold_pages))
     tok_c = _drain(cold, rid, 6)
     assert tok_c == tok_d, f"f16-narrow decode {tok_c} != dense {tok_d}"
-    dense.shutdown(); cold.shutdown()
+    dense.shutdown()
+    cold.shutdown()
 
 
 def test_pages_past_the_host_budget_spill_to_ssd_and_promote_byte_equal(tmp_path):

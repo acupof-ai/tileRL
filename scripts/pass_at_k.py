@@ -66,7 +66,7 @@ def main() -> int:
     from tilerl.tokenizer import get_tokenizer
 
     with open(args.data) as f:
-        rows = [json.loads(l) for l in f if l.strip()]
+        rows = [json.loads(line) for line in f if line.strip()]
     rows = rows[args.offset:args.offset + args.n]
     print(f"pass_at_k: {len(rows)} problems x k={args.k} at cap {args.max_new_tokens}, "
           f"temperature {args.temperature}", flush=True)

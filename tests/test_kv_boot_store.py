@@ -170,7 +170,8 @@ def test_a_corrupted_page_file_fails_loudly(tmp_path):
     except RuntimeError as exc:
         assert "checksum" in str(exc) or "corrupt" in str(exc)
     finally:
-        e.shutdown(); fresh.shutdown()
+        e.shutdown()
+        fresh.shutdown()
 
 
 def test_dense_bulk_boot_is_refused_with_sparse_k(tmp_path):
@@ -223,7 +224,9 @@ def test_engine_admit_treats_a_corrupt_boot_entry_as_a_miss(tmp_path):
     prompt = np.arange(3, 3 + 3 * BLOCK_TOKENS, dtype=np.int64)
     cfg, writer, entry = _save_boot_for_prompt(tmp_path, prompt)
     kf = entry / "k.bin"
-    b = bytearray(kf.read_bytes()); b[0] ^= 0xFF; kf.write_bytes(b)
+    b = bytearray(kf.read_bytes())
+    b[0] ^= 0xFF
+    kf.write_bytes(b)
     writer.shutdown()
 
     booter = _engine(cfg, tmp_path, store=True)

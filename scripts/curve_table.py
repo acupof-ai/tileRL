@@ -25,7 +25,7 @@ from pathlib import Path
 
 
 def load_curve(run_dir: Path, step: int) -> list[dict]:
-    rows = [json.loads(l) for l in (run_dir / f"eval-curve-{step}.jsonl").open()]
+    rows = [json.loads(line) for line in (run_dir / f"eval-curve-{step}.jsonl").open()]
     return rows
 
 
@@ -117,7 +117,7 @@ def single_table(run_dir: Path, steps: list[int]) -> None:
 
 def cross(run0: Path, run1: Path, from_step: int, to_step: int, eval_file: Path,
           perm0: list[int] | None, perm1: list[int] | None, negctl: str | None = None) -> None:
-    gold = [json.loads(l)["answer"] for l in eval_file.open()]
+    gold = [json.loads(line)["answer"] for line in eval_file.open()]
     print(f"gold distinct: {len(set(gold))} of {len(gold)} (collision rows are blind to the check below)")
     steps = [from_step, to_step]
     assert_aligned(run0, steps)
@@ -149,7 +149,7 @@ def baseline(run0: Path, run1: Path, step: int, eval_file: Path,
     """The null hypothesis for a dip overlap: how much two HEALTHY policies'
     wrong sets overlap anyway (hard problems are hard for both). At a step
     before either curve dipped, the overlap is pure problem difficulty."""
-    gold = [json.loads(l)["answer"] for l in eval_file.open()]
+    gold = [json.loads(line)["answer"] for line in eval_file.open()]
     print(f"gold distinct: {len(set(gold))} of {len(gold)} (collision rows are blind to the check below)")
     r0 = load_curve(run0, step)
     r1 = load_curve(run1, step)

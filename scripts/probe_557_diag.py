@@ -76,10 +76,10 @@ def run(ctx, b, sparse: bool, captured="default"):
     o_sample = Engine._sample_batch
 
     def hook(self, rows):
-        for r, l, g in rows:
+        for r, logits, g in rows:
             if len(r.output) < STEPS:
                 lg.setdefault(r.req_id, {})[len(r.output)] = (
-                    int(l.argmax()), l.detach().float().clone().cpu())
+                    int(logits.argmax()), logits.detach().float().clone().cpu())
         return o_sample(self, rows)
     Engine._sample_batch = hook
 

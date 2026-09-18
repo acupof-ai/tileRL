@@ -607,7 +607,8 @@ def main() -> int:
                           "segment": "layer" if t_batch > _MLP_SEGMENT_MAX_T else "mlp"},
                          sort_keys=True), flush=True)
 
-        secs.clear(); calls.clear()  # keep only the LAST step: step 0 pays every JIT
+        secs.clear()
+        calls.clear()  # keep only the LAST step: step 0 pays every JIT
         timings: dict[str, float] = {}
         warm = step == a.steps - 1
         t0 = time.perf_counter()

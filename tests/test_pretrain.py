@@ -93,7 +93,7 @@ def test_pretrain_step_checkpoint_roundtrip(tmp_path):
     losses = pretrain(model, dataset, backend, optimizer, steps=5, seed=0)
 
     assert len(losses) == 5
-    assert all(math.isfinite(l) for l in losses)
+    assert all(math.isfinite(loss) for loss in losses)
     assert any(not torch.equal(model.params[k].cpu(), before[k]) for k in before)
 
     # periodic + final checkpoints land on disk

@@ -166,7 +166,8 @@ def main() -> None:
     print("WARM_SPEC_GATE_RESULT " + json.dumps(result))
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)
-    warm.shutdown(); cold.shutdown()
+    warm.shutdown()
+    cold.shutdown()
     if not result["all_token_equal"]:
         raise SystemExit(1)
 

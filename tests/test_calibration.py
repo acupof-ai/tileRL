@@ -581,8 +581,8 @@ def test_kernels_sparse_table_renders_derived_hbm_and_pcie_bounds(tmp_path, monk
     assert "HBM bound" in out and "PCIe bound" in out
     # The scorer moves bytes over HBM only (one HBM bound, its PCIe bound pending);
     # the fetch moves bytes over PCIe only and its bound is derived (not pending).
-    score_l = next(l for l in out.splitlines() if "sparse_indexer_score" in l)
-    fetch_l = next(l for l in out.splitlines() if "sparse_cold_fetch" in l)
+    score_l = next(line for line in out.splitlines() if "sparse_indexer_score" in line)
+    fetch_l = next(line for line in out.splitlines() if "sparse_cold_fetch" in line)
     assert score_l.count("ms") == 1 and "pending" in score_l
     assert fetch_l.count("ms") == 2 and "pending" not in fetch_l
     assert "24,576" in fetch_l  # tiny: 12 hot pages x 2048 B bf16 block

@@ -204,7 +204,8 @@ def main() -> None:
         print("  the 53-flip population had median 1.071 / max 4.462 -- this single "
               "question's value is what the curve has to explain")
     if a.out:
-        o = Path(a.out); o.mkdir(parents=True, exist_ok=True)
+        o = Path(a.out)
+        o.mkdir(parents=True, exist_ok=True)
         (o / "amplification.json").write_text(json.dumps(
             {"q": qi, "subject": subjects[qi], "gold": golds[qi],
              "arm": arm, "floor": floor}, indent=1))

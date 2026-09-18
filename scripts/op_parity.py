@@ -71,19 +71,21 @@ def main() -> int:
     key = "layers.0.in_proj_qkv"  # GDN in_proj_qkv is fp8 e4m3
     if P.get(key + ".w8") is not None:
         w8, ws = dev(P[key + ".w8"]), dev(P[key + ".wscale"])
-        osc = P.get(key + ".oscale"); osc = dev(osc) if osc is not None else None
+        osc = P.get(key + ".oscale")
+        osc = dev(osc) if osc is not None else None
         xk = torch.randn(1, 8, w8.shape[1], generator=g).to(backend.device)
         kk = backend.linear_fp8(xk, w8, ws, oscale=osc)
         rr = reference.linear_fp8(xk, w8, ws, oscale=osc) if hasattr(reference, "linear_fp8") else None
         print(f"{'linear_fp8':<28} {relerr(kk, rr):>12.4e}" if rr is not None else f"{'linear_fp8':<28} {'no ref':>12}")
 
-    I = cfg.intermediate_size
-    a = torch.randn(1, 8, I, generator=g).to(backend.device)
-    b = torch.randn(1, 8, I, generator=g).to(backend.device)
+    inter = cfg.intermediate_size
+    a = torch.randn(1, 8, inter, generator=g).to(backend.device)
+    b = torch.randn(1, 8, inter, generator=g).to(backend.device)
     print(f"{'silu_mul':<28} {relerr(backend.silu_mul(a, b), reference.silu_mul(a, b)):>12.4e}")
 
     ids = torch.arange(8, device=backend.device)
-    emb = dev(P["embed_tokens"]); ke = backend.embedding(ids, emb)
+    emb = dev(P["embed_tokens"])
+    ke = backend.embedding(ids, emb)
     re_ = reference.embedding(ids, emb)
     print(f"{'embedding':<28} {relerr(ke, re_):>12.4e}")
 

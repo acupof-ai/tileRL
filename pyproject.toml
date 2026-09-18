@@ -82,17 +82,19 @@ extend-exclude = [".claude"]  # agent worktrees are separate checkouts with thei
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "SIM"]
-# Day-1 baseline (2026-08-24): these categories are violated by in-flight code
-# in src/ and tests/, which another workflow owns. Re-enable them one by one as
-# the tree is cleaned — do not let the list grow.
+# Day-1 baseline (2026-08-24): only line-too-long is still ignored everywhere.
+# E702/E731/E741 were cleared in tests/ and scripts/ (SIM108 landed whole-tree in
+# #706), so those three moved to per-file-ignores and are now enforced outside
+# src/ — a regression in tests/ or scripts/ fails the gate.
 ignore = [
     "E501",   # line-too-long
-    "E702",   # multiple-statements-on-one-line-semicolon
-    "E731",   # lambda-assignment
-    "E741",   # ambiguous-variable-name
 ]
 
 [tool.ruff.lint.per-file-ignores]
 # F821 (undefined-name) stays enabled everywhere else. One suppression left:
 # selfcheck helpers in autograd.py. reference.py's was retired by importing Any.
 "src/tilerl/autograd.py" = ["F821"]
+# src/ trees still have these sites (src/tilerl E702 x3, E731 x1, E741 x11; the
+# kernels package too); tests/ and scripts/ are clean, so the ignore is scoped to
+# any src/ tree and the rest is enforced.
+"**/src/**" = ["E702", "E731", "E741"]

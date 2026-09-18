@@ -78,7 +78,7 @@ def arm(engine, tok, prompts, conc, allowed):
     def w_sample(rows):
         # every MMLU answer is the single token off the prefill forward
         if rows:
-            lg = torch.stack([l for _, l, _ in rows]).float()
+            lg = torch.stack([logits for _, logits, _ in rows]).float()
             sel = lg[:, list(allowed)]
             for k, (r, _, _) in enumerate(rows):
                 margins.setdefault(order[r.req_id], sel[k].tolist())
@@ -194,7 +194,8 @@ def main() -> None:
     ref = arms[keys[0]]["margins"]
     allgaps = [top2_gap(v) for v in ref.values()]
 
-    o = Path(a.out); o.mkdir(parents=True, exist_ok=True)
+    o = Path(a.out)
+    o.mkdir(parents=True, exist_ok=True)
     (o / "concurrency.json").write_text(json.dumps({
         "n": a.n, "seed": a.seed, "concurrencies": concs, "ladder_delta": a.ladder_delta,
         "fuse": [int(f) for f in fuses],

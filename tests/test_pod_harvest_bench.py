@@ -33,7 +33,7 @@ def test_harvest_appends_new_and_refuses_conflict(tmp_path, capsys):
 
     lines = local.read_text().splitlines()
     assert len(lines) == 3
-    ids = [json.loads(l)["id"] for l in lines]
+    ids = [json.loads(line)["id"] for line in lines]
     assert ids == ["aaa", "bbb", "ccc"]
     assert json.loads(lines[1])["value"] == 90.0  # local bbb unchanged
 

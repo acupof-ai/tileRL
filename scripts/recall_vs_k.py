@@ -39,7 +39,7 @@ def main():
     result = {}
     for ctx in ctxs:
         with open(corpus / f"held_{ctx}.jsonl") as fh:
-            rows = [json.loads(l) for l in fh][:NSPAN[ctx]]
+            rows = [json.loads(line) for line in fh][:NSPAN[ctx]]
         agg = {k: {"random": [], "bounds": [], "oracle": []} for k in KS}
         sink = win = total = None
         for j, row in enumerate(rows):
@@ -54,10 +54,10 @@ def main():
             rng = torch.Generator().manual_seed(SEED * 7919 + j)
             with torch.no_grad():
                 bsel = quest_bounds_scores(_qe, bounds)
-            for l in range(L):
-                m = raw[0, l]                                 # [nq,p], sums~1
+            for layer in range(L):
+                m = raw[0, layer]                                 # [nq,p], sums~1
                 # window/sink sanity on the first source layer of the first span
-                if j == 0 and l == 0:
+                if j == 0 and layer == 0:
                     sink = float(m[:, 0].mean())
                     win = float(m[:, P - W:].sum(-1).mean())
                     total = float(m.sum(-1).mean())
@@ -66,8 +66,8 @@ def main():
                     rnd = torch.tensor(indexable)[
                         torch.randperm(len(indexable), generator=rng)[:ke]].tolist()
                     orc = [indexable[int(i)] for i in
-                           target[0, l].sum(0)[torch.tensor(indexable)].topk(ke).indices]
-                    bnd = [int(i) for i in bsel[0, l, :P - W].topk(ke).indices]
+                           target[0, layer].sum(0)[torch.tensor(indexable)].topk(ke).indices]
+                    bnd = [int(i) for i in bsel[0, layer, :P - W].topk(ke).indices]
                     agg[k]["random"].append(cap(m, rnd, winpages))
                     agg[k]["bounds"].append(cap(m, bnd, winpages))
                     agg[k]["oracle"].append(cap(m, orc, winpages))

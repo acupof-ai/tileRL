@@ -390,7 +390,7 @@ def main27b(args):
         # continuation-quality SLO: teacher-force sparse greedy tokens through dense.
         fname = args.nll_spans or f"held_{args.ctx}_nspan.jsonl"
         with open(Path(args.corpus) / fname) as fh:
-            rows = [json.loads(l) for l in fh.read().splitlines() if l.strip()]
+            rows = [json.loads(line) for line in fh.read().splitlines() if line.strip()]
         spans = [np.asarray(r["ids"], dtype=np.int64)[: args.ctx] for r in rows]
         nll_sweep(
             model,
