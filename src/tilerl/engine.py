@@ -231,7 +231,8 @@ class _StepTiming:
 
     __slots__ = ("slow_s", "tot", "count", "cur", "t0", "n", "last_total", "note",
                  "_eng", "cuda", "ev_s", "ev_e", "mem0", "fwd_t0", "fwd_host_ms",
-                 "fwd_gpu_ms", "fwd_path", "fwd_sparse", "last_why", "alloc_conf")
+                 "fwd_gpu_ms", "fwd_path", "fwd_sparse", "last_why", "alloc_conf",
+                 "phase_dec", "phase_pre")
 
     def __init__(self, engine=None) -> None:
         self.slow_s = float(os.environ.get("TILERL_STEP_TIMING_SLOW_MS", "500")) / 1000.0
@@ -255,6 +256,11 @@ class _StepTiming:
         self.fwd_path = "eager"
         self.fwd_sparse = False
         self.last_why = ""
+        # dec/pre row counts THIS tick, so a log parser can keep decode ticks and
+        # drop the chunked-prefill ticks that would otherwise flatten the decode
+        # distribution. Env-gated like the rest; off, tick_end never reads it.
+        self.phase_dec = 0
+        self.phase_pre = 0
         # Counter semantics change by allocator backend; printed so a reading is
         # not made under the wrong assumption (cudaMallocAsync zeros these).
         self.alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "default")
@@ -262,6 +268,8 @@ class _StepTiming:
     def tick_start(self) -> None:
         self.cur.clear()
         self.note = ""
+        self.phase_dec = 0
+        self.phase_pre = 0
         self.t0 = time.perf_counter()
         self.fwd_host_ms = 0.0
         self.fwd_gpu_ms = None
@@ -327,9 +335,13 @@ class _StepTiming:
         if dt > self.slow_s:
             parts = " ".join(f"{k}={v * 1000:.0f}ms" for k, v in self.cur.items())
             extra = f" [{self.note}]" if self.note else ""
+            # dec/pre let a log analysis keep decode-only ticks and drop chunked
+            # prefill ticks; with SLOW_MS=0 every tick prints, so this is the
+            # phase tag for the whole-tick distribution.
+            phase = f" dec={self.phase_dec} pre={self.phase_pre}"
             tail = self._slow_tail(dt * 1000)
-            print(f"[step-timing] tick {self.n} total={dt * 1000:.0f}ms {parts}{extra} {tail}",
-                  file=sys.stderr, flush=True)
+            print(f"[step-timing] tick {self.n} total={dt * 1000:.0f}ms{phase} {parts}"
+                  f"{extra} {tail}", file=sys.stderr, flush=True)
 
     def _slow_tail(self, dt_ms: float) -> str:
         """Device span + allocator deltas for one slow forward. Never syncs:
@@ -1105,6 +1117,9 @@ class Engine:
                 _tm.tick_start()
                 _t = time.perf_counter()
             decodes, prefills, chunks = self._build_plan()
+            if _tm is not None:
+                _tm.phase_dec = len(decodes)
+                _tm.phase_pre = len(prefills)
             if not decodes and not prefills:
                 idle = True
             else:

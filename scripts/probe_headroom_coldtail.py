@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -122,6 +123,15 @@ def wait_ready(url: str, trials: int) -> None:
     raise SystemExit("server not reachable on /health within ready wait")
 
 
+def _log_size(path: str) -> int:
+    """Current byte length of the server log; the parse window starts here so
+    fill-phase ticks (already flushed) are excluded. A missing/empty log is 0."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def nvidia_free_mib() -> int | None:
     try:
         out = subprocess.run(
@@ -134,7 +144,7 @@ def nvidia_free_mib() -> int | None:
 
 # --- log parsing -------------------------------------------------------------
 
-_TICK = re.compile(r"\[step-timing\] tick (\d+) total=(-?\d+)ms (.*)")
+_TICK = re.compile(r"\[step-timing\] tick (\d+) total=(-?\d+)ms(?: dec=(\d+) pre=(\d+))? (.*)")
 _KV = re.compile(r"(\w+)=(-?\d+)ms")
 _OFFERS = re.compile(r"offers_pages=(\d+)")
 _FREE = re.compile(r" free=(-?\d+)MiB")
@@ -144,18 +154,24 @@ def parse_tick(line: str) -> dict | None:
     m = _TICK.search(line)
     if not m:
         return None
-    n, total, rest = int(m.group(1)), int(m.group(2)), m.group(3)
+    n, total = int(m.group(1)), int(m.group(2))
+    # Older logs predate the dec/pre tag; treat untagged as decode-less so they
+    # are excluded rather than silently counted (fail-safe toward prefill).
+    dec = int(m.group(3)) if m.group(3) is not None else 0
+    pre = int(m.group(4)) if m.group(4) is not None else 0
+    rest = m.group(5)
     segs = {k: int(v) for k, v in _KV.findall(rest)}
     mo = _OFFERS.search(rest)
     offers = int(mo.group(1)) if mo else 0
     mf = _FREE.search(rest)
-    # type-2 hollow: no finalize batch, 1.1-1.4 s total, model inner <= 60% total.
     hollow = offers == 0 and total >= 1100 and segs.get("model", 0) <= int(0.6 * total)
-    return {"n": n, "total_ms": total, "offers_pages": offers,
+    return {"n": n, "total_ms": total, "dec": dec, "pre": pre,
+            "is_decode": dec > 0,
+            "offers_pages": offers,
             "finalize_ms": segs.get("sparse_finalize", 0),
             "model_ms": segs.get("model", 0),
             "free_mib": int(mf.group(1)) if mf else None,
-            "type1": offers > 0, "type2": hollow}
+            "type1": dec > 0 and offers > 0, "type2": dec > 0 and hollow}
 
 
 def pct(xs: list[int], q: float) -> int:
@@ -165,20 +181,31 @@ def pct(xs: list[int], q: float) -> int:
     return xs[min(len(xs) - 1, int(q * (len(xs) - 1)))]
 
 
-def parse_log(log_path: str) -> dict:
+def parse_log(log_path: str, byte_offset: int = 0) -> dict:
+    """Parse ticks at/after byte_offset (the warm POST start) and keep DECODE
+    ticks only. The fill phase's chunked prefills and the warm request's own
+    prefill ticks (pre>0) are dropped: the baseline distribution is warm DECODE
+    ticks alone. With SLOW_MS=0 every tick is logged, so this is the real
+    decode distribution, not a >threshold tail."""
     with open(log_path, errors="replace") as fh:
-        ticks = [t for line in fh if (t := parse_tick(line))]
+        fh.seek(byte_offset)
+        raw = fh.readlines()
+    all_ticks = [t for line in raw if (t := parse_tick(line))]
+    ticks = [t for t in all_ticks if t["is_decode"]]
     totals = [t["total_ms"] for t in ticks]
     t1 = [t for t in ticks if t["type1"]]
     t2 = [t for t in ticks if t["type2"]]
     fin = [t["finalize_ms"] for t in t1 if t["finalize_ms"] > 0]
     pages = [t["offers_pages"] for t in t1]
     return {
-        "ticks": len(ticks),
+        "log_byte_offset": byte_offset,
+        "ticks_in_window": len(all_ticks),
+        "decode_ticks": len(ticks),
+        "dropped_prefill_ticks": len(all_ticks) - len(ticks),
         "p50_ms": pct(totals, 0.50), "p90_ms": pct(totals, 0.90),
         "max_ms": max(totals, default=0),
-        "frac_over_300": round(len([x for x in totals if x > 300]) / len(ticks), 3)
-        if ticks else 0.0,
+        "frac_over_300": round(len([x for x in totals if x > 300]) / len(totals), 3)
+        if totals else 0.0,
         "type1_finalize_ticks": len(t1),
         "type1_finalize_ms_median": pct(fin, 0.5),
         "type1_finalize_ms_max": max(fin, default=0),
@@ -211,12 +238,30 @@ def cmd_arm(a) -> int:
               "refusing to measure a non-full tier", flush=True)
         return 3
 
+    # Snapshot the log byte size right before the warm POST. step-timing lines
+    # flush=True, so every fill tick is on disk by now; the parse window starts
+    # here and the dec>0 filter drops the warm request's own prefill ticks.
+    log_offset = _log_size(a.log)
     s = _post(a.url + "/v1/chat/completions",
               _body(prompt_32k(a.prompt_tokens, 0), a.warm_gen),
               a.timeout, stream=True)
     hw = health(a.url)
-    decode_tok = max(1, s["chunks"] - 1)
-    tok_s = round(decode_tok / s["decode_s"], 3) if s["decode_s"] else 0.0
+    # Fail closed: no streamed content or no timed decode span means the tok/s
+    # number is a divide-by-zero lie, not a measurement.
+    if s["chunks"] < 2 or s["decode_s"] <= 0:
+        print(f"NO-DECODE chunks={s['chunks']} decode_s={s['decode_s']}; "
+              "no warm decode was captured", flush=True)
+        return 13
+    ticks = parse_log(a.log, log_offset)
+    if ticks["decode_ticks"] < a.min_decode_ticks:
+        print(f"TOO-FEW-DECODE-TICKS decode={ticks['decode_ticks']} "
+              f"window={ticks['ticks_in_window']} dropped_prefill="
+              f"{ticks['dropped_prefill_ticks']} < --min-decode-ticks "
+              f"{a.min_decode_ticks}; refusing to emit a distribution off "
+              "fewer decode ticks than the baseline n (5-12)", flush=True)
+        return 13
+    decode_tok = s["chunks"] - 1
+    tok_s = round(decode_tok / s["decode_s"], 3)
     blocks_total = hw.get("blocks_total", 0)
     summary = {
         "arm_headroom_mib": a.headroom,
@@ -236,7 +281,7 @@ def cmd_arm(a) -> int:
             "process_free_mib": hw.get("device_free_bytes", 0) >> 20,
             "physical_free_mib_nvidia": nvidia_free_mib(),
         },
-        "ticks": parse_log(a.log),
+        "ticks": ticks,
     }
     with open(a.out, "w") as fh:
         json.dump(summary, fh, indent=1)
@@ -282,24 +327,59 @@ def cmd_compare(a) -> int:
 
 
 def _self_check() -> int:
-    l1 = ("[step-timing] tick 7 total=1259ms plan=1ms stats=2ms forward=1250ms "
-          "sparse_select=3ms model=330ms sparse_finalize=629ms sample=1ms "
-          "[offers_pages=132] free=210MiB reserved=30000MiB path=eager sparse=1 "
-          "fwd_host=1250ms fwd_gpu=400ms why=sync_wait")
+    l1 = ("[step-timing] tick 7 total=1259ms dec=1 pre=0 plan=1ms stats=2ms "
+          "forward=1250ms sparse_select=3ms model=330ms sparse_finalize=629ms "
+          "sample=1ms [offers_pages=132] free=210MiB reserved=30000MiB path=eager "
+          "sparse=1 fwd_host=1250ms fwd_gpu=400ms why=sync_wait")
     t = parse_tick(l1)
-    assert t["type1"] and not t["type2"]
+    assert t["is_decode"] and t["type1"] and not t["type2"]
     assert t["finalize_ms"] == 629 and t["offers_pages"] == 132 and t["free_mib"] == 210
-    l2 = ("[step-timing] tick 8 total=1303ms plan=1ms forward=1300ms model=350ms "
-          "sample=1ms  free=206MiB reserved=30000MiB path=eager sparse=1 "
-          "fwd_host=1300ms fwd_gpu=420ms why=sync_wait")
+    # A finalize batch on a PREFILL tick is not a type-1 decode tick.
+    lp = l1.replace("dec=1 pre=0", "dec=0 pre=1")
+    tp = parse_tick(lp)
+    assert tp["is_decode"] is False and not tp["type1"]
+    l2 = ("[step-timing] tick 8 total=1303ms dec=1 pre=0 plan=1ms forward=1300ms "
+          "model=350ms sample=1ms  free=206MiB reserved=30000MiB path=eager "
+          "sparse=1 fwd_host=1300ms fwd_gpu=420ms why=sync_wait")
     t = parse_tick(l2)
-    assert t["type2"] and not t["type1"] and t["model_ms"] == 350
-    t = parse_tick("[step-timing] tick 9 total=180ms forward=176ms model=170ms why=cpu")
-    assert t and not t["type1"] and not t["type2"]
+    assert t["is_decode"] and t["type2"] and not t["type1"] and t["model_ms"] == 350
+    t = parse_tick("[step-timing] tick 9 total=180ms dec=1 pre=0 forward=176ms "
+                   "model=170ms why=cpu")
+    assert t and t["is_decode"] and not t["type1"] and not t["type2"]
+    # An untagged legacy line decodes as non-decode (fail-safe toward exclusion).
+    t = parse_tick("[step-timing] tick 10 total=200ms forward=199ms model=199ms")
+    assert t and t["is_decode"] is False
     assert pct([100, 200, 300, 400], 0.5) == 200
     assert pct(list(range(100, 1100, 100)), 0.9) == 900  # 10 pts, 9th nearest-rank
     assert len(prompt_32k(32000, 1).split()) > 30000
     assert prompt_32k(100, 1) != prompt_32k(100, 2)  # seeds -> independent
+
+    # Window: fill prefill ticks BEFORE the offset and the warm request's own
+    # prefill tick after it must both be dropped; only dec>0 ticks count.
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+        fh.write("[step-timing] tick 1 total=900ms dec=0 pre=1 model=900ms\n")  # fill
+        fh.write("[step-timing] tick 2 total=800ms dec=0 pre=1 model=800ms\n")  # fill
+        offset = fh.tell()
+        fh.write("[step-timing] tick 3 total=700ms dec=0 pre=1 model=700ms\n")  # warm prefill
+        fh.write("[step-timing] tick 4 total=170ms dec=1 pre=0 model=165ms\n")
+        fh.write("[step-timing] tick 5 total=1300ms dec=1 pre=0 model=350ms\n")  # hollow
+        logf = fh.name
+    stats = parse_log(logf, offset)
+    assert stats["ticks_in_window"] == 3
+    assert stats["decode_ticks"] == 2, stats
+    assert stats["dropped_prefill_ticks"] == 1
+    assert stats["type2_hollow_ticks"] == 1
+    assert stats["p50_ms"] == 170 and stats["max_ms"] == 1300
+    os.unlink(logf)
+    # All-prefill window: zero decode ticks -> the arm must fail closed, and the
+    # fraction must not read as a clean 0.0 off an empty set.
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+        fh.write("[step-timing] tick 1 total=900ms dec=0 pre=1 model=900ms\n")
+        logf0 = fh.name
+    s0 = parse_log(logf0, 0)
+    assert s0["decode_ticks"] == 0 and s0["frac_over_300"] == 0.0
+    os.unlink(logf0)
     print("probe_headroom_coldtail self-check ok")
     return 0
 
@@ -326,6 +406,9 @@ def main() -> int:
     a.add_argument("--fill-gen", type=int, default=8)
     a.add_argument("--warm-gen", type=int, default=32)
     a.add_argument("--min-cold-gb", type=float, default=7.0)
+    a.add_argument("--min-decode-ticks", type=int, default=5,
+                   help="fail closed unless the warm window logs at least this "
+                        "many decode ticks (baseline n was 5-12)")
     a.add_argument("--timeout", type=float, default=7200.0)
     a.add_argument("--ready-trials", type=int, default=600)
     a.set_defaults(fn=cmd_arm)
