@@ -1056,9 +1056,16 @@ def test_the_fp8_kv_pool_generates_what_the_bf16_pool_does():
     one the design note names: shifting the scale by one block keeps the bytes and the
     geometry and produces finite, plausible logits, so it is asserted here too.
 
-    fp8 is checked on the torch side only. The C backend cannot codegen `float8_e4m3fn`
-    at all, so the KERNEL path is card-only; the pool, the scale plane and the
-    quantize/dequantize round-trip are plain torch and run here.
+    No fp8 kernel runs here. The C backend cannot codegen `float8_e4m3fn`, so both
+    sides take the torch fallback: the write path through ``PagedKvPool.write_tokens``
+    and the read path through ``kv_layer()``'s dequantized plane. Measured on cpu —
+    zero fp8-named kernels dispatched, and ``paged_attention`` receives bf16, never the
+    raw fp8 plane (handing it a real fp8 plane + scale raises NotImplementedError at
+    one dispatch point above the arms). What this gates is therefore the pool's stored
+    format and the scale read-back end to end: deleting the scale from
+    ``reference.dequant_kv_fp8`` turns it red, while token agreement alone does not see
+    the scale-less write mutant. Kernel parity for the fp8 arms is card-only, in
+    tests/test_ops_parity.py.
     """
     if not _fp8_allocatable():
         pytest.skip("this device cannot allocate float8_e4m3fn, so no fp8 pool can be built")
@@ -2569,7 +2576,7 @@ def test_the_cpu_kv_pool_keeps_mains_dtype_now_that_build_engine_passes_one():
     cfg = tiny()
     backend = get_backend()
     if backend.arch != "cpu":
-        pytest.skip("this pins the CPU parity cell's dtype; other arches have their own")
+        pytest.skip("this pins the CPU parity cell's dtype")
     model = build_random(cfg, seed=3)
     e = build_engine(cfg, model, backend, num_blocks=8, num_slots=2, max_batch=2,
                      max_total_tokens=64)

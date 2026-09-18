@@ -513,9 +513,14 @@ def test_paged_attention_prefill_tiled_vs_naive(backend):
 
 
 def test_write_tokens_parity(backend):
-    """Paged KV scatter kernel vs the pool's torch-loop write (sm90 only)."""
+    """Paged KV scatter kernel vs the pool's torch-loop write.
+
+    Runs the sm90 cell only: the gate below is ``arch != "sm90"``. The sm70 cell also
+    registers ``write_tokens`` (the f32 variant), so that cell's parity is unexercised
+    here -- widening the gate would add sm70 device coverage, which is its own decision
+    and not this test's."""
     if backend.arch != "sm90":
-        pytest.skip("write_tokens kernel is sm90-only")
+        pytest.skip("this test runs the sm90 cell only; the sm70 cell registers it too")
     torch.manual_seed(24)
     from tilerl.engine import BatchKv
     from tilerl.kv_cache import PagedKvPool
@@ -798,9 +803,14 @@ def test_gdn_chunk_rounding_bound(device):
 @pytest.mark.parametrize("t", [1, 4])
 def test_gdn_chunk_matches_decode(backend, t):
     """The chunk kernel equals the in-place decode kernel, per-chain-step planes
-    included, at both a plain decode width and a verify width (sm90 only)."""
+    included, at both a plain decode width and a verify width.
+
+    Runs the sm90 cell only: the gate below is ``arch != "sm90"``. The sm70 cell also
+    registers ``gdn_chunk_fused`` and ``gdn_decode_fused``, so that cell's parity is
+    unexercised here -- widening the gate would add sm70 device coverage, which is its
+    own decision and not this test's."""
     if backend.arch != "sm90":
-        pytest.skip("GDN fused kernels are sm90-only")
+        pytest.skip("this test runs the sm90 cell only; the sm70 cell registers it too")
     q, k, v, g, beta, z, state, kw = _gdn_inputs(2, t, 2, 4, 16, 16, 4, 29)
     f32, bf16, c = backend._f32, backend._bf16, backend._c
     i32 = backend._i32
