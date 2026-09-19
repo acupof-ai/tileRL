@@ -6,6 +6,12 @@
 > tick timing split (per-stage numbers in the #698 bench data
 > wins/draft-window-2048-2026-09-17/decision-note.md).
 
+>
+> **Update 2026-09-19:** in the current 1 GiB-RAM/8 GiB-SSD tier the steady
+> finalize tail is gone (1–2 ms) and the long tail moved to a once-per-request
+> cold SSD close (~3.1 s); see
+> [2026-09-19-sm70-32k-decode-physical-wall-and-ssd-close-tail.md](2026-09-19-sm70-32k-decode-physical-wall-and-ssd-close-tail.md).
+
 ## Context
 
 V100 sm70 hybrid serve, main `07eca439`, draft read window W=2048, flags
