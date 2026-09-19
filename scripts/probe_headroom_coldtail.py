@@ -4,28 +4,46 @@
 relocation-long-tail.md).
 
 The operator boots ONE arm's serve (TILERL_DEVICE_HEADROOM_MIB=0|384|768,
-TILERL_STEP_TIMING=1, TILERL_STEP_TIMING_SLOW_MS=0) and then runs this against
-it. It does NOT restart the server — restarting belongs to ops, one boot per
-arm, so two flows never race. It drives the full load against the already-up
-arm and ends with a single machine-readable line:
+TILERL_DRAFT_ATTN_WINDOW_TOKENS=<the baseline W, 2048>, TILERL_STEP_TIMING=1,
+TILERL_STEP_TIMING_SLOW_MS=0) and then runs this against it. It does NOT
+restart the server — restarting belongs to ops, one boot per arm, so two flows
+never race. It drives the full load against the already-up arm and ends with a
+single machine-readable line:
 
-    ARM_DONE <headroom_mib> <decode_tok_s>   (exit 0 on success)
+    ARM_DONE <headroom_mib> <median_tok_s> reps=<good>/<N> W=[<engaged>]  (exit 0)
 
-Sequence per arm:
+For each of --warm-reps (default 3) independent repetitions it REFILLS the cold
+tier then runs one warm, so the reported tok/s is a median with a spread rather
+than one noisy shot:
   1. fill  — N independent (non-prefix-sharing) >=32k sparse prompts force the
      shared cold pool to the full-tier state (the W-sweep filler shape); assert
      cold occupancy actually crossed --min-cold-gb before measuring;
   2. warm  — one primed-warm 32k prompt streamed; time first-token -> last-token
      (decode-only tok/s, prefill excluded), the baseline's quantity;
-  3. read  — /health build fields + nvidia-smi physical free, then parse THIS
-     arm's server log and split slow ticks into type-1 finalize batches
-     (offers_pages>0) and type-2 hollow forwards (no offers, 1.1-1.4 s, inner
-     model well under total).
+  3. read  — /health build fields + spec_drafted/spec_accepted delta (accept
+     rate) + nvidia-smi physical free; parse THIS rep's server log window
+     (byte offset at the warm POST, dec>0 ticks only) and split type-1 finalize
+     batches (offers_pages>0) from type-2 hollow forwards (no offers, 1.1-1.4 s,
+     inner model well under total);
+  4. cross-check the serve's actually-engaged draft READ window from its
+     `[draft-window] W=` self-proof line against --expect-window; a mismatch or
+     a missing engage (when W>0 was armed) fails the rep.
+
+Whether the window is armed is a BUILD-TIME constant, and the engine logs each
+(batch, first-page) shape's `[draft-window] W=` line only once for the whole
+boot — fill's 32k decodes already print the same-shape line, so a post-warm
+offset search finds nothing and false-reports a mismatch. The engage check is
+therefore existence evidence read from the WHOLE log (offset 0); the warm byte
+offset bounds only the decode-tick distribution.
+
+Fail-closed: rc3 cold tier under --min-cold-gb; rc13 no/too-few decode ticks,
+window mismatch, or fewer than --min-good-reps good reps — none prints ARM_DONE.
 
 Writes one JSON summary per arm and prints ARM_DONE. SLOW_MS must be 0 so every
 tick is logged — p50/p90 and the >300 ms fraction need the full distribution.
-Pure stdlib, no torch; runs from the laptop against the pod URL. control0 must
-match the historical baseline口径 (2.69/4.25/6.56/7.86 tok/s), so the warm
+Pure stdlib, no torch; runs from the laptop against the pod URL. The baseline
+(2.69/4.25/6.56/7.86 tok/s) was measured at W=2048, so every arm arms
+TILERL_DRAFT_ATTN_WINDOW_TOKENS=2048 and passes --expect-window 2048; the warm
 quantity is first-token→last-token decode tok/s over a 32k context.
 
 Run: python3 scripts/probe_headroom_coldtail.py --self-check
@@ -148,6 +166,7 @@ _TICK = re.compile(r"\[step-timing\] tick (\d+) total=(-?\d+)ms(?: dec=(\d+) pre
 _KV = re.compile(r"(\w+)=(-?\d+)ms")
 _OFFERS = re.compile(r"offers_pages=(\d+)")
 _FREE = re.compile(r" free=(-?\d+)MiB")
+_WLINE = re.compile(r"\[draft-window\] W=(\d+)")
 
 
 def parse_tick(line: str) -> dict | None:
@@ -174,9 +193,34 @@ def parse_tick(line: str) -> dict | None:
             "type1": dec > 0 and offers > 0, "type2": dec > 0 and hollow}
 
 
+def observed_draft_window(log_path: str, byte_offset: int = 0) -> int | None:
+    """The draft READ window the serve engaged, from its self-proof
+    `[draft-window] W=<tokens>` line, read at/after ``byte_offset``.
+
+    The arm passes byte_offset=0: whether a window is armed is a build-time
+    constant and each (batch, first-page) shape logs the line once per boot, so
+    the evidence may sit in the fill phase long before the warm offset. Use the
+    warm byte offset ONLY to bound the decode-tick distribution, never this."""
+    seen = None
+    with open(log_path, errors="replace") as fh:
+        fh.seek(byte_offset)
+        for line in fh:
+            m = _WLINE.search(line)
+            if m:
+                seen = int(m.group(1))  # build constant; every shape logs the same W
+    return seen
+
+
 def pct(xs: list[int], q: float) -> int:
     if not xs:
         return 0
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(q * (len(xs) - 1)))]
+
+
+def fpct(xs: list[float], q: float) -> float:
+    if not xs:
+        return 0.0
     xs = sorted(xs)
     return xs[min(len(xs) - 1, int(q * (len(xs) - 1)))]
 
@@ -229,63 +273,119 @@ def _cold_tier_gb(h: dict) -> tuple[float, float, float]:
     return priv, shared, priv + shared
 
 
+def _fill_cold_tier(a, rep: int) -> tuple[dict, list[int]]:
+    """Drive fill_n independent 32k sparse prompts; return (health, prompt tokens)."""
+    rows = []
+    for i in range(a.fill_n):
+        out = _post(a.url + "/v1/chat/completions",
+                    _body(prompt_32k(a.prompt_tokens, rep * 1000 + i + 1), a.fill_gen),
+                    a.timeout, stream=False)
+        pt = out.get("usage", {}).get("prompt_tokens", 0)
+        rows.append(pt)
+        if pt < a.prompt_tokens * 0.9:
+            print(f"WARN rep{rep} fill {i}: only {pt} prompt tokens "
+                  f"(want ~{a.prompt_tokens})", flush=True)
+    return health(a.url), rows
+
+
+def _one_warm(a, rep: int) -> dict | None:
+    """One independent refill + primed-warm 32k, return the rep record or None on a
+    fail-closed condition (caller counts it; None never yields a clean ARM_DONE)."""
+    hfill, pt_rows = _fill_cold_tier(a, rep)
+    cold_priv_gb, cold_shared_gb, cold_gb = _cold_tier_gb(hfill)
+    if cold_gb < a.min_cold_gb:
+        print(f"REP{rep}-FILL-INSUFFICIENT cold_total={cold_gb:.2f}GiB "
+              f"(private={cold_priv_gb:.2f} shared={cold_shared_gb:.2f}) "
+              f"< {a.min_cold_gb}GiB", flush=True)
+        return None
+    # hfill is the post-fill /health snapshot: it both carries the cold totals
+    # and is the spec-counter baseline (fill drafts its own gen tokens), so the
+    # warm accept rate is isolated to the warm request without a second poll.
+    log_offset = _log_size(a.log)
+    s = _post(a.url + "/v1/chat/completions",
+              _body(prompt_32k(a.prompt_tokens, rep * 1000), a.warm_gen),
+              a.timeout, stream=True)
+    h_spec_after = health(a.url)
+    if s["chunks"] < 2 or s["decode_s"] <= 0:
+        print(f"REP{rep}-NO-DECODE chunks={s['chunks']} decode_s={s['decode_s']}",
+              flush=True)
+        return None
+    ticks = parse_log(a.log, log_offset)
+    if ticks["decode_ticks"] < a.min_decode_ticks:
+        print(f"REP{rep}-TOO-FEW-DECODE-TICKS decode={ticks['decode_ticks']} "
+              f"window={ticks['ticks_in_window']} dropped_prefill="
+              f"{ticks['dropped_prefill_ticks']} < --min-decode-ticks "
+              f"{a.min_decode_ticks}", flush=True)
+        return None
+    # Build-time constant: read the engage line from the WHOLE log (offset 0),
+    # since fill's same-shape decode already printed it and the engine logs each
+    # shape once per boot. The warm offset would find nothing and false-fail.
+    w_obs = observed_draft_window(a.log, 0)
+    if a.expect_window > 0 and w_obs != a.expect_window:
+        print(f"REP{rep}-WINDOW-MISMATCH armed W={a.expect_window} "
+              f"serve engaged W={w_obs}; do not compare against a W=2048 baseline",
+              flush=True)
+        return None
+    if a.expect_window == 0 and w_obs not in (None, 0):
+        print(f"REP{rep}-WINDOW-MISMATCH armed W=0 but serve engaged W={w_obs}",
+              flush=True)
+        return None
+    drafted_d = h_spec_after.get("spec_drafted", 0) - hfill.get("spec_drafted", 0)
+    accepted_d = h_spec_after.get("spec_accepted", 0) - hfill.get("spec_accepted", 0)
+    accept_rate = round(accepted_d / drafted_d, 4) if drafted_d > 0 else None
+    return {
+        "rep": rep, "decode_tok_s": round((s["chunks"] - 1) / s["decode_s"], 3),
+        "content_chunks": s["chunks"], "first_to_last_s": round(s["decode_s"], 3),
+        "wall_s": round(s["wall_s"], 3),
+        "engaged_draft_window_w": w_obs if a.expect_window > 0 else 0,
+        "cold_total_gb": round(cold_gb, 3),
+        "cold_private_gb": round(cold_priv_gb, 3),
+        "cold_shared_gb": round(cold_shared_gb, 3),
+        "fill_prompt_tokens": pt_rows,
+        "spec_drafted_delta": drafted_d, "spec_accepted_delta": accepted_d,
+        "spec_accept_rate": accept_rate, "ticks": ticks,
+        "device_free_mib": h_spec_after.get("device_free_bytes", 0) >> 20,
+    }
+
+
 def cmd_arm(a) -> int:
     wait_ready(a.url, a.ready_trials)
     h0 = health(a.url)
-    pt_rows = []
-    for i in range(a.fill_n):
-        out = _post(a.url + "/v1/chat/completions",
-                    _body(prompt_32k(a.prompt_tokens, i + 1), a.fill_gen),
-                    a.timeout, stream=False)
-        pt = out.get("usage", {}).get("prompt_tokens", 0)
-        pt_rows.append(pt)
-        if pt < a.prompt_tokens * 0.9:
-            print(f"WARN fill {i}: only {pt} prompt tokens (want ~{a.prompt_tokens})",
-                  flush=True)
-    hfill = health(a.url)
-    cold_priv_gb, cold_shared_gb, cold_gb = _cold_tier_gb(hfill)
-    if cold_gb < a.min_cold_gb:
-        print(f"FILL-INSUFFICIENT cold_total={cold_gb:.2f}GiB "
-              f"(private={cold_priv_gb:.2f} shared={cold_shared_gb:.2f}) < "
-              f"{a.min_cold_gb}GiB; refusing to measure a non-full tier",
-              flush=True)
-        return 3
-
-    # Snapshot the log byte size right before the warm POST. step-timing lines
-    # flush=True, so every fill tick is on disk by now; the parse window starts
-    # here and the dec>0 filter drops the warm request's own prefill ticks.
-    log_offset = _log_size(a.log)
-    s = _post(a.url + "/v1/chat/completions",
-              _body(prompt_32k(a.prompt_tokens, 0), a.warm_gen),
-              a.timeout, stream=True)
+    _cold0_priv, _cold0_shared, cold0_total = _cold_tier_gb(h0)
+    reps = []
+    for r in range(a.warm_reps):
+        rec = _one_warm(a, r)
+        if rec is not None:
+            reps.append(rec)
+    # Fail closed: too few good reps must never print ARM_DONE or a clean median.
+    if len(reps) < a.min_good_reps:
+        print(f"NO-GOOD-REPS good={len(reps)}/{a.warm_reps} "
+              f"< --min-good-reps {a.min_good_reps}; refusing ARM_DONE", flush=True)
+        return 13
     hw = health(a.url)
-    # Fail closed: no streamed content or no timed decode span means the tok/s
-    # number is a divide-by-zero lie, not a measurement.
-    if s["chunks"] < 2 or s["decode_s"] <= 0:
-        print(f"NO-DECODE chunks={s['chunks']} decode_s={s['decode_s']}; "
-              "no warm decode was captured", flush=True)
-        return 13
-    ticks = parse_log(a.log, log_offset)
-    if ticks["decode_ticks"] < a.min_decode_ticks:
-        print(f"TOO-FEW-DECODE-TICKS decode={ticks['decode_ticks']} "
-              f"window={ticks['ticks_in_window']} dropped_prefill="
-              f"{ticks['dropped_prefill_ticks']} < --min-decode-ticks "
-              f"{a.min_decode_ticks}; refusing to emit a distribution off "
-              "fewer decode ticks than the baseline n (5-12)", flush=True)
-        return 13
-    decode_tok = s["chunks"] - 1
-    tok_s = round(decode_tok / s["decode_s"], 3)
     blocks_total = hw.get("blocks_total", 0)
+    toks = [r["decode_tok_s"] for r in reps]
+    rates = [r["spec_accept_rate"] for r in reps if r["spec_accept_rate"] is not None]
+    windows = sorted({r["engaged_draft_window_w"] for r in reps})
     summary = {
         "arm_headroom_mib": a.headroom,
-        "fill": {"n": a.fill_n, "prompt_tokens": pt_rows,
-                 "cold_total_gb": round(cold_gb, 3),
-                 "cold_private_gb": round(cold_priv_gb, 3),
-                 "cold_shared_gb": round(cold_shared_gb, 3),
-                 "cold_total_before_gb": round(sum(_cold_tier_gb(h0)[0:2]), 3)},
-        "warm32k": {"decode_tok_s": tok_s, "content_chunks": s["chunks"],
-                    "first_to_last_s": round(s["decode_s"], 3),
-                    "wall_s": round(s["wall_s"], 3)},
+        "expect_draft_window_w": a.expect_window,
+        "engaged_draft_window_w_values": windows,
+        "warm_reps": a.warm_reps, "good_reps": len(reps),
+        "warm32k": {
+            "decode_tok_s_median": fpct(toks, 0.5),
+            "decode_tok_s_min": min(toks), "decode_tok_s_max": max(toks),
+            "decode_tok_s_spread": round(max(toks) - min(toks), 3),
+            "per_rep_tok_s": toks,
+        },
+        "spec_accept_rate_median": fpct(rates, 0.5) if rates else None,
+        "spec_accept_rate_per_rep": rates,
+        "fill": {"n_per_rep": a.fill_n,
+                 "cold_total_gb_first": reps[0]["cold_total_gb"],
+                 "cold_total_gb_last": reps[-1]["cold_total_gb"],
+                 "cold_private_gb_last": reps[-1]["cold_private_gb"],
+                 "cold_shared_gb_last": reps[-1]["cold_shared_gb"],
+                 "cold_total_before_gb": round(cold0_total, 3)},
         "health": {
             "sparse_headroom_bytes": hw.get("sparse_headroom_bytes", 0),
             "sparse_headroom_dropped_blocks":
@@ -296,12 +396,14 @@ def cmd_arm(a) -> int:
             "process_free_mib": hw.get("device_free_bytes", 0) >> 20,
             "physical_free_mib_nvidia": nvidia_free_mib(),
         },
-        "ticks": ticks,
+        "reps": reps,
     }
     with open(a.out, "w") as fh:
         json.dump(summary, fh, indent=1)
     print(json.dumps(summary, indent=1), flush=True)
-    print(f"ARM_DONE {a.headroom} {tok_s}", flush=True)
+    med = summary["warm32k"]["decode_tok_s_median"]
+    print(f"ARM_DONE {a.headroom} {med} reps={len(reps)}/{a.warm_reps} W={windows}",
+          flush=True)
     return 0
 
 
@@ -318,24 +420,44 @@ def cmd_compare(a) -> int:
             "full_frac_over_300": [0.40, 0.58], "empty_frac_over_300": 0.10}
     rows = {}
     for name, s in sorted(arms.items()):
-        h, t = s["health"], s["ticks"]
+        h, w3 = s["health"], s["warm32k"]
+        rep_ticks = [r["ticks"] for r in s.get("reps", [])]
+        # Pool the per-rep tick distributions (n varies per rep) so the reported
+        # p50/p90/finalize reflect every measured warm decode tick, not rep 1.
+        all_p50 = [t["p50_ms"] for t in rep_ticks]
+        all_p90 = [t["p90_ms"] for t in rep_ticks]
+        all_max = [t["max_ms"] for t in rep_ticks]
+        all_frac = [t["frac_over_300"] for t in rep_ticks]
+        all_fin_med = [t["type1_finalize_ms_median"] for t in rep_ticks]
+        all_fin_max = [t["type1_finalize_ms_max"] for t in rep_ticks]
+        all_off_med = [t["type1_offers_pages_median"] for t in rep_ticks]
+        all_off_max = [t["type1_offers_pages_max"] for t in rep_ticks]
+        t1n = sum(t["type1_finalize_ticks"] for t in rep_ticks)
+        t2n = sum(t["type2_hollow_ticks"] for t in rep_ticks)
         rows[name] = {
             "headroom_mib": s["arm_headroom_mib"],
-            "warm32k_decode_tok_s": s["warm32k"]["decode_tok_s"],
-            "p50/p90/max_ms": [t["p50_ms"], t["p90_ms"], t["max_ms"]],
-            "frac_over_300": t["frac_over_300"],
-            "finalize_med/max_ms": [t["type1_finalize_ms_median"],
-                                    t["type1_finalize_ms_max"]],
-            "offers_med/max_pages": [t["type1_offers_pages_median"],
-                                     t["type1_offers_pages_max"]],
-            "type1_ticks": t["type1_finalize_ticks"],
-            "type2_hollow_ticks": t["type2_hollow_ticks"],
+            "draft_window_w": s.get("expect_draft_window_w"),
+            "warm32k_tok_s_median/min/max": [w3["decode_tok_s_median"],
+                                             w3["decode_tok_s_min"],
+                                             w3["decode_tok_s_max"]],
+            "tok_s_spread": w3["decode_tok_s_spread"],
+            "per_rep_tok_s": w3["per_rep_tok_s"],
+            "good_reps": s.get("good_reps"),
+            "spec_accept_rate_median": s.get("spec_accept_rate_median"),
+            "p50/p90/max_ms_median_across_reps": [pct(all_p50, 0.5),
+                                                  pct(all_p90, 0.5),
+                                                  max(all_max)],
+            "frac_over_300_range": [min(all_frac), max(all_frac)] if all_frac else [],
+            "finalize_med/max_ms": [pct(all_fin_med, 0.5), max(all_fin_max)],
+            "offers_med/max_pages": [pct(all_off_med, 0.5), max(all_off_max)],
+            "type1_ticks_total": t1n, "type2_hollow_ticks_total": t2n,
             "blocks_total": h["blocks_total"],
             "resident_slots_floor": h["resident_slots_floor"],
+            "slots_total": h["slots_total_state_pool"],
             "dropped_blocks": h["sparse_headroom_dropped_blocks"],
             "process_free_mib": h["process_free_mib"],
             "physical_free_mib": h["physical_free_mib_nvidia"],
-            "cold_total_gb": s["fill"]["cold_total_gb"],
+            "cold_total_gb_last": s["fill"].get("cold_total_gb_last"),
         }
     print(json.dumps({"baseline": base, "arms": rows}, indent=1))
     return 0
@@ -366,6 +488,8 @@ def _self_check(ns=None) -> int:
     assert t and t["is_decode"] is False
     assert pct([100, 200, 300, 400], 0.5) == 200
     assert pct(list(range(100, 1100, 100)), 0.9) == 900  # 10 pts, 9th nearest-rank
+    assert fpct([5.0, 9.0, 1.0, 3.0], 0.5) == 3.0
+    assert fpct([2.0, 4.0], 0.0) == 2.0 and fpct([2.0, 4.0], 1.0) == 4.0
     assert len(prompt_32k(32000, 1).split()) > 30000
     assert prompt_32k(100, 1) != prompt_32k(100, 2)  # seeds -> independent
 
@@ -395,6 +519,28 @@ def _self_check(ns=None) -> int:
     s0 = parse_log(logf0, 0)
     assert s0["decode_ticks"] == 0 and s0["frac_over_300"] == 0.0
     os.unlink(logf0)
+
+    # The window engage line is a build-time constant the engine prints once per
+    # (batch, first-page) shape. Fill's 32k decode prints it BEFORE the warm
+    # offset; the arm reads the WHOLE log (offset 0), so an engage line that only
+    # exists in the fill phase is still recognized as armed. Searching from the
+    # warm offset would return None and false-fail every rep (the #728 bug).
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+        fh.write("[draft-window] W=2048 sq=[2] first=[115] windowed_seq_len=[2048]\n")
+        wm_off = fh.tell()
+        fh.write("[step-timing] tick 900 total=180ms dec=1 pre=0 model=170ms\n")
+        logfw = fh.name
+    assert observed_draft_window(logfw, 0) == 2048       # whole-log: armed
+    assert observed_draft_window(logfw, wm_off) is None   # warm-offset: deduped
+    assert observed_draft_window(logfw, 10_000) is None   # past EOF: nothing
+    os.unlink(logfw)
+    # An off (W=0) run writes no engage line anywhere -> None.
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+        fh.write("[step-timing] tick 1 total=180ms dec=1 pre=0 model=170ms\n")
+        logfo = fh.name
+    assert observed_draft_window(logfo, 0) is None
+    os.unlink(logfo)
+
     # Dispatch arity: arm/compare run as fn(namespace). A regressed ns.fn() call
     # only raises TypeError on the server arm (selfcheck never dispatches), so pin
     # the one-arg call here without a server.
@@ -447,6 +593,16 @@ def main() -> int:
     a.add_argument("--prompt-tokens", type=int, default=32000)
     a.add_argument("--fill-gen", type=int, default=8)
     a.add_argument("--warm-gen", type=int, default=32)
+    a.add_argument("--warm-reps", type=int, default=3,
+                   help="independent refill+warm repetitions per arm; reports the "
+                        "median and spread of warm-32k tok/s (not one shot)")
+    a.add_argument("--min-good-reps", type=int, default=2,
+                   help="fail closed (rc13) unless at least this many reps succeed; "
+                        "a 3-rep arm must have >=2 good reps")
+    a.add_argument("--expect-window", type=int, default=0,
+                   help="the TILERL_DRAFT_ATTN_WINDOW_TOKENS the serve was armed "
+                        "with (2048 for the baseline-comparable arms); cross-checked "
+                        "against the whole-log serve [draft-window] line, mismatch rc13")
     a.add_argument("--min-cold-gb", type=float, default=7.0)
     a.add_argument("--min-decode-ticks", type=int, default=5,
                    help="fail closed unless the warm window logs at least this "
