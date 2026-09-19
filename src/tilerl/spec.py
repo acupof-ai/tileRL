@@ -54,6 +54,40 @@ ROW_MS = 0.53
 #: the draft skipping the bucket cost a served first visit 14 compiles inline.
 _PREFILL_BUCKET = 64
 
+#: Opt-in: a DECODE-only draft step keeps its true query width ``q`` instead of
+#: rounding up to ``_PREFILL_BUCKET``. The bucket exists so a chunked PREFILL's
+#: widening prompt length cannot recompile the seq_q_lens kernels (14 compiles /
+#: 15.5 s on a served first visit); a decode step's q is at most ``width`` (1+depth,
+#: 2 at d1) and carries no prefill at all, so the bucket buys it nothing. What it
+#: costs on the sm70 split arm is 32x the attention work — S query rows x n history
+#: each — plus a grid (``T.Kernel(KVSPLIT, S * H, B)``) that drops 16x, halved again
+#: because ``sm70_kvsplit`` raises KVSPLIT 16 -> 32 below S=8 (a win at these widths
+#: per that comment, not a cost); the PO/PM/PL staging
+#: ``T.empty((B, S, H, KVSPLIT, D))`` drops the same 16x, and fc/gate/up/down run
+#: at M = B*T.
+#: "Decode-only" is the SAME predicate ``_windowed_read_kv`` already applies — see
+#: :meth:`DraftHead._draft_q_width`. Default off: this is a device-measured lever,
+#: not a default flip.
+_DRAFT_TRUE_Q_WIDTH = bool(os.environ.get("TILERL_DRAFT_TRUE_Q_WIDTH"))
+
+
+def draft_step_is_decode_only(sq, width: int, decode=None) -> bool:
+    """True when every row's query span is a decode-phase verify tail: the one
+    shape whose T may be its true ``q`` rather than a prefill bucket.
+
+    One definition, two consumers with opposite failure modes — ``DraftHead.step``
+    picks T with it and ``_windowed_read_kv`` decides whether the READ window may
+    engage with it. Stated once so they cannot drift into the state where the
+    forward is narrow and the window is full-prefix (a silent numerics change) or
+    the reverse (a wasted wide launch). A row still PREFILLING (``decode=False``)
+    and a decode-phase CATCH-UP row (q > width) both fail it: neither carries a
+    tail, so neither may narrow the forward or truncate the read.
+    """
+    if decode is None:
+        decode = [True] * len(sq)
+    return all(d and int(q) <= width for d, q in zip(decode, sq))
+
+
 #: Verify widths the sm70 M-ladder serves without padding waste. A width
 #: between rungs pays the next rung's full price: depth 5 (W=6) costs the same
 #: 8-row launch as depth 7 (W=8), which measured 10% SLOWER than depth 3 on the
@@ -401,6 +435,22 @@ class DraftHead:
         really truncates on device before trusting a W sweep."""
         return self._read_window_stats
 
+    def _draft_q_width(self, plan, w: int) -> int:
+        """The T of the forward below: the bucketed ``w``, or the true max ``q``
+        when ``draft_step_is_decode_only`` holds for every plan row.
+
+        Padding a decode row up to the bucket is free of correctness risk (every
+        kernel gates on SeqQLens, kernels_mma.py:71, and ``sq`` keeps the exact
+        lengths) but not of cost: attention runs S query rows against n history
+        each, so T=64 over q=2 does 32x the work of rows nothing reads.
+        """
+        if not _DRAFT_TRUE_Q_WIDTH:
+            return w
+        if not draft_step_is_decode_only([hi - lo + 1 for _, lo, hi, _ in plan], self.width,
+                                         [r.decoding for r, *_ in plan]):
+            return w
+        return max(hi - lo + 1 for _, lo, hi, _ in plan)
+
     def _windowed_read_kv(self, kv, sl, sq, dblocks, decode=None):
         """Per-row trailing-window READ view for a decode batch, or None.
 
@@ -454,7 +504,7 @@ class DraftHead:
         #    advanced without drafting (q > draft.width; the hidden-gap case).
         # sq alone is not enough (a catch-up row is phase=DECODE yet carries q>1),
         # and phase alone is not enough either.
-        if not all(d and int(q) <= self.width for d, q in zip(decode, sq)):
+        if not draft_step_is_decode_only(sq, self.width, decode):
             return None
         width = kv.block_table.shape[1]      # == num_blocks: same compiled-in Mb
         firsts: list[int] = []
@@ -585,6 +635,11 @@ class DraftHead:
         w = max(hi - lo + 1 for _, lo, hi, _ in plan)
         if w > 1:
             w = -(-w // _PREFILL_BUCKET) * _PREFILL_BUCKET
+        # A decode-only step keeps its true q: the bucket is for a prefill's widening
+        # prompt length, and rounding a verify tail 2 -> 64 multiplies the attention
+        # grid (S is in it on sm70) and every projection's M by 32 for rows no kernel
+        # reads. Opt-in, see _DRAFT_TRUE_Q_WIDTH.
+        w = self._draft_q_width(plan, w)
         # Table width = pool size, for the same reason as engine.py:666 -- the kernels
         # compile Mb in, so a per-tick width recompiles. `max(len(r.blocks))` grows one
         # column per BLOCK_TOKENS of context, so it was a second shape axis after the
