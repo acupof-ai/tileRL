@@ -87,8 +87,14 @@ ticks (n=6 cb0, n=7 cb1):
 
 Steady decode did not regress: tick p50 184→183 ms, model segment 168→166 ms,
 draft 12→12; effective tok/s (decode ticks + accepted bonus over decode wall)
-9.49/9.01 → 9.37/9.38. Correctness: a follower repeating an identical 32k prompt
-got byte-identical tokens, `finish_reason=length`, `prefix_hits +1`.
+9.49/9.01 → 9.37/9.38.
+
+Correctness (client-terminal observation, not vendored): a follower repeating
+an identical 32k prompt returned byte-identical tokens, `finish_reason=length`,
+and `/health` `prefix_hits` moved +1 in the client-side `follower_smoke.py`
+run. That stdout was not saved and the boot log has no per-request prefix-hit
+line, so treat this as a live operator read, not an artifact — re-capture the
+follower response and health delta to a file next window.
 
 The two largest close terms — `ssd_mmap` (~1.83→1.86 s) and
 `pub_cold_transfer` (~1.73→1.78 s) — are unchanged. They are host/SSD byte

@@ -1,10 +1,11 @@
 # Shared-prefix SSD spill ignores the cold-SSD byte cap and never returns disk — 2026-09-19
 
 > Status: landed behind an env gate (`TILERL_COLD_PREFIX_SSD_CAP=1`), default
-> OFF, device confirmed on V100 2026-09-19 (659c2fbb): the physical
-> `.prefix.bin` is pinned at 8192 MiB with zero drops and reclaims after
-> release, but a full-cap steady state adds an evict/reload tail (one warm rep
-> fell to 5.84 effective tok/s). Observed on V100 during the 2026-09-18
+> OFF. Device partial confirmation on V100 2026-09-19 (659c2fbb): the physical
+> `.prefix.bin` is pinned at 8192 MiB with zero drops under load (vendored
+> size timeline); post-release trailing reclaim was NOT sampled in this window
+> and stays pending-next-window. A full-cap steady state adds an evict/reload
+> tail (one warm rep fell to 5.84 effective tok/s). Observed during the 2026-09-18
 > headroom window: the `.prefix.bin` shared-prefix spill grew to 13.6 GiB
 > logical / 25 GiB physical against an explicit `--cold-ssd-bytes` of 8 GiB.
 
@@ -65,17 +66,34 @@ fill-2/warm-2 protocol (37.6k prompts, 1 GiB-RAM / 8 GiB-SSD f16). A 20-second
 sampler recorded apparent + physical (`du`) `.prefix.bin` size and the health
 logical counter through the run.
 
-**Cap holds physically, no wrong pages.** Physical file size sat at exactly
-**8192 MiB** at every full-tier sample and logical `kv_cold_shared_ssd_bytes`
-at 8,589,279,232 B (~8.0 GiB); `kv_cold_drops=0`. The uncapped arms reached
-13.6 GiB logical / 16–25 GiB physical on the same two-rep workload. A follower
-repeating an identical 32k prompt after the cap was reached got byte-identical
-tokens, `finish_reason=length`, `prefix_hits +1`.
+**Cap holds physically under load, no wrong pages (vendored).** Physical file
+size sat at exactly **8192 MiB** at every full-tier sample and logical
+`kv_cold_shared_ssd_bytes` at 8,589,279,232 B (~8.0 GiB); `kv_cold_drops=0`.
+The uncapped arms reached 13.6 GiB logical / 16–25 GiB physical on the same
+two-rep workload. The 60-sample physical-size timeline (`cb2-sizes.txt`,
+20 s spacing) covers the fill + warm phase; its last sample (23:21:25) is still
+on the 8192 MiB plateau.
 
-**Reclaim works.** After the warm run plus follower requests ended and their
-publish refs released, `ls -lh` showed the apparent file back at 8.1 GiB from
-the 8.6 GiB (8192 MiB physical) high water — the trailing-extent truncation
-returns disk rather than leaving the file at the peak forever.
+**Reclaim NOT confirmed this window.** The sampler stopped with the serve still
+at the cap and did not cover a post-release read, the test spills were deleted
+on the restore to the flags-off production serve, and the cap path can't be
+re-driven without a new window — so there is no on-disk shrink evidence here.
+The earlier oral "8.6→8.1 GiB after release" was a unit muddle
+(8,606,715,904 B = 8.016 GiB = the same 8192 MiB plateau in decimal GB, not a
+later smaller value) and is withdrawn. Trailing-extent truncation is covered by
+the hermetic CPU tier test; physical post-release reclaim stays
+**pending-next-window** — re-sample `du` after the publish refs release with the
+spill left in place.
+
+**Follower correctness: client-terminal observation, not vendored.** A follower
+repeating an identical 32k prompt returned byte-identical tokens
+(`finish_reason=length`, `/health` `prefix_hits` delta +1) in the client-side
+`follower_smoke.py` run on both cb1 and cb2. That script's stdout was not
+redirected to a saved log and the boot log carries no per-request prefix-hit
+line, so this is an unaudited client-terminal read, not a vendored artifact;
+the prefix-hit assertion should be captured to a file in the next window.
+`kv_cold_drops=0` (health at the time) is the one machine-readable no-wrong-page
+signal that was read directly.
 
 **New tail: full-cap evict/reload churn.** With the file at the cap during the
 second warm rep, eviction-and-reload dominated: that rep's effective tok/s fell
@@ -107,6 +125,6 @@ count.
 | date | commit | machine | target | model | physical spill | drops / correctness | full-cap tail |
 |---|---|---|---|---|---:|---|---|
 | 2026-09-19 | pending PR | CPU (hermetic) | HostKvPages shared-prefix spill cap + reclaim | — | — | bounded cap enforced; trailing extents truncated to header | — |
-| 2026-09-19 | 659c2fbb | V100 sm70 | shared `.prefix.bin` cap + trailing reclaim | Qwen3.8-27B-NVFP4, 37.6k sparse, 1G/8G f16 | pinned 8192 MiB (was 16–25 GiB), reclaimed to 8.1 GiB post-release | 0 drops; follower tokens byte-identical, prefix_hits+1 | rep2 eff 9.25→5.84 tok/s, tick p90 738 ms, close max 7.65 s |
+| 2026-09-19 | 659c2fbb | V100 sm70 | shared `.prefix.bin` cap (filler+warm only) | Qwen3.8-27B-NVFP4, 37.6k sparse, 1G/8G f16 | pinned 8192 MiB under load (was 16–25 GiB); post-release reclaim NOT sampled, pending-next-window | 0 drops (health); follower identical = client-terminal only | rep2 eff 9.25→5.84 tok/s, tick p90 738 ms, close max 7.65 s |
 
 Raw artifacts: tests `tests/test_sparse_kv_tier.py`; change `src/tilerl/kv_tiers.py`.
