@@ -1,12 +1,18 @@
 # Background publisher for request-close host/SSD bytes — 2026-09-20
 
-> Status: landed behind an env gate (`TILERL_CLOSE_BG_PUBLISH=1`), default OFF,
-> CPU hermetic gates green; device delta pending-remote (V100 stopped 2026-09-16,
-> ckl physical wall). Second of two PRs on the deterministic per-request
-> close-time lock stall. The first ([2026-09-19-batched-close-publish-d2h.md](2026-09-19-batched-close-publish-d2h.md),
-> #741) collapsed the per-page device syncs (close 2940→2321 ms, −21%) but left
-> the two host/SSD-byte terms flat: `ssd_mmap` 1833→1865 and `pub_cold_transfer`
-> 1726→1783 ms. This PR moves both off the close critical path.
+> Status: landed behind an env gate (`TILERL_CLOSE_BATCH_D2H=1`/`TILERL_CLOSE_BG_PUBLISH=1`),
+> default OFF; device partial confirmation on V100 2026-09-20 (0041fb14): the
+> shared-SSD write leaves the step thread when the bounded queue fits
+> (`pub_cold_transfer` 1783→9 ms), correctness/latency all green, but the default
+> queue depth 512 overflows a 32k close (34.5% inline) and the private-spill
+> read (`ssd_mmap`) is still charged into the close tick. Not ready for a default
+> flip.
+
+Second of two PRs on the deterministic per-request close-time lock stall. The
+first ([2026-09-19-batched-close-publish-d2h.md](2026-09-19-batched-close-publish-d2h.md),
+#741) collapsed the per-page device syncs (close 2940→2321 ms, −21%) but left
+the two host/SSD-byte terms flat: `ssd_mmap` 1833→1865 and `pub_cold_transfer`
+1726→1783 ms. This PR was meant to move both off the close critical path.
 
 ## Context
 
@@ -112,17 +118,76 @@ inline path; the worker thread is not started.
   in-flight publish before `prefix.clear` runs (mutation-red on removing the
   stop call).
 
-## Device target (pending-remote)
+## Device confirmation (V100 sm70, 2026-09-20, 0041fb14)
 
-The terms this must move, from the V100 2026-09-19 #741 measurement
-(`659c2fbb`, medians over the release tail): `ssd_mmap` ~1.86 s and
-`pub_cold_transfer` ~1.78 s of the ~2.32 s close. Expected effect: both leave
-the `release_close_request` segment (paid later on the worker, overlapping
-forward ticks); close should approach the remaining index/frame work. Steady
-decode must not regress (model ~166 ms/tick, eff ~9.4 tok/s in #741): the
-worker moves only host bytes under a short tier lock and never touches CUDA.
-Re-measure with the #732 five-subsegment parse on the next V100 window before
-any default flip; keep the gate default-off until that number is captured.
+Three served arms, same fill-then-warm protocol as the prior window (W=2048,
+1 GiB-RAM / 8 GiB-SSD f16, 37.6k prompts): bg0 `TILERL_CLOSE_BATCH_D2H=1` only
+(the 1-PR state, fill-2/warm-2), bg1 `TILERL_CLOSE_BG_PUBLISH=1` with the
+default `TILERL_CLOSE_BG_DEPTH=512` (fill-2/warm-2), bg2 the bg flag with
+`TILERL_CLOSE_BG_DEPTH=8192` (fill-1/warm-1, kept small for disk headroom).
+
+Per-request close medians over the release tail ticks (ms):
+
+| arm | release_close_request | ssd_mmap | pub_cold_transfer | pub_frame_d2h | bg degraded |
+|---|---:|---:|---:|---:|---:|
+| bg0 batch only | 2326 | 1919 | 1874 | 43 | — |
+| bg1 bg, depth 512 (default) | 2752 | 2258 | 960 | 41 | 34.5% |
+| bg2 bg, depth 8192 | 1020 / **6478** (n=2) | 3341 | **9** | 154 | **0%** |
+
+### What worked
+
+- **Shared-SSD write leaves the step thread when the queue fits.** At depth
+  8192 `kv_cold_bg_degraded=0` and `pub_cold_transfer` drops 1783→9 ms. The
+  physical proof is the size timeline (`bg2-sizes.txt`, bytes in 2³⁰): after a
+  publisher returns, `.prefix.bin` keeps growing as the worker commits —
+  6.7 → 8.8 → 10.7 GiB across the following requests — i.e. the bytes land off
+  the request's wall.
+- **No steady regression.** model 165–166 ms, decode tick p50 182–183 ms, raw
+  4.6–5.2 tok/s, acceptance unchanged across all three arms.
+- **Correctness and cancel latency, all vendored** (not terminal reads): a
+  follower repeating the identical 32k prompt returns byte-identical tokens,
+  `finish_reason=length`, `/health` `prefix_hits +1`, `kv_cold_drops=0`
+  (`bg{1,2}-follower.json`); a client cancel while a follower is in flight frees
+  the slot in 0.40–0.81 s and `/health` answers in 1 ms (`bg{1,2}-cancel.json`)
+  — the off-lock `wait_committed` design holds, the tick lock is never held on
+  the worker. Zero `kv_cold_bg_timeouts` / `bg_failed` all window.
+
+### What did not
+
+- **Default queue depth 512 overflows a 32k close.** One 37.6k close enqueues
+  thousands of page jobs (~3100–4700 observed); against a 512-deep bounded
+  queue the surplus returns False and transfers **inline**, so bg1 still ran
+  34.5% of transfers under the lock and its close median was not lower (2752).
+  Depth needs to be derived from the maximum close burst (follow-up).
+- **The private-spill read did not cleanly leave the close tick.** Even at
+  depth 8192 with zero inline fallback, `ssd_mmap` self-time (~3.3 s median on
+  bg2's two tail ticks) is still charged into `release_close_request`, and the
+  two bg2 close ticks were 1020 and **6478 ms** — too thin (n=2) and too
+  long-tailed to claim "close is sub-second". Only three facts are established:
+  (1) `pub_cold_transfer` → 9 ms and the spill grows asynchronously, (2) the
+  ColdSsdFile self-measured `ssd_mmap` lands in the close tick, (3) close wall
+  was 1.0–6.5 s. Whether that residual time is the device busy or the step
+  thread host-blocked (the worker's `share_hold_kv` private-spill lift and
+  shared write contend with the close path on `_tlock`) is **not decided**: the
+  `fwd_gpu=7457` on the 6478 ms tick is a no-`synchronize` CUDA-event span that
+  inflates under any mid-forward blocking wait even with the device idle
+  (`sync_streams=0`), so it must not be read as "the GPU was busy 7.3 s". Static
+  read for an implicit CUDA call on the worker path is assigned to fixkv; if
+  inconclusive, a non-blocking event-query busy/idle probe plus worker-thread
+  mmap timing (not drained into the step timer) folds into the next device
+  window alongside the depth fix.
+- **Backlogged follower wait.** When the worker is behind, a follower spends
+  ~4.9 s off-lock in `wait_committed` before adopting (`bg2-follower.json`). It
+  holds no tick lock, but the interaction latency is real.
+
+Verdict: the mechanism is correct and improves cancel/interaction latency, but
+it stays **default OFF**; flipping needs the queue-depth fix and a follow-up
+that takes the worker's private-spill lift fully off the close path.
+
+Vendored in `wins/bg-publish-device-2026-09-20/`: `bg0/bg1/bg2.json` (arm
+summaries), `bg{1,2}-follower.json` and `bg{1,2}-cancel.json` (response +
+health snapshots), `bg1/bg2-sizes.txt` (physical-size timelines, 2³⁰ units).
+Raw per-tick logs are `~/tilerl-logs/serve-bg{0,1,2}.boot` on the box.
 
 ## Rule
 
@@ -137,8 +202,13 @@ key with neither a blob nor a future.
 
 ## Follow-up
 
-- Device re-measurement (V100) and, if green, a default flip after a served
-  soak.
+- Derive `TILERL_CLOSE_BG_DEPTH` from the maximum close burst (default 512
+  overflows a 32k close; 8192 fit with 0 inline in this window) — small,
+  statically testable.
+- Take the worker's private-spill lift (`share_hold_kv` off `sparse_cold.bin`)
+  fully off the close path; determine device-busy vs host-blocked with the
+  non-blocking event-query + worker-thread mmap probe in the next device window.
+- A default flip only after both land and a served soak.
 - Pinned-host-buffer pooling with a cold-tier release hook (the #741 leftover;
   orthogonal to this PR).
 
@@ -147,7 +217,7 @@ key with neither a blob nor a future.
 | date | commit | machine | target | model | close terms | steady decode |
 |---|---|---|---|---|---|---|
 | 2026-09-20 | pending PR | CPU (hermetic) | background close-publish mechanism + wiring | — | ssd_mmap/pub_cold_transfer move off the close segment (host-only on CPU; timing n/a) | unchanged |
-| next V100 window | pending-remote | V100 sm70 | request-close host/SSD bytes | Qwen3.8-27B-NVFP4, 1G/8G f16 | target: ssd_mmap ~1.86 s + pub_cold_transfer ~1.78 s off-lock | must hold ~166 ms/tick, ~9.4 tok/s |
+| 2026-09-20 | 0041fb14 | V100 sm70 | request-close host/SSD bytes | Qwen3.8-27B-NVFP4, 37.6k sparse, 1G/8G f16 | depth8192: pub_cold_transfer 1783→9 ms + spill grows async, 0 inline; ssd_mmap ~3.3 s still in close tick, close 1020/6478 ms (n=2); default depth512 degrades 34.5% | held: model 165–166 ms, tick 182–183 ms, raw 4.6–5.2 tok/s |
 
 Raw artifacts: `tests/test_sparse_kv_tier.py`, `tests/test_sparse_engine.py`;
 changes `src/tilerl/kv_tiers.py`, `src/tilerl/kv_cache.py`,

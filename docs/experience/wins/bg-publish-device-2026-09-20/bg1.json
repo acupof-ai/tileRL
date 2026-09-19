@@ -1,0 +1,121 @@
+{
+ "arm_headroom_mib": 0,
+ "expect_draft_window_w": 2048,
+ "engaged_draft_window_w_values": [
+  2048
+ ],
+ "warm_reps": 2,
+ "good_reps": 2,
+ "warm32k": {
+  "decode_tok_s_median": 4.6,
+  "decode_tok_s_min": 4.6,
+  "decode_tok_s_max": 5.198,
+  "decode_tok_s_spread": 0.598,
+  "per_rep_tok_s": [
+   4.6,
+   5.198
+  ]
+ },
+ "spec_accept_rate_median": 0.8235,
+ "spec_accept_rate_per_rep": [
+  0.8235,
+  0.8824
+ ],
+ "fill": {
+  "n_per_rep": 2,
+  "cold_total_gb_first": 5.441,
+  "cold_total_gb_last": 13.599,
+  "cold_private_gb_last": 0.0,
+  "cold_shared_gb_last": 1.0,
+  "cold_private_ssd_gb_last": 0.0,
+  "cold_shared_ssd_gb_last": 12.6,
+  "cold_total_before_gb": 0.0
+ },
+ "health": {
+  "sparse_headroom_bytes": 0,
+  "sparse_headroom_dropped_blocks": 0,
+  "blocks_total": 2213,
+  "resident_slots_floor": 4,
+  "slots_total_state_pool": 4,
+  "process_free_mib": 1266,
+  "physical_free_mib_nvidia": 1266
+ },
+ "reps": [
+  {
+   "rep": 0,
+   "decode_tok_s": 4.6,
+   "content_chunks": 18,
+   "first_to_last_s": 3.696,
+   "wall_s": 214.603,
+   "engaged_draft_window_w": 2048,
+   "cold_total_gb": 5.441,
+   "cold_private_gb": 0.0,
+   "cold_shared_gb": 1.0,
+   "cold_private_ssd_gb": 0.0,
+   "cold_shared_ssd_gb": 4.442,
+   "fill_prompt_tokens": [
+    37567,
+    37566
+   ],
+   "spec_drafted_delta": 17,
+   "spec_accepted_delta": 14,
+   "spec_accept_rate": 0.8235,
+   "ticks": {
+    "log_byte_offset": 194540,
+    "ticks_in_window": 214,
+    "decode_ticks": 17,
+    "dropped_prefill_ticks": 197,
+    "p50_ms": 183,
+    "p90_ms": 356,
+    "max_ms": 2956,
+    "frac_over_300": 0.176,
+    "type1_finalize_ticks": 2,
+    "type1_finalize_ms_median": 16,
+    "type1_finalize_ms_max": 40,
+    "type1_offers_pages_median": 64,
+    "type1_offers_pages_max": 169,
+    "type2_hollow_ticks": 1,
+    "steady_free_mib": 1266
+   },
+   "device_free_mib": 1266
+  },
+  {
+   "rep": 1,
+   "decode_tok_s": 5.198,
+   "content_chunks": 18,
+   "first_to_last_s": 3.27,
+   "wall_s": 205.613,
+   "engaged_draft_window_w": 2048,
+   "cold_total_gb": 13.599,
+   "cold_private_gb": 0.0,
+   "cold_shared_gb": 1.0,
+   "cold_private_ssd_gb": 0.0,
+   "cold_shared_ssd_gb": 12.6,
+   "fill_prompt_tokens": [
+    37565,
+    37566
+   ],
+   "spec_drafted_delta": 17,
+   "spec_accepted_delta": 15,
+   "spec_accept_rate": 0.8824,
+   "ticks": {
+    "log_byte_offset": 489409,
+    "ticks_in_window": 214,
+    "decode_ticks": 17,
+    "dropped_prefill_ticks": 197,
+    "p50_ms": 177,
+    "p90_ms": 206,
+    "max_ms": 3044,
+    "frac_over_300": 0.059,
+    "type1_finalize_ticks": 2,
+    "type1_finalize_ms_median": 12,
+    "type1_finalize_ms_max": 55,
+    "type1_offers_pages_median": 54,
+    "type1_offers_pages_max": 169,
+    "type2_hollow_ticks": 1,
+    "steady_free_mib": 1266
+   },
+   "device_free_mib": 1266
+  }
+ ]
+}

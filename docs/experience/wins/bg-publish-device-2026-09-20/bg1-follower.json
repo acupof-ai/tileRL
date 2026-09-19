@@ -1,0 +1,46 @@
+{
+ "t0": "05:50:19",
+ "health_before": {
+  "prefix_hits": 0,
+  "kv_cold_drops": 0,
+  "kv_cold_bg_queued": 9296,
+  "kv_cold_bg_degraded": 4776,
+  "kv_cold_bg_timeouts": 0,
+  "kv_cold_bg_failed": 0,
+  "kv_cold_shared_ssd_bytes": 16448880640,
+  "running": 0
+ },
+ "publisher": {
+  "s": 202.814,
+  "content": "This text appears to be a **re",
+  "finish": "length"
+ },
+ "health_after_publisher": {
+  "prefix_hits": 0,
+  "kv_cold_drops": 0,
+  "kv_cold_bg_queued": 10711,
+  "kv_cold_bg_degraded": 5706,
+  "kv_cold_bg_timeouts": 0,
+  "kv_cold_bg_failed": 0,
+  "kv_cold_shared_ssd_bytes": 19368837120,
+  "running": 0
+ },
+ "follower_wall_s": 3.52,
+ "follower_post_return_s": 3.519,
+ "follower": {
+  "content": "This text appears to be a **re",
+  "finish": "length"
+ },
+ "tokens_equal": true,
+ "health_after_follower": {
+  "prefix_hits": 1,
+  "kv_cold_drops": 0,
+  "kv_cold_bg_queued": 10711,
+  "kv_cold_bg_degraded": 5706,
+  "kv_cold_bg_timeouts": 0,
+  "kv_cold_bg_failed": 0,
+  "kv_cold_shared_ssd_bytes": 19368837120,
+  "running": 0
+ },
+ "t1": "05:53:45"
+}

@@ -1,0 +1,20 @@
+{
+ "publisher_s": 200.9,
+ "after_publish": {
+  "kv_cold_bg_queued": 12289,
+  "kv_cold_bg_degraded": 6473,
+  "kv_cold_bg_timeouts": 0,
+  "kv_cold_bg_failed": 0,
+  "running": 0
+ },
+ "cancel_return_after_s": 0.81,
+ "slot_freed_after_s": 0.81,
+ "after_cancel": {
+  "kv_cold_bg_queued": 12289,
+  "kv_cold_bg_degraded": 6473,
+  "kv_cold_bg_timeouts": 0,
+  "kv_cold_bg_failed": 0,
+  "running": 0
+ },
+ "health_roundtrip_s": 0.001
+}
