@@ -877,3 +877,147 @@ def test_a_shared_spill_failure_stays_in_ram_and_disables_spill(tmp_path):
     finally:
         ColdSsdFile.write = orig
         cold.close()
+
+
+def test_bounded_shared_spill_refuses_pages_past_the_cap_and_keeps_them_in_ram(tmp_path, monkeypatch):
+    """TILERL_COLD_PREFIX_SSD_CAP=1 bounds the publish-only .prefix.bin by the
+    same --cold-ssd-bytes admission the private spill reports (observed
+    unbounded: 13.6 GiB logical / 25 GiB physical vs an 8 GiB cap). A shared
+    page past the cap is not written (False) and stays in host RAM instead of
+    filling the disk; the counter never exceeds the cap. Off by default."""
+    monkeypatch.setenv("TILERL_COLD_PREFIX_SSD_CAP", "1")
+    per = 2 * 2 * BLOCK_TOKENS
+    ssd = str(tmp_path / "c.bin")
+    # host holds 1 page; explicit SSD cap holds only 2 shared pages
+    cold = HostKvPages(budget_bytes=per, ssd_path=ssd, ssd_capacity_bytes=per * 2)
+    assert cold.prefix_spill_bounded is True
+    assert cold.stats()["kv_cold_shared_ssd_bounded"] == 1
+    try:
+        def page(i):
+            return {"k": torch.full((per,), i, dtype=torch.uint8),
+                    "v": torch.full((per,), i, dtype=torch.uint8)}
+        # three holds against a 1-page RAM budget: LRU spills the first two to the
+        # shared SSD (filling the 2-page cap); the third stays in RAM
+        for i in (1, 2, 3):
+            cold.share_hold(i, page(i), per)
+        assert cold._shared_ssd_bytes == per * 2, cold._shared_ssd_bytes
+        # the RAM-resident third page cannot spill past the cap -> stays RAM
+        assert cold._shared_evict_ram(3) is False
+        assert cold._shared_ssd_bytes == per * 2
+        # the page is still served from RAM (a cache miss, not a lost publish)
+        assert cold.share_take(3) is not None
+    finally:
+        cold.close()
+
+
+def test_host_tier_wires_reclaim_to_the_shared_spill_only_by_env(tmp_path, monkeypatch):
+    """Wiring-layer gate (red on main): the reclaim flag must reach the LAZILY
+    created SHARED ColdSsdFile from the env, and forgetting a trailing live page
+    must actually shrink that file; the PRIVATE spill file is never reclaiming.
+    Constructing ColdSsdFile(reclaim=True) directly does not prove the host tier
+    passes it when it lazily opens .prefix.bin — this exercises that seam."""
+    per = 2 * 2 * BLOCK_TOKENS
+    ssd = str(tmp_path / "w.bin")
+
+    def page(i):
+        return {"k": torch.full((per,), i, dtype=torch.uint8),
+                "v": torch.full((per,), i, dtype=torch.uint8)}
+
+    # env ON: a shared spill exists after LRU eviction and is reclaiming; release
+    # of its only live slot truncates the trailing extent back.
+    monkeypatch.setenv("TILERL_COLD_PREFIX_SSD_CAP", "1")
+    cold = HostKvPages(budget_bytes=per, ssd_path=ssd, ssd_capacity_bytes=per * 8)
+    try:
+        cold.share_hold(1, page(1), per)
+        cold.share_hold(2, page(2), per)  # evicts 1 to the shared SSD
+        assert cold._shared_ssd is not None
+        assert cold._shared_ssd._reclaim is True, "env on must wire reclaim=True to shared"
+        size_before = os.path.getsize(cold._shared_ssd._path)
+        cold.share_release(1)  # last ref of the spilled page -> forget + tail reclaim
+        assert os.path.getsize(cold._shared_ssd._path) < size_before
+    finally:
+        cold.close()
+
+    # env OFF: the same shared spill is created with reclaim=False and never shrinks.
+    monkeypatch.delenv("TILERL_COLD_PREFIX_SSD_CAP", raising=False)
+    cold2 = HostKvPages(budget_bytes=per, ssd_path=ssd, ssd_capacity_bytes=per * 8)
+    try:
+        cold2.share_hold(1, page(1), per)
+        cold2.share_hold(2, page(2), per)
+        assert cold2._shared_ssd is not None and cold2._shared_ssd._reclaim is False
+        size_before = os.path.getsize(cold2._shared_ssd._path)
+        cold2.share_release(1)
+        assert os.path.getsize(cold2._shared_ssd._path) == size_before
+    finally:
+        cold2.close()
+
+    # The PRIVATE spill file is NEVER reclaiming, regardless of the env.
+    monkeypatch.setenv("TILERL_COLD_PREFIX_SSD_CAP", "1")
+    pool = PagedKvPool(2, 2, 8, num_layers=2, device=_device())
+    pool.attach_cold(HostKvPages(budget_bytes=0, ssd_path=str(tmp_path / "p.bin")))
+    kk, vv = _kv(7, 1, 2, 8)
+    b = pool.alloc_block()
+    pool.write_block(b, 0, kk[0], vv[0], layer=0)
+    pool.write_block(b, 0, kk[0], vv[0], layer=1)
+    pool.demote_page(b, key=(3, 0))
+    assert pool.cold._ssd is not None and pool.cold._ssd._reclaim is False
+    pool.cold.close()
+
+    # default OFF (env removed): the same write past the cap is allowed
+    monkeypatch.delenv("TILERL_COLD_PREFIX_SSD_CAP", raising=False)
+    cold2 = HostKvPages(budget_bytes=per, ssd_path=ssd, ssd_capacity_bytes=per)
+    try:
+        assert cold2.prefix_spill_bounded is False
+        b = {"k": torch.zeros(per, dtype=torch.uint8),
+             "v": torch.zeros(per, dtype=torch.uint8)}
+        cold2.share_hold(9, {k: t.clone() for k, t in b.items()}, per)
+        assert cold2._shared_evict_ram(9) is True
+        assert cold2._shared_ssd_bytes == per
+    finally:
+        cold2.close()
+
+
+def test_spill_file_reclaims_freed_trailing_extents_to_disk(tmp_path, monkeypatch):
+    """reclaim=True truncates the file back when the last live extent empties, so
+    a release wave returns physical disk instead of leaving the spill at its
+    high-water mark forever (the #735 extent growth reuses slots but never
+    shrank). Mid-file free extents cycle through the LIFO free list; only the
+    fully-free TAIL collapses."""
+    from tilerl.kv_tiers import ColdSsdFile
+
+    monkeypatch.setenv("TILERL_COLD_PREFIX_SSD_CAP", "1")
+    spec = [("x", (64,), "float32", 256)]
+    f = ColdSsdFile(str(tmp_path / "r.bin"), spec, reclaim=True)
+    g = ColdSsdFile.GROWTH_SLOTS
+    grown = f.HEADER + 2 * g * 256
+    for i in range(g + 2):  # force growth into the 2nd extent
+        f.write(i, {"x": torch.arange(64, dtype=torch.float32) + i})
+    assert os.path.getsize(str(tmp_path / "r.bin")) == grown
+    # release just one early (extent-0) page: no tail collapse (extent 1 full)
+    f.forget(0)
+    assert os.path.getsize(str(tmp_path / "r.bin")) == grown
+    # release every extent-1 page (the tail) -> file collapses to one extent
+    for i in range(g, g + 2):
+        f.forget(i)
+    one_extent = f.HEADER + g * 256
+    assert f._cap == g
+    assert os.path.getsize(str(tmp_path / "r.bin")) == one_extent
+    # remaining extent-0 slots (except 0) still round-trip byte-exact
+    for i in range(1, g):
+        assert torch.equal(f.read(i, False)["x"], torch.arange(64, dtype=torch.float32) + i)
+    # releasing the last live extent collapses the file to the header only
+    for i in range(1, g):
+        f.forget(i)
+    assert f._cap == 0
+    assert os.path.getsize(str(tmp_path / "r.bin")) == f.HEADER
+    f.close()
+
+    # reclaim=False (default private file / gate off): forgetting never shrinks
+    f2 = ColdSsdFile(str(tmp_path / "r2.bin"), spec, reclaim=False)
+    for i in range(g + 2):
+        f2.write(i, {"x": torch.zeros(64, dtype=torch.float32)})
+    for i in range(g + 2):
+        f2.forget(i)
+    assert f2._cap == 2 * g and os.path.getsize(str(tmp_path / "r2.bin")) == grown
+    f2.close()
+
