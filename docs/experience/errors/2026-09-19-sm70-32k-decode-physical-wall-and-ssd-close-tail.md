@@ -53,7 +53,8 @@ to the flag.
 **Steady rate is a hardware wall.** d3 effective is 10.7 tok/s (<20) and the
 steady model segment is 169 ms (≥120 ms) — both pre-registered arms hold. At a
 steady decode tick the model trunk is 168–169 ms, ~90% of the ~185 ms tick;
-sparse select and finalize are 1–2 ms, the d1 draft step is 12 ms. There is no
+sparse select is 1–2 ms and finalize is 11–18 ms on the positive-finalize
+type-1 ticks (37–50 ms max), the d1 draft step is 12 ms. There is no
 software segment left whose removal approaches 50 tok/s. d3 beats d1 on
 *effective* tokens (10.7 vs 9.5) because each forward emits up to 4 tokens, even
 though its raw streamed rate is lower and its per-verify cost is higher (24 ms
@@ -71,13 +72,21 @@ exactly why #736 shipped opt-in rather than a default flip.
 **The long tail is a separate, per-request design cost, not steady decode.**
 Once per request, at close, the engine transfers cold shared pages to SSD:
 `release_close_request` ≈ 2.95–3.18 s, inside it `ssd_mmap` 1.81–2.03 s and
-`pub_cold_transfer` 1.71–1.87 s. d3 additionally hit one 9.95 s model tick.
-These are >300 ms outliers (5.9% of decode ticks); they do not move the steady
-median but they dominate worst-case request latency. This is the SSD-heavy
-1 GiB-RAM form; the 2026-09-17 full-tier finalize numbers (190–222 /
-729–1138 ms, 8 GiB RAM tier) are a different tier shape and are not comparable —
-the finalize segment here is a 1–2 ms steady / ≤60 ms max, and the tail moved
-from finalize to the request-close SSD transfer.
+`pub_cold_transfer` 1.71–1.87 s. Long decode ticks (>300 ms) are 5.9% of warm
+decode ticks on every d1 arm and 15.4%/7.1% on the two d3 reps; they do not
+move the steady median but they dominate worst-case request latency. This is
+the SSD-heavy 1 GiB-RAM form; the 2026-09-17 full-tier finalize numbers
+(190–222 / 729–1138 ms, 8 GiB RAM tier) are a different tier shape and are not
+comparable — the warm steady `sparse_finalize` segment here is a 11–18 ms
+median (37–50 ms max across the ten reps), and the tail moved from finalize to
+the request-close SSD transfer.
+
+A separate fill-phase outlier is raw-log-only, not in the vendored warm JSON:
+in the d3 serve log `serve-d3.boot`, tick 198 is a 9978 ms decode tick
+(`model=9952ms`, `offers_pages=0`, `ssd_mmap=0`) immediately after two
+7446/7914 ms prefill ticks (196/197) during a cold fill — a hollow model
+forward at the fill edge, distinct from the steady trunk and from the SSD
+close tail. Tick 199 (6625 ms) is the same shape.
 
 ## Fix
 
