@@ -262,15 +262,18 @@ def parse_log(log_path: str, byte_offset: int = 0) -> dict:
 
 # --- the one-command arm -----------------------------------------------------
 
-def _cold_tier_gb(h: dict) -> tuple[float, float, float]:
-    # The full-tier condition is HOST cold occupancy = live-row private pages plus
-    # the shared pool accumulated across all fills. /health emits them as separate
-    # keys and stats() merges private over the shared name, so reading kv_cold_bytes
-    # alone under-counts (private resets toward 0 when a request ends) and a full
-    # tier falsely fails rc3. SSD spill is a different tier and is excluded.
+def _cold_tier_gb(h: dict) -> tuple[float, float, float, float, float]:
+    # Cold occupancy across BOTH tiers: private/shared pages in pinned host RAM
+    # plus their SSD spill (each has its own /health key). Excluding SSD was
+    # correct for the old RAM-only 8GiB tier; with --kv-cold-bytes 1GiB +
+    # --cold-ssd-bytes most cold bytes live under kv_cold_*_ssd_bytes and a
+    # RAM-only gate can never pass (the #731 private-vs-shared under-count
+    # applies per tier, so read all four keys, not a merged name).
     priv = h.get("kv_cold_bytes", 0) / 2**30
     shared = h.get("kv_cold_shared_bytes", 0) / 2**30
-    return priv, shared, priv + shared
+    priv_ssd = h.get("kv_cold_ssd_bytes", 0) / 2**30
+    shared_ssd = h.get("kv_cold_shared_ssd_bytes", 0) / 2**30
+    return priv, shared, priv_ssd, shared_ssd, priv + shared + priv_ssd + shared_ssd
 
 
 def _fill_cold_tier(a, rep: int) -> tuple[dict, list[int]]:
@@ -292,10 +295,12 @@ def _one_warm(a, rep: int) -> dict | None:
     """One independent refill + primed-warm 32k, return the rep record or None on a
     fail-closed condition (caller counts it; None never yields a clean ARM_DONE)."""
     hfill, pt_rows = _fill_cold_tier(a, rep)
-    cold_priv_gb, cold_shared_gb, cold_gb = _cold_tier_gb(hfill)
+    cold_priv_gb, cold_shared_gb, cold_priv_ssd_gb, cold_shared_ssd_gb, cold_gb = (
+        _cold_tier_gb(hfill))
     if cold_gb < a.min_cold_gb:
         print(f"REP{rep}-FILL-INSUFFICIENT cold_total={cold_gb:.2f}GiB "
-              f"(private={cold_priv_gb:.2f} shared={cold_shared_gb:.2f}) "
+              f"(ram_priv={cold_priv_gb:.2f} ram_shared={cold_shared_gb:.2f} "
+              f"ssd_priv={cold_priv_ssd_gb:.2f} ssd_shared={cold_shared_ssd_gb:.2f}) "
               f"< {a.min_cold_gb}GiB", flush=True)
         return None
     # hfill is the post-fill /health snapshot: it both carries the cold totals
@@ -341,6 +346,8 @@ def _one_warm(a, rep: int) -> dict | None:
         "cold_total_gb": round(cold_gb, 3),
         "cold_private_gb": round(cold_priv_gb, 3),
         "cold_shared_gb": round(cold_shared_gb, 3),
+        "cold_private_ssd_gb": round(cold_priv_ssd_gb, 3),
+        "cold_shared_ssd_gb": round(cold_shared_ssd_gb, 3),
         "fill_prompt_tokens": pt_rows,
         "spec_drafted_delta": drafted_d, "spec_accepted_delta": accepted_d,
         "spec_accept_rate": accept_rate, "ticks": ticks,
@@ -351,12 +358,16 @@ def _one_warm(a, rep: int) -> dict | None:
 def cmd_arm(a) -> int:
     wait_ready(a.url, a.ready_trials)
     h0 = health(a.url)
-    _cold0_priv, _cold0_shared, cold0_total = _cold_tier_gb(h0)
+    cold0 = _cold_tier_gb(h0)
+    cold0_total = cold0[-1]
     reps = []
     for r in range(a.warm_reps):
         rec = _one_warm(a, r)
-        if rec is not None:
-            reps.append(rec)
+        if rec is None:
+            # Fail fast: a later rep cannot refill what this rep's gate proved
+            # absent, and every extra fill grows the SSD spill high-water file.
+            break
+        reps.append(rec)
     # Fail closed: too few good reps must never print ARM_DONE or a clean median.
     if len(reps) < a.min_good_reps:
         print(f"NO-GOOD-REPS good={len(reps)}/{a.warm_reps} "
@@ -385,6 +396,8 @@ def cmd_arm(a) -> int:
                  "cold_total_gb_last": reps[-1]["cold_total_gb"],
                  "cold_private_gb_last": reps[-1]["cold_private_gb"],
                  "cold_shared_gb_last": reps[-1]["cold_shared_gb"],
+                 "cold_private_ssd_gb_last": reps[-1]["cold_private_ssd_gb"],
+                 "cold_shared_ssd_gb_last": reps[-1]["cold_shared_ssd_gb"],
                  "cold_total_before_gb": round(cold0_total, 3)},
         "health": {
             "sparse_headroom_bytes": hw.get("sparse_headroom_bytes", 0),
@@ -550,16 +563,18 @@ def _self_check(ns=None) -> int:
             return 0
     nschk = _NS()
     assert _dispatch(nschk) == 0 and nschk.got is nschk
-    # Cold fullness is private + SHARED host bytes: a full tier reads private low
-    # (it resets per request) while shared holds the accumulated pool. Gating on
-    # private alone false-fails rc3; the decision must be made on the total.
+    # Cold fullness spans RAM and SSD, private and shared: a 1GiB-RAM/8GiB-SSD
+    # tier reads RAM near its cap with most bytes on SSD; gating on RAM alone,
+    # or dropping one SSD key, false-fails the full-tier check.
     gb = 2**30
-    p, sh, tot = _cold_tier_gb({"kv_cold_bytes": int(1.2 * gb),
-                                "kv_cold_shared_bytes": int(6.0 * gb)})
-    assert p < 7 <= tot, (p, sh, tot)
-    _, _, tot_low = _cold_tier_gb({"kv_cold_bytes": int(1.0 * gb),
-                                   "kv_cold_shared_bytes": int(2.0 * gb)})
-    assert tot_low < 7
+    p, sh, ps, ss, tot = _cold_tier_gb({"kv_cold_bytes": int(0.5 * gb),
+                                        "kv_cold_shared_bytes": int(0.5 * gb),
+                                        "kv_cold_ssd_bytes": int(1.0 * gb),
+                                        "kv_cold_shared_ssd_bytes": int(5.5 * gb)})
+    assert (p, sh, ps, ss, tot) == (0.5, 0.5, 1.0, 5.5, 7.5), (p, sh, ps, ss, tot)
+    _p, _sh, _ps, _ss, tot_no_ssd = _cold_tier_gb(
+        {"kv_cold_bytes": int(0.5 * gb), "kv_cold_shared_bytes": int(0.5 * gb)})
+    assert tot_no_ssd == 1.0 and tot_no_ssd < 7, tot_no_ssd
     print("probe_headroom_coldtail self-check ok")
     return 0
 
