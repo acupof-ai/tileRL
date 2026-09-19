@@ -134,9 +134,9 @@ logs — the bg*.json arm summaries carry only rep aggregates). ms medians:
 
 | arm (tail ticks) | release_close_request | ssd_mmap | pub_cold_transfer | pub_frame_d2h | bg degraded |
 |---|---:|---:|---:|---:|---:|
-| bg0 batch only (n=6) | 2326 | 1919 | 1874 | 43 | — |
+| bg0 batch only (n=6) | 2326 | 1919.5 | 1874 | 43 | — |
 | bg1 bg, depth 512 default (n=8) | 2752 | 2258 | 960 | 41 | 34.5% |
-| bg2 bg, depth 8192 (n=4) | **1036** (987–**6478**) | 1160 (1072–5511) | **8** (8–11) | 41 (36–265) | **0%** |
+| bg2 bg, depth 8192 (n=4) | **1036** (987–**6478**) | 1160 (1072–5511) | **8** (8–11) | 41.5 (36–265) | **0%** |
 
 bg2 is fill-1/warm-1 and has four tail ticks: three tight at 987–1052 ms plus
 one 6478 ms outlier (tick 202), so the honest median is 1036 ms — not "sub-second
