@@ -531,14 +531,24 @@ class SparseRuntime:
         synced. Runs AFTER the single batch-tail sync and BEFORE the publisher's
         frames are freed. ``items`` is the batch's deferred list of tuples built by
         transfer_to_shared: ("cold",...) pages rehome from the private host/SSD
-        namespace; ("frame",...) pages carry a ready pinned trunk blob."""
+        namespace; ("frame",...) pages carry a ready pinned trunk blob.
+
+        With TILERL_CLOSE_BG_PUBLISH the host/SSD byte move is handed to the cold
+        tier's single background publisher (offer_publish/offer_hold); a full
+        bounded queue makes that call return False and the transfer runs inline
+        here, so a publish is never dropped. The pages were reserved (entries on
+        the lookup chains) before this point, so a follower blocks on their
+        futures rather than seeing a half-published prefix."""
         ctx = self.ctx
         tm = ctx.step_timing
+        cold = ctx.kv.cold
         for item in items:
             if item[2] == "cold":
                 _r, page, _kind, content_key, extra_host = item
+                if cold.offer_publish((_r.req_id, page), content_key, extra_host):
+                    continue
                 t = time.perf_counter() if tm is not None else 0.0
-                n = ctx.kv.cold.share_hold_kv(
+                n = cold.share_hold_kv(
                     (_r.req_id, page), content_key, extra=extra_host)
                 if tm is not None:
                     tm.mark("pub_cold_transfer", t)
@@ -549,8 +559,17 @@ class SparseRuntime:
                         else p for p in _r.cold_pages]
                 continue
             _r, page, _kind, content_key, extra_host, blob, n = item
+            extra_n = sum(x.numel() * x.element_size() for x in extra_host.values()
+                          if torch.is_tensor(x))
+            # Fold bounds/draft into the host frame BEFORE handing it over: the
+            # worker stores the blob verbatim and never sees extra_host. The
+            # inline fallback passes the already-folded blob and an empty extra
+            # so _commit_frame does not count extra_n twice.
+            blob.update(extra_host)
+            if cold.offer_hold(content_key, blob, n + extra_n):
+                continue
             t = time.perf_counter() if tm is not None else 0.0
-            self._commit_frame(blob, n, extra_host, content_key, tm, t)
+            self._commit_frame(blob, n + extra_n, {}, content_key, tm, t)
 
     def finalize(self, sf, rows, hidden=None) -> list:
         """After the forward: store Quest bounds of every now-complete page, then
