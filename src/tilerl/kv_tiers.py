@@ -317,7 +317,8 @@ class HostKvPages:
     def __init__(self, budget_bytes: int = 4 << 30, ssd_path: str = "",
                  ssd_capacity_bytes: int = 0, step_timing=None,
                  bg_publish: bool | None = None, bg_depth: int | None = None,
-                 bg_wait_s: float | None = None) -> None:
+                 bg_wait_s: float | None = None,
+                 bg_max_payload_bytes: int | None = None) -> None:
         # Fail fast: both the private spill and its shared-prefix sibling must be
         # writable now, because the failure used to surface only after the host
         # budget bound mid-decode (V100 /data00 root-owned, 2026-09-14).
@@ -389,10 +390,34 @@ class HostKvPages:
         #: remove them before the worker consumes the job (bounded by queue depth).
         self._pub_private: set = set()
         self.bg_enabled = _close_bg_publish() if bg_publish is None else bool(bg_publish)
-        self.bg_depth = (int(os.environ.get("TILERL_CLOSE_BG_DEPTH", "512"))
-                         if bg_depth is None else bg_depth)
+        # Default queue depth when neither the caller nor TILERL_CLOSE_BG_DEPTH
+        # gives one. 512 is enough for a small CPU test; build_engine replaces it
+        # with a context-derived depth for serving. The env var always wins so an
+        # operator can bound object count without a code change.
+        self.bg_depth = (
+            int(os.environ["TILERL_CLOSE_BG_DEPTH"])
+            if "TILERL_CLOSE_BG_DEPTH" in os.environ and bg_depth is None
+            else (512 if bg_depth is None else bg_depth))
         self.bg_wait_s = (float(os.environ.get("TILERL_CLOSE_BG_WAIT_S", "30"))
                           if bg_wait_s is None else bg_wait_s)
+        #: Hard cap on the host bytes a queued job's payload may pin (0 = off).
+        #: Queue DEPTH bounds object count and the SSD-lift backlog (those jobs
+        #: carry only a private-key reference + the small bounds tensor); this cap
+        #: bounds the one payload that is actually a full page blob — the "hold"
+        #: frame snapshot — so a worker lag cannot accumulate GiB of pinned frames
+        #: the host budget does not account for. Over-cap offers degrade inline.
+        #: Hard cap on host bytes held by queued job payloads ABOVE the pinned
+        #: budget (0 = off). A "hold" frame blob is the one large payload: the 1PR
+        #: batch allocates it regardless, but enqueue delays its entry into the
+        #: shared budget (and thus its LRU spill), so a close burst could pin a
+        #: burst of frame blobs the budget does not yet see. "kv" jobs carry only
+        #: the small bounds extra (the blob already sits under the budget); SSD
+        #: jobs carry none. Over-cap offers degrade inline, which spills at once.
+        self.bg_max_bytes = (
+            int(os.environ["TILERL_CLOSE_BG_MAX_BYTES"])
+            if "TILERL_CLOSE_BG_MAX_BYTES" in os.environ and bg_max_payload_bytes is None
+            else (0 if bg_max_payload_bytes is None else bg_max_payload_bytes))
+        self._pub_payload_bytes = 0
         self.bg_queued = 0
         self.bg_degraded = 0  # queue full -> caller transferred inline
         self.bg_timeouts = 0
@@ -427,6 +452,9 @@ class HostKvPages:
                 kind, private_key, shared_key, payload = job
                 event = None
                 with self._tlock:
+                    # The payload either enters the shared budget below or is
+                    # dropped on failure; either way it stops being queued.
+                    self._pub_payload_bytes -= self._job_payload_n(job)
                     ok = True
                     try:
                         if kind == "kv":
@@ -700,17 +728,34 @@ class HostKvPages:
         return self._enqueue(("hold", None, shared_key, (blob, nbytes)),
                              None, shared_key)
 
+    def _job_payload_n(self, job) -> int:
+        """Host bytes a queued job pins ABOVE the pinned budget until the worker
+        commits it. Only a "hold" frame blob qualifies: it was allocated by the
+        1PR close batch regardless but enters the shared budget (and thus its LRU
+        spill) only at commit. "kv" and SSD jobs are uncharged — the kv blob is
+        already budgeted and the SSD blob is on disk; the bounds extra is tens of
+        bytes and bounded by queue depth, so it is ignored rather than let a
+        frame-heavy burst block the reference-heavy SSD lifts."""
+        if job[0] == "hold":
+            return int(job[3][1])
+        return 0
+
     def _enqueue(self, job, private_key, shared_key: int) -> bool:
         with self._tlock:
             if not self.bg_enabled or self._pub_q is None:
                 return False
             if shared_key in self._shared or shared_key in self._pub_pending:
                 return False
+            payload_n = self._job_payload_n(job)
+            if self.bg_max_bytes and self._pub_payload_bytes + payload_n > self.bg_max_bytes:
+                self.bg_degraded += 1
+                return False
             try:
                 self._pub_q.put_nowait(job)
             except queue.Full:
                 self.bg_degraded += 1
                 return False
+            self._pub_payload_bytes += payload_n
             self._pub_pending[shared_key] = threading.Event()
             self._pub_pending_refs[shared_key] = 0
             if private_key is not None:

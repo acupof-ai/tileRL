@@ -1246,6 +1246,41 @@ def test_bg_publish_budget_evictor_reparks_a_queued_source():
         cold.close()
 
 
+def test_bg_publish_payload_byte_cap_degrades_hold_offers_inline():
+    """The byte guard (distinct from queue depth): queued HOLD frame blobs enter
+    the pinned shared budget only at commit, so a worker lag can pin a burst of
+    them the cold budget does not yet see. bg_max_payload_bytes bounds that
+    above-budget sum; an over-cap hold offer returns False for an inline commit
+    (which spills immediately), so the process cannot accumulate unbounded pinned
+    frames — never an OOM. KV/SSD jobs (bytes already budgeted or on disk) are
+    not charged and are not blocked by the frame cap."""
+    import threading
+
+    blob_n = 128
+    cold = HostKvPages(
+        budget_bytes=1 << 30, bg_publish=True, bg_depth=64,
+        bg_max_payload_bytes=blob_n)  # room for exactly one hold blob
+    gate = threading.Event()
+    _gate_worker(cold, gate)
+    try:
+        assert cold.offer_hold(1000, {"k": torch.zeros(blob_n // 2,
+                                dtype=torch.uint8)}, blob_n)
+        # second hold blob would exceed the cap -> inline fallback
+        assert cold.offer_hold(1001, {"k": torch.zeros(blob_n // 2,
+                                dtype=torch.uint8)}, blob_n) is False
+        assert cold.stats()["kv_cold_bg_degraded"] == 1
+        assert cold._pub_payload_bytes == blob_n
+        # a kv job with only a small bounds extra is NOT charged the blob and is
+        # admitted even though the frame cap is spent
+        _hold_private(cold, 90, 1.0)
+        assert cold.offer_publish(90, 900, {"bounds": torch.zeros(2)})
+        gate.set()
+        assert cold.drain_publishes(5)
+        assert cold._pub_payload_bytes == 0  # charged back down on commit
+    finally:
+        cold.close()
+
+
 def test_bg_publish_close_drains_before_closing_files():
     """shutdown join: a queued job commits in close() even when the worker is
     still parked; the worker thread is stopped, no hang."""

@@ -148,6 +148,38 @@ def fit_blocks(
     )
 
 
+def _bg_publish_sizing(num_slots: int, max_total_tokens: int,
+                       cold_budget_bytes: int) -> dict:
+    """Default background-publisher queue size and payload cap for one engine
+    (TILERL_CLOSE_BG_PUBLISH). Explicit env vars always win, so when either is
+    set by the operator this returns nothing for it.
+
+    Depth: one close emits at most one job per whole page (measured
+    ceil(37567/16)=2348 jobs for a 37.6k request on V100; never 1-2/page), and
+    up to num_slots publishers can release in one tick while the worker drains
+    the prior wave. Size for every slot closing a full context at once, plus one
+    spare wave, so a release burst never degrades inline on object count:
+
+        depth = (num_slots + 1) * ceil(max_total_tokens / 16).
+
+    Payload cap: queueing allocates no big blob (the 1PR close batch already
+    made the "hold" frame blob; "kv" blobs are already budgeted; SSD jobs are on
+    disk) — it only delays a hold blob entering the pinned cold budget. Cap
+    queued payload at the cold budget so worst-case pinned stays <= 2x budget
+    and the LRU converges right after; an over-cap frame offer commits inline
+    (which spills immediately), never OOM."""
+    if os.environ.get("TILERL_CLOSE_BG_PUBLISH", "").strip() in (
+            "", "0", "false", "False"):
+        return {}
+    sizing: dict = {}
+    if "TILERL_CLOSE_BG_DEPTH" not in os.environ:
+        pages = (max_total_tokens + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+        sizing["bg_depth"] = (num_slots + 1) * pages
+    if "TILERL_CLOSE_BG_MAX_BYTES" not in os.environ:
+        sizing["bg_max_payload_bytes"] = cold_budget_bytes
+    return sizing
+
+
 def build_engine(
     cfg,
     model: Any,
@@ -488,6 +520,7 @@ def build_engine(
                 budget_bytes=kv_cold_bytes,
                 ssd_path=cold_ssd_path,
                 ssd_capacity_bytes=cold_ssd_bytes,
+                **_bg_publish_sizing(num_slots, max_total_tokens, kv_cold_bytes),
             )
         )
     if sparse_k and kv_store:
