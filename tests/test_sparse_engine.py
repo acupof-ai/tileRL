@@ -499,7 +499,98 @@ def test_batched_close_publishes_match_the_per_page_path(tmp_path, monkeypatch):
     assert ts == ts_miss, f"batched follower {ts} != per-page miss {ts_miss}"
 
 
-def test_close_publishes_syncs_at_exit_and_keeps_per_page_independent_storage():
+def test_bg_publish_close_path_follower_hits_after_async_transfer(monkeypatch):
+    """TILERL_CLOSE_BG_PUBLISH=1 on top of the 1PR batch: a publisher close hands
+    every page transfer to the cold tier's background worker and returns with the
+    blobs still queued; a same-prompt follower admitted one tick later blocks on
+    the futures, then HITS the full prefix and decodes the miss-oracle tokens.
+    The CPU cell runs the identical queue/future/wait code (the worker only moves
+    host bytes), so this gates the wiring end to end without a card."""
+    monkeypatch.setenv("TILERL_CLOSE_BATCH_D2H", "1")
+    monkeypatch.setenv("TILERL_CLOSE_BG_PUBLISH", "1")
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    follow = np.concatenate([prompt, np.arange(100, 120, dtype=np.int64)])
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    def _sparse():
+        return build_engine(
+            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30)
+
+    oracle = _sparse()
+    ts_miss = _drain(oracle, oracle.submit(follow, params), 8)
+    oracle.shutdown()
+
+    pub = _sparse()
+    assert pub._kv.cold.bg_enabled
+    # A short prompt never drop-publishes: all five pages are device-resident at
+    # close and go through the frame path into the background queue.
+    short_p = np.arange(7, 7 + 5 * BLOCK_TOKENS, dtype=np.int64)
+    sr = pub.submit(short_p, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+    _drain(pub, sr, 4)
+    short_entry = pub._sparse.prefix.lookup(short_p)
+    assert short_entry is not None and len(short_entry["keys"]) == 5
+    for key in short_entry["keys"]:
+        blob = pub._kv.cold.share_take(key)
+        assert blob is not None and "bounds" in blob and "k" in blob, key
+    assert pub._kv.cold.stats()["kv_cold_bg_queued"] >= 5
+
+    rid = pub.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    _drain(pub, rid, 200)
+    entry = pub._sparse.prefix.lookup(follow)
+    assert entry is not None and len(entry["keys"]) == 24
+    cold = pub._kv.cold
+    for key in entry["keys"]:
+        blob = cold.share_take(key)
+        assert blob is not None and "bounds" in blob, key
+
+    rf = pub.submit(follow, params)
+    pub.step()
+    req = next(x for x in pub._running if x.req_id == rf)
+    assert req.sparse_matched == 24 * BLOCK_TOKENS, req.sparse_matched
+    ts = _drain(pub, rf, 8)
+    pub.shutdown()
+    assert ts == ts_miss, f"bg-publish follower {ts} != per-page miss {ts_miss}"
+
+
+def test_bg_publish_timeout_adopts_nothing(monkeypatch):
+    """A follower whose hit pages never commit (worker parked past the wait
+    budget) takes a full miss: sparse_matched stays 0 and it prefills from zero,
+    rather than raising on a missing shared blob."""
+    import threading
+
+    monkeypatch.setenv("TILERL_CLOSE_BATCH_D2H", "1")
+    monkeypatch.setenv("TILERL_CLOSE_BG_PUBLISH", "1")
+    monkeypatch.setenv("TILERL_CLOSE_BG_WAIT_S", "0.05")
+    pub = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+        kv_cold_bytes=1 << 30)
+    gate = threading.Event()
+    pub._kv.cold._pub_before_job = lambda job: gate.wait(5)
+    try:
+        sp = np.arange(3, 3 + 4 * BLOCK_TOKENS, dtype=np.int64)
+        sr = pub.submit(sp, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+        _drain(pub, sr, 2)  # close hands pages to the worker, which is parked
+        assert pub._kv.cold.stats()["kv_cold_bg_queued"] >= 1
+        # A follower admits one tick: its hit pages never commit within the wait
+        # budget, so it must take a FULL miss (sparse_matched 0), not raise on a
+        # missing blob. Add a tail so the prompt is longer than the entry.
+        follow = np.concatenate([sp, np.arange(200, 208, dtype=np.int64)])
+        rf = pub.submit(follow, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+        pub.step()
+        req = next(x for x in pub._running if x.req_id == rf)
+        assert req.sparse_matched == 0
+        assert pub._kv.cold.stats()["kv_cold_bg_timeouts"] >= 1
+        gate.set()
+        _drain(pub, rf, 2)
+        pub.shutdown()
+    finally:
+        gate.set()
+
     """Ordering at the pool layer: a forced close_publishes batch is unsynced
     inside (non_blocking snapshots are only in flight) and synced at __exit__;
     per-page _page_blob results are distinct host buffers (the batch never pools

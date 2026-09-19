@@ -271,12 +271,16 @@ class PagedKvPool:
         exact batched code path (a plain cuda-flagged cell never reaches it).
 
         Env-gated (TILERL_CLOSE_BATCH_D2H=1); without it the close path keeps
-        its per-page blocking copy behavior exactly. The gate is backend-agnostic
-        so the CPU cell drives the identical prepare/commit split (its copies are
-        synchronous clones and the tail sync is a no-op); only on cuda does the
-        single batched sync change wall time."""
+        its per-page blocking copy behavior exactly. TILERL_CLOSE_BG_PUBLISH=1
+        also enables the batch: its background handoff needs the same
+        prepare/defer split. The gate is backend-agnostic so the CPU cell drives
+        the identical prepare/commit split (its copies are synchronous clones
+        and the tail sync is a no-op); only on cuda does the single batched
+        sync change wall time."""
         enabled = force or os.environ.get(
             "TILERL_CLOSE_BATCH_D2H", "").strip() not in (
+            "", "0", "false", "False") or os.environ.get(
+            "TILERL_CLOSE_BG_PUBLISH", "").strip() not in (
             "", "0", "false", "False")
         if not enabled:
             yield _CloseBatchDisabled()

@@ -1361,6 +1361,11 @@ class Engine:
             # trunk hidden at matched-1 (the first tail draft conditions on it);
             # an old/trunk-only entry is a miss (prefill from zero).
             entry = self._sparse.prefix.lookup(req.tokens) if self._sparse.prefix else None
+            if entry is not None and not self._kv.cold.wait_ready(entry["keys"]):
+                # A background close publish did not commit in time (worker
+                # wedged/stopping): treat the prefix as a miss, never adopt an
+                # entry whose blobs are not served.
+                entry = None
             if entry is not None and self._draft is not None and (
                     entry.get("hidden") is None or any(
                         self._kv.cold.share_take_field(k, "dk") is None
@@ -1527,6 +1532,11 @@ class Engine:
         if t is not None:
             t.join(timeout)
         self._thread = None
+        # Drain the background close-publisher BEFORE clearing the prefix index:
+        # queued page transfers must commit so the index's share_release sees the
+        # records it references. No-op when the gate is off.
+        if self._kv.cold is not None:
+            self._kv.cold.stop_publisher(timeout)
         if self._sparse is not None and self._sparse.prefix is not None:
             self._sparse.prefix.clear()  # release shared prefix blobs to the cold tier
 
