@@ -499,6 +499,218 @@ def test_batched_close_publishes_match_the_per_page_path(tmp_path, monkeypatch):
     assert ts == ts_miss, f"batched follower {ts} != per-page miss {ts_miss}"
 
 
+def test_bg_publish_close_path_follower_hits_after_async_transfer(monkeypatch):
+    """TILERL_CLOSE_BG_PUBLISH=1 on top of the 1PR batch: a publisher close hands
+    every page transfer to the cold tier's background worker and returns with the
+    blobs still queued; a same-prompt follower admitted one tick later blocks on
+    the futures, then HITS the full prefix and decodes the miss-oracle tokens.
+    The CPU cell runs the identical queue/future/wait code (the worker only moves
+    host bytes), so this gates the wiring end to end without a card."""
+    monkeypatch.setenv("TILERL_CLOSE_BATCH_D2H", "1")
+    monkeypatch.setenv("TILERL_CLOSE_BG_PUBLISH", "1")
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    follow = np.concatenate([prompt, np.arange(100, 120, dtype=np.int64)])
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    def _sparse():
+        return build_engine(
+            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30)
+
+    oracle = _sparse()
+    ts_miss = _drain(oracle, oracle.submit(follow, params), 8)
+    oracle.shutdown()
+
+    pub = _sparse()
+    assert pub._kv.cold.bg_enabled
+    # A short prompt never drop-publishes: all five pages are device-resident at
+    # close and go through the frame path into the background queue.
+    short_p = np.arange(7, 7 + 5 * BLOCK_TOKENS, dtype=np.int64)
+    sr = pub.submit(short_p, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+    _drain(pub, sr, 4)
+    short_entry = pub._sparse.prefix.lookup(short_p)
+    assert short_entry is not None and len(short_entry["keys"]) == 5
+    assert pub._kv.cold.stats()["kv_cold_bg_queued"] >= 5
+    # Worker is asynchronous: wait off-lock for the queued frames to commit, then
+    # share_take (non-blocking) reads each back with its bounds plane.
+    assert pub._kv.cold.wait_committed(short_entry["keys"], 10)
+    for key in short_entry["keys"]:
+        blob = pub._kv.cold.share_take(key)
+        assert blob is not None and "bounds" in blob and "k" in blob, key
+
+    rid = pub.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    _drain(pub, rid, 200)
+    entry = pub._sparse.prefix.lookup(follow)
+    assert entry is not None and len(entry["keys"]) == 24
+    cold = pub._kv.cold
+    assert cold.wait_committed(entry["keys"], 10)
+    for key in entry["keys"]:
+        blob = cold.share_take(key)
+        assert blob is not None and "bounds" in blob, key
+
+    rf = pub.submit(follow, params)
+    pub.step()
+    req = next(x for x in pub._running if x.req_id == rf)
+    assert req.sparse_matched == 24 * BLOCK_TOKENS, req.sparse_matched
+    ts = _drain(pub, rf, 8)
+    pub.shutdown()
+    assert ts == ts_miss, f"bg-publish follower {ts} != per-page miss {ts_miss}"
+
+
+def test_bg_publish_timeout_adopts_nothing(monkeypatch):
+    """A follower whose hit pages never commit (worker parked past the wait
+    budget) takes a full miss: sparse_matched stays 0 and it prefills from zero,
+    rather than raising on a missing shared blob."""
+    import threading
+
+    monkeypatch.setenv("TILERL_CLOSE_BATCH_D2H", "1")
+    monkeypatch.setenv("TILERL_CLOSE_BG_PUBLISH", "1")
+    monkeypatch.setenv("TILERL_CLOSE_BG_WAIT_S", "0.05")
+    pub = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+        kv_cold_bytes=1 << 30)
+    gate = threading.Event()
+    pub._kv.cold._pub_before_job = lambda job: gate.wait(5)
+    try:
+        sp = np.arange(3, 3 + 4 * BLOCK_TOKENS, dtype=np.int64)
+        sr = pub.submit(sp, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+        _drain(pub, sr, 2)  # close hands pages to the worker, which is parked
+        assert pub._kv.cold.stats()["kv_cold_bg_queued"] >= 1
+        # A follower admits one tick: its hit pages never commit within the wait
+        # budget, so it must take a FULL miss (sparse_matched 0), not raise on a
+        # missing blob. Add a tail so the prompt is longer than the entry.
+        follow = np.concatenate([sp, np.arange(200, 208, dtype=np.int64)])
+        rf = pub.submit(follow, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+        pub.step()
+        req = next(x for x in pub._running if x.req_id == rf)
+        assert req.sparse_matched == 0
+        assert pub._kv.cold.stats()["kv_cold_bg_timeouts"] >= 1
+        gate.set()
+        _drain(pub, rf, 2)
+        pub.shutdown()
+    finally:
+        gate.set()
+
+
+def test_bg_publish_prefetch_wait_does_not_block_submit_or_poll(monkeypatch):
+    """Blocking-1 contract: the follower's wait on the publish worker runs OFF
+    the engine tick lock. With the worker parked and a follower head in waiting,
+    a concurrent poll() (take_finished, which takes the same self._lock) must
+    return promptly rather than stall for the wait budget. If the wait ever
+    moves back under self._lock, this goes red."""
+    import threading
+    import time as _time
+
+    monkeypatch.setenv("TILERL_CLOSE_BATCH_D2H", "1")
+    monkeypatch.setenv("TILERL_CLOSE_BG_PUBLISH", "1")
+    monkeypatch.setenv("TILERL_CLOSE_BG_WAIT_S", "5")
+    eng = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+        kv_cold_bytes=1 << 30)
+    gate = threading.Event()
+    eng._kv.cold._pub_before_job = lambda job: gate.wait(5)
+    try:
+        sp = np.arange(3, 3 + 4 * BLOCK_TOKENS, dtype=np.int64)
+        _drain(eng, eng.submit(sp, SamplingParams(
+            temperature=0.0, max_new_tokens=2, seed=0)), 2)
+        follow = np.concatenate([sp, np.arange(200, 208, dtype=np.int64)])
+        eng.submit(follow, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+
+        lock_free = threading.Event()
+
+        def run_step():
+            eng.step()  # parks in the off-lock pre-wait until the gate opens
+            lock_free.set()
+
+        st = threading.Thread(target=run_step)
+        st.start()
+        # Wait until step is inside its pre-wait: the parked worker still holds
+        # the follower's pages uncommitted (bg_wait_s is 5 s, not the timeout arm).
+        _time.sleep(0.3)
+        # A peer operation that takes self._lock must return promptly, proving
+        # the publish wait does not hold the tick lock. cancel on an unknown rid
+        # is False but still acquires/release that lock.
+        done = threading.Event()
+
+        def peer():
+            eng.cancel(999_999)
+            done.set()
+
+        pt = threading.Thread(target=peer)
+        pt.start()
+        assert done.wait(1.0), "an engine-lock op blocked behind the publish wait"
+        gate.set()
+        st.join(10)
+    finally:
+        gate.set()
+        eng.shutdown()
+
+
+def test_bg_publish_engine_shutdown_drains_before_prefix_clear(monkeypatch):
+    """Engine-level drain contract (the production path never calls
+    HostKvPages.close() directly): with the publish worker parked and jobs still
+    queued, engine.shutdown() must let the worker DRAIN every in-flight publish
+    and only then run prefix.clear(). Observed at the instant clear begins: the
+    queue has zero unfinished jobs and every close-published key is already a
+    committed shared record. Deleting Engine.shutdown's stop_publisher call must
+    leave clear running while jobs are uncommitted (this gate goes red)."""
+    import threading
+
+    monkeypatch.setenv("TILERL_CLOSE_BATCH_D2H", "1")
+    monkeypatch.setenv("TILERL_CLOSE_BG_PUBLISH", "1")
+    eng = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+        kv_cold_bytes=1 << 30)
+    cold = eng._kv.cold
+    gate = threading.Event()
+    cold._pub_before_job = lambda job: gate.wait(5)
+
+    sp = np.arange(3, 3 + 4 * BLOCK_TOKENS, dtype=np.int64)
+    sr = eng.submit(sp, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+    _drain(eng, sr, 2)  # close enqueues pages the parked worker never commits
+    keys = list(eng._sparse.prefix.lookup(sp)["keys"])
+    assert keys and cold._pub_q.unfinished_tasks > 0
+
+    state_at_clear = {}
+    real_clear = eng._sparse.prefix.clear
+
+    def record_clear():
+        # The publisher is drained AND stopped before clear (queue reference is
+        # set None in stop_publisher): if shutdown skipped the stop, this is a
+        # live queue with unfinished_tasks > 0 instead.
+        state_at_clear["queue_stopped"] = cold._pub_q is None
+        state_at_clear["committed"] = [k in cold._shared for k in keys]
+        real_clear()
+
+    eng._sparse.prefix.clear = record_clear
+    # Release the parked worker 0.5 s after shutdown starts draining: a correct
+    # shutdown blocks on the drain, so clear runs only after commits land; a
+    # shutdown that skipped the drain runs clear immediately and goes red.
+    def release():
+        threading.Event().wait(0.5)
+        gate.set()
+
+    threading.Thread(target=release, daemon=True).start()
+    eng.shutdown(timeout=15)
+    gate.set()
+
+    assert state_at_clear, "prefix.clear never ran during shutdown"
+    assert state_at_clear["queue_stopped"], "clear ran before the publisher stopped"
+    # The load-bearing invariant: clear releases shared refs only after every
+    # in-flight publish committed (a shutdown that skipped the drain reaches
+    # clear while the worker is parked and these are all False).
+    assert state_at_clear["committed"] and all(state_at_clear["committed"]), \
+        state_at_clear
+
+
 def test_close_publishes_syncs_at_exit_and_keeps_per_page_independent_storage():
     """Ordering at the pool layer: a forced close_publishes batch is unsynced
     inside (non_blocking snapshots are only in flight) and synced at __exit__;

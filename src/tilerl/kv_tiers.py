@@ -12,6 +12,8 @@ from __future__ import annotations
 import contextlib
 import os
 import pickle
+import queue
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -43,6 +45,16 @@ def _prefix_spill_bounded() -> bool:
     TILERL_COLD_PREFIX_SSD_CAP=1 to bound it by --cold-ssd-bytes and return
     freed trailing extents to the filesystem."""
     return os.environ.get("TILERL_COLD_PREFIX_SSD_CAP", "").strip() not in (
+        "", "0", "false", "False")
+
+
+def _close_bg_publish() -> bool:
+    """Env gate for moving the request-close private->shared page transfer
+    (host pop + private-SSD lift + .prefix.bin write) off the close critical
+    path onto one bounded single-consumer thread. Default OFF: the transfer
+    stays inline on the step thread, byte-identical. Set
+    TILERL_CLOSE_BG_PUBLISH=1 to enable."""
+    return os.environ.get("TILERL_CLOSE_BG_PUBLISH", "").strip() not in (
         "", "0", "false", "False")
 
 
@@ -303,13 +315,20 @@ class HostKvPages:
     """
 
     def __init__(self, budget_bytes: int = 4 << 30, ssd_path: str = "",
-                 ssd_capacity_bytes: int = 0, step_timing=None) -> None:
+                 ssd_capacity_bytes: int = 0, step_timing=None,
+                 bg_publish: bool | None = None, bg_depth: int | None = None,
+                 bg_wait_s: float | None = None) -> None:
         # Fail fast: both the private spill and its shared-prefix sibling must be
         # writable now, because the failure used to surface only after the host
         # budget bound mid-decode (V100 /data00 root-owned, 2026-09-14).
         assert_spill_writable(ssd_path)
         if ssd_path:  # "" means no spill; the derived sibling would be ".prefix.bin"
             assert_spill_writable(_shared_ssd_path(ssd_path))
+        #: One re-entrant lock over every RAM/SSD/shared structure. The step
+        #: thread and the optional background publish thread take it for short
+        #: sections; RLock so a locked public method may call another. The one
+        #: place that must NOT hold it is a follower waiting on a publish event.
+        self._tlock = threading.RLock()
         self.budget_bytes = budget_bytes
         #: opaque cold key -> held bytes / blob (int block on #500, (req,page) tuple on sparse)
         self._held: OrderedDict[Any, int] = OrderedDict()
@@ -358,16 +377,104 @@ class HostKvPages:
         self.prefix_spill_bounded = bool(ssd_path) and _prefix_spill_bounded()
         #: one RAM LRU across private and shared pages: ("p",key)/("s",key) -> n.
         self._ram_order: OrderedDict[tuple[str, Any], int] = OrderedDict()
+        # ----- optional background private->shared publish (TILERL_CLOSE_BG_PUBLISH) -----
+        #: content key -> event fired once the key is committed (or abandoned).
+        #: A follower whose lookup entry names a not-yet-committed key waits on
+        #: the event instead of raising, and treats a timeout as a cache miss.
+        self._pub_pending: dict[int, threading.Event] = {}
+        #: share_ref/share_release calls that land before the worker commits the
+        #: key; folded into the record's refcount at commit.
+        self._pub_pending_refs: dict[int, int] = {}
+        #: private keys an in-flight job is about to transfer; forget() must not
+        #: remove them before the worker consumes the job (bounded by queue depth).
+        self._pub_private: set = set()
+        self.bg_enabled = _close_bg_publish() if bg_publish is None else bool(bg_publish)
+        self.bg_depth = (int(os.environ.get("TILERL_CLOSE_BG_DEPTH", "512"))
+                         if bg_depth is None else bg_depth)
+        self.bg_wait_s = (float(os.environ.get("TILERL_CLOSE_BG_WAIT_S", "30"))
+                          if bg_wait_s is None else bg_wait_s)
+        self.bg_queued = 0
+        self.bg_degraded = 0  # queue full -> caller transferred inline
+        self.bg_timeouts = 0
+        self.bg_failed = 0
+        self._pub_q: queue.Queue | None = None
+        self._pub_thread: threading.Thread | None = None
+        #: Test seam: invoked by the worker with the dequeued job and NO tier lock
+        #: held; production is a no-op. Lets a gate park the worker before commit
+        #: while the test drives ref/forget races on the step-thread side.
+        self._pub_before_job = lambda job: None
+        if self.bg_enabled:
+            self._start_publisher()
+
+    def _start_publisher(self) -> None:
+        self._pub_q = queue.Queue(maxsize=self.bg_depth)
+        self._pub_thread = threading.Thread(
+            target=self._publish_worker, name="tilerl-cold-publish", daemon=True)
+        self._pub_thread.start()
+
+    def _publish_worker(self) -> None:
+        """Single consumer: run each page's private->shared transfer off the
+        step thread. The worker is the ONLY other thread touching this tier and
+        takes _tlock for the transfer. Never touches CUDA: every source byte is
+        already host-resident (a RAM blob handed with the job, a RAM private
+        blob, or the private spill file)."""
+        while True:
+            job = self._pub_q.get()
+            try:
+                if job is None:
+                    return
+                self._pub_before_job(job)  # test seam: runs with NO tier lock held
+                kind, private_key, shared_key, payload = job
+                event = None
+                with self._tlock:
+                    ok = True
+                    try:
+                        if kind == "kv":
+                            ok = bool(
+                                self.share_hold_kv(private_key, shared_key, payload))
+                        else:  # "hold": a host frame blob already folded with bounds
+                            blob, n = payload
+                            self.share_hold(shared_key, blob, n)
+                        # The key is committed now: leave the pending tables BEFORE
+                        # folding the delta, so a delta that hits zero goes through
+                        # the ordinary share_release pop, not back into pending.
+                        delta = self._pub_pending_refs.pop(shared_key, 0)
+                        self._pub_private.discard(private_key)
+                        event = self._pub_pending.pop(shared_key, None)
+                        if ok and delta:
+                            rec = self._shared.get(shared_key)
+                            if rec is not None:
+                                rec[1] += delta
+                                if rec[1] <= 0:
+                                    self.share_release(shared_key)
+                        elif not ok:
+                            # The private source was dropped before the worker ran
+                            # (host budget, no spill file): nothing to serve.
+                            self.bg_failed += 1
+                    except Exception:
+                        # A failed background publish is a cache miss, never a
+                        # wedged follower: drop the pending refs and fire the
+                        # event so a waiting share_take returns None.
+                        self.bg_failed += 1
+                        self._pub_pending_refs.pop(shared_key, None)
+                        self._pub_private.discard(private_key)
+                        event = self._pub_pending.pop(shared_key, None)
+                if event is not None:
+                    event.set()
+            finally:
+                self._pub_q.task_done()
 
     @property
     def bytes_held(self) -> int:
         """Pinned host RAM held right now, private blobs + shared prefix blobs.
         Both share the one budget; SSD is separate and not counted here."""
-        return self._used + self._shared_ram
+        with self._tlock:
+            return self._used + self._shared_ram
 
     @property
     def ssd_bytes(self) -> int:
-        return self._ssd_bytes
+        with self._tlock:
+            return self._ssd_bytes
 
     @property
     def ssd_capacity_bytes(self) -> int:
@@ -384,7 +491,8 @@ class HostKvPages:
             return 0
 
     def __contains__(self, key) -> bool:
-        return key in self._held or (self._ssd is not None and key in self._ssd)
+        with self._tlock:
+            return key in self._held or (self._ssd is not None and key in self._ssd)
 
     def hold(self, key, blob: dict, nbytes: int) -> bool:
         """Pin one page blob; True when held (in host RAM or spilled to SSD).
@@ -393,22 +501,23 @@ class HostKvPages:
         file when one is attached. Over-budget pages evict LRU to SSD; without a
         spill file an LRU/self eviction is a drop, as before. ``key`` is opaque:
         an int physical id (#500 retier seam) or a (req, page) tuple (sparse)."""
-        if not nbytes or key in self:
-            self.drops += 1
-            return False
-        if nbytes > self.budget_bytes:
-            if not self._ssd_path:
+        with self._tlock:
+            if not nbytes or key in self:
                 self.drops += 1
                 return False
-            self._write_ssd(key, blob, nbytes)
+            if nbytes > self.budget_bytes:
+                if not self._ssd_path:
+                    self.drops += 1
+                    return False
+                self._write_ssd(key, blob, nbytes)
+                return True
+            self._blobs[key] = blob
+            self._held[key] = nbytes
+            self._used += nbytes
+            self._ram_order[("p", key)] = nbytes
+            self.demotions += 1
+            self._enforce_budget()
             return True
-        self._blobs[key] = blob
-        self._held[key] = nbytes
-        self._used += nbytes
-        self._ram_order[("p", key)] = nbytes
-        self.demotions += 1
-        self._enforce_budget()
-        return True
 
     def _enforce_budget(self) -> None:
         """Evict oldest RAM-resident pages (private AND shared prefix, one LRU)
@@ -433,6 +542,12 @@ class HostKvPages:
                     blob = self._blobs.pop(k, None)
                     if blob is None or self._held.get(k) != n:
                         continue  # promoted/forgotten between enqueue and sweep
+                    if k in self._pub_private:
+                        # A background publish is about to transfer this blob;
+                        # re-park it rather than spill/drop the worker's source.
+                        self._blobs[k] = blob
+                        self._ram_order[("p", k)] = n
+                        continue
                     self._held.pop(k)
                     self._used -= n
                     if self._ssd_path:
@@ -473,60 +588,75 @@ class HostKvPages:
     def take(self, key) -> dict | None:
         """Remove and return the page blob — from host RAM, or read back through
         the SSD spill path — or None if neither tier has it."""
-        n = self._held.pop(key, None)
-        blob = self._blobs.pop(key, None)
-        self._ram_order.pop(("p", key), None)
-        if blob is not None:
-            self._used -= n
-            self.promotions += 1
-            return blob
-        if self._ssd is not None and key in self._ssd:
-            pin = torch.cuda.is_available()  # promote H2D wants a pinned source
-            blob = self._ssd.read(key, pin)
-            self._ssd.forget(key)
-            self._ssd_bytes -= self._ssd_page_bytes.pop(key, self._ssd.stride)
-            self.promotions += 1
-            return blob
-        return None
+        with self._tlock:
+            n = self._held.pop(key, None)
+            blob = self._blobs.pop(key, None)
+            self._ram_order.pop(("p", key), None)
+            if blob is not None:
+                self._used -= n
+                self.promotions += 1
+                return blob
+            if self._ssd is not None and key in self._ssd:
+                pin = torch.cuda.is_available()  # promote H2D wants a pinned source
+                blob = self._ssd.read(key, pin)
+                self._ssd.forget(key)
+                self._ssd_bytes -= self._ssd_page_bytes.pop(key, self._ssd.stride)
+                self.promotions += 1
+                return blob
+            return None
 
     def peek(self, key) -> dict | None:
         """A held RAM blob WITHOUT removing it (clone source for the shared index).
         Does not reach SSD: a page cloned for sharing must still be host-resident."""
-        return self._blobs.get(key)
+        with self._tlock:
+            return self._blobs.get(key)
 
     def forget(self, key) -> None:
-        n = self._held.pop(key, None)
-        self._blobs.pop(key, None)
-        self._ram_order.pop(("p", key), None)
-        if n is not None:
-            self._used -= n
-        elif self._ssd is not None and key in self._ssd:
-            self._ssd.forget(key)
-            self._ssd_bytes -= self._ssd_page_bytes.pop(key, self._ssd.stride)
+        with self._tlock:
+            if key in self._pub_private:
+                # A background publish job will consume this private blob; its
+                # publisher release is the signed ref delta, not a removal here.
+                return
+            n = self._held.pop(key, None)
+            self._blobs.pop(key, None)
+            self._ram_order.pop(("p", key), None)
+            if n is not None:
+                self._used -= n
+            elif self._ssd is not None and key in self._ssd:
+                self._ssd.forget(key)
+                self._ssd_bytes -= self._ssd_page_bytes.pop(key, self._ssd.stride)
 
     def stats(self) -> dict[str, int]:
-        return {
-            "kv_cold_pages": len(self._held),
-            "kv_cold_bytes": self._used,
-            "kv_cold_ssd_pages": 0 if self._ssd is None else len(self._ssd),
-            "kv_cold_ssd_bytes": self._ssd_bytes,
-            "kv_cold_shared_pages": len(self._shared),
-            "kv_cold_shared_bytes": self._shared_ram,
-            "kv_cold_shared_ssd_bytes": self._shared_ssd_bytes,
-            "kv_cold_shared_ssd_bounded": int(self.prefix_spill_bounded),
-            "kv_cold_demotions": self.demotions,
-            "kv_cold_promotions": self.promotions,
-            "kv_cold_drops": self.drops,
-        }
+        with self._tlock:
+            return {
+                "kv_cold_pages": len(self._held),
+                "kv_cold_bytes": self._used,
+                "kv_cold_ssd_pages": 0 if self._ssd is None else len(self._ssd),
+                "kv_cold_ssd_bytes": self._ssd_bytes,
+                "kv_cold_shared_pages": len(self._shared),
+                "kv_cold_shared_bytes": self._shared_ram,
+                "kv_cold_shared_ssd_bytes": self._shared_ssd_bytes,
+                "kv_cold_shared_ssd_bounded": int(self.prefix_spill_bounded),
+                "kv_cold_demotions": self.demotions,
+                "kv_cold_promotions": self.promotions,
+                "kv_cold_drops": self.drops,
+                "kv_cold_bg_queued": self.bg_queued,
+                "kv_cold_bg_degraded": self.bg_degraded,
+                "kv_cold_bg_timeouts": self.bg_timeouts,
+                "kv_cold_bg_failed": self.bg_failed,
+            }
 
     def close(self) -> None:
-        """Release the spill files' mmap and handles (host RAM is GC'd with the blobs)."""
-        if self._ssd is not None:
-            self._ssd.close()
-            self._ssd = None
-        if self._shared_ssd is not None:
-            self._shared_ssd.close()
-            self._shared_ssd = None
+        """Drain queued publishes, stop the worker, then release the spill files'
+        mmap and handles (host RAM is GC'd with the blobs)."""
+        self.stop_publisher()
+        with self._tlock:
+            if self._ssd is not None:
+                self._ssd.close()
+                self._ssd = None
+            if self._shared_ssd is not None:
+                self._shared_ssd.close()
+                self._shared_ssd = None
 
     # ----- shared, content-addressed prefix pages (sparse PrefixStore seam) -----
     def share_hold(self, key: int, blob: dict, nbytes: int) -> None:
@@ -538,14 +668,134 @@ class HostKvPages:
         Idempotent on key — just adds a reference. With no ssd_path a shared page
         cannot spill or drop, so it pins in RAM until its entry ages out and all
         refs release — the host bound is then the published-prefix working set."""
-        rec = self._shared.get(key)
-        if rec is not None:
-            rec[1] += 1
+        with self._tlock:
+            rec = self._shared.get(key)
+            if rec is not None:
+                rec[1] += 1
+                return
+            self._shared[key] = [nbytes, 1, blob]
+            self._shared_ram += nbytes
+            self._ram_order[("s", key)] = nbytes
+            self._enforce_budget()
+
+    def offer_publish(self, private_key, shared_key: int, extra: dict | None) -> bool:
+        """Enqueue one private->shared page transfer for the background worker
+        (TILERL_CLOSE_BG_PUBLISH). The private blob stays exactly where it is —
+        RAM or the private spill file — until the worker consumes it; the page is
+        reserved under ``shared_key`` immediately, so a follower blocks on its
+        event instead of taking a miss, and share_ref/share_release calls landing
+        before the commit accumulate as a signed delta folded into refcount 1.
+
+        Returns False when the key is already committed (a duplicate content key)
+        or the bounded queue is full: the caller then transfers inline, which
+        bounds queue memory and never drops a publish. Reservation and enqueue are
+        one locked step, so a key can never be reserved without its job queued."""
+        return self._enqueue(("kv", private_key, shared_key, extra),
+                             private_key, shared_key)
+
+    def offer_hold(self, shared_key: int, blob: dict, nbytes: int) -> bool:
+        """Enqueue one already-host frame blob's shared hold (the device-resident
+        close page whose D2H the 1PR batch synced before its frame freed). Same
+        reservation/future contract as :meth:`offer_publish`."""
+        return self._enqueue(("hold", None, shared_key, (blob, nbytes)),
+                             None, shared_key)
+
+    def _enqueue(self, job, private_key, shared_key: int) -> bool:
+        with self._tlock:
+            if not self.bg_enabled or self._pub_q is None:
+                return False
+            if shared_key in self._shared or shared_key in self._pub_pending:
+                return False
+            try:
+                self._pub_q.put_nowait(job)
+            except queue.Full:
+                self.bg_degraded += 1
+                return False
+            self._pub_pending[shared_key] = threading.Event()
+            self._pub_pending_refs[shared_key] = 0
+            if private_key is not None:
+                self._pub_private.add(private_key)
+            self.bg_queued += 1
+            return True
+
+    def drain_publishes(self, timeout: float | None = None) -> bool:
+        """Block until every queued publish has committed (shutdown join). False
+        on timeout. Pending reservations whose jobs never ran are abandoned:
+        their events fire so a waiter takes a miss rather than hanging."""
+        if self._pub_q is None:
+            return True
+        if timeout is None:
+            self._pub_q.join()
+            return True
+        deadline = time.monotonic() + timeout
+        with self._pub_q.all_tasks_done:
+            while self._pub_q.unfinished_tasks and time.monotonic() < deadline:
+                self._pub_q.all_tasks_done.wait(deadline - time.monotonic())
+        ok = self._pub_q.unfinished_tasks == 0
+        if not ok:
+            with self._tlock:
+                for key, ev in list(self._pub_pending.items()):
+                    self._pub_pending.pop(key, None)
+                    self._pub_pending_refs.pop(key, None)
+                    ev.set()
+        return ok
+
+    def stop_publisher(self, timeout: float | None = None) -> None:
+        """Drain every queued publish, then send the sentinel and join. Timeout
+        bounds only the final join (a worker that ignores sentinels); the drain
+        itself waits for all queued jobs because a clean shutdown is not a crash.
+        Idempotent."""
+        q, t = self._pub_q, self._pub_thread
+        if q is None:
             return
-        self._shared[key] = [nbytes, 1, blob]
-        self._shared_ram += nbytes
-        self._ram_order[("s", key)] = nbytes
-        self._enforce_budget()
+        self.drain_publishes(None)
+        q.put(None)
+        if t is not None and timeout is not None:
+            t.join(timeout)
+        elif t is not None:
+            t.join()
+        self._pub_thread = None
+        self._pub_q = None  # offers after stop fall back to inline transfers
+
+    def has_pending(self) -> bool:
+        """True while at least one background publish is queued/uncommitted."""
+        with self._tlock:
+            return bool(self._pub_pending)
+
+    def has_all_keys(self, keys) -> bool:
+        """Non-blocking commit check: every key is a live shared record. An
+        adopt runs this under the engine lock after wait_committed returned; a
+        False result adopts nothing (timeout, failed publish, or a release that
+        landed in between) instead of letting a later share_take raise."""
+        with self._tlock:
+            return all(k in self._shared for k in keys)
+
+    def wait_committed(self, keys, timeout_s: float | None = None) -> bool:
+        """OFF-LOCK wait for background publishes of ``keys`` to commit, then
+        confirm every key is a live shared record. False on timeout OR a queued
+        publish that failed/abandoned: the caller adopts nothing (a cache miss).
+
+        The only call that blocks on the publish worker. It must run with the
+        engine lock released: share_take/share_take_field stay non-blocking so no
+        forward/admit path can stall a tick on the worker."""
+        if timeout_s is None:
+            timeout_s = self.bg_wait_s
+        deadline = time.monotonic() + timeout_s
+        ok = True
+        for key in keys:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                ok = False
+                break
+            ev = self._pub_pending.get(key)
+            if ev is not None and not ev.wait(remaining):
+                self.bg_timeouts += 1
+                ok = False
+                break
+        if not ok:
+            return False
+        with self._tlock:
+            return all(k in self._shared for k in keys)
 
     def share_hold_kv(self, private_key, shared_key: int,
                       extra: dict | None = None) -> int:
@@ -554,52 +804,54 @@ class HostKvPages:
         (the small host bounds), and hand it to the shared namespace. The blob
         starts spilled (written straight to the prefix file) when it was already
         past the host budget - no copy is pulled into RAM. Returns bytes held."""
-        n = self._held.pop(private_key, None)
-        blob = self._blobs.pop(private_key, None)
-        self._ram_order.pop(("p", private_key), None)
-        if n is not None:
-            self._used -= n
-        if blob is None:
-            # already past the host budget: lift the blob off the private spill
-            # file once (disk, not RSS), fold in bounds, and place it straight in
-            # the shared spill namespace - nothing added to host RAM.
-            if self._ssd is None or private_key not in self._ssd:
-                return 0
-            # Dedupe BEFORE the lift: a second publisher of the same content key
-            # (identical prompts both past the host budget) consumes its private
-            # copy and ref++s, instead of resetting refs / leaking the first
-            # prefix-file slot under live refs. Bounds are deterministic per
-            # content, so the existing record already carries them.
-            existing = self._shared.get(shared_key)
-            if existing is not None:
+        with self._tlock:
+            n = self._held.pop(private_key, None)
+            blob = self._blobs.pop(private_key, None)
+            self._ram_order.pop(("p", private_key), None)
+            self._pub_private.discard(private_key)
+            if n is not None:
+                self._used -= n
+            if blob is None:
+                # already past the host budget: lift the blob off the private spill
+                # file once (disk, not RSS), fold in bounds, and place it straight in
+                # the shared spill namespace - nothing added to host RAM.
+                if self._ssd is None or private_key not in self._ssd:
+                    return 0
+                # Dedupe BEFORE the lift: a second publisher of the same content key
+                # (identical prompts both past the host budget) consumes its private
+                # copy and ref++s, instead of resetting refs / leaking the first
+                # prefix-file slot under live refs. Bounds are deterministic per
+                # content, so the existing record already carries them.
+                existing = self._shared.get(shared_key)
+                if existing is not None:
+                    n = self._ssd_page_bytes.pop(private_key, self._ssd.stride)
+                    self._ssd.forget(private_key)
+                    self._ssd_bytes -= n
+                    existing[1] += 1
+                    return existing[0]
                 n = self._ssd_page_bytes.pop(private_key, self._ssd.stride)
+                blob = self._ssd.read(private_key, False)
                 self._ssd.forget(private_key)
                 self._ssd_bytes -= n
-                existing[1] += 1
-                return existing[0]
-            n = self._ssd_page_bytes.pop(private_key, self._ssd.stride)
-            blob = self._ssd.read(private_key, False)
-            self._ssd.forget(private_key)
-            self._ssd_bytes -= n
+                if extra:
+                    blob.update(extra)
+                    n += sum(t.numel() * t.element_size()
+                             for t in extra.values() if torch.is_tensor(t))
+                self._shared[shared_key] = [n, 1, None]
+                self._ram_order.pop(("s", shared_key), None)  # starts spilled
+                if not self._write_shared_ssd(shared_key, blob, n):
+                    # Sibling spill unwritable: the blob is in hand, keep it in RAM
+                    # instead of a record that says "spilled" but is unreadable.
+                    self._shared[shared_key] = [n, 1, blob]
+                    self._shared_ram += n
+                    self._ram_order[("s", shared_key)] = n
+                return n
             if extra:
                 blob.update(extra)
                 n += sum(t.numel() * t.element_size()
                          for t in extra.values() if torch.is_tensor(t))
-            self._shared[shared_key] = [n, 1, None]
-            self._ram_order.pop(("s", shared_key), None)  # starts spilled
-            if not self._write_shared_ssd(shared_key, blob, n):
-                # Sibling spill unwritable: the blob is in hand, keep it in RAM
-                # instead of a record that says "spilled" but is unreadable.
-                self._shared[shared_key] = [n, 1, blob]
-                self._shared_ram += n
-                self._ram_order[("s", shared_key)] = n
+            self.share_hold(shared_key, blob, n)
             return n
-        if extra:
-            blob.update(extra)
-            n += sum(t.numel() * t.element_size()
-                     for t in extra.values() if torch.is_tensor(t))
-        self.share_hold(shared_key, blob, n)
-        return n
 
 
     def _shared_evict_ram(self, key: int) -> bool:
@@ -654,77 +906,95 @@ class HostKvPages:
         """A read-only REFERENCE to a shared page blob. Read-through: a spilled
         page is loaded from the prefix file (without removing it — the store
         entry still owns it; promotion copies it into a private fresh block).
-        None when the key is not a shared page."""
-        rec = self._shared.get(key)
-        if rec is None:
-            return None
-        blob = rec[2]
-        if blob is None and self._shared_ssd is not None and ("s", key) in self._shared_ssd:
-            blob = self._shared_ssd.read(("s", key), torch.cuda.is_available())
-            rec[2] = blob
-            self._shared_ram += rec[0]
-            self._shared_ssd.forget(("s", key))
-            self._shared_ssd_bytes -= rec[0]
-            self._ram_order[("s", key)] = rec[0]
-            self._shared.move_to_end(key)
-            self._enforce_budget()
-        return blob
+        None when the key is not a shared page OR its background publish has not
+        committed yet — this never blocks on the worker; a follower waits once,
+        off the engine lock, via wait_committed before adopting."""
+        with self._tlock:
+            rec = self._shared.get(key)
+            if rec is None:
+                return None
+            blob = rec[2]
+            if blob is None and self._shared_ssd is not None and ("s", key) in self._shared_ssd:
+                blob = self._shared_ssd.read(("s", key), torch.cuda.is_available())
+                rec[2] = blob
+                self._shared_ram += rec[0]
+                self._shared_ssd.forget(("s", key))
+                self._shared_ssd_bytes -= rec[0]
+                self._ram_order[("s", key)] = rec[0]
+                self._shared.move_to_end(key)
+                self._enforce_budget()
+            return blob
 
     def share_take_field(self, key: int, field: str):
         """One named tensor of a shared page blob (``bounds``), read-through from
-        the prefix spill file when the blob is spilled, without loading its K/V."""
-        rec = self._shared.get(key)
-        if rec is None:
+        the prefix spill file when the blob is spilled, without loading its K/V.
+        Non-blocking: None while a background publish is still queued."""
+        with self._tlock:
+            rec = self._shared.get(key)
+            if rec is None:
+                return None
+            blob = rec[2]
+            if blob is not None:
+                return blob.get(field)
+            if self._shared_ssd is not None and ("s", key) in self._shared_ssd:
+                return self._shared_ssd.read_field(("s", key), field)
             return None
-        blob = rec[2]
-        if blob is not None:
-            return blob.get(field)
-        if self._shared_ssd is not None and ("s", key) in self._shared_ssd:
-            return self._shared_ssd.read_field(("s", key), field)
-        return None
 
     def share_release(self, key: int) -> None:
         """Drop one store reference; the blob is deleted/spilled-slot freed at
-        the last reference."""
-        rec = self._shared.get(key)
-        if rec is None:
-            return
-        rec[1] -= 1
-        if rec[1] > 0:
-            return
-        n, _refs, blob = self._shared.pop(key)
-        self._ram_order.pop(("s", key), None)
-        if blob is not None:
-            self._shared_ram -= n
-        elif self._shared_ssd is not None and ("s", key) in self._shared_ssd:
-            self._shared_ssd.forget(("s", key))
-            self._shared_ssd_bytes -= n
+        the last reference. A release landing while the key's publish is still
+        queued accumulates as a signed delta the worker folds into refcount 1."""
+        with self._tlock:
+            if key in self._pub_pending:
+                self._pub_pending_refs[key] -= 1
+                return
+            rec = self._shared.get(key)
+            if rec is None:
+                return
+            rec[1] -= 1
+            if rec[1] > 0:
+                return
+            n, _refs, blob = self._shared.pop(key)
+            self._ram_order.pop(("s", key), None)
+            if blob is not None:
+                self._shared_ram -= n
+            elif self._shared_ssd is not None and ("s", key) in self._shared_ssd:
+                self._shared_ssd.forget(("s", key))
+                self._shared_ssd_bytes -= n
 
     def share_ref(self, key: int) -> None:
         """Add one store reference to an already-shared key (a frozen prefix
         copy shares the blob of the entry it was snapshotted from). No-op when
-        the key has already been released (evicted between freeze and ref)."""
-        rec = self._shared.get(key)
-        if rec is not None:
-            rec[1] += 1
+        the key has already been released (evicted between freeze and ref).
+        Pending (background publish queued, not yet committed): accumulate."""
+        with self._tlock:
+            if key in self._pub_pending:
+                self._pub_pending_refs[key] += 1
+                return
+            rec = self._shared.get(key)
+            if rec is not None:
+                rec[1] += 1
 
     def share_keys(self) -> frozenset[int]:
-        return frozenset(self._shared)
+        with self._tlock:
+            return frozenset(self._shared) | frozenset(self._pub_pending)
 
     def drain_ssd_ms(self) -> float:
         """Milliseconds spent touching the mmap'd spill files since the last
         drain, across the private and shared files. The engine drains this into
         the step timer at the end of the tick that paid it."""
-        ms = 0.0
-        for f in (self._ssd, self._shared_ssd):
-            if f is not None:
-                ms += f.ssd_ms
-                f.ssd_ms = 0.0
-        return ms
+        with self._tlock:
+            ms = 0.0
+            for f in (self._ssd, self._shared_ssd):
+                if f is not None:
+                    ms += f.ssd_ms
+                    f.ssd_ms = 0.0
+            return ms
 
     def shared_bytes(self) -> int:
         """Pinned RAM held for shared prefix blobs (test/ledger diagnostic)."""
-        return self._shared_ram
+        with self._tlock:
+            return self._shared_ram
 
 
 
