@@ -757,38 +757,45 @@ class HostKvPages:
         self._pub_thread = None
         self._pub_q = None  # offers after stop fall back to inline transfers
 
-    def wait_ready(self, keys, timeout_s: float | None = None) -> bool:
-        """Wait until none of ``keys`` has a publish still queued, then confirm
-        every key actually committed. False on timeout OR a queued publish that
-        failed/abandoned: the caller adopts nothing (a cache miss). No tier lock
-        is held across the waits."""
-        if timeout_s is None:
-            timeout_s = self.bg_wait_s
-        deadline = time.monotonic() + timeout_s
-        for key in keys:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            ev = self._pub_pending.get(key)
-            if ev is None:
-                continue
-            if not ev.wait(remaining):
-                self.bg_timeouts += 1
-                return False
+    def has_pending(self) -> bool:
+        """True while at least one background publish is queued/uncommitted."""
+        with self._tlock:
+            return bool(self._pub_pending)
+
+    def has_all_keys(self, keys) -> bool:
+        """Non-blocking commit check: every key is a live shared record. An
+        adopt runs this under the engine lock after wait_committed returned; a
+        False result adopts nothing (timeout, failed publish, or a release that
+        landed in between) instead of letting a later share_take raise."""
         with self._tlock:
             return all(k in self._shared for k in keys)
 
-    def wait_shared(self, key: int, timeout_s: float | None = None) -> bool:
-        """Block until pending ``key`` commits. True when it committed (caller
-        re-reads under the tier lock), False on timeout/abandon = cache miss.
-        NEVER called holding _tlock."""
-        ev = self._pub_pending.get(key)
-        if ev is None:
-            return True
-        if not ev.wait(timeout_s):
-            self.bg_timeouts += 1
+    def wait_committed(self, keys, timeout_s: float | None = None) -> bool:
+        """OFF-LOCK wait for background publishes of ``keys`` to commit, then
+        confirm every key is a live shared record. False on timeout OR a queued
+        publish that failed/abandoned: the caller adopts nothing (a cache miss).
+
+        The only call that blocks on the publish worker. It must run with the
+        engine lock released: share_take/share_take_field stay non-blocking so no
+        forward/admit path can stall a tick on the worker."""
+        if timeout_s is None:
+            timeout_s = self.bg_wait_s
+        deadline = time.monotonic() + timeout_s
+        ok = True
+        for key in keys:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                ok = False
+                break
+            ev = self._pub_pending.get(key)
+            if ev is not None and not ev.wait(remaining):
+                self.bg_timeouts += 1
+                ok = False
+                break
+        if not ok:
             return False
-        return True
+        with self._tlock:
+            return all(k in self._shared for k in keys)
 
     def share_hold_kv(self, private_key, shared_key: int,
                       extra: dict | None = None) -> int:
@@ -899,12 +906,9 @@ class HostKvPages:
         """A read-only REFERENCE to a shared page blob. Read-through: a spilled
         page is loaded from the prefix file (without removing it — the store
         entry still owns it; promotion copies it into a private fresh block).
-        None when the key is not a shared page, or when a background publish it
-        is waiting on does not commit within bg_wait_s (a cache miss)."""
-        with self._tlock:
-            pending = key in self._pub_pending
-        if pending and not self.wait_shared(key, self.bg_wait_s):
-            return None
+        None when the key is not a shared page OR its background publish has not
+        committed yet — this never blocks on the worker; a follower waits once,
+        off the engine lock, via wait_committed before adopting."""
         with self._tlock:
             rec = self._shared.get(key)
             if rec is None:
@@ -924,11 +928,7 @@ class HostKvPages:
     def share_take_field(self, key: int, field: str):
         """One named tensor of a shared page blob (``bounds``), read-through from
         the prefix spill file when the blob is spilled, without loading its K/V.
-        Waits on a pending background publish with the same miss timeout."""
-        with self._tlock:
-            pending = key in self._pub_pending
-        if pending and not self.wait_shared(key, self.bg_wait_s):
-            return None
+        Non-blocking: None while a background publish is still queued."""
         with self._tlock:
             rec = self._shared.get(key)
             if rec is None:

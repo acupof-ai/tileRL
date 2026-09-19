@@ -44,24 +44,40 @@ One bounded single-consumer thread owned by `HostKvPages`
   memory is bounded and no publish is lost. Reservation and enqueue are one
   locked step: a key cannot be reserved without its job queued (no permanent
   hang from a dangling entry).
-- **Follower waits, bounded, then misses.** `share_keys()` includes pending
-  keys so the freeze-ref pass in `publish_dropped` sees them; `share_ref` /
-  `share_release` landing before commit accumulate as a signed delta folded
-  into the record's starting refcount 1 (a −1 entry evicted pre-commit
-  releases the record the moment it commits). Before adopting, engine `_admit`
-  calls `cold.wait_ready(keys, $TILERL_CLOSE_BG_WAIT_S`, default 30 s): a
-  follower blocks off the engine lock until every page commits; a timeout or a
-  worker transfer failure abandons the key (event fires, no record) and the
-  follower adopts nothing — a full prefill cache miss, never a raise.
+- **Follower waits OFF the tick lock, bounded, then misses.** The engine is a
+  single step thread but `submit`/`poll`/`shutdown` share its `self._lock`; a
+  wait taken inside `_admit` (which runs under the tick lock in `step`) would
+  freeze all of them for up to the wait budget and re-pay the moved bytes on
+  the admit path. So the wait is split out: `step` calls
+  `_await_waiting_publishes` BEFORE taking the tick lock — a short locked
+  snapshot of the waiting sparse heads, then lock release, a read-only
+  `peek_hit` per head (no hits++/LRU side effect), and one
+  `cold.wait_committed(keys)` blocking on the worker with no engine lock held.
+  Back under the tick lock, `_admit` only does a non-blocking
+  `has_all_keys(keys)` commit probe; a timeout, a failed/abandoned publish, or
+  a release that lands in between makes the entry None and the follower does a
+  full prefill miss, never a raise on a missing blob. `share_take` /
+  `share_take_field` are non-blocking (None while queued); `wait_committed` is
+  the only call that blocks on the worker and no forward/admit path calls it
+  under the engine lock.
+- **Concurrency in the wait window.** While a follower waits, the only thread
+  mutating the cold shared namespace is the worker committing jobs; another
+  tick cannot run (the step thread has not taken its lock) and submit/cancel
+  only touch queues. The queued private blob is pinned against the publisher's
+  own `cold.forget` and the RAM-budget evictor (re-parked, not spilled/dropped).
+  After the wait, the locked `has_all_keys` re-check closes the race with a
+  release; adopting a committed key adds no content-key store ref (`resolve`
+  takes a read reference and drops the page→key link, the store entry keeps
+  its ref), so an adopted follower cannot be evicted under itself.
 - **Source lifetime.** A queued host/SSD page's private blob is protected from
   the publisher's own `cold.forget` (the key stays in `_pub_private` until the
   worker consumes it) and from the RAM-budget eviction loop (re-parked, not
   spilled/dropped). Device bytes are never the async source: the frame blob was
   produced by #741's batch before `free_block`.
 - **Lock order.** One new `RLock` inside the tier; the step thread and worker
-  take it only for short sections. The engine never holds its lock while
-  waiting on a future (the wait is in `_admit` between locks), so the order is
-  engine-lock → tier-lock one way; the worker takes only the tier lock.
+  take it only for short sections. The engine never holds its tick lock while
+  waiting on a future (the wait is an explicit pre-lock phase of `step`), and
+  the worker takes only the tier lock — engine-lock → tier-lock stays one-way.
 - **Shutdown join.** `engine.shutdown` drains the queue and joins the worker
   before `prefix.clear()` releases refs; a crash with jobs queued is
   indistinguishable from the prefix never having been published (the shared
@@ -74,21 +90,27 @@ inline path; the worker thread is not started.
 
 ## Gates (CPU, hermetic)
 
-- Full CPU suite **1021 passed / 22 skipped / 1 xfailed** with the changed tier
+- Full CPU suite **1025 passed / 22 skipped / 1 xfailed** with the changed tier
   (mechanism both enabled and default-off).
-- Tier mechanism (`tests/test_sparse_kv_tier.py`, 9 new): RAM page future
-  resolves and the private copy is gone; frame `offer_hold` path; private-SSD
-  lift through the worker; queue-full → False + inline source untouched;
-  worker failure fires a miss (no hang); refs landing before commit fold
-  correctly in both signs; `forget` while queued keeps the source; `close()`
-  drains and joins; default-off starts no worker.
-- Engine e2e (`tests/test_sparse_engine.py`, 2 new): with both gates on, a
+- Tier mechanism (`tests/test_sparse_kv_tier.py`, 10 new): RAM page future
+  resolves (share_take non-blocking until commit) and the private copy is gone;
+  frame `offer_hold` path; private-SSD lift through the worker; queue-full →
+  False + inline source untouched; worker failure fires a miss (no hang); refs
+  landing before commit fold correctly in both signs; `forget` while queued
+  keeps the source; the RAM-budget evictor re-parks (does not drop) a queued
+  source; `close()` drains and joins; default-off starts no worker.
+- Engine e2e (`tests/test_sparse_engine.py`, 4 new): with both gates on, a
   fully-resident short prompt closes all pages through the background queue
-  (`kv_cold_bg_queued ≥ 5`), a same-prompt follower admitted next tick blocks
-  on the futures, HITS the full 24-page prefix, and decodes exactly the
-  prefix-miss oracle tokens; a worker parked past `TILERL_CLOSE_BG_WAIT_S`
-  makes a follower take a full miss (`sparse_matched == 0`,
-  `kv_cold_bg_timeouts ≥ 1`) rather than raising on a missing blob.
+  (`kv_cold_bg_queued ≥ 5`), a same-prompt follower admitted on the NEXT step
+  (whose pre-lock wait blocks on the futures) HITS the full 24-page prefix and
+  decodes exactly the prefix-miss oracle tokens; a worker parked past
+  `TILERL_CLOSE_BG_WAIT_S` makes a follower take a full miss
+  (`sparse_matched == 0`, `kv_cold_bg_timeouts ≥ 1`) rather than raising on a
+  missing blob; while the follower is parked in the off-lock pre-wait a peer
+  `cancel` (same `self._lock`) returns immediately (mutation-red on moving the
+  wait back under the tick lock); and `engine.shutdown` drains/commits every
+  in-flight publish before `prefix.clear` runs (mutation-red on removing the
+  stop call).
 
 ## Device target (pending-remote)
 
@@ -106,9 +128,11 @@ any default flip; keep the gate default-off until that number is captured.
 
 When a lock-critical boundary must PUBLISH bytes that are already off the
 device, reserve the key and enqueue the byte move atomically, move the bytes
-on one bounded single consumer, and let a same-tick reader block on a per-key
-event off the lock with a timeout that degrades to a cache miss — never move
-host bytes under the device-tick lock, and never leave a lookup entry naming a
+on one bounded single consumer, and let a same-tick reader wait on per-key
+events in a dedicated phase that holds NONE of the critical locks (short
+snapshot → release → wait → re-check under the lock), with the wait timing out
+into a cache miss — never move host bytes under the device-tick lock, never
+wait on the worker while holding it, and never leave a lookup entry naming a
 key with neither a blob nor a future.
 
 ## Follow-up

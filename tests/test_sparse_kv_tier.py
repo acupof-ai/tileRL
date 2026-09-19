@@ -1052,19 +1052,21 @@ def test_bg_publish_disabled_by_default_starts_no_worker():
 
 
 def test_bg_publish_transfers_a_ram_page_and_future_resolves():
-    """An offered RAM page is reserved at once (share_keys sees it, share_take
-    blocks) and committed by the worker; the committed blob is the source bytes
-    and the private copy is gone."""
+    """An offered RAM page is reserved at once (share_keys sees it; share_take is
+    non-blocking and returns None until commit). wait_committed blocks off-lock,
+    after which the blob is the source bytes and the private copy is gone."""
     cold = HostKvPages(budget_bytes=1 << 30, bg_publish=True, bg_wait_s=5)
     try:
         _hold_private(cold, 7, 3.0)
         assert cold.offer_publish(7, 700, {"bounds": torch.zeros(2)})
         assert cold.stats()["kv_cold_bg_queued"] == 1
-        assert 700 in cold.share_keys()  # visible immediately, pending
-        blob = cold.share_take(700)      # blocks on the future until committed
+        assert 700 in cold.share_keys()      # visible immediately, pending
+        assert cold.share_take(700) is None  # non-blocking: not committed yet
+        assert cold.wait_committed([700])    # blocks off-lock until committed
+        blob = cold.share_take(700)
         assert blob is not None and "bounds" in blob
         assert torch.all(blob["k"] == 3.0) and torch.all(blob["v"] == -3.0)
-        assert cold.take(7) is None      # transferred, not cloned
+        assert cold.take(7) is None          # transferred, not cloned
         assert cold._shared[700][1] == 1
     finally:
         cold.close()
@@ -1078,6 +1080,7 @@ def test_bg_publish_hold_path_commits_a_frame_blob():
         blob = {"k": torch.ones(3, dtype=torch.float16)}
         n = blob["k"].numel() * 2
         assert cold.offer_hold(800, blob, n)
+        assert cold.wait_committed([800])
         assert torch.all(cold.share_take(800)["k"] == 1.0)
     finally:
         cold.close()
@@ -1097,6 +1100,7 @@ def test_bg_publish_lifts_an_ssd_private_page(tmp_path):
         pool.demote_page(b, key=3)  # past the 64-byte budget -> private SSD
         assert cold.ssd_bytes > 0
         assert cold.offer_publish(3, 900, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([900])
         blob = cold.share_take(900)
         assert blob is not None and "bounds" in blob
         assert torch.all(blob["k"] == 9) and torch.all(blob["v"] == -9)
@@ -1151,10 +1155,11 @@ def test_bg_publish_failed_transfer_fires_miss_not_hang():
     try:
         _hold_private(cold, 2, 2.0)
         assert cold.offer_publish(2, 200, None)
-        assert cold.wait_shared(200, 0.05) is False  # worker parked -> timeout
+        assert cold.wait_committed([200], 0.05) is False  # parked -> timeout
         assert cold.stats()["kv_cold_bg_timeouts"] == 1
         gate.set()
-        assert cold.share_take(200) is None          # failure fired -> miss
+        assert cold.wait_committed([200], 5) is False     # failure fired -> miss
+        assert cold.share_take(200) is None
         assert cold.stats()["kv_cold_bg_failed"] == 1
         assert 200 not in cold._pub_pending
     finally:
@@ -1207,6 +1212,36 @@ def test_bg_publish_forget_while_queued_keeps_the_source():
         blob = cold.share_take(2100)
         assert blob is not None and torch.all(blob["k"] == 4.0)
         assert cold.take(21) is None
+    finally:
+        cold.close()
+
+
+def test_bg_publish_budget_evictor_reparks_a_queued_source():
+    """Symmetric to the forget guard: while a page's transfer is queued the
+    RAM-budget evictor must not spill/drop the blob the worker is about to
+    transfer. A tight budget that evicts an older page drops the NEWER page
+    instead and re-parks the queued one; after the worker commits the shared
+    blob still serves the source bytes. Mutation-red on deleting the repark
+    branch in _enforce_budget: the queued page is dropped and the commit misses.
+    """
+    import threading
+
+    page_n = 2 * 2 * 4 * 2  # _hold_private blob: two (2,4) fp16 tensors
+    cold = HostKvPages(budget_bytes=page_n, bg_publish=True)  # one-page budget, no SSD
+    gate = threading.Event()
+    _gate_worker(cold, gate)
+    try:
+        _hold_private(cold, 5, 7.0)          # exactly fills the budget
+        assert cold.offer_publish(5, 500, None)
+        _hold_private(cold, 6, 8.0)          # forces the budget loop to evict
+        # the queued page 5 survived (re-parked); the newer unreserved page 6
+        # was the one dropped to fit the one-page budget
+        assert 5 in cold._blobs and 6 not in cold._blobs
+        assert cold.stats()["kv_cold_drops"] == 1
+        gate.set()
+        assert cold.wait_committed([500], 5)
+        blob = cold.share_take(500)
+        assert blob is not None and torch.all(blob["k"] == 7.0)
     finally:
         cold.close()
 

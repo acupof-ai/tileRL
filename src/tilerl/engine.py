@@ -1130,9 +1130,36 @@ class Engine:
                 raise RequestFailed(request_id, reason, message)
             return self._finished.pop(request_id, None)
 
+    def _await_waiting_publishes(self) -> None:
+        """Block OFF the tick lock until the background close-publishes a waiting
+        sparse follower would adopt have committed. This is the only place the
+        engine waits on the publish worker, and it runs BEFORE taking
+        ``self._lock`` so a slow worker never stalls submit/poll/shutdown or moves
+        the ssd_mmap/cold_transfer bytes back under the tick lock.
+
+        Snapshot the waiting sparse requests under a short lock, release it,
+        resolve each head's would-be entry read-only (peek_hit), and wait. The
+        adopt under the tick lock re-checks commitment; a timeout or a release in
+        between is a miss there, never a raise."""
+        cold = self._kv.cold
+        if cold is None or not getattr(cold, "bg_enabled", False) or not cold.has_pending():
+            return
+        with self._lock:
+            waiting = [(r.req_id, tuple(int(t) for t in r.tokens))
+                       for r in self._waiting if r.sparse_on][: self.limits.max_batch]
+        if self._sparse is None or self._sparse.prefix is None:
+            return
+        for _rid, tokens in waiting:
+            entry = self._sparse.prefix.peek_hit(tokens)
+            if entry is not None and not cold.wait_committed(entry["keys"]):
+                # Timed out / abandoned: the locked adopt probe below takes the
+                # miss. Stop awaiting further heads this tick (one deadline spent).
+                return
+
     def step(self) -> None:
         """Run one tick: one forward over the planned rows."""
         idle = False
+        self._await_waiting_publishes()
         with self._lock:
             _tm = self._step_timing
             if _tm is not None:
@@ -1361,10 +1388,12 @@ class Engine:
             # trunk hidden at matched-1 (the first tail draft conditions on it);
             # an old/trunk-only entry is a miss (prefill from zero).
             entry = self._sparse.prefix.lookup(req.tokens) if self._sparse.prefix else None
-            if entry is not None and not self._kv.cold.wait_ready(entry["keys"]):
-                # A background close publish did not commit in time (worker
-                # wedged/stopping): treat the prefix as a miss, never adopt an
-                # entry whose blobs are not served.
+            if entry is not None and not self._kv.cold.has_all_keys(entry["keys"]):
+                # A background close publish for this entry is still queued (the
+                # off-lock step pre-wait timed out or the job was enqueued after
+                # that snapshot): never block under the tick lock. Adopt nothing
+                # this tick — the entry stays on the chains and a later tick
+                # adopts once committed; right now it is a full prefill miss.
                 entry = None
             if entry is not None and self._draft is not None and (
                     entry.get("hidden") is None or any(
