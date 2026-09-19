@@ -1021,3 +1021,209 @@ def test_spill_file_reclaims_freed_trailing_extents_to_disk(tmp_path, monkeypatc
     assert f2._cap == 2 * g and os.path.getsize(str(tmp_path / "r2.bin")) == grown
     f2.close()
 
+
+# ---------------------------------------------------------------- background publish
+
+def _hold_private(cold, key, fill=1.0):
+    """One RAM-resident private page blob."""
+    blob = {"k": torch.full((2, 4), fill, dtype=torch.float16),
+            "v": torch.full((2, 4), -fill, dtype=torch.float16)}
+    cold.hold(key, blob, sum(t.numel() * t.element_size() for t in blob.values()))
+    return blob
+
+
+def _gate_worker(cold, gate):
+    """Park the worker on an event AFTER dequeue but BEFORE taking the tier lock,
+    so the test can drive ref/forget races without a lock deadlock."""
+    cold._pub_before_job = lambda job: gate.wait(5)
+
+
+def test_bg_publish_disabled_by_default_starts_no_worker():
+    """The mechanism is opt-in: a default tier has no worker and offers report
+    False so callers fall back to the inline transfer byte-for-byte."""
+    cold = HostKvPages(budget_bytes=1 << 30)
+    try:
+        assert cold.bg_enabled is False and cold._pub_thread is None
+        _hold_private(cold, 4)
+        assert cold.offer_publish(4, 400, None) is False
+        assert cold._pub_pending == {}
+    finally:
+        cold.close()
+
+
+def test_bg_publish_transfers_a_ram_page_and_future_resolves():
+    """An offered RAM page is reserved at once (share_keys sees it, share_take
+    blocks) and committed by the worker; the committed blob is the source bytes
+    and the private copy is gone."""
+    cold = HostKvPages(budget_bytes=1 << 30, bg_publish=True, bg_wait_s=5)
+    try:
+        _hold_private(cold, 7, 3.0)
+        assert cold.offer_publish(7, 700, {"bounds": torch.zeros(2)})
+        assert cold.stats()["kv_cold_bg_queued"] == 1
+        assert 700 in cold.share_keys()  # visible immediately, pending
+        blob = cold.share_take(700)      # blocks on the future until committed
+        assert blob is not None and "bounds" in blob
+        assert torch.all(blob["k"] == 3.0) and torch.all(blob["v"] == -3.0)
+        assert cold.take(7) is None      # transferred, not cloned
+        assert cold._shared[700][1] == 1
+    finally:
+        cold.close()
+
+
+def test_bg_publish_hold_path_commits_a_frame_blob():
+    """The device-resident close page's synced host frame goes through offer_hold:
+    no private key, committed verbatim under the content key."""
+    cold = HostKvPages(budget_bytes=1 << 30, bg_publish=True)
+    try:
+        blob = {"k": torch.ones(3, dtype=torch.float16)}
+        n = blob["k"].numel() * 2
+        assert cold.offer_hold(800, blob, n)
+        assert torch.all(cold.share_take(800)["k"] == 1.0)
+    finally:
+        cold.close()
+
+
+def test_bg_publish_lifts_an_ssd_private_page(tmp_path):
+    """A queued offer whose source is already on the private spill file is lifted
+    to the prefix file by the worker and reads back byte-correct."""
+    ssd = str(tmp_path / "bg.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    try:
+        b = pool.alloc_block()
+        pool.k_pool[:, b].fill_(9)
+        pool.v_pool[:, b].fill_(-9)
+        pool.demote_page(b, key=3)  # past the 64-byte budget -> private SSD
+        assert cold.ssd_bytes > 0
+        assert cold.offer_publish(3, 900, {"bounds": torch.zeros(2)})
+        blob = cold.share_take(900)
+        assert blob is not None and "bounds" in blob
+        assert torch.all(blob["k"] == 9) and torch.all(blob["v"] == -9)
+        assert cold.take(3) is None
+    finally:
+        cold.close()
+
+
+def test_bg_publish_queue_full_degrades_to_false_inline_path():
+    """A full bounded queue makes offer return False so the caller transfers
+    inline; nothing is reserved, no publish is lost or silently stranded."""
+    import threading
+
+    cold = HostKvPages(budget_bytes=1 << 30, bg_publish=True, bg_depth=1)
+    gate = threading.Event()
+    dequeued = threading.Event()
+
+    def hook(job):
+        dequeued.set()
+        gate.wait(5)
+
+    cold._pub_before_job = hook  # parks AFTER dequeue, BEFORE commit
+    try:
+        _hold_private(cold, 1)
+        assert cold.offer_publish(1, 100, None)
+        assert dequeued.wait(5)      # job1 left the one queue slot
+        _hold_private(cold, 2)
+        assert cold.offer_publish(2, 200, None)  # fills the 1-deep queue
+        _hold_private(cold, 3)
+        assert cold.offer_publish(3, 300, None) is False
+        assert cold.stats()["kv_cold_bg_degraded"] == 1
+        assert 300 not in cold.share_keys()  # never reserved
+        assert cold.take(3) is not None      # source untouched -> inline works
+        gate.set()
+    finally:
+        cold.close()
+
+
+def test_bg_publish_failed_transfer_fires_miss_not_hang():
+    """A worker transfer that raises abandons the key: the future fires and a
+    waiter takes a miss (bg_failed counted), never a permanent hang."""
+    import threading
+
+    cold = HostKvPages(budget_bytes=1 << 30, bg_publish=True, bg_wait_s=5)
+    gate = threading.Event()
+    _gate_worker(cold, gate)
+
+    def boom(private_key, shared_key, extra=None):
+        raise OSError("simulated spill failure")
+
+    cold.share_hold_kv = boom
+    try:
+        _hold_private(cold, 2, 2.0)
+        assert cold.offer_publish(2, 200, None)
+        assert cold.wait_shared(200, 0.05) is False  # worker parked -> timeout
+        assert cold.stats()["kv_cold_bg_timeouts"] == 1
+        gate.set()
+        assert cold.share_take(200) is None          # failure fired -> miss
+        assert cold.stats()["kv_cold_bg_failed"] == 1
+        assert 200 not in cold._pub_pending
+    finally:
+        cold.close()
+
+
+def test_bg_publish_fold_refs_landing_before_commit():
+    """share_ref/share_release calls between reservation and commit fold into
+    refcount 1: +1 needs two releases; -1 releases the record on commit."""
+    import threading
+
+    cold = HostKvPages(budget_bytes=1 << 30, bg_publish=True)
+    gate = threading.Event()
+    _gate_worker(cold, gate)
+    try:
+        _hold_private(cold, 11, 1.0)
+        _hold_private(cold, 12, 1.0)
+        assert cold.offer_publish(11, 1100, None)
+        assert cold.offer_publish(12, 1200, None)
+        cold.share_ref(1100)       # freeze ref lands while queued
+        cold.share_release(1200)   # entry already gone while queued
+        gate.set()
+        assert cold.drain_publishes(5)
+        assert cold._shared[1100][1] == 2
+        cold.share_release(1100)
+        assert cold._shared[1100][1] == 1
+        cold.share_release(1100)
+        assert 1100 not in cold._shared
+        assert 1200 not in cold._shared  # folded delta 0 -> released at commit
+    finally:
+        cold.close()
+
+
+def test_bg_publish_forget_while_queued_keeps_the_source():
+    """The publisher's cold.forget landing while the job is queued must not remove
+    the blob the worker is about to transfer; after the worker commits the private
+    namespace is empty and the shared blob is served."""
+    import threading
+
+    cold = HostKvPages(budget_bytes=1 << 30, bg_publish=True)
+    gate = threading.Event()
+    _gate_worker(cold, gate)
+    try:
+        _hold_private(cold, 21, 4.0)
+        assert cold.offer_publish(21, 2100, {"bounds": torch.zeros(2)})
+        cold.forget(21)  # queued: retained, and returns without removing
+        assert 21 in cold  # source still present for the worker to transfer
+        gate.set()
+        assert cold.drain_publishes(5)
+        blob = cold.share_take(2100)
+        assert blob is not None and torch.all(blob["k"] == 4.0)
+        assert cold.take(21) is None
+    finally:
+        cold.close()
+
+
+def test_bg_publish_close_drains_before_closing_files():
+    """shutdown join: a queued job commits in close() even when the worker is
+    still parked; the worker thread is stopped, no hang."""
+    import threading
+
+    cold = HostKvPages(budget_bytes=1 << 30, bg_publish=True)
+    gate = threading.Event()
+    _gate_worker(cold, gate)
+    _hold_private(cold, 31, 5.0)
+    assert cold.offer_publish(31, 3100, {"bounds": torch.zeros(2)})
+    thread = cold._pub_thread
+    gate.set()
+    cold.close()  # drains + joins; no hang
+    assert thread is not None and not thread.is_alive()
+
+
