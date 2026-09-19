@@ -36,6 +36,16 @@ def _shared_ssd_path(ssd_path: str) -> str:
     return (ssd_path[:-4] if ssd_path.endswith(".bin") else ssd_path) + ".prefix.bin"
 
 
+def _prefix_spill_bounded() -> bool:
+    """Env gate for the shared-prefix (.prefix.bin) spill cap + disk reclaim.
+    Default OFF: the shared spill stays append-grown and admission-unbounded
+    (a publish-only cache), preserving prior behavior and tests. Set
+    TILERL_COLD_PREFIX_SSD_CAP=1 to bound it by --cold-ssd-bytes and return
+    freed trailing extents to the filesystem."""
+    return os.environ.get("TILERL_COLD_PREFIX_SSD_CAP", "").strip() not in (
+        "", "0", "false", "False")
+
+
 def assert_spill_writable(path: str) -> None:
     """Open/creates ``path`` for writing at build time, so a serve pointed at an
     unwritable spill location refuses to START instead of wedging the first tick
@@ -76,7 +86,7 @@ class ColdSsdFile:
     GROWTH_SLOTS = 64
 
     def __init__(self, path: str, spec: list[tuple[str, tuple, str, int]],
-                 step_timing=None) -> None:
+                 step_timing=None, reclaim: bool = False) -> None:
         import json
         import mmap
 
@@ -84,6 +94,17 @@ class ColdSsdFile:
 
         self._np = np
         self._mmap = mmap
+        #: When True, forgetting the last live slot of a trailing extent truncates
+        #: the file back, so a release wave returns physical disk instead of
+        #: leaving the spill grown to its high-water mark forever. LIFO free-slot
+        #: reuse already bounds the high slot under a steady working set; this only
+        #: reclaims the TAIL. Off (default) the file is append-grown as before.
+        # ponytail: tail-collapse only; interior free extents are reused via the
+        # LIFO free list. Add FALLOC_FL_PUNCH_HOLE (linux) / F_PUNCHHOLE (apfs)
+        # if mid-file fragmentation ever leaves physical bytes above the cap.
+        self._reclaim = reclaim
+        #: live slot count per extent index (extent = slot // GROWTH_SLOTS).
+        self._extent_live: list[int] = []
         #: Optional env-gated step timer. Every path that touches the mmap adds
         #: its wall time to `ssd_ms`, which the owning HostKvPages drains into
         #: the step timer. Bracket here rather than at each call site so a new
@@ -107,6 +128,10 @@ class ColdSsdFile:
             self._f.flush()
         self._map = None
         self._cap = (os.path.getsize(path) - self.HEADER) // self.stride
+        # A reopened file's slots are all FREE (the slot map is in-memory; a
+        # reopened serving spill resolves nothing), so it starts with zero live
+        # extents regardless of its on-disk high-water size.
+        self._extent_live = []
         self._remap(self._cap)
 
     def _remap(self, cap: int) -> None:
@@ -115,6 +140,9 @@ class ColdSsdFile:
             self._map.close()
             self._map = None
         self._cap = cap
+        n_ext = (cap + self.GROWTH_SLOTS - 1) // self.GROWTH_SLOTS
+        if n_ext > len(self._extent_live):
+            self._extent_live.extend([0] * (n_ext - len(self._extent_live)))
         if cap:
             self._map = self._mmap.mmap(self._f.fileno(), self.HEADER + cap * self.stride)
 
@@ -130,6 +158,25 @@ class ColdSsdFile:
             os.ftruncate(self._f.fileno(), self.HEADER + cap * self.stride)
             self._remap(cap)
         return slot
+
+    def _shrink_trailing_extents(self) -> None:
+        """Release physical disk of every fully-free extent at the high-water end:
+        lower _next_slot into the last extent that still holds a live slot and
+        truncate the file to it, one remap. Does nothing mid-file (those slots
+        cycle through the LIFO free list)."""
+        e = len(self._extent_live) - 1
+        while e >= 0 and self._extent_live[e] == 0:
+            self._extent_live.pop()
+            e -= 1
+        cap = 0 if e < 0 else (e + 1) * self.GROWTH_SLOTS
+        if cap >= self._cap:
+            return
+        # The freed trailing slots are no longer reachable: drop them from the LIFO
+        # reuse list and pull the monotonic cursor back so a later write grows fresh.
+        self._free_slots = [s for s in self._free_slots if s < cap]
+        self._next_slot = min(self._next_slot, cap)
+        os.ftruncate(self._f.fileno(), self.HEADER + cap * self.stride)
+        self._remap(cap)
 
     def _charge(self, t: float) -> None:
         self.ssd_ms += (time.perf_counter() - t) * 1000.0
@@ -159,6 +206,7 @@ class ColdSsdFile:
             dst.copy_(t.contiguous().view(torch.uint8).reshape(-1))
             off += n
         self._slot_of[key] = slot
+        self._extent_live[slot // self.GROWTH_SLOTS] += 1
         # No per-page flush: the page cache writes this back; the serving spill
         # is an in-process capacity tier, not a durability log (KvBootStore is).
 
@@ -219,6 +267,9 @@ class ColdSsdFile:
         slot = self._slot_of.pop(key, None)
         if slot is not None:
             self._free_slots.append(slot)
+            self._extent_live[slot // self.GROWTH_SLOTS] -= 1
+            if self._reclaim:
+                self._shrink_trailing_extents()
 
     def __contains__(self, key) -> bool:
         return key in self._slot_of
@@ -301,6 +352,10 @@ class HostKvPages:
         #: spill failure is different — a live row needs that page — and raises.
         self.shared_spill_disabled = False
         self.shared_spill_error = ""
+        #: Env-gated (TILERL_COLD_PREFIX_SSD_CAP): the publish-only prefix spill
+        #: is bounded by the same --cold-ssd-bytes admission cap and reclaims
+        #: freed trailing extents to disk. Off by default (append-grown, unbounded).
+        self.prefix_spill_bounded = bool(ssd_path) and _prefix_spill_bounded()
         #: one RAM LRU across private and shared pages: ("p",key)/("s",key) -> n.
         self._ram_order: OrderedDict[tuple[str, Any], int] = OrderedDict()
 
@@ -458,6 +513,7 @@ class HostKvPages:
             "kv_cold_shared_pages": len(self._shared),
             "kv_cold_shared_bytes": self._shared_ram,
             "kv_cold_shared_ssd_bytes": self._shared_ssd_bytes,
+            "kv_cold_shared_ssd_bounded": int(self.prefix_spill_bounded),
             "kv_cold_demotions": self.demotions,
             "kv_cold_promotions": self.promotions,
             "kv_cold_drops": self.drops,
@@ -564,13 +620,25 @@ class HostKvPages:
 
     def _write_shared_ssd(self, key: int, blob: dict, nbytes: int) -> bool:
         """Spill one shared page; True when written. OSError disables shared spill
-        for the process and leaves the page in RAM (log once). Never raises."""
+        for the process and leaves the page in RAM (log once). Never raises.
+
+        With TILERL_COLD_PREFIX_SSD_CAP the prefix file is bounded by the same
+        --cold-ssd-bytes admission the PRIVATE spill already reports: a page that
+        would exceed it is NOT written and returns False, so the caller keeps it
+        in host RAM (the published cache is allowed to forget, never to fill the
+        disk — observed at 13.6 GiB logical / 25 GiB physical against an 8 GiB
+        cap with the gate off). Bounded mode also reclaims freed trailing
+        extents on forget. The gate is off by default."""
         if not self._ssd_path or self.shared_spill_disabled:
+            return False
+        if self.prefix_spill_bounded and self._shared_ssd_bytes + nbytes > self.ssd_capacity_bytes:
             return False
         try:
             if self._shared_ssd is None:
-                self._shared_ssd = ColdSsdFile(_shared_ssd_path(self._ssd_path), _blob_spec(blob),
-                                               step_timing=self.step_timing)
+                self._shared_ssd = ColdSsdFile(
+                    _shared_ssd_path(self._ssd_path), _blob_spec(blob),
+                    step_timing=self.step_timing,
+                    reclaim=self.prefix_spill_bounded)
             self._shared_ssd.write(("s", key), blob)
         except OSError as e:
             self.shared_spill_disabled = True
