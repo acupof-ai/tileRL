@@ -2622,14 +2622,30 @@ class Engine:
                 # take_freeze_refs/share_ref loop below carry no mark, so roughly
                 # a third of this bucket is unmarked. A profile that reads a
                 # leftover here as a per-page cost is reading the index work.
-                keys = self._sparse.prefix.close_request(
-                    req.req_id, req.tokens, self._sparse.bounds_view(req.req_id))
-                written_page = ((req.draft_pos + 1) // BLOCK_TOKENS
-                                if self._draft is not None and req.draft_blocks
-                                else -1)
-                for p, content_key in keys.items():
-                    draft_block = req.draft_blocks[p] if p <= written_page else None
-                    self._sparse.transfer_to_shared(req, p, content_key, draft_block)
+                #
+                # close_publishes (TILERL_CLOSE_BATCH_D2H=1) collapses the
+                # per-page bounds/draft/frame D2H into non-blocking launches; the
+                # context's single sync at exit runs HERE, still inside this
+                # segment and strictly BEFORE the free_block loop below, so a
+                # recycled publisher frame cannot overwrite bytes still copying.
+                # The deferred cold-tier commits happen after that sync.
+                _deferred: list = []
+                with self._kv.close_publishes() as _cb:
+                    keys = self._sparse.prefix.close_request(
+                        req.req_id, req.tokens, self._sparse.bounds_view(req.req_id))
+                    written_page = ((req.draft_pos + 1) // BLOCK_TOKENS
+                                    if self._draft is not None and req.draft_blocks
+                                    else -1)
+                    for p, content_key in keys.items():
+                        draft_block = req.draft_blocks[p] if p <= written_page else None
+                        self._sparse.transfer_to_shared(req, p, content_key, draft_block)
+                    if getattr(_cb, "active", False):
+                        _deferred = _cb.deferred
+                # __exit__ has now run the single sync (still in this segment,
+                # strictly BEFORE the free_block loop below): the prepared pinned
+                # bounds/draft/frame bytes are valid, so commit them to the tier.
+                if _deferred:
+                    self._sparse.transfer_deferred(req, _deferred)
                 for content_key in self._sparse.prefix.take_freeze_refs():
                     self._kv.cold.share_ref(content_key)
             if _tm is not None:

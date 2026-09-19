@@ -425,6 +425,107 @@ def test_sparse_prefix_publishes_only_when_pages_leave_the_hot_union():
     assert ts == ts_miss, f"prefix-hit follower {ts} != prefix-miss sparse {ts_miss}"
 
 
+def test_batched_close_publishes_match_the_per_page_path(tmp_path, monkeypatch):
+    """TILERL_CLOSE_BATCH_D2H=1 (1PR): the request-close prefix publish gathers
+    bounds/draft/frame D2H non-blocking and commits to the cold tier only after
+    the single batch-tail sync (which runs before the publisher frames free). The
+    observable result must be identical to the per-page blocking path: every
+    published page's shared blob equals its trunk page byte-for-byte, lives in
+    INDEPENDENT host storage (the frame is freed and reused, not aliased), and a
+    same-prompt follower still hits and decodes the miss-oracle tokens.
+
+    CPU cell: copies are synchronous clones and the tail sync is a no-op, but the
+    prepare/defer/post-sync-commit split runs for real, so this gates the exact
+    code path the cuda sync collapse uses."""
+    monkeypatch.setenv("TILERL_CLOSE_BATCH_D2H", "1")
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    follow = np.concatenate([prompt, np.arange(100, 120, dtype=np.int64)])
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    def _sparse():
+        return build_engine(
+            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30)
+
+    # miss-oracle under the SAME batched gate (so device settings are identical)
+    oracle = _sparse()
+    ts_miss = _drain(oracle, oracle.submit(follow, params), 8)
+    oracle.shutdown()
+
+    pub = _sparse()
+    # The close path is active on this pool (gate is backend-agnostic on CPU too).
+    assert getattr(pub._kv, "_close_batch", None) is None  # set only during close
+    # A prompt fully inside the hot union never DROP-publishes: every page is
+    # still DEVICE-resident at finish, so close_request must publish all five from
+    # live frames through the deferred FRAME path. This is the case that fails if
+    # the post-sync commit is skipped (the lookup entry names keys with no blob).
+    short_p = np.arange(7, 7 + 5 * BLOCK_TOKENS, dtype=np.int64)
+    sr = pub.submit(short_p, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+    for _ in range(30):
+        pub.step()
+        x = next((q for q in pub._running if q.req_id == sr), None)
+        if x is not None and x.decoding:
+            break
+    _drain(pub, sr, 4)
+    short_entry = pub._sparse.prefix.lookup(short_p)
+    assert short_entry is not None and len(short_entry["keys"]) == 5
+    # every close-published FRAME page committed to the shared tier after sync,
+    # with the bounds plane attached in the same deferred commit
+    for key in short_entry["keys"]:
+        blob = pub._kv.cold.share_take(key)
+        assert blob is not None and "bounds" in blob and "k" in blob, key
+
+    rid = pub.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    _drain(pub, rid, 200)
+    entry = pub._sparse.prefix.lookup(follow)
+    assert entry is not None and len(entry["keys"]) == 24
+    # every published page is readable from the shared tier (drop-published pages
+    # committed inline; close-published pages via the deferred frame commit)
+    cold = pub._kv.cold
+    for key in entry["keys"]:
+        blob = cold.share_take(key)
+        assert blob is not None and "bounds" in blob, key
+
+    # a same-prompt follower still HITS the batched-published prefix and decodes
+    # exactly the miss-oracle tokens
+    rf = pub.submit(follow, params)
+    pub.step()
+    req = next(x for x in pub._running if x.req_id == rf)
+    assert req.sparse_matched == 24 * BLOCK_TOKENS, req.sparse_matched
+    ts = _drain(pub, rf, 8)
+    pub.shutdown()
+    assert ts == ts_miss, f"batched follower {ts} != per-page miss {ts_miss}"
+
+
+def test_close_publishes_syncs_at_exit_and_keeps_per_page_independent_storage():
+    """Ordering at the pool layer: a forced close_publishes batch is unsynced
+    inside (non_blocking snapshots are only in flight) and synced at __exit__;
+    per-page _page_blob results are distinct host buffers (the batch never pools
+    staging into one shared buffer — pooling is the separate follow-up PR)."""
+    from tilerl.kv_cache import PagedKvPool, _CloseBatchActive
+    from tilerl.kv_tiers import HostKvPages
+
+    pool = PagedKvPool(8, 2, 16, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
+    blocks = [pool.alloc_block(), pool.alloc_block()]
+    for i, b in enumerate(blocks):
+        pool.k_pool[:, b].fill_(i + 1)
+        pool.v_pool[:, b].fill_(-(i + 1))
+    with pool.close_publishes(force=True) as cb:
+        assert isinstance(cb, _CloseBatchActive) and cb.active and not cb.synced
+        b0, n0 = pool._page_blob(blocks[0], non_blocking=True)
+        b1, n1 = pool._page_blob(blocks[1], non_blocking=True)
+        assert cb.launched is False  # CPU snapshots are sync; nothing async in flight
+    assert cb.synced  # __exit__ ran the (no-op on CPU) batch-tail synchronization
+    # each page got its own byte-correct, independent-storage blob
+    assert torch.equal(b0["k"], pool.k_pool[:, blocks[0]])
+    assert torch.equal(b1["k"], pool.k_pool[:, blocks[1]])
+    assert b0["k"].data_ptr() != b1["k"].data_ptr()
+    assert n0 > 0 and n0 == n1
+
+
 def test_sparse_prefix_out_of_order_drops_never_publish_a_hole():
     """Pages leave the pinned resident union in arbitrary order. The index may
     publish an entry only over a CONTIGUOUS 0..m-1 run with a held blob, a bound
