@@ -1,0 +1,52 @@
+##### cb0 (cb0.boot)
+decode=51 steady=45 tail(>=1s)=6
+STEADY p50 total 184 model 168 draft 12
+CLOSETAIL model                    n=6 med=170 max=286 sum=1132
+CLOSETAIL sparse_select            n=6 med=2 max=3 sum=11
+CLOSETAIL sparse_finalize          n=6 med=1 max=1 sum=6
+CLOSETAIL sample                   n=6 med=2951 max=3302 sum=18058
+CLOSETAIL ssd_mmap                 n=6 med=1833 max=2065 sum=11138
+CLOSETAIL pub_cold_transfer        n=6 med=1726 max=1942 sum=10372
+CLOSETAIL pub_bounds_d2h           n=6 med=293 max=409 sum=1855
+CLOSETAIL pub_draft_clone          n=6 med=352 max=392 sum=2160
+CLOSETAIL pub_frame_d2h            n=6 med=340 max=384 sum=2076
+CLOSETAIL pub_share_hold           n=6 med=210 max=280 sum=1281
+CLOSETAIL release_close_request    n=6 med=2940 max=3287 sum=17984
+CLOSETAIL release_cold_forget      n=6 med=10 max=13 sum=63
+CLOSETAIL release_blocks           n=1 med=1 max=1 sum=1
+release_close_request per tail tick: [2813, 2890, 2928, 2953, 3113, 3287]
+##### cb1 (cb1.boot)
+decode=61 steady=54 tail(>=1s)=7
+STEADY p50 total 183 model 166 draft 12
+CLOSETAIL model                    n=7 med=167 max=189 sum=1181
+CLOSETAIL sparse_select            n=7 med=1 max=2 sum=8
+CLOSETAIL sparse_finalize          n=7 med=1 max=61 sum=67
+CLOSETAIL sample                   n=7 med=2346 max=3959 sum=17667
+CLOSETAIL ssd_mmap                 n=7 med=1865 max=2716 sum=13674
+CLOSETAIL pub_cold_transfer        n=7 med=1783 max=2507 sum=12933
+CLOSETAIL pub_bounds_d2h           n=7 med=111 max=280 sum=962
+CLOSETAIL pub_draft_clone          n=7 med=177 max=406 sum=1500
+CLOSETAIL pub_frame_d2h            n=7 med=41 max=269 sum=518
+CLOSETAIL pub_share_hold           n=7 med=161 max=332 sum=1320
+CLOSETAIL release_close_request    n=7 med=2321 max=3825 sum=17395
+CLOSETAIL release_cold_forget      n=7 med=9 max=30 sum=91
+CLOSETAIL release_blocks           n=1 med=2 max=2 sum=2
+release_close_request per tail tick: [2046, 2161, 2282, 2321, 2364, 2396, 3825]
+##### cb2 (cb2.boot)
+decode=61 steady=50 tail(>=1s)=11
+STEADY p50 total 185 model 168 draft 12
+CLOSETAIL model                    n=11 med=172 max=1260 sum=5084
+CLOSETAIL draft_step               n=3 med=31 max=40 sum=86
+CLOSETAIL sparse_select            n=11 med=2 max=11 sum=36
+CLOSETAIL sparse_finalize          n=11 med=1 max=2622 sum=4232
+CLOSETAIL sample                   n=11 med=2019 max=7663 sum=24527
+CLOSETAIL ssd_mmap                 n=8 med=835 max=2464 sum=8912
+CLOSETAIL pub_cold_transfer        n=7 med=826 max=2274 sum=8295
+CLOSETAIL pub_bounds_d2h           n=7 med=258 max=333 sum=1491
+CLOSETAIL pub_draft_clone          n=7 med=388 max=557 sum=2378
+CLOSETAIL pub_frame_d2h            n=7 med=48 max=254 sum=627
+CLOSETAIL pub_share_hold           n=7 med=596 max=5903 sum=11283
+CLOSETAIL release_close_request    n=7 med=2499 max=7651 sum=24259
+CLOSETAIL release_cold_forget      n=7 med=10 max=27 sum=96
+CLOSETAIL release_blocks           n=4 med=2 max=2 sum=7
+release_close_request per tail tick: [1752, 1997, 2137, 2499, 3514, 4709, 7651]

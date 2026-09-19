@@ -1,10 +1,12 @@
 # Batched one-sync D2H for request-close prefix publish — 2026-09-19
 
 > Status: landed behind an env gate (`TILERL_CLOSE_BATCH_D2H=1`), default OFF,
-> device delta pending-remote. First of two PRs attacking the deterministic
-> per-request close-time lock stall (the 1.8–8.9 s in the step timer's `sample`
-> bucket measured on V100 2026-09-18). This PR removes the per-page device sync
-> count; the second PR moves host/SSD bytes off the critical path.
+> device delta measured on V100 2026-09-19 (659c2fbb): request-close median
+> 2940 → 2321 ms (−21%), steady decode unchanged. First of two PRs attacking
+> the deterministic per-request close-time lock stall (the 1.8–8.9 s in the
+> step timer's `sample` bucket measured on V100 2026-09-18). This PR removes
+> the per-page device sync count; the second PR moves host/SSD bytes off the
+> critical path.
 
 ## Context
 
@@ -63,12 +65,46 @@ the e2e gate covers the exact code path cuda uses.
 - The pre-existing batched-demotion gates (one batched `cuda.synchronize`) pin
   the sync-before-frame-free contract this reuses.
 
-Device confirmation is pending-remote: perf1 re-runs the #732 five-segment
-probe on the next V100 window with the gate set to read how much of
-`pub_bounds_d2h` / `pub_draft_clone` / `pub_frame_d2h` the single sync removes.
-At the measured 1 G-RAM / 8 G-SSD shape the two largest terms were `ssd_mmap`
-and `pub_cold_transfer` (host/SSD, the second PR), so this PR is the clean
-low-risk lock-in baseline and likely does not by itself remove the whole stall.
+## Device confirmation (V100 sm70, 2026-09-19, 659c2fbb)
+
+Three served arms on the 27B, same fill-then-warm protocol (2× 37.6k
+independent fills to a full tier, 2 warm reps of 32 tokens, W=2048, 1 GiB-RAM /
+8 GiB-SSD f16, `SLOW_MS=0`): cb0 both gates off, cb1 `TILERL_CLOSE_BATCH_D2H=1`,
+cb2 plus `TILERL_COLD_PREFIX_SSD_CAP=1`. Only the cb0→cb1 pair isolates this PR.
+
+Per-request close, five `#732` sub-segments, median ms over the release tail
+ticks (n=6 cb0, n=7 cb1):
+
+| sub-segment | cb0 off | cb1 batch | delta |
+|---|---:|---:|---:|
+| `release_close_request` total | 2940 | 2321 | **−21%** |
+| `pub_frame_d2h` | 340 | 41 | −88% |
+| `pub_bounds_d2h` | 293 | 111 | −62% |
+| `pub_draft_clone` | 352 | 177 | −50% |
+| `pub_share_hold` | 210 | 161 | −23% |
+| `ssd_mmap` | 1833 | 1865 | flat |
+| `pub_cold_transfer` | 1726 | 1783 | flat |
+
+Steady decode did not regress: tick p50 184→183 ms, model segment 168→166 ms,
+draft 12→12; effective tok/s (decode ticks + accepted bonus over decode wall)
+9.49/9.01 → 9.37/9.38.
+
+Correctness (client-terminal observation, not vendored): a follower repeating
+an identical 32k prompt returned byte-identical tokens, `finish_reason=length`,
+and `/health` `prefix_hits` moved +1 in the client-side `follower_smoke.py`
+run. That stdout was not saved and the boot log has no per-request prefix-hit
+line, so treat this as a live operator read, not an artifact — re-capture the
+follower response and health delta to a file next window.
+
+The two largest close terms — `ssd_mmap` (~1.83→1.86 s) and
+`pub_cold_transfer` (~1.73→1.78 s) — are unchanged. They are host/SSD byte
+movement, not device-sync count, which is exactly the scope reserved for the
+second PR. This PR's −21% is the frame/bounds/draft per-page sync collapse and
+is the clean low-risk lock-in baseline predicted at landing.
+
+Vendored: `close-batch-cap-device-2026-09-19/{cb0,cb1,cb2}.json` (arm summaries)
+and `close-segments.txt` (the full sub-segment parse). Raw per-tick timing is in
+`~/tilerl-logs/serve-cb{0,1,2}.boot` on the V100 box.
 
 ## Rule
 
@@ -87,9 +123,10 @@ commit to after that single sync; the sync must precede frame recycling.
 
 ## Results
 
-| date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
-|---|---|---|---|---|---:|---:|---:|
-| 2026-09-19 | pending PR | CPU (hermetic) | engine close-time prefix publish D2H | — | — | — | N per-page syncs → 1 (device ms pending-remote) |
+| date | commit | machine | target | model | close med ms | per-page D2H sub-segments | throughput |
+|---|---|---|---|---|---:|---|---|
+| 2026-09-19 | pending PR | CPU (hermetic) | engine close-time prefix publish D2H | — | — | N per-page syncs → 1 | — |
+| 2026-09-19 | 659c2fbb | V100 sm70 | request-close prefix publish D2H | Qwen3.8-27B-NVFP4, 37.6k sparse, 1G/8G f16 | 2940→2321 (−21%) | frame −88%, bounds −62%, draft −50%; ssd_mmap/cold_transfer flat | steady unchanged; eff 9.0–9.5 tok/s |
 
 Raw artifacts: `tests/test_sparse_engine.py`; changes `src/tilerl/kv_cache.py`,
 `src/tilerl/sparse_runtime.py`, `src/tilerl/engine.py`.
