@@ -250,7 +250,8 @@ not continuous across boots — see the cold-tier rule above.
 | A3 | `SERVE_DEPTH=3` | depth alone, graph-on |
 | A4 | `SERVE_DEPTH=3 SERVE_DECODE_GRAPH=0` | depth × graph interaction |
 | A5 | `SERVE_SPARSE_K=0 SERVE_COLD_SSD=""` | the dense engine, no sparse, no cold tier (#759 merged) |
-| A6 | A1 + `SERVE_DRAFT_WINDOW=2048` | the V100 W=2048 arm, cold-filled, V100 wall protocol |
+| A6.0 | A1 (the W=0 baseline for the window pair) | — |
+| A6.2 | A1 + `SERVE_DRAFT_WINDOW=2048` | the V100 W=2048 arm; the W effect is A6.0↔A6.2 only |
 
 ### A6 fills the cold tier first; A1–A5 start cold
 
@@ -258,6 +259,25 @@ The spill does not survive a boot (above), so an arm's cold state is built insid
 its own process. **A6 gets there before it measures**, because it mirrors the V100
 wall protocol: fill, then measure warm, `probe_headroom_coldtail.py arm` performs
 that shape and reports a plateau rate.
+
+**A6's protocol is `--fill-n 5 --warm-reps 3 --min-good-reps 2 --min-cold-gb 7.0`,
+and it is a two-arm pair.** Run as A6.0 (W=0, the baseline) and A6.2 (W=2048, the
+treatment) on one tree; the W effect is read only between those two. The
+`fill5/warm3` shape is the V100 wall harness's own (`run_close_window_v100.sh`
+passes `--warm-reps 3` and leaves `--fill-n` at its default 5), so "mirrors the
+V100 wall protocol" and this line say the same thing.
+
+**Both arms must start from an empty cold tier, and the way to get that is to
+delete the arm's own spill file before each arm boots.** The on-disk high-water is
+*not* re-adopted (the rule above: a reopened spill maps its length but restores no
+index, and the hit path is memory-only), so the four keys read 0 at boot whether or
+not the file is there — verify that rather than assume it. What the deletion buys
+is that the two arms start from the *same* disk state: A6.0 created its spill as it
+filled, and handing that pre-grown file to A6.2 would be one avoidable difference
+between the pair. Assert zero-traffic four keys on the way up **for both arms**.
+The file's name depends on the layout signature (`kv_tiers._shared_bucket_path`):
+the cold layout uses plain `.prefix.bin`, a warm-spec layout a `.w<n>.bin` sibling —
+so confirm **which** file the arm owns before deleting anything.
 
 **A1–A5 do not fill.** They run the n=30 corpus pass from a cold start, and the
 against-A2 comparison is taken **per phase**, not over the whole arm. The reason is
@@ -562,6 +582,55 @@ would be a second lifecycle misalignment, and it would only catch the tail of th
 fill. So A4's phase boundary comes from the tick lines' own `ssd_mmap`, and its
 cold state from the closing `/health`. **Its fill curve is missing and the A/B
 split has no trace corroboration** — the tick measurement does not depend on it.
+
+## The draft window as a result: W=2048 is slower here, and why V100's gain did not carry
+
+A6 ran 2026-09-20 as a **two-arm controlled pair**, not one arm: A6.0 (W=0, the
+baseline) and A6.2 (W=2048, the treatment). Both on tree `38b974f1`, both
+`d1 / k128 / graph-on`, both `fill5 / warm3 / min-good2 / min-cold-gb 7.0`, one
+serve per boot, cold tier emptied before each (`shared_ssd` deleted, zero-traffic
+four keys asserted 0 on the way up). **The single variable is the draft window.**
+
+| arm | W | warm-32k tok/s (median) | per-rep | tick p50 | model p50 | draft_step p50 | accept_rate |
+|---|---|---|---|---|---|---|---|
+| A6.0 | 0 | **11.393** | 11.701 / 11.393 / 11.256 | **81 ms** | **72 ms** | 5 ms | 0.8235 |
+| A6.2 | 2048 | **10.627** | 10.804 / 10.627 / 10.374 | **87 ms** | **79 ms** | 4 ms | 0.8235 |
+
+**W=2048 is 6.7% slower, and the sign is robust.** The band was computed before
+the p50s were read: request-block bootstrap halfwidth 1.50 / 1.00 ms and
+split-half drift 5.0 / 0.0 ms, so **±5.0 ms** — the +6 ms tick gap is **outside**
+it. The three per-rep values do not overlap (W=0's worst 11.256 exceeds W=2048's
+best 10.804), and the boot-window tick read agrees with the probe's warm-only read
+(81/87 vs 80–81/87–88).
+
+**The gain V100 modelled was in the draft; here there is nothing there to save.**
+The V100 +53% figure was *modelled*, from `draft_ms 117.4 → 12.1` at 32k W=2048 —
+and V100's own on-device verdict was "no flip". On H20 `draft_step` is **4–5 ms in
+both arms**, so the window's whole available saving is ~1 ms; the two platforms'
+addressable pools differ by two orders of magnitude. The acceptance rate is
+**identical** (0.8235 both arms), so no tok/s move can be attributed to accept
+length. **H20 does not flip the default.**
+
+**The 6 ms lands in the trunk, and that is unexplained.** `model` moves 72 → 79 ms
+while `draft_step` moves 5 → 4. The window is designed to change the draft head's
+read span, not the trunk. Reported as measured, with no mechanism claimed — a
+code-reading investigation is owed before any explanation is written.
+
+**Cold tier: state the epoch, and do not set it beside A1–A4.** Both arms' terminal
+four keys are **bit-identical** to each other — `0 / 0 / 7.999 / 35.8`
+(`cold_*_gb_last`, the reading at the end of rep 2, TOTAL 43.799), and both reach a
+lifecycle peak of `0 / 0 / 7.999 / 38.376` (TOTAL 46.375). Those two are **the same
+quantity at two instants on one trace**, not two instruments: `shared_ssd` is
+monotone across both traces (zero decreases > 0.01 GiB), and the peak trails the
+last-rep reading by the 2–5 minutes the sampler kept running after the probe
+exited. **Quote one with its instant named, not both side by side.**
+
+And these numbers are **not** A1–A4's 67.500. Two reasons, either sufficient: this
+pair ran **24** 32k requests (5×3 fill + 3 warm + warmup) against A1–A4's **36**, and
+it ran on a tree carrying **#746's `kv_tiers.py` rewrite**. Both arms' zero-traffic
+boot state was `0 / 0 / 0 / 0`, so the pair starts cold and the totals are its own.
+The `shared` tier does still pin at its 7.999 cap — but a value sampled mid-fill is
+not a terminal state, so an intermediate reading of it says nothing about the arm.
 
 ## Rule
 
