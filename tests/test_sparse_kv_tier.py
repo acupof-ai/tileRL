@@ -2499,3 +2499,60 @@ def test_step_thread_shared_write_failure_keeps_page_in_ram_no_leak(tmp_path):
     assert not bucket._reserved and bucket._borrowed == 0
     assert len(bucket._free_slots) == before
     cold.close()
+
+
+def test_bg_publish_ssd_lift_accepts_a_none_extra(tmp_path):
+    """``extra`` is annotated ``dict | None`` and None is a legal argument
+    (``test_bg_publish_disabled_by_default_starts_no_worker`` passes it), so an
+    SSD source must lift with no contribution rather than AttributeError inside
+    the worker. It used to sum ``extra.values()`` OUTSIDE the ``if extra:``
+    guard -- the same shape the RAM branch had already got right.
+
+    Recovery, not just the first call: the same content must publish again after
+    the None lift and read back byte-equal, and the third case is the opposite
+    direction -- a NON-empty extra still adds its bytes, so the guard is not
+    quietly discarding every extra."""
+    ssd = str(tmp_path / "nonex.bin")
+    cold = HostKvPages(budget_bytes=1, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+
+    def spill(key, fill):
+        b = pool.alloc_block()
+        pool.k_pool[:, b].fill_(fill)
+        pool.v_pool[:, b].fill_(-fill)
+        pool.demote_page(b, key=key)  # -> private SSD
+        return b
+
+    try:
+        spill(7, 1.0)
+        src_n = cold._ssd.stride
+        before_failed = cold.bg_failed
+        assert cold.offer_publish(7, 700, None)
+        assert cold.wait_committed([700])
+
+        # 1. the None lift committed, contributed no extra bytes, took no failure
+        assert cold.bg_failed == before_failed
+        assert cold._shared[700][0] == src_n
+        # ...and the source page really is gone (consumed, not merely unpinned)
+        assert 7 not in cold._ssd
+        assert cold._ssd._borrowed == 0 and not cold._ssd._pinned_keys
+
+        # 2. the same content publishes again and reads back byte-equal
+        spill(7, 2.0)
+        assert cold.offer_publish(7, 701, None)
+        assert cold.wait_committed([701])
+        got = cold.share_take(701)
+        assert got is not None and torch.all(got["k"] == 2.0)
+        assert cold._shared[701][0] == src_n
+
+        # 3. control: a NON-empty extra DOES add its bytes (so the guard is not
+        #    just discarding every extra)
+        spill(8, 3.0)
+        bound = torch.zeros(2)
+        assert cold.offer_publish(8, 800, {"bounds": bound})
+        assert cold.wait_committed([800])
+        nbytes = bound.numel() * bound.element_size()
+        assert cold._shared[800][0] == src_n + nbytes
+    finally:
+        cold.close()
