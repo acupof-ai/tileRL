@@ -39,8 +39,11 @@ def sandbox(env_extra):
         (d / "models").mkdir()
         (d / "mmlu-assets").mkdir()
         # Crashes immediately, no matter the serve argv; sleeps make boots distinct.
+        # Dumps its own environment first, so a gate can read what the supervisor
+        # actually handed the child (the extra write is harmless to the fuse tests,
+        # which only count boots and read the log).
         stub = d / "venv70/bin/python"
-        stub.write_text("#!/bin/bash\nexit 7\n")
+        stub.write_text('#!/bin/bash\nexport > "$SERVE_ROOT/childenv.txt"\nexit 7\n')
         stub.chmod(0o755)
         env = dict(os.environ)
         env.update(
@@ -79,3 +82,33 @@ def test_crashes_outside_the_window_age_out_and_never_trip():
         log = (d / "servehybridsse.log").read_text()
         assert "FUSE:" not in log
         assert "gave up after 2 restarts" in log
+
+
+def test_the_child_gets_expandable_segments():
+    """The sm70 allocator flag must reach the served process, and an operator's
+    own value must win over the launcher's default (it changes allocator behaviour
+    globally, so a run that opts out has to be able to).
+
+    `export` quotes the value, so the assertions match the assignment rather than
+    the bare pair: the first version omitted the quotes and went red against a
+    script that was already correct."""
+    with sandbox({"MAX_RESTARTS": "0"}) as (d, env):
+        subprocess.run(["bash", str(SRC)], capture_output=True, text=True, timeout=120, env=env)
+        child = (d / "childenv.txt").read_text()
+        assert 'PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"' in child, child[:400]
+
+    with sandbox({"MAX_RESTARTS": "0",
+                  "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"}) as (d, env):
+        subprocess.run(["bash", str(SRC)], capture_output=True, text=True, timeout=120, env=env)
+        child = (d / "childenv.txt").read_text()
+        assert 'PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"' in child, child[:400]
+        assert "expandable_segments:True" not in child
+
+
+def test_only_the_sm70_launcher_sets_it():
+    """Scoped to the sm70 launcher, not a cross-backend default: the sm90 and dense
+    launch paths must not inherit it."""
+    here = pathlib.Path(__file__).parent.parent / "scripts"
+    for name in ("serve_h20.sh", "serve_v100_dense.sh", "serve_v100.sh"):
+        text = (here / name).read_text()
+        assert "PYTORCH_CUDA_ALLOC_CONF" not in text, f"{name} sets the sm70 allocator flag"
