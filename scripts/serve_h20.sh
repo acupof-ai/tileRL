@@ -206,7 +206,8 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
       curl -sf -m 3 -o /dev/null "http://127.0.0.1:$PORT/health" && break; sleep 2; done
     if [ -n "$TRACE" ]; then
       : > "$TRACE"
-      bash "$SCRIPT_DIR/serve_cold_trace.sh" "$TRACE" "$child" 10 >> "$TRACE" 2>&1 &
+      # Sampler self-redirects into $TRACE and reads LIVENESS_BASE for the port.
+      bash "$SCRIPT_DIR/serve_cold_trace.sh" "$TRACE" "$child" 10 &
       samp=$!
     fi
     echo "serve_h20: warmup start at $(date -Is)" >> "$LOG"

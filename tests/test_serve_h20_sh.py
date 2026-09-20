@@ -17,6 +17,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -116,27 +117,107 @@ def test_dry_run_names_the_per_arm_trace_file():
 
 TRACE_SRC = pathlib.Path(__file__).parent.parent / "scripts" / "serve_cold_trace.sh"
 
+# Binds port 0 (ephemeral), prints the chosen port, then serves a fixed health.
+_HEALTH_SERVER_SRC = """
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"stats": {"kv_cold_bytes": 0, "kv_cold_ssd_bytes": 0,
+            "kv_cold_shared_bytes": 1 << 30, "kv_cold_shared_ssd_bytes": 0,
+            "finished": 2, "decode_forwards": 10, "tokens_generated": 20}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+httpd = HTTPServer(("127.0.0.1", 0), H)
+print(httpd.server_address[1], flush=True)
+httpd.serve_forever()
+"""
+
+
+def _health_server():
+    return subprocess.Popen([sys.executable, "-c", _HEALTH_SERVER_SRC],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+
+def _wait_exit(proc, seconds=20):
+    for _ in range(int(seconds / 0.5)):
+        if proc.poll() is not None:
+            return proc.poll()
+        time.sleep(0.5)
+    return None
+
 
 def test_cold_trace_sampler_dies_with_its_serve_pid(tmp_path):
-    # The sampler's only termination condition is the tracked serve pid: a
-    # standalone loop with a fixed iteration count died silent mid-matrix and
-    # kept writing across arms. Bound to a live pid, it must exit when that pid
-    # is gone (the curl against an absent /health adds nothing but must not end
-    # the loop while the serve still lives).
-    serve = subprocess.Popen(["sleep", "30"])
+    # Bound to a live pid it must stay up; when that pid is gone it exits, even
+    # though the health endpoint is unreachable (pid death, not the fail counter).
+    serve = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         samp = subprocess.Popen(
-            ["bash", str(TRACE_SRC), str(tmp_path / "trace.txt"), str(serve.pid), "1"])
+            ["bash", str(TRACE_SRC), str(tmp_path / "trace.txt"), str(serve.pid), "1"],
+            env={**os.environ, "LIVENESS_BASE": "http://127.0.0.1:1",
+                 "TRACE_MAX_FAILS": "1000"})
         time.sleep(2)
         assert serve.poll() is None and samp.poll() is None, "sampler died with serve alive"
         serve.terminate()
         serve.wait()
-        for _ in range(30):
-            if samp.poll() is not None:
-                break
-            time.sleep(0.5)
-        assert samp.poll() is not None, "sampler outlived the serve it was bound to"
+        assert _wait_exit(samp) is not None, "sampler outlived the serve it was bound to"
     finally:
+        serve.kill()
+        samp.kill()
+
+
+def test_cold_trace_fails_fast_on_a_dead_port(tmp_path):
+    # A serve pid that is alive but an unreachable/wrong health port must not
+    # spin out an empty trace for the whole arm: after TRACE_MAX_FAILS consecutive
+    # unreadable answers it exits non-zero and says why in the trace file.
+    serve = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    trace = tmp_path / "trace.txt"
+    try:
+        samp = subprocess.Popen(
+            ["bash", str(TRACE_SRC), str(trace), str(serve.pid), "1"],
+            env={**os.environ, "LIVENESS_BASE": "http://127.0.0.1:1",
+                 "TRACE_MAX_FAILS": "3"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        rc = _wait_exit(samp, 15)
+        assert rc == 3, f"want fatal exit 3 on dead port, got {rc}"
+        assert "TRACE_FATAL" in trace.read_text()
+        assert serve.poll() is None, "fatal is the unreadable health, not serve death"
+    finally:
+        serve.kill()
+        samp.kill()
+
+
+def test_cold_trace_writes_rows_to_its_own_file_from_configured_port(tmp_path):
+    # Positive control for the blocking defect: the sampler writes the requested
+    # file itself (no outer redirect) and reads LIVENESS_BASE, so a non-default
+    # port produces real rows rather than an empty trace.
+    srv = _health_server()
+    port = int(srv.stdout.readline().strip())
+    serve = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    trace = tmp_path / "trace.txt"
+    try:
+        samp = subprocess.Popen(
+            ["bash", str(TRACE_SRC), str(trace), str(serve.pid), "1"],
+            env={**os.environ, "LIVENESS_BASE": f"http://127.0.0.1:{port}"},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        rows = ""
+        for _ in range(20):
+            time.sleep(0.5)
+            if trace.exists():
+                rows = trace.read_text()
+                if "shared=" in rows:
+                    break
+        assert "decfwd=10" in rows and "TOTAL=1.000" in rows, f"no sample row:\n{rows}"
+        samp.terminate()
+        # Rows land in the named file with stdout=DEVNULL and no outer redirect,
+        # proving the script opened OUT itself rather than relying on the launcher.
+    finally:
+        srv.kill()
         serve.kill()
         samp.kill()
 
