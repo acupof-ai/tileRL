@@ -46,7 +46,7 @@ trap 'stopping=1; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait
 for ((n = 0; n <= MAX_RESTARTS; n++)); do
   # An unbounded log on this pod is how 123 GiB once filled the disk.
   if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "$LOG_CAP" ]; then : > "$LOG"; fi
-  echo "=== boot $n at $(date -Is)  sha $(git rev-parse --short HEAD)" \
+  echo "=== boot $n at $(date +%Y-%m-%dT%H:%M:%S%z)  sha $(git rev-parse --short HEAD)" \
        "dirty $(git status --porcelain | wc -l) ===" >> "$LOG"
   started=$SECONDS
   # Backgrounded so the trap above can run: bash defers traps while it blocks on a

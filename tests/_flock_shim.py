@@ -8,8 +8,9 @@ exercised on CI's ubuntu job.
 
 This is not a stub that pretends the lock succeeded. A shim that always exits 0
 is worse than the skip: execution runs past the lock check into the restart
-loop, and the failure that surfaces (a BSD `date -Is` complaint, from a branch
-the launcher was never supposed to reach) names neither the lock nor the
+loop, and the failure that surfaces (originally a BSD `date -Is` complaint from
+that branch -- since fixed to a portable format, so the tell is now just a
+launcher that booted rather than refused) names neither the lock nor the
 launcher. The lock-holder test in `test_serve_v100_sh.py` exists to catch
 exactly that, and it goes red under such a shim.
 

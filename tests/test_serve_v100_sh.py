@@ -4,6 +4,8 @@ It runs the real script with a stub `python`, because a check that greps a shell
 asserts what the script says, not what it does. Both defects it caught were behavioural:
 TERM stopped the supervisor without stopping the server (23466 MiB held, nothing
 watching), and the sandboxes landed in the repo checkout because the pod sets no TMPDIR.
+The timestamp gate is the exception that is not behavioural: it checks the `date`
+FORMAT, because `date -Is` is a GNU-only spelling that BSD `date` rejects outright.
 
 Runs on macOS too, where flock(1) is absent: `_flock_shim` puts a real
 fcntl-backed flock on PATH for the subprocesses. On Linux the shim is not built
@@ -192,3 +194,56 @@ def test_the_sandboxes_do_not_land_in_the_cwd():
         assert d.exists()
     assert not d.exists(), "sandbox() did not remove its directory"
     assert not list(pathlib.Path.cwd().glob("serve_v100_check.*"))
+
+
+def test_the_boot_timestamp_is_portable_and_parseable():
+    """The boot/exit lines are the only record of when a restart happened, and they
+    used `date -Is`, which BSD `date` rejects (`date: invalid argument 's' for -I`)
+    -- so on macOS every one of those lines carried an empty timestamp.
+
+    The gate is the timestamp FORMAT, not a grep for the new spelling: run both
+    `date` implementations the scripts can meet and require each to emit a value the
+    platform's own parser accepts. A grep would pass on a string no `date` produces.
+    """
+    from datetime import datetime
+
+    fmt = "%Y-%m-%dT%H:%M:%S%z"
+    for name, binary in (("bsd/macOS", "date"), ("gnu", "gdate")):
+        if shutil.which(binary) is None:
+            continue  # gdate is a macOS extra; CI's Ubuntu has GNU as plain `date`
+        out = subprocess.run([binary, "+" + fmt], capture_output=True, text=True, timeout=30)
+        assert out.returncode == 0, (name, out.stderr[:200])
+        stamp = out.stdout.strip()
+        # Python is the reader that matters: the vendored artifacts are parsed by
+        # hand-written code, and `fromisoformat` accepts %z with and without the
+        # colon (verified: +0800 and +08:00 both parse).
+        parsed = datetime.fromisoformat(stamp)
+        assert parsed.tzinfo is not None, (name, stamp)
+        # ... and the platform's own parser must accept it too, since an operator
+        # reading the log will reach for `date -j -f` (BSD) or `date -d` (GNU).
+        if name.startswith("bsd"):
+            p = subprocess.run(["date", "-j", "-f", fmt, stamp, "+%s"],
+                               capture_output=True, text=True, timeout=30)
+        else:
+            p = subprocess.run(["gdate", "-d", stamp, "+%s"],
+                               capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, (name, stamp, p.stderr[:200])
+
+    # No launcher may go back to the non-portable form. `%:z` is NOT the fix either:
+    # BSD date prints it literally (`...20:37:37:z`), measured.
+    here = SRC.parent
+    offenders = [p.name for p in sorted(here.glob("serve_*.sh"))
+                 if "date -Is" in p.read_text() or "date +%Y-%m-%dT%H:%M:%S%:z" in p.read_text()]
+    assert not offenders, f"non-portable timestamp in {offenders}"
+
+
+def test_the_old_form_really_was_broken_on_this_platform():
+    """Negative control for the gate above: if this platform's `date` accepts `-Is`,
+    the test is vacuous here and the portability claim rests on nothing."""
+    r = subprocess.run(["date", "-Is"], capture_output=True, text=True, timeout=30)
+    if r.returncode == 0:
+        # GNU date accepts it, so on THIS host there is nothing to catch. The
+        # macos-14 row is where this control has teeth; do not assert a failure
+        # the platform cannot produce (that is how a gate goes red on CI alone).
+        return
+    assert "invalid argument" in r.stderr or "illegal" in r.stderr, r.stderr[:200]
