@@ -13,8 +13,14 @@ same log under the standard set, so a headroom arm and a sweep arm can be placed
 side by side, or not placed at all when the log cannot support it.
 
     python3 scripts/steady_filter.py --log ~/servehybridsse.log --out steady.json
-    python3 scripts/steady_filter.py --log ~/closewin/bg1/serve.log \
-        --window 194540:489409 --window 489409     # this arm's warm spans only
+    python3 scripts/steady_filter.py --log ~/closewin/bgcap/serve.log \
+        --window 194540:264100 --window 489409:558000   # this arm's warm spans
+
+Each `--window` is one rep, `start:end`, both from `arm.json`'s `reps[].ticks`
+(`log_byte_offset` is the warm POST start, `log_byte_end` that rep's own end).
+Use the rep's OWN end: the start offset is a warm START, so a span reaching to the
+next rep's start contains the next rep's cold fill, whose short-context decode
+ticks pass the standard set.
 
 Read-only. Every field it prints is derived from the tick lines; nothing is
 inferred. When the exclusion reason cannot be recovered from an older log format
@@ -65,13 +71,13 @@ def parse_line(line: str) -> dict | None:
 def parse_rows(log_path: str, offset: int = 0, until: int | None = None) -> list[dict]:
     """Tick rows in ``[offset, until)`` bytes.
 
-    The window matters as much as the start. `probe_headroom_coldtail` records
-    one ``log_byte_offset`` per rep, taken after that rep's cold fill and before
-    its warm POST; the reps' warm windows are DISJOINT, with the next rep's fill
-    in between -- and a fill emits short-context decode ticks that pass the
-    standard set. Starting at the first rep's offset and reading to EOF therefore
-    admits every later rep's fill into the steady set. `until` is the next rep's
-    offset (or EOF for the last one).
+    The window needs BOTH ends. `probe_headroom_coldtail` records one
+    ``log_byte_offset`` per rep, taken after that rep's cold fill and before its
+    warm POST -- so it is a warm START. Reading from it to EOF takes in the next
+    rep's fill, whose short-context decode ticks pass the standard set. The rep's
+    own ``log_byte_end`` (taken after its warm returns) is the other end; the
+    harness passes one ``start:end`` span per rep. ``until=None`` reads to EOF and
+    is right only for a whole-file read.
     """
     out = []
     with open(log_path, errors="replace") as fh:
@@ -204,14 +210,16 @@ def main() -> int:
     ap.add_argument("--log", required=True)
     ap.add_argument("--out", help="write the summary JSON here")
     ap.add_argument("--window", action="append", default=None,
-                    metavar="OFF[:UNTIL]",
-                    help="byte span to read, repeatable. Each rep's warm POST "
-                         "offset (arm.json reps[].ticks.log_byte_offset) starts "
-                         "one; the next rep's offset ends it (the last runs to "
-                         "EOF). Repeat it -- an arm has several reps, and the "
-                         "spans are disjoint with each rep's cold fill in "
-                         "between, whose short-context decode ticks pass the "
-                         "standard set. Default: the whole file (offset 0).")
+                    metavar="START:END",
+                    help="byte span to read, repeatable. Build one per rep from "
+                         "arm.json: START is reps[].ticks.log_byte_offset (the warm "
+                         "POST start) and END is that rep's own "
+                         "reps[].ticks.log_byte_end. Use the rep's OWN end, not the "
+                         "next rep's start -- the offset is a warm START, so "
+                         "next-start spans contain the next rep's cold fill, whose "
+                         "short-context decode ticks pass the standard set. "
+                         "OFF with no END reads to EOF (a whole-file read). "
+                         "Default: the whole file (offset 0).")
     ap.add_argument("--tail-ms", type=int, default=TAIL_MS,
                     help="a steady-set tick slower than this is reported as close tail")
     ap.add_argument("--self-check", action="store_true")
@@ -305,6 +313,13 @@ def _self_check() -> int:
     # too. Prove both halves on a synthetic log laid out the way the harness
     # windows a real one -- two reps with a fill between them, and warmup before
     # the first offset.
+    #
+    # The marks are the PROBE's convention, which is what makes this test able to
+    # fail: `log_byte_offset` is taken after the fill and before the warm POST (a
+    # warm START), and `log_byte_end` after the warm returns. An earlier version of
+    # this self-check hand-picked warm-END positions for BOTH ends, a geometry the
+    # probe never writes, and so stayed green while the harness built
+    # `[off_i, off_{i+1})` -- which contains warm_i AND fill_{i+1}.
     import tempfile
     plain = line(1, 175, 1, 0, 155, 3, "eager", 1)      # supervisor warmup
     fill0 = line(2, 178, 1, 0, 158, 3, "eager", 1)      # rep0 fill
@@ -312,35 +327,54 @@ def _self_check() -> int:
     fill1 = line(4, 400, 1, 0, 380, 3, "eager", 1)      # rep1 fill (also standard)
     warm1a, warm1b = (line(5, 177, 1, 0, 157, 3, "eager", 1),
                       line(6, 179, 1, 0, 159, 3, "eager", 1))
+    rows_text = [plain, fill0, warm0, fill1, warm1a, warm1b]
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
-        fh.write("\n".join([plain, fill0, warm0, fill1, warm1a, warm1b]) + "\n")
+        fh.write("\n".join(rows_text) + "\n")
         lpath = fh.name
-    # Byte offsets as the probe would record them: after the fill, before the warm.
+    # marks[i] = byte just past line i. The probe's boundaries:
+    #   rep0: start = past fill0, end = past warm0
+    #   rep1: start = past fill1, end = past warm1b
     marks, pos = [], 0
-    for text in [plain, fill0, warm0, fill1, warm1a, warm1b]:
+    for text in rows_text:
         pos += len(text) + 1
         marks.append(pos)
-    # marks[i] = byte just past the i-th line. rep0's warm window is
-    # [past fill0, past warm0); rep1's runs from past fill1 to EOF. fill1 lies
-    # in neither.
-    spans = [(marks[1], marks[2]), (marks[3], None)]
+    spans = [(marks[1], marks[2]), (marks[3], marks[5])]
     got = []
     for off, until in spans:
         got.extend(parse_rows(lpath, off, until))
     sw = summarise(got, tail_ms=300, windows=spans)
-    # The fill (400 ms) is standard-set and would land in the TAIL if the window
-    # were "from the first offset to EOF"; the warmup tick would land in the
-    # median. Both are outside the spans, so neither does.
+    # warm0/warm1a/warm1b only. fill1 (400 ms) is standard-set and sits OUTSIDE
+    # both spans; the warmup tick is outside too.
     assert sw["steady_n"] == 3, sw
     assert sw["ticks_total"] == 3, sw
     assert sw["tail_n"] == 0, sw
     assert sw["steady_p50_ms"] == 177.0, sw
-    # Negative control: without the windows the same log reports the warmup and
-    # the fill, so the assertion above is failing for the windowing and not
-    # because those ticks were never steady to begin with.
+    # INVERSE control: a genuine >300 ms tick INSIDE a warm span must be selected
+    # into the tail set. Without this, "tail_n == 0" above would also pass if the
+    # window simply dropped every slow tick, which is the opposite failure.
+    slow = line(7, 900, 1, 0, 600, 3, "eager", 1)
+    with open(lpath, "a") as fh:
+        fh.write(slow + "\n")
+    slow_span = (marks[3], marks[5] + len(slow) + 1)
+    inside = parse_rows(lpath, slow_span[0], slow_span[1])
+    s_in = summarise(inside, tail_ms=300, windows=[slow_span])
+    assert s_in["tail_n"] == 1 and s_in["tail_max_ms"] == 900, s_in
+    assert s_in["steady_n"] == 2, s_in          # warm1a, warm1b stay in the body
+    # And the negative control for the window itself: unwindowed, the same file
+    # reports the warmup and BOTH fills, so the assertions above fail for the
+    # windowing and not because those ticks were never standard.
     un = summarise(parse_rows(lpath), tail_ms=300)
-    assert un["ticks_total"] == 6 and un["steady_n"] == 5, un
-    assert un["tail_n"] == 1 and un["tail_max_ms"] == 400, un
+    assert un["ticks_total"] == 7, un
+    assert un["steady_n"] == 5, un          # 7 total minus the two over 300 ms
+    assert un["tail_n"] == 2 and un["tail_max_ms"] == 900, un
+    # The off-by-one-phase construction the harness used to build, on the same
+    # file: [off_0, off_1) admits fill1. This is the regression, pinned.
+    wrong = []
+    for off, until in ((marks[1], marks[3]), (marks[3], None)):
+        wrong.extend(parse_rows(lpath, off, until))
+    s_wrong = summarise(wrong, tail_ms=300, windows=[(marks[1], marks[3]), (marks[3], None)])
+    assert s_wrong["tail_max_ms"] == 900, s_wrong   # fill1 and the slow tick
+    assert s_wrong["ticks_total"] > sw["ticks_total"], (s_wrong, sw)
 
     print("steady_filter: standard-set split OK")
     return 0

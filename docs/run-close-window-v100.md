@@ -14,10 +14,11 @@ scripts/run_close_window_v100.sh --all                  # every arm, then prompt
 
 Per arm, in order: stop any serve → boot `serve_hybrid_v100.sh` under that arm's
 env **with its own `SERVE_LOG`** → wait for `/health` → **assert the health body**
-→ start the passive reclaim sampler → run `probe_headroom_coldtail.py arm` →
-re-window the steady filter → follower correctness smoke → cancel-immediacy smoke
-→ stop the serve. Artifacts land in `$OUT/<arm>/` (`serve.log`, `arm.json`,
-`steady.json`, `reclaim.json`, `follower.json`, `cancel.log`, and a log per step).
+→ start the passive reclaim sampler (only on the `bgcap`/`bg2` pair — see
+[below](#the-reclaim-sampler)) → run `probe_headroom_coldtail.py arm` → re-window
+the steady filter → follower correctness smoke → cancel-immediacy smoke → stop the
+serve. Artifacts land in `$OUT/<arm>/` (`serve.log`, `arm.json`, `steady.json`,
+`reclaim.json`, `follower.json`, `cancel.log`, and a log per step).
 
 A failed smoke fails the arm, and the exit code says which:
 
@@ -65,7 +66,7 @@ flag, so this env is injected per arm by the harness and never by the launcher.
 | `bg1` | `+ TILERL_CLOSE_BG_PUBLISH=1 TILERL_CLOSE_BG_DEPTH=512` | #743's background publisher at its own default depth |
 | `bg2` | `+ TILERL_CLOSE_BG_PUBLISH=1` | the publisher with #745's **derived** depth (`(num_slots+1)·ceil(max_ctx/16)`) |
 | `bg3` | `+ TILERL_CLOSE_BG_PUBLISH=1 TILERL_CLOSE_BG_DEPTH=8192` | the depth the 2026-09-20 window measured clean |
-| `bgcap` | `+ TILERL_CLOSE_BG_PUBLISH=1 TILERL_COLD_PREFIX_SSD_CAP=1` | #740's trailing truncation, sampled from the shared prefix spill. `bg2` is its control |
+| `bgcap` | `+ TILERL_CLOSE_BG_PUBLISH=1 TILERL_COLD_PREFIX_SSD_CAP=1` | #740's trailing truncation, sampled from the shared prefix spill. `bg2` is its control (the sampler runs on this pair) |
 | `locksplit` | — | **refused**: #746 is not merged, and a flag nothing reads would report a no-op as a measured result |
 
 `bg1` vs `bg2` is the depth question, not a second flag: `bg2` leaves the depth
@@ -73,7 +74,10 @@ unset so `build.py` derives it from the shape.
 
 `bgcap` carries the cap because the cap **changes what the engine does** — put on
 every arm it would make them incomparable on the thing they are compared on. The
-reclaim sampler runs on every arm regardless; only the cap is arm-specific.
+reclaim sampler runs on the `bgcap`/`bg2` pair only; the cap is arm-specific.
+
+`locksplit` is not sampled either: it refuses to run (below), so there is no serve
+to sample against.
 
 ## Reading the result
 
@@ -115,15 +119,26 @@ Three properties worth knowing before trusting it:
   steady. `steady_filter.py` reports those rows as
   `excluded_undecidable_n` with a note rather than counting them; the clause that
   rejects them is `sparse == 1`, not a separate absence check.
-- **The read is windowed to the arm's warm spans, and both ends matter.** Standard
+- **The read is windowed to the arm's warm spans, and BOTH ends matter.** Standard
   set is not the same as steady state: the supervisor's warmup (dense 7000 +
   sparse 9000, 8-token decodes) and each rep's cold **fill** write short-context
   decode ticks that pass the standard set — the fill's land in the tail, the
-  warmup's in the median. The reps' warm windows are disjoint with the next rep's
-  fill between them, so `arm.json`'s one `log_byte_offset` per rep becomes one
-  `--window off_i[:off_{i+1}]`, and the filter takes the median over the union of
-  those spans in a single call. Averaging per-rep medians instead would weight a
+  warmup's in the median.
+
+  A span needs the rep's **own** end, not the next rep's start. `log_byte_offset`
+  is taken *after* the fill and *before* the warm POST, so it is a warm **start**:
+  `[off_i, off_{i+1})` contains `warm_i` **and** `fill_{i+1}` — the very ticks this
+  is meant to drop, and only the last rep would be clean that way (and only
+  because nothing happens to write after it). So `arm.json` carries
+  `log_byte_end` per rep (taken when the warm returns, before the next fill
+  exists) and the harness passes one `--window start:end` **per rep, the last
+  included**, in a single call. Averaging per-rep medians instead would weight a
   2-tick rep the same as an 8-tick one.
+
+  `probe_headroom_coldtail.py` reads its per-rep `p50/p90/max_ms` and
+  `frac_over_300` through the same window, so its numbers move with this too: a
+  rep followed by a fill was reporting that fill's tick in `max_ms` (measured
+  176 ms warm-only against 400 ms).
 
   Consequence for reading `steady.json` at all: `windows` records the spans the
   median is over. `[[0, null]]` means the whole file was read, so on a close-window
@@ -145,18 +160,32 @@ means two full windows.
   cross-thread disk accounting;
 - `reclaim.json` — the #740 trailing truncation, from apparent bytes only.
 
-### The reclaim sampler is the arm's clock
+### The reclaim sampler
 
-`RECLAIM_SAMPLES=120` at `RECLAIM_INTERVAL_S=20` is `(120-1)·20 = 2380 s` — 39.7
-minutes — and the arm `wait`s on it before stopping the serve. The probe's own
-work finishes well inside that, so **every arm costs the sampler's full duration**
-(7 arms ≈ 4.6 h of wall clock, most of it idle). Set the two together to the
-release being watched rather than leaving the default: the shrink to capture is
-one release, and rows past it only extend the plateau.
+The sampler is started on the two arms that carry the question — `bgcap` (the cap:
+truncation observable) and `bg2` (the same bg config **without** the cap, so the
+plateau is its control) — and those arms **wait on it**. Every other arm skips it:
+without the cap the shared spill is unbounded and never truncates, and before this
+was gated all seven arms paid the sampler's full duration for a non-result.
 
-Raising `RECLAIM_INTERVAL_S` is the cheap knob (fewer, further-apart rows for the
-same span); lowering `--samples` shortens the span and risks ending on the
-plateau, which the probe reports honestly as a zero shrink rather than failing.
+Two things set the span, both arithmetic on measured numbers:
+
+- **It must still be running when rep0's first release happens.** One 32k cold
+  fill prompt costs ~156 s measured; the probe's `--fill-n` default is **5** (the
+  harness does not pass it) and the warm request is itself a 32k prompt, so the
+  first release is `(5+1)·156 ≈ 936 s` in. A `60 × 10` span (`590 s`) ends ~350 s
+  *before* the event it exists to sample — the rows would show only the plateau.
+- **It must not run far past the probe.** At this shape the probe is the longer of
+  the two (3 reps × 936 s ≈ 47 min), so the sampler's span fits inside the arm
+  rather than setting it.
+
+The shipped `90 × 15 = 1335 s` clears 936 s with ~400 s of post-release tail.
+`RECLAIM_SAMPLES` is **coupled to `--fill-n`**: if the harness ever passes a larger
+`--fill-n`, the first release moves out and the span has to grow with it.
+
+```sh
+RECLAIM_SAMPLES=120 RECLAIM_INTERVAL_S=15 scripts/run_close_window_v100.sh --arm bgcap
+```
 
 ## Recovery checklist
 

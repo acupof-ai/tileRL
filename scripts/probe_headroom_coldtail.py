@@ -261,15 +261,32 @@ def fpct(xs: list[float], q: float) -> float:
     return xs[min(len(xs) - 1, int(q * (len(xs) - 1)))]
 
 
-def parse_log(log_path: str, byte_offset: int = 0) -> dict:
-    """Parse ticks at/after byte_offset (the warm POST start) and keep DECODE
-    ticks only. The fill phase's chunked prefills and the warm request's own
-    prefill ticks (pre>0) are dropped: the baseline distribution is warm DECODE
-    ticks alone. With SLOW_MS=0 every tick is logged, so this is the real
-    decode distribution, not a >threshold tail."""
+def parse_log(log_path: str, byte_offset: int = 0, byte_end: int | None = None) -> dict:
+    """Parse ticks in ``[byte_offset, byte_end)`` and keep DECODE ticks only. The
+    fill phase's chunked prefills and the warm request's own prefill ticks (pre>0)
+    are dropped: the baseline distribution is warm DECODE ticks alone. With
+    SLOW_MS=0 every tick is logged, so this is the real decode distribution, not a
+    >threshold tail.
+
+    ``byte_end`` is the second boundary of a rep's warm window. ``byte_offset``
+    alone is a warm START, so a reader that runs to EOF takes in the NEXT rep's fill
+    -- whose short-context decode ticks pass the standard steady set. The caller
+    passes the log size taken at THIS point in the rep, before that fill exists, so
+    the window is exact; ``None`` means read to EOF and report where it ended.
+    """
+    out = []
     with open(log_path, errors="replace") as fh:
         fh.seek(byte_offset)
-        raw = fh.readlines()
+        while True:
+            pos = fh.tell()
+            if byte_end is not None and pos >= byte_end:
+                break
+            line = fh.readline()
+            if not line:
+                break
+            out.append(line)
+        end = fh.tell() if byte_end is None else byte_end
+    raw = out
     all_ticks = [t for line in raw if (t := parse_tick(line))]
     ticks = [t for t in all_ticks if t["is_decode"]]
     totals = [t["total_ms"] for t in ticks]
@@ -279,6 +296,7 @@ def parse_log(log_path: str, byte_offset: int = 0) -> dict:
     pages = [t["offers_pages"] for t in t1]
     return {
         "log_byte_offset": byte_offset,
+        "log_byte_end": end,
         "ticks_in_window": len(all_ticks),
         "decode_ticks": len(ticks),
         "dropped_prefill_ticks": len(all_ticks) - len(ticks),
@@ -362,10 +380,16 @@ def _one_warm(a, rep: int) -> dict | None:
         stream=True,
     )
     h_spec_after = health(a.url)
+    # Second boundary of this rep's warm window. Taken here, before the NEXT rep's
+    # fill starts, so the size at this instant is exactly the end of this rep's warm
+    # decode -- no later phase can have written past it. Without an end, a reader
+    # starting at log_offset runs into the next rep's fill, whose short-context
+    # decode ticks pass the standard steady set.
+    log_end = _log_size(a.log)
     if s["chunks"] < 2 or s["decode_s"] <= 0:
         print(f"REP{rep}-NO-DECODE chunks={s['chunks']} decode_s={s['decode_s']}", flush=True)
         return None
-    ticks = parse_log(a.log, log_offset)
+    ticks = parse_log(a.log, log_offset, log_end)
     if ticks["decode_ticks"] < a.min_decode_ticks:
         print(
             f"REP{rep}-TOO-FEW-DECODE-TICKS decode={ticks['decode_ticks']} "

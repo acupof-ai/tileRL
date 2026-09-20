@@ -36,8 +36,27 @@ EXPECT_BLOCKS=${EXPECT_BLOCKS:-2213}
 EXPECT_MODEL=${EXPECT_MODEL:-qwen38-27b}
 PROMPT_TOKENS=${PROMPT_TOKENS:-32000}
 WARM_REPS=${WARM_REPS:-3}
-RECLAIM_SAMPLES=${RECLAIM_SAMPLES:-120}
-RECLAIM_INTERVAL_S=${RECLAIM_INTERVAL_S:-20}
+# The reclaim sampler runs only on the arms that can actually shrink (below), and
+# run_arm waits on it. Two constraints set its span, both arithmetic on measured
+# numbers:
+#
+#   1. It must still be RUNNING when the release it watches happens. One 32k cold
+#      fill prompt costs ~156 s measured, the probe's --fill-n default is 5 (the
+#      harness does not pass it) and the warm request is itself a 32k prompt, so
+#      rep0's first release is ~(5+1)*156 = 936 s in. A 60x10 span (590 s) would
+#      have ENDED ~350 s before the event it exists to sample.
+#   2. It must not run far PAST the probe. The probe is the longer of the two at
+#      this shape -- 3 reps x 936 s = ~47 min against a 1335 s sampler -- so an
+#      overlong sampler costs nothing extra, but a span longer than the probe would
+#      make every gated arm pay the difference for tail rows on a settled plateau.
+#
+# 90 x 15 = 1335 s (~22 min) sits comfortably inside the ~47 min probe and covers
+# the 936 s release with ~400 s of post-release tail. It replaces a 120x20 default
+# that cost 39.7 min on EVERY arm, including the five where the shrink is
+# physically impossible. RECLAIM_SAMPLES is COUPLED to --fill-n: a larger --fill-n
+# pushes the first release out and the span has to grow with it.
+RECLAIM_SAMPLES=${RECLAIM_SAMPLES:-90}
+RECLAIM_INTERVAL_S=${RECLAIM_INTERVAL_S:-15}
 
 usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
@@ -205,12 +224,24 @@ run_arm() {
   # Started whether or not the file exists yet: it is created by the window's own
   # first publish, and the sampler reads a missing path as size 0, so gating on
   # existence would skip sampling on exactly the arm that creates it.
-  local shared_spill="${COLD_SSD%.bin}.prefix.bin"
-  "$PYTHON" scripts/probe_headroom_coldtail.py reclaim-sample \
-    --spill-path "$shared_spill" --out "$dir/reclaim.json" \
-    --samples "$RECLAIM_SAMPLES" --interval-s "$RECLAIM_INTERVAL_S" \
-    >"$dir/reclaim.log" 2>&1 &
-  reclaim_pid=$!
+  #
+  # BUT only on the arm pair where the reclaim is a MEASUREMENT. Without
+  # TILERL_COLD_PREFIX_SSD_CAP the shared spill is unbounded and never truncates,
+  # so a sample of it can only read a plateau -- and because the arm `wait`s on the
+  # sampler, every other arm paid its full duration for a non-result. The two arms
+  # that carry the question are bgcap (the cap: truncation observable) and bg2 (the
+  # same bg config WITHOUT the cap: the plateau is the control for it). Sampling
+  # only bgcap would state a shrink with nothing to compare it against.
+  local reclaim_pid= reclaim_on=0
+  case "$name" in bgcap|bg2) reclaim_on=1 ;; esac
+  if [ "$reclaim_on" = 1 ]; then
+    local shared_spill="${COLD_SSD%.bin}.prefix.bin"
+    "$PYTHON" scripts/probe_headroom_coldtail.py reclaim-sample \
+      --spill-path "$shared_spill" --out "$dir/reclaim.json" \
+      --samples "$RECLAIM_SAMPLES" --interval-s "$RECLAIM_INTERVAL_S" \
+      >"$dir/reclaim.log" 2>&1 &
+    reclaim_pid=$!
+  fi
 
   "$PYTHON" scripts/probe_headroom_coldtail.py arm \
     --url "$HEALTH_URL" --headroom 0 --log "$arm_log" --out "$dir/arm.json" \
@@ -224,42 +255,62 @@ run_arm() {
   # dec==1 & sparse==1 & model>0 & sample>0 & path!=graph with the tail listed
   # apart. Re-filter the same log so the two can be tabled together -- or not
   # tabled at all, when this log cannot support the standard set.
-  # Window the standard-set re-filter to this arm's WARM spans. Two things must
-  # be excluded and a single start offset excludes only the first:
-  #   - the supervisor's warmup (dense 7000 + sparse 9000 prompts, 8-token
-  #     decodes) which runs before any arm measurement;
-  #   - each rep's cold FILL, which sits BETWEEN the reps' warm windows in the
-  #     same log and emits short-context decode ticks that pass the standard set.
-  # arm.json records one warm-POST byte offset per rep, so the reps' spans are
-  # [off_i, off_{i+1}) with the last running to EOF; a fill lies in no span.
-  # One --window per rep and ONE call, so the median is taken over the union of
-  # the rows rather than averaged across per-rep medians (which would weight a
+  # Window the standard-set re-filter to this arm's WARM spans. Three things must be
+  # excluded and a start offset excludes none of them:
+  #   - the supervisor's warmup (dense 7000 + sparse 9000 prompts, 8-token decodes)
+  #     which runs before any arm measurement;
+  #   - EVERY rep's cold FILL, which sits between that rep's warm window and the
+  #     previous one in the same log and emits short-context decode ticks that pass
+  #     the standard set.
+  # The probe's log_byte_offset is a warm START (taken after the fill, before the
+  # warm POST), so [off_i, off_{i+1}) would contain warm_i AND fill_{i+1} -- the very
+  # ticks this is meant to drop. Each rep therefore carries its own log_byte_end, and
+  # every span is an explicit start:end, the last one included (relying on the last
+  # rep being clean only because nothing writes after it is step-ordering, not
+  # geometry, and a later step added after the filter would silently break it).
+  # One --window per rep and ONE call, so the median is taken over the union of the
+  # rows rather than averaged across per-rep medians (which would weight a
   # 2-tick rep the same as an 8-tick one).
-  local win_args=() offs
-  offs=$("$PYTHON" -c '
+  local win_args=() spans
+  spans=$("$PYTHON" -c '
 import json, sys
 try:
     arm = json.load(open(sys.argv[1]))
 except (OSError, ValueError):
-    print("", end="")      # no arm.json -> no offsets -> the branch below says so
-    raise SystemExit
+    raise SystemExit          # no arm.json -> no spans -> the branch below says so
+bad = []
 for r in arm.get("reps", []):
-    if r.get("ticks"):
-        print(r["ticks"]["log_byte_offset"])' "$dir/arm.json")
-  if [ -z "$offs" ]; then
-    # No offsets means no warm spans to filter to, so there is NO standard-set
-    # figure for this arm. Falling through to an unwindowed read would write a
-    # steady.json whose median contains the supervisor's warmup -- a number that
-    # looks like the others and is not. Refuse instead of degrading.
-    log "arm $name: no rep offsets in arm.json (probe did not complete a rep?)"
+    t = r.get("ticks")
+    if not t:
+        continue
+    start = t.get("log_byte_offset")
+    end = t.get("log_byte_end")
+    if end is None:
+        # No fallback to EOF: only the LAST rep would be clean that way, and only
+        # because nothing happens to write after it (step ordering, not geometry).
+        # A stale arm.json is refused like a missing one rather than yielding a
+        # number that quietly includes the next rep fill.
+        bad.append(str(start))
+    else:
+        print("%d:%d" % (start, end))
+if bad:
+    print("reps %s lack log_byte_end (arm.json predates the probe fix); the "
+          "warm window cannot be bounded, so no steady figure is produced"
+          % ", ".join(bad), file=sys.stderr)
+    raise SystemExit(3)
+' "$dir/arm.json" 2>"$dir/spans.note") || spans=
+  if [ -z "$spans" ]; then
+    # No spans means no bounded warm windows, so there is NO standard-set figure
+    # for this arm. Falling through to an unwindowed (or open-ended) read would
+    # write a steady.json whose median contains the supervisor's warmup and a later
+    # rep's fill -- a number that looks like the others and is not. Refuse instead
+    # of degrading, and surface the extractor's own reason when it gave one.
+    log "arm $name: no bounded warm spans in arm.json"
+    [ -s "$dir/spans.note" ] && log "  -- $(cat "$dir/spans.note")"
     log "  -- steady.json NOT written: there is no warm span to filter to"
   else
-    local prev=
-    for o in $offs; do
-      [ -n "$prev" ] && win_args+=(--window "$prev:$o")
-      prev=$o
-    done
-    win_args+=(--window "$prev")
+    # Each line is already a start:end span, so the shell only forwards them.
+    for s in $spans; do win_args+=(--window "$s"); done
     # ${a[@]+...} so an empty win_args does not trip `set -u` on bash 3.2.
     "$PYTHON" scripts/steady_filter.py --log "$arm_log" --out "$dir/steady.json" \
       ${win_args[@]+"${win_args[@]}"} >"$dir/steady.log" 2>&1
