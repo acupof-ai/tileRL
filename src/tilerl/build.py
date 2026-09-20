@@ -157,17 +157,21 @@ def _bg_publish_sizing(num_slots: int, max_total_tokens: int,
     Depth: one close emits at most one job per whole page (measured
     ceil(37567/16)=2348 jobs for a 37.6k request on V100; never 1-2/page), and
     up to num_slots publishers can release in one tick while the worker drains
-    the prior wave. Size for every slot closing a full context at once, plus one
-    spare wave, so a release burst never degrades inline on object count:
+    the prior wave. Size the queue for every slot closing a full context at
+    once, plus one spare wave, so a release burst never degrades inline on
+    object count:
 
-        depth = (num_slots + 1) * ceil(max_total_tokens / 16).
+        depth = (num_slots + 1) * ceil(max_total_tokens / 16)
+              -> queue ENTRIES, not host slots (entries mostly hold references).
 
-    Payload cap: queueing allocates no big blob (the 1PR close batch already
-    made the "hold" frame blob; "kv" blobs are already budgeted; SSD jobs are on
-    disk) — it only delays a hold blob entering the pinned cold budget. Cap
-    queued payload at the cold budget so worst-case pinned stays <= 2x budget
-    and the LRU converges right after; an over-cap frame offer commits inline
-    (which spills immediately), never OOM."""
+    Payload cap: two payloads exist only after the 1PR batch and enter the
+    pinned cold budget solely at worker commit — the "hold" frame blob and a
+    warm-spec "kv" job's attached draft dk/dv host snapshots (bounds ride with
+    them); the kv base blob is already budgeted/on-disk. Cap those late-accounted
+    queued bytes at the cold budget so pinned stays <= 2x budget, and an over-cap
+    offer commits inline (which spills at once), never OOM. The dk/dv attach
+    only to pages the prompt actually wrote through the draft (warm coverage),
+    far fewer than the full context, so this is not tight in practice."""
     if os.environ.get("TILERL_CLOSE_BG_PUBLISH", "").strip() in (
             "", "0", "false", "False"):
         return {}
