@@ -33,6 +33,15 @@ class SpillWriteError(OSError):
     shared-prefix case, which is a cache the engine may simply forget."""
 
 
+class SpillSpecError(ValueError):
+    """A blob's per-field dtype/shape/field-set does not match a spill file's
+    frozen spec. A shared bucket is keyed by field-name signature but freezes ONE
+    concrete layout: without this check an equal-byte-width dtype swap is
+    silently reinterpreted on readback (garbage) and a shape mismatch raises a raw
+    RuntimeError out of copy_ after a slot was already allocated. Shared callers
+    treat it as 'keep the page in RAM', never a wedge or a corrupt spill."""
+
+
 def _shared_ssd_path(ssd_path: str) -> str:
     """The shared-prefix spill file is a sibling of the private spill path."""
     return (ssd_path[:-4] if ssd_path.endswith(".bin") else ssd_path) + ".prefix.bin"
@@ -129,11 +138,14 @@ class _SlotToken:
         self._settled = False
 
     def commit(self, key) -> bool:
+        """Publish the reserved slot. Settles only on SUCCESS: if the commit body
+        raises, this call settles nothing and drops no borrow, so a caller
+        finally/dispose still rolls the reservation back via release (defect D)."""
         if self._settled:
             return False
-        self._settled = True
         with self.file._mlock:
             self.file._commit_slot_locked(key, self.slot)
+        self._settled = True
         return True
 
     def release(self) -> bool:
@@ -211,6 +223,10 @@ class ColdSsdFile:
         #: drain_worker_ssd_ms so its disk time cannot masquerade as a step-tick
         #: stall (it runs with no engine/tick lock held by the step).
         self.ssd_ms_worker = 0.0
+        #: Count of best-effort trailing-extent truncates that failed (a shrink is
+        #: retried on a later forget; this makes a repeated failure observable
+        #: instead of swallowed). Test/stats diagnostic.
+        self.reclaim_failures = 0
         self._path = path
         self._spec = spec
         self.stride = sum(n for *_k, n in spec)
@@ -323,12 +339,18 @@ class ColdSsdFile:
 
     def _commit_slot_locked(self, key, slot: int) -> None:
         """Publish a reserved slot (install key, count extent, drop borrow).
-        Idempotent/no-op if the slot was already settled."""
+        Ordering: the extent increment — the one step that can raise
+        (IndexError if the extent table was desynced) — runs BEFORE any visible
+        commit. If it raises, the slot stays _reserved with its borrow, so the
+        caller's token.commit propagates the error and its dispose() then rolls
+        the reservation cleanly instead of leaving an orphan slot + live borrow
+        (defect D). Idempotent/no-op if the slot was already settled."""
         if slot not in self._reserved:
             return
+        extent = slot // self.GROWTH_SLOTS
+        self._extent_live[extent] += 1  # may raise: nothing committed yet
         self._reserved.discard(slot)
         self._slot_of[key] = slot
-        self._extent_live[slot // self.GROWTH_SLOTS] += 1
         self._borrowed = max(0, self._borrowed - 1)
         self._prune_maps_locked()
 
@@ -342,6 +364,19 @@ class ColdSsdFile:
     def _drop_read_borrow_locked(self) -> None:
         self._borrowed = max(0, self._borrowed - 1)
         self._prune_maps_locked()
+
+    def _check_blob_spec(self, blob: dict) -> None:
+        """Reject a blob whose field-set / per-field shape / dtype does not match
+        the layout this file froze at first open. The field-NAME signature alone
+        routes to this file, so this is where equal-width dtype swaps and shape
+        mismatches must be caught: without it a width-matching swap is silently
+        reinterpreted as the frozen dtype on readback and a shape mismatch makes
+        copy_ raise a raw RuntimeError. Raises SpillSpecError (a ValueError)."""
+        if _blob_spec(blob) != self._spec:
+            raise SpillSpecError(
+                f"blob layout {_blob_spec(blob)} does not match frozen spill "
+                f"spec {self._spec} for {self._path!r}"
+            )
 
     def _copy_into(self, mapping, slot: int, blob: dict) -> None:
         """Byte copy into a reserved slot through its borrow-protected mapping.
@@ -359,7 +394,10 @@ class ColdSsdFile:
             off += n
 
     def write_reserved(self, slot: int, blob: dict, mapping) -> None:
-        """The slow disk bytes of one reserved slot, copied with NO lock held."""
+        """The slow disk bytes of one reserved slot, copied with NO lock held.
+        Raises SpillSpecError before touching the slot if the blob does not match
+        the file's frozen layout (the caller disposes the reserved token)."""
+        self._check_blob_spec(blob)
         self._copy_into(mapping, slot, blob)
 
     def commit_slot(self, key, slot: int) -> None:
@@ -374,38 +412,57 @@ class ColdSsdFile:
             self._release_slot_locked(slot)
 
     def _shrink_trailing_extents(self) -> bool:
-        """Release physical disk of every fully-free extent at the high-water end:
-        lower _next_slot into the last extent that still holds a live slot and
-        truncate the file to it, one remap. Does nothing mid-file (those slots
-        cycle through the LIFO free list). An extent with a slot a lock-outside IO
-        has RESERVED (live count not yet incremented) is treated as occupied, so
-        truncation can never SIGBUS a borrowed mapping's bytes. Returns False when
-        the best-effort truncate itself failed (the slot/extent bookkeeping still
-        stands; the file keeps the over-allocated size and reuses the slots)."""
+        """All-or-nothing tail reclaim: drop every fully-free extent at the
+        high-water end by truncating the file and remapping FIRST, and committing
+        the extent/free-list/cursor metadata only after that succeeds. An extent
+        with a RESERVED slot is treated as occupied so a truncate can never
+        SIGBUS a borrowed mapping's bytes. On OSError NO metadata changes: the
+        file keeps its size, the freed slots stay on the LIFO and the next forget
+        retries the shrink — a failed truncate can never wedge the file (the old
+        order popped the extent list before the truncate and then wedged every
+        later write with an out-of-range extent index)."""
         e = len(self._extent_live) - 1
         while (
             e >= 0
             and self._extent_live[e] == 0
             and not any(s // self.GROWTH_SLOTS == e for s in self._reserved)
         ):
-            self._extent_live.pop()
             e -= 1
-        cap = 0 if e < 0 else (e + 1) * self.GROWTH_SLOTS
-        if cap >= self._cap:
+        new_cap = 0 if e < 0 else (e + 1) * self.GROWTH_SLOTS
+        if new_cap >= self._cap:
             return True
-        # The freed trailing slots are no longer reachable: drop them from the LIFO
-        # reuse list and pull the monotonic cursor back so a later write grows fresh.
-        self._free_slots = [s for s in self._free_slots if s < cap]
-        self._next_slot = min(self._next_slot, cap)
-        # Best-effort physical reclaim: the slot/extent BOOKKEEPING above already
-        # released the space; a truncate failure (ENOSPC race, FS quirk) must not
-        # propagate and abort the caller's already-settled state — the file keeps
-        # its (now over-allocated) size and reuses the slots via the free list.
+        new_extents = self._extent_live[: e + 1]
+        new_free = [s for s in self._free_slots if s < new_cap]
+        new_next = min(self._next_slot, new_cap)
+        # Physical change first. Keep the old mmap generation(s) alive while a
+        # lock-outside IO borrows one (_prune_maps_locked is a no-op then); a
+        # reserved slot is excluded from the collapse above, so no borrow reaches
+        # the truncated tail.
         try:
-            os.ftruncate(self._f.fileno(), self.HEADER + cap * self.stride)
-            self._remap(cap)
+            os.ftruncate(self._f.fileno(), self.HEADER + new_cap * self.stride)
+            if new_cap:
+                new_map = self._mmap.mmap(self._f.fileno(), self.HEADER + new_cap * self.stride)
+            else:
+                new_map = None
         except OSError:
+            self.reclaim_failures += 1
             return False
+        if new_map is not None:
+            self._maps.append(new_map)
+            self._map = new_map
+            self._prune_maps_locked()
+        else:
+            # collapsed to zero slots: every old mapping now spans truncated
+            # bytes, so close them all rather than keep an out-of-range map.
+            for old in self._maps:
+                with contextlib.suppress(ValueError):
+                    old.close()
+            self._maps = []
+            self._map = None
+        self._cap = new_cap
+        self._extent_live = new_extents
+        self._free_slots = new_free
+        self._next_slot = new_next
         return True
 
     def _charge(self, t: float) -> None:
@@ -427,9 +484,17 @@ class ColdSsdFile:
             self._charge(t)
 
     def _write(self, key, blob: dict) -> None:
+        self._check_blob_spec(blob)  # reject before allocating a slot
         with self._mlock:
             slot = self._alloc_slot_locked()
-            self._copy_into(self._map, slot, blob)
+            try:
+                self._copy_into(self._map, slot, blob)
+            except BaseException:
+                # copy_ failed after allocation: hand the slot straight back to
+                # the free list (the extent count was never incremented) so a
+                # non-spec RuntimeError cannot strand an unreachable slot.
+                self._free_slots.append(slot)
+                raise
             self._slot_of[key] = slot
             self._extent_live[slot // self.GROWTH_SLOTS] += 1
         # No per-page flush: the page cache writes this back; the serving spill
@@ -487,30 +552,29 @@ class ColdSsdFile:
             self._borrowed = max(0, self._borrowed - 1)
             self._prune_maps_locked()
 
-    def consume_pinned(self, key) -> tuple[bool, bool]:
-        """Forget a pinned key's slot and unpin it. Returns (freed, reclaim_ok):
-        freed is True when it actually popped a live slot (caller decrements
-        bytes once); reclaim_ok is False only when a live slot was freed but the
-        env-gated trailing-extent truncate failed (the caller then treats the
-        lift as failed and releases its destination token)."""
+    def consume_pinned(self, key) -> bool:
+        """Forget a pinned key's slot and unpin it. Returns True when it
+        actually popped a live slot (caller decrements bytes once); False when the
+        key was already gone (caller must not double-free). A trailing-extent
+        shrink is all-or-nothing and retried later, so it does NOT change this
+        result or leave the file half-updated."""
         with self._mlock:
             return self._consume_pinned_locked(key)
 
-    def _consume_pinned_locked(self, key) -> tuple[bool, bool]:
+    def _consume_pinned_locked(self, key) -> bool:
         """Non-reentrant variant: consume under an already-held _mlock. Whether
         the key was pinned by a lift OR is an ordinary spill slot owned by the
         caller's in-flight publish, this is the single release: pop, free the
-        slot, count the extent down (best-effort shrink), unpin."""
+        slot, count the extent down (tail shrink is atomic/retried), unpin."""
         slot = self._slot_of.pop(key, None)
         self._pinned_keys.discard(key)
         if slot is None:
-            return False, True
+            return False
         self._free_slots.append(slot)
         self._extent_live[slot // self.GROWTH_SLOTS] -= 1
-        reclaim_ok = True
         if self._reclaim:
-            reclaim_ok = self._shrink_trailing_extents()
-        return True, reclaim_ok
+            self._shrink_trailing_extents()
+        return True
 
     def rollback_pinned(self, key) -> None:
         """Unpin a key WITHOUT freeing its slot (the source is NOT consumed):
@@ -679,6 +743,17 @@ class HostKvPages:
         #: the SUM across every bucket (one global cap, never per-bucket).
         self._shared_ssds: dict = {}
         self._shared_ssd_bytes = 0
+        #: Bytes the single publish worker has RESERVED in a bucket slot but not
+        #: yet committed or released (the lock-free write window). Admission for
+        #: BOTH the worker reserve and an inline step-thread spill checks
+        #: _shared_ssd_bytes + this, so in-flight and committed pages together can
+        #: never exceed the cap (the old check omitted in-flight bytes and an
+        #: inline burst over-committed while the worker sat in write_reserved).
+        self._shared_ssd_pending = 0
+        #: Count of blobs rejected to RAM for not matching their bucket's frozen
+        #: shape/dtype (a field-name signature routed them but the concrete spec
+        #: differed). Observable fail-loud, never a silent reinterpreted read.
+        self.shared_spec_failures = 0
         #: Blobs currently held in pinned RAM, keyed by content key. A tag=None
         #: record lives only here; a tag=sig spilled record may ALSO cache its blob
         #: here after a share_take read-through (the tag still says spilled).
@@ -901,14 +976,26 @@ class HostKvPages:
         if extra:
             blob.update(extra)
         n = src_n + sum(t.numel() * t.element_size() for t in extra.values() if torch.is_tensor(t))
-        token = None
         sig = _blob_sig(blob)
-        over_cap = (
-            not self._ssd_path
-            or self.shared_spill_disabled
-            or (self.prefix_spill_bounded and self._shared_ssd_bytes + n > self.ssd_capacity_bytes)
-        )
-        if sig is not None and not over_cap:
+        # Authoritative admission UNDER _tlock, after the read: inline commits
+        # that landed during the lock-free read are now in _shared_ssd_bytes, and
+        # the single worker's own in-flight page is in _shared_ssd_pending. This
+        # reserve is what makes committed+in-flight never exceed the cap (A).
+        with self._tlock:
+            reserve_bytes = (
+                bool(self._ssd_path)
+                and not self.shared_spill_disabled
+                and sig is not None
+                and (
+                    not self.prefix_spill_bounded
+                    or self._shared_ssd_bytes + self._shared_ssd_pending + n
+                    <= self.ssd_capacity_bytes
+                )
+            )
+            if reserve_bytes:
+                self._shared_ssd_pending += n
+        token = None
+        if reserve_bytes:
             try:
                 bucket = (
                     self._ensure_shared_ssd(blob)
@@ -919,10 +1006,25 @@ class HostKvPages:
                     token = bucket.reserve_slot()
                     try:
                         bucket.write_reserved(token.slot, blob, token.mapping)
+                    except SpillSpecError:
+                        # Bucket frozen to a different concrete dtype/shape
+                        # despite the same field-name signature. The source bytes
+                        # are good, so keep this page in RAM and count it; do not
+                        # disable spill for other layouts.
+                        token.dispose()
+                        token = None
+                        self.shared_spec_failures += 1
                     except OSError:
                         token.dispose()  # settled release; blob falls back to RAM
                         token = None
                         self._disable_shared_spill()
+            except SpillSpecError:
+                # Spec mismatch surfaced while opening/validating (no token yet):
+                # RAM fallback for this page only.
+                if token is not None:
+                    token.dispose()
+                token = None
+                self.shared_spec_failures += 1
             except OSError:
                 # Bucket open/grow failed: keep the blob in RAM, same as a write
                 # OSError. dispose() is a no-op here (reserve never returned).
@@ -932,32 +1034,33 @@ class HostKvPages:
                 self._disable_shared_spill()
             except BaseException:
                 # Read already SUCCEEDED, so this job owns the private source:
-                # consume it exactly once and resolve as a miss on ANY other
-                # exception from open/reserve/write.
+                # release the admission reservation and the token, consume the
+                # source once, resolve as a miss on ANY non-OSError from
+                # open/reserve/write (incl. a frozen-spec mismatch, SpillSpecError).
                 if token is not None:
                     token.dispose()
                 with self._tlock:
+                    self._shared_ssd_pending -= n
                     self._consume_owned_source(private_key, src_n)
                     self.bg_failed += 1
                     return self._fold_and_event(shared_key)
         with self._tlock:
-            return self._finalize_ssd_lift(private_key, shared_key, blob, n, src_n, sig, token)
+            return self._finalize_ssd_lift(
+                private_key, shared_key, blob, n, src_n, sig, token, reserve_bytes
+            )
 
-    def _consume_owned_source(self, private_key, src_n) -> bool:
+    def _consume_owned_source(self, private_key, src_n) -> None:
         """Consume the in-flight private source exactly once (caller holds
         _tlock): pop its byte record, free+unpin the pinned spill slot, decrement
-        the private byte total, clear the in-flight marker. Returns the spill
-        file's reclaim result (False = trailing-extent truncate failed)."""
+        the private byte total, clear the in-flight marker. The tail shrink is
+        atomic and retried on a later forget, so it neither rolls this back nor
+        fails the publish."""
         self._ssd_page_bytes.pop(private_key, None)
-        reclaim_ok = True
-        if self._ssd is not None:
-            freed, reclaim_ok = self._ssd.consume_pinned(private_key)
-            if freed:
-                self._ssd_bytes -= src_n
+        if self._ssd is not None and self._ssd.consume_pinned(private_key):
+            self._ssd_bytes -= src_n
         self._pub_private.discard(private_key)
-        return reclaim_ok
 
-    def _finalize_ssd_lift(self, private_key, shared_key, blob, n, src_n, sig, token):
+    def _finalize_ssd_lift(self, private_key, shared_key, blob, n, src_n, sig, token, reserved):
         """Phase 3 under _tlock. Consume the owned private source once. Re-check
         the content key: an inline publisher that committed during the lock-free
         IO wins, so this job releases ITS destination token and only folds a ref
@@ -965,26 +1068,42 @@ class HostKvPages:
         slot). A failed trailing-extent reclaim on the source is likewise a miss
         that releases the token rather than publishing against unsettled
         accounting. Otherwise publish spilled (token commit) or RAM (token None)."""
-        reclaim_ok = self._consume_owned_source(private_key, src_n)
+        self._consume_owned_source(private_key, src_n)
         existing = self._shared.get(shared_key)
-        if existing is not None or not reclaim_ok:
+        if existing is not None:
+            if reserved:
+                self._shared_ssd_pending -= n
             if token is not None:
-                token.dispose()  # inline record owns a slot, or source reclaim failed
-            if not reclaim_ok:
-                self.bg_failed += 1
-            if existing is not None:
-                existing[1] += 1
+                token.dispose()  # the inline record already owns a shared slot
+            existing[1] += 1
             return self._fold_and_event(shared_key)
-        if token is not None:
-            token.commit(("s", shared_key))
-            self._shared_ssd_bytes += n
-            self._shared[shared_key] = [n, 1, sig]
-        else:
-            self._shared[shared_key] = [n, 1, None]
-            self._shared_blobs[shared_key] = blob
-            self._shared_ram += n
-            self._ram_order[("s", shared_key)] = n
-            self._enforce_budget()
+        try:
+            if token is not None:
+                token.commit(("s", shared_key))
+                # reservation flips to committed: total admitted bytes unchanged.
+                self._shared_ssd_pending -= n
+                self._shared_ssd_bytes += n
+                self._shared[shared_key] = [n, 1, sig]
+            else:
+                if reserved:
+                    # Reserved then fell back to RAM (write OSError/spec): the
+                    # bucket slot was released; free the reserved admission too.
+                    self._shared_ssd_pending -= n
+                self._shared[shared_key] = [n, 1, None]
+                self._shared_blobs[shared_key] = blob
+                self._shared_ram += n
+                self._ram_order[("s", shared_key)] = n
+                self._enforce_budget()
+        except BaseException:
+            # Destination settle failed AFTER the source was consumed (defect D:
+            # e.g. commit into a desynced bucket). token.commit left the token
+            # unsettled, so dispose rolls the reserved slot/borrow back; release
+            # the admission and resolve a miss — never leak an orphan slot.
+            if token is not None:
+                token.dispose()
+            if reserved:
+                self._shared_ssd_pending -= n
+            self.bg_failed += 1
         return self._fold_and_event(shared_key)
 
     def _fold_and_event(self, shared_key):
@@ -1015,6 +1134,11 @@ class HostKvPages:
         with self._tlock:
             bucket = self._shared_ssds.get(sig)
             if bucket is not None:
+                # The field-name signature matched; the concrete dtype/shape must
+                # too, or the bucket cannot hold this blob. Reject to RAM.
+                if bucket._spec != _blob_spec(blob):
+                    self.shared_spec_failures += 1
+                    return None
                 return bucket
             if (
                 not self._ssd_path
@@ -1245,6 +1369,9 @@ class HostKvPages:
                 "kv_cold_bg_degraded": self.bg_degraded,
                 "kv_cold_bg_timeouts": self.bg_timeouts,
                 "kv_cold_bg_failed": self.bg_failed,
+                "kv_cold_shared_spec_failures": self.shared_spec_failures,
+                "kv_cold_reclaim_failures": (0 if self._ssd is None else self._ssd.reclaim_failures)
+                + sum(f.reclaim_failures for f in self._shared_ssds.values()),
             }
 
     def close(self) -> None:
@@ -1513,7 +1640,13 @@ class HostKvPages:
         forget. The gate is off by default."""
         if not self._ssd_path or self.shared_spill_disabled:
             return False
-        if self.prefix_spill_bounded and self._shared_ssd_bytes + nbytes > self.ssd_capacity_bytes:
+        # Count the worker's in-flight reservation in admission so a step-thread
+        # spill cannot over-commit while the single worker sits in its lock-free
+        # write (defect A).
+        if (
+            self.prefix_spill_bounded
+            and self._shared_ssd_bytes + self._shared_ssd_pending + nbytes > self.ssd_capacity_bytes
+        ):
             return False
         bucket = self._shared_ssds.get(sig)
         if bucket is None:
@@ -1537,8 +1670,18 @@ class HostKvPages:
                 )
                 return False
             self._shared_ssds[sig] = bucket
+        elif bucket._spec != _blob_spec(blob):
+            # Same field-name signature, different concrete dtype/shape: the
+            # bucket is frozen to the first layout. Keep this page in RAM and
+            # count the rejection rather than silently reinterpret its bytes or
+            # let copy_ raise through share_hold (defect B).
+            self.shared_spec_failures += 1
+            return False
         try:
             bucket.write(("s", key), blob)
+        except SpillSpecError:
+            self.shared_spec_failures += 1
+            return False
         except OSError as e:
             self.shared_spill_disabled = True
             self.shared_spill_error = f"errno {e.errno}: {e.strerror}"
@@ -1548,6 +1691,12 @@ class HostKvPages:
                 f"for this process, shared pages stay in RAM",
                 flush=True,
             )
+            return False
+        except BaseException:
+            # A non-OS copy failure (RuntimeError) must not propagate out of the
+            # shared spill and wedge the close tick holding _tlock: this page
+            # stays in RAM and is counted; other layouts/pages still spill.
+            self.shared_spec_failures += 1
             return False
         self._shared_ssd_bytes += nbytes
         return True

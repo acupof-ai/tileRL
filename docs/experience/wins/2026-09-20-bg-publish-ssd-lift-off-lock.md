@@ -97,10 +97,6 @@ The worker stays CUDA-free (the prior diagnosis stands): private reads are
     double-charging bytes, or orphaning the inline slot.
   - Pending ref deltas still fold on a failed/missed job whose key an inline
     commit won (refs = inline 1 + folded delta).
-  - A failed trailing-extent reclaim on the private consume reports back
-    (`consume_pinned -> (freed, reclaim_ok)`); the job then releases its
-    destination token and resolves as a miss rather than committing against
-    unsettled accounting.
   - `take()` refuses (`None`) a private key an in-flight job owns
     (`_pub_private`, or the spill file's per-key pin): taking it would race the
     worker's own consume and double-decrement `_ssd_bytes` / recycle a pinned
@@ -113,7 +109,48 @@ The worker stays CUDA-free (the prior diagnosis stands): private reads are
     fails loud into RAM (never opens its own file, ≤4 sibling files). A cold and
     a warm page round-trip in both creation orders and a non-owned field reads
     as a clean miss, never KeyError.
-- Full CPU suite **1082 passed / 14 skipped / 1 xfailed** (merged over latest main incl. #749/#756).
+- **Second adversarial pass — four concurrency defects, each deterministic
+  end-to-end, fixed and mutation-verified red-before-green:**
+  - **C (atomic tail reclaim).** `_shrink_trailing_extents` used to mutate the
+    extent list / free list / cursor BEFORE `ftruncate`; an OSError then left
+    the bookkeeping at the new size while the file stayed large, so the next
+    write indexed a popped extent and wedged the file (step release AND worker
+    paths). The truncate+remap now happen FIRST; metadata is committed in one
+    step only after they succeed. On failure nothing changes, the freed slots
+    stay reusable (`reclaim_failures` is counted), and a later forget retries —
+    repeated failures across publish cycles never raise IndexError and the first
+    release after recovery really truncates.
+  - **D (phase-3 finally, defense in depth independent of C).** The destination
+    `token.commit()` settled its flag before running the commit body, so if
+    `_commit_slot_locked` raised (extent increment) AFTER the private source was
+    consumed, a later `dispose()` was a no-op: an orphan reserved slot + a leaked
+    mapping borrow accumulated per job. `commit()` now settles only on success,
+    the extent increment precedes any visible commit, and `_finalize_ssd_lift`
+    wraps everything after the source consume in try/except — a raise rolls the
+    token and admission back and resolves a miss. The inline write returns a
+    post-alloc slot to the free list on copy failure and the shared write maps a
+    non-OS failure to RAM (never propagates out of `share_hold`). Gates inject a
+    RuntimeError into commit independently of the shrink trigger and assert the
+    second write still serves; worker and step-thread paths each have a gate.
+  - **A (cap over-subscription).** The worker reserved its destination slot
+    during the lock-free write without charging admission, so an inline
+    step-thread spill admitted against a counter that omitted the in-flight page
+    (cap 8192 + in-flight 4096 + two inline 4096 → 12288). Admission now counts
+    committed `_shared_ssd_bytes` + in-flight `_shared_ssd_pending` under
+    `_tlock`; the worker reserves after reading its blob, and every
+    commit/release/RAM-fallback/racer path releases the reservation exactly
+    once. The repro now ends exactly at the cap, with the second inline page in
+    RAM.
+  - **B (frozen-spec validation).** A field-NAME signature routed blobs to a
+    bucket whose concrete dtype/shape was frozen at first open: an equal-width
+    dtype swap was silently reinterpreted as the frozen dtype on readback and a
+    shape mismatch raised a raw RuntimeError out of `share_hold`. `ColdSsdFile`
+    now validates the full spec (field set + dtype + shape) before copying and
+    raises `SpillSpecError`; both the worker lift and the inline spill reject a
+    non-matching layout to RAM (counted `shared_spec_failures`, exposed in
+    stats) rather than corrupt a read or wedge the tick. A non-owned field still
+    reads as a clean miss.
+- Full CPU suite **1086 passed / 14 skipped / 1 xfailed** (merged over latest main; second adversarial pass C/A/B/D fixed).
 
 ## Rule
 
@@ -136,7 +173,7 @@ Steady decode (~166 ms/tick, ~9.4 tok/s) must hold.
 
 | date | machine | target | result |
 |---|---|---|---|
-| 2026-09-20 | CPU (hermetic) | SSD lift disk IO off `_tlock` | IO-off-lock + source-pin + rollback + hardening gates green (all mutation-red); 1082 passed |
+| 2026-09-20 | CPU (hermetic) | SSD lift disk IO off `_tlock` | IO-off-lock + source-pin + rollback + hardening + C/A/B/D concurrency gates green (all mutation-red); 1086 passed |
 | next V100 window | V100 sm70, pending-remote | close ssd_mmap ~3.3 s | target: real lock-wait removed; lock-vs-drain split to be measured |
 
 Raw artifacts: `tests/test_sparse_kv_tier.py`; changes `src/tilerl/kv_tiers.py`.
