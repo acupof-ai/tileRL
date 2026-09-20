@@ -501,6 +501,68 @@ state, and the difference *is* the cold-tier fill. Model segment 77 ms against
 the V100's 168 ms is 2.18x, but the two ran different W, so the comparison is
 labeled, not bare.
 
+## The graph flag as a result: five arms, and what replicated
+
+A1–A4 ran 2026-09-20, n=30, 0-start, one serve per boot. `clean` below is the
+steady-B median over the `ssd_mmap == 0` subset — the verdict column, since
+cold-relocation ticks sit inside the same steady set and their count differs per
+arm (A2 carries 102, A1r 56). Every arm's `Δdecode_forwards` equals its window's
+steady tick count, diff 0.
+
+| arm | depth | graph | steady | boundary | **clean B p50 (n)** | B p90 | model | accept | tok/fwd | tick tok/s | eff tok/s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| A1 | 1 | on | 992 | 935 | **85 (811)** | 103 | 77 | — | 1.9355 | 11.76 | 22.77 |
+| **A1r** | 1 | **on** | 1019 | 866 | **82 (826)** | 95 | 74 | 0.8695 | 1.8842 | 12.20 | 22.98 |
+| **A2** | 1 | **off** | 1028 | 846 | **96 (809)** | 106 | 81 | 0.8551 | 1.8677 | 10.42 | 19.46 |
+| **A3** | 3 | **on** | 639 | 797 | **100 (514)** | 119 | 85 | 0.6641 | 3.0047 | 10.00 | 30.05 |
+| **A4** | 3 | **off** | 642 | 795 | **119 (497)** | — | 97 | 0.6651 | 2.9907 | 8.40 | 25.13 |
+
+**The single-variable contrasts.** A1r/A2 differ only in `decode_graph` (same
+tree `96040093`, same thinking setting, same 0-start). A3/A4 differ the same way
+at depth 3:
+
+| pair | contrast | ms | % |
+|---|---|---|---|
+| d1 | A1r(on) 82 vs A2(off) 96 | **−14** | **−14.6%** |
+| d3 | A3(on) 100 vs A4(off) 119 | **−19** | **−16.0%** |
+
+**Both signs and both magnitudes replicate.** Graph-on is *faster* on the 32k
+sparse decode tick, by about 15% at either depth. Quote the **percentage**: the
+absolute gaps differ (14 vs 19 ms) only because the d3 baseline is higher, and
+that is the reason both are reported.
+
+The band was fixed before A4 ran and was not moved after: request-block
+bootstrap halfwidth ≤1.5 ms and split-half drift ≤3.0 ms on every arm, all under
+the pre-registered ±4 ms. A4 landed 15 ms clear of the nearer threshold.
+
+**The mechanism is a code path, not the graph replaying.** `build.py` resolves
+`sparse_device_select = _graph_on(backend, decode_graph)` when the caller leaves
+it unset, and the serve sets neither that nor the CLI's switch — so on sm90
+**turning the graph on also turns sparse device selection on**, and a
+pure-decode tick runs the device-resident-table path instead of rebuilding its
+packed table and re-resolving logical→physical on the host, per row, per group,
+per plane. Neither arm replays a graph at 32k sparse: `sparse_min_tokens` is set,
+so `sparse_graph_on` is False and both decode eagerly. What the flag buys here is
+the device-select path, which is why the effect is a tick *rate* and not a
+latency spike.
+
+**Two costs the same flag carries, which are not evidence about the tick.** The
+capture-time `ensure_pad` reservation is resident on graph-on arms: driver
+`device_free` 52.886 vs 54.560 GiB, allocator `reserved` 42746 vs 41506 MiB. And
+the padding row holds a **state slot** as well as a block — at d1, 476 MiB of
+state against a KV block's ~1 MiB. **The d1 state figure does not extrapolate:**
+d3 measured **754 MiB**, so read the pad's state cost per arm rather than
+scaling it. (A prediction scaled from d1's 454 MiB to d3 was wrong, which is why
+it was demoted from a gate to an observation.)
+
+**A4 ran without a cold trace.** The previous sampler had stopped (13:19, ~40 min
+earlier than its own `sleep`-based estimate — its real period exceeds its sleep
+interval) and none was started for A4, by ruling: attaching a sampler mid-window
+would be a second lifecycle misalignment, and it would only catch the tail of the
+fill. So A4's phase boundary comes from the tick lines' own `ssd_mmap`, and its
+cold state from the closing `/health`. **Its fill curve is missing and the A/B
+split has no trace corroboration** — the tick measurement does not depend on it.
+
 ## Rule
 
 An arm matrix is only a matrix if every arm's env is pinned the same way, every
@@ -509,3 +571,13 @@ which one ran. A banner is a log cut; the resolved value is the evidence. A rate
 without its cold fill state is not a rate. And the delta a report quotes is
 `/health`'s, read over a span whose tick count agrees — if the two disagree, the
 span bracketed a restart and the number is not an arm.
+
+A contrast needs its variable to be the *only* one: two arms that differ in depth
+and graph at once are not a contrast, and two that ran different trees are not
+one either — A1 sits on an earlier tree than A1r/A2, so its `model` column is
+labelled, not compared. And a checklist's items can all be true while the list
+answers the neighbouring question: verify the *resolved* flag, not the requested
+one; verify the flag's *identity*, not that its substring appears; and before
+sending traffic, count the client processes, because "this serve is configured
+correctly" and "nothing is already running on it" are different questions.
+
