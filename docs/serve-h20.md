@@ -129,6 +129,43 @@ root-0755 at the mount point; set `SERVE_COLD_SSD` to a writable subdirectory
 there to use it. Set `SERVE_COLD_SSD=""` to run sparse with a host-only cold
 budget and no spill file.
 
+## Reading an arm out of the serve log
+
+An arm is a boot, not a code path: the env knobs on the launcher above
+(`SERVE_DEPTH`, `SERVE_SPARSE_K`, `SERVE_DECODE_GRAPH`) pick it, and each boot
+appends its own descriptor line, so `/work/serve_h20.log` holds every arm of a
+window rather than one arm per file. `#758` added that line
+(`serve_h20: tree … sha … depth=… sparse_k=… decode_graph=…`) precisely so an
+arm can be read off the log instead of a relayed command line.
+
+[`scripts/probe_h20_arm_read.py`](../scripts/probe_h20_arm_read.py) reads one
+arm's line window out of that log and one arm's acceptance out of the two
+`/health` reads that bracket it:
+
+```
+python3 scripts/probe_h20_arm_read.py log /work/serve_h20.log \
+    --arm-sparse 1 --from-line <this arm's boot line> --to-line <next arm's - 1>
+python3 scripts/probe_h20_arm_read.py health before.json after.json
+```
+
+The tick classification is **imported from `scripts/steady_filter.py`**, not
+reimplemented: that module owns the standard steady set
+(`dec==1 and sparse==1 and model>0 and sample>0 and path!=graph`), the close-tail
+split, and the two percentile conventions. A second copy is how the conventions
+drifted apart in the first place — a p50 is `statistics.median` while a pNN is
+nearest-rank, and on the even tick counts a warm window actually yields
+(5–12) the two disagree (a two-tick `[184, 179]` is 181.5 by the first and 179 by
+the second). What this script adds over `steady_filter` is only the line window
+and the boot-line self-certification.
+
+`health` divides `tokens_generated` by the engine's own `decode_forwards`, so
+`accept_len` is generated-per-forward at any depth without the caller naming the
+depth: a d3 arm's drafted delta is already three times its forward count.
+
+**When the log and `/health` disagree about which arm served, the boot line
+wins** — it is written by the serve that ran, and the health counters are
+cumulative across boots.
+
 ## Liveness and the restart fuse
 
 The same out-of-process guard as V100,
