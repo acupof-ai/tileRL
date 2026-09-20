@@ -124,9 +124,20 @@ number came from:
 | `probe_headroom_coldtail.py` | `dec > 0` only (its `is_decode`), plus its own type1/type2 split | a graph/idle decode-tagged tick is not excluded, and the closing tick is not separated |
 
 So a p50 from the headroom probe and a p50 from the sweep probe are the same
-statistic over **different sets**. Until the headroom probe carries the full
-steady filter, compare like with like and do not put the two columns in one
-table as if they were interchangeable.
+statistic over **different sets**. Do not put the two columns in one table as if
+they were interchangeable.
+
+**The way across is `scripts/steady_filter.py`**, which re-reads a log under the
+standard set so a headroom arm and a sweep arm can be placed side by side — or
+not placed at all when the log cannot support it. It is where that set is
+defined, as the symbol `STANDARD_FILTER` and the predicate `is_standard`;
+`summarise` reports the steady median with the long close-tail ticks split out
+via `tail_ms`, and `parse_rows(log_path, offset, until)` windows the read by byte
+span. Two conventions live in it deliberately and must not be mixed: `median` is
+the true median (`statistics.median`, averaging the middle pair on even n) while
+`pct` is nearest-rank — a tick duration is quoted on the former, a percentile on
+the latter. Prefer these symbols over re-deriving the set, and cite them by name
+rather than by file so a later move does not silently break the reference.
 
 **The closing tick is not a steady tick.** A request's last tick has the model
 at its steady cost and `sample` taking over the whole tick (e.g.
