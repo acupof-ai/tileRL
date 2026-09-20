@@ -66,17 +66,243 @@ def test_the_instrumentation_preset_disables_liveness_polling():
     assert "LIVENESS_POLL_S=999999" in env, env
     assert "TILERL_STEP_TIMING=1" in env, env
     assert "TILERL_STEP_TIMING_SLOW_MS=0" in env, env
+    # The draft READ window is instrumentation, not a treatment, and the probe
+    # asserts it (--expect-window 2048). Without it the loader default is W=0 and
+    # every arm exits rc13 before producing a number.
+    assert "TILERL_DRAFT_ATTN_WINDOW_TOKENS=2048" in env, env
 
 
 def test_arm_list_is_stable_and_the_unmerged_arm_is_refused():
     r = _run("--list")
     names = r.stdout.split()
-    assert names == ["baseline", "batch", "bg1", "bg2", "bg3", "locksplit"], names
+    assert names == ["baseline", "batch", "bg1", "bg2", "bg3", "bgcap", "locksplit"], names
     # #746 is not merged: the arm must refuse rather than boot a serve that
     # ignores an unknown flag and report a no-op as a result.
     assert _arm_envs()["locksplit"] == "PENDING_746"
     src = SRC.read_text()
     assert "PENDING_746" in src and "SKIPPED" in src
+
+
+def test_bgcap_is_the_only_arm_with_the_spill_cap():
+    """The cap changes what the engine does, so it is an arm and not shared
+    instrumentation: on every arm it would make them incomparable on the thing
+    they are compared on. bg2 is its control (same bg config, no cap)."""
+    arms = _arm_envs()
+    assert "TILERL_COLD_PREFIX_SSD_CAP=1" in arms["bgcap"], arms["bgcap"]
+    for a, env in arms.items():
+        if a != "bgcap":
+            assert "TILERL_COLD_PREFIX_SSD_CAP" not in env, (a, env)
+    # bgcap differs from bg2 by exactly the cap.
+    a, b = arms["bgcap"].split(), arms["bg2"].split()
+    assert set(a) - set(b) == {"TILERL_COLD_PREFIX_SSD_CAP=1"}, (a, b)
+    assert set(b) - set(a) == set(), (a, b)
+
+
+def test_reclaim_sampling_runs_only_on_the_arms_that_carry_the_question():
+    """Without the cap the shared spill is unbounded and never truncates, so a
+    sample of it can only read a plateau -- and because the arm WAITS on the
+    sampler, every other arm paid its full duration for a non-result. The two arms
+    that carry the question are bgcap (cap: truncation observable) and bg2 (same bg
+    config without the cap: the plateau is its control). Sampling bgcap alone would
+    state a shrink with nothing to compare it against."""
+    src = SRC.read_text()
+    assert 'case "$name" in bgcap|bg2) reclaim_on=1 ;; esac' in src, "the gate is not the pair"
+    assert "if [ \"$reclaim_on\" = 1 ]" in src, "the gate result is not used"
+    # The pair really is cap-vs-no-cap, which is what makes bg2 the control.
+    arms = _arm_envs()
+    assert "TILERL_COLD_PREFIX_SSD_CAP=1" in arms["bgcap"]
+    assert "TILERL_COLD_PREFIX_SSD_CAP" not in arms["bg2"]
+    assert set(arms["bgcap"].split()) - set(arms["bg2"].split()) == {
+        "TILERL_COLD_PREFIX_SSD_CAP=1"}
+    # ... and no OTHER arm samples, so the remaining five do not pay the wait.
+    assert sum("TILERL_COLD_PREFIX_SSD_CAP=1" in e for e in arms.values()) == 1
+
+
+def test_reclaim_span_outlives_the_first_release_it_watches():
+    """The sampler is the arm's clock: run_arm waits on it before stopping the
+    serve. If its span ends before rep0's first release, it samples the plateau and
+    the release it exists to catch is never in its rows -- and the arm still pays
+    the full span.
+
+    Arithmetic, from measured numbers: one 32k cold fill prompt ~156 s, the probe's
+    --fill-n default 5 (the harness does not pass it), and the warm request is
+    itself a 32k prompt. A 60x10 span (590 s) is short of that; the shipped default
+    must clear it."""
+    import re
+
+    src = SRC.read_text()
+    samples = int(re.search(r"RECLAIM_SAMPLES=\$\{RECLAIM_SAMPLES:-(\d+)\}", src).group(1))
+    interval = int(re.search(r"RECLAIM_INTERVAL_S=\$\{RECLAIM_INTERVAL_S:-(\d+)\}", src).group(1))
+    span = (samples - 1) * interval
+    fill_s, fill_n = 156, 5          # measured fill; the probe's default --fill-n
+    first_release = fill_n * fill_s + fill_s
+    assert span >= first_release, (
+        f"sampler span {span}s ends before rep0's first release ~{first_release}s")
+    # The old default cost every arm ~40 min, including the five that cannot shrink.
+    assert span <= 40 * 60, f"{span}s is the old unbounded wait back again"
+
+
+def test_reclaim_span_matches_the_documented_arithmetic():
+    """The header states the constraint and the numbers it was derived from. Keep
+    the two in step: a default changed without the comment is how the coupling
+    gets silently broken. Matched case-insensitively -- the assertion is about the
+    fact being stated, not about the capitalisation."""
+    src = SRC.read_text().lower()
+    assert "936 s" in src, "the header no longer states rep0's first release"
+    assert "90 x 15" in src, "the header no longer states the shipped span"
+    assert "coupled" in src, "the --fill-n coupling is not stated"
+
+
+def test_reclaim_samples_the_shared_spill_not_the_private_one():
+    """The #740 trailing truncation reclaims `<cold-ssd-path>.prefix.bin`
+    (kv_tiers._shared_ssd_path). Sampling the private `$COLD_SSD` measured a file
+    the effect does not touch, so the reading could only ever be a plateau."""
+    src = SRC.read_text()
+    assert "${COLD_SSD%.bin}.prefix.bin" in src, src[:200]
+    assert '--spill-path "$shared_spill"' in src
+    # ... and the sampler is NOT gated on that file existing. The shared spill is
+    # created by this window's own first publish, so an existence gate would skip
+    # sampling on exactly the arm that creates it; the sampler reads a missing
+    # path as size 0, which is what the first rows of a real run look like.
+    assert '[ -f "$shared_spill" ]' not in src, "the sampler is gated on existence"
+
+
+def test_each_arm_gets_its_own_log():
+    """steady_filter and the probe read from offset 0, and the supervisor only
+    truncates a log already over LOG_CAP at boot -- so a shared fixed path made
+    arm N's statistic cover arms 1..N-1 too."""
+    src = SRC.read_text()
+    assert "SERVE_LOG=$arm_log" in src, "the serve is not given a per-arm log"
+    assert '--log "$arm_log"' in src, "the probe does not read the per-arm log"
+    assert 'steady_filter.py --log "$arm_log"' in src
+    # ... and no reader still points at the shared path
+    assert '--log "$LOG"' not in src, "a reader still uses the shared log"
+
+
+def test_the_steady_filter_is_windowed_to_each_reps_warm_span():
+    """A per-arm log is not enough: the supervisor's warmup (dense 7000 + sparse
+    9000, 8-token decodes) and each rep's cold FILL write short-context decode
+    ticks that PASS the standard set, so reading the whole file reports warmup and
+    fill in the steady median.
+
+    A single start offset is not enough either, and this is the subtlety: the probe
+    records `log_byte_offset` AFTER the fill and BEFORE the warm POST (a warm
+    START), so `[off_i, off_{i+1})` contains warm_i AND fill_{i+1} -- the very ticks
+    the windowing claims to drop. Every span must end at that rep's own
+    `log_byte_end`.
+
+    The first version of this test shipped the bug: it built ONE `--window off` to
+    EOF and only grepped the multi-rep wiring, so the single-rep construction it
+    executed was correct while the multi-rep one the harness builds was not. This
+    test drives the SHIPPED span extractor over a multi-rep arm.json laid out the
+    way the probe records boundaries, and asserts on the filter's output -- the
+    only construction that can see an off-by-one-phase span."""
+    import json
+    import subprocess
+    import tempfile
+
+    src = SRC.read_text()
+    assert "log_byte_end" in src, "the harness does not read the rep END offsets"
+    # No bounded window (missing arm.json, or one predating log_byte_end) means no
+    # standard-set figure: the filter must not be run unwindowed or open-ended,
+    # either of which reports warmup and a later rep's fill as steady.
+    assert "steady.json NOT written" in src, "the no-span path degrades silently"
+    assert "raise SystemExit(3)" in src, "a pre-fix arm.json is not refused"
+    # `set -u` + an EMPTY array: `"${win_args[@]}"` is an unbound-variable abort on
+    # bash 3.2 (macOS's /bin/bash, which is what starts the window from the laptop),
+    # and the empty case is reachable -- it is the no-span branch. The guarded
+    # expansion is what makes that branch survive there.
+    #
+    # The negative direction is NOT asserted: bash 5 (the ubuntu-latest row) made an
+    # unguarded empty expansion a rc-0 no-op, so "it must fail" is a version
+    # artifact rather than the contract. That assertion is what failed CI here -- it
+    # was green on macOS bash 3.2 and red on Ubuntu bash 5. Removing the guard is
+    # still caught, by the version-independent textual assert above; what this runs
+    # is the positive contract, that the guarded form expands correctly on the
+    # interpreter running the gate.
+    assert '${win_args[@]+"${win_args[@]}"}' in src, "unguarded empty-array expansion"
+    guarded = ("set -u\n"
+               'A=()\n'
+               'f() { printf "%s\\n" "$*"; }\n'
+               'f ${A[@]+"${A[@]}"}\n'
+               'B=(--window 5)\n'
+               'f ${B[@]+"${B[@]}"}\n')
+    r = subprocess.run(["bash", "-c", guarded], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == ["", "--window 5"], r.stdout
+
+    # The exact multi-rep log: warmup, fill0, warm0, fill1, warm1a, warm1b. fill0 is
+    # 178 ms and fill1 is 400 ms so one fill would land in the body and the other in
+    # the tail -- either way the two headline quantities move.
+    def tick(n, total, model):
+        return (f"[step-timing] tick {n} total={total}ms dec=1 pre=0 "
+                f"model={model}ms sample=3ms path=eager sparse=1")
+    lines = [tick(1, 175, 155),   # supervisor warmup
+             tick(2, 178, 158),   # fill0
+             tick(3, 176, 156),   # warm0
+             tick(4, 400, 380),   # fill1  <- the tick the old construction admitted
+             tick(5, 177, 157),   # warm1a
+             tick(6, 179, 159)]   # warm1b
+    d = pathlib.Path(tempfile.mkdtemp(prefix="cwspan."))
+    (d / "serve.log").write_text("\n".join(lines) + "\n")
+    # Boundaries the way the probe records them: start = after the rep's fill,
+    # end = after the rep's warm returns.
+    def past(i):
+        return sum(len(x) + 1 for x in lines[: i + 1])
+    spans = {"rep0": (past(1), past(2)), "rep1": (past(3), past(5))}
+    (d / "arm.json").write_text(json.dumps({
+        "reps": [{"ticks": {"log_byte_offset": s, "log_byte_end": e}}
+                 for s, e in spans.values()]}))
+
+    # Drive the SHIPPED extractor, not a re-implementation of it: pull the inline
+    # python block out of the harness source and run it as the harness does, with
+    # `$dir` (and its arm.json) supplied. Sliced between the two markers that
+    # bracket it, so a reworded comment above cannot silently empty this.
+    start = src.index("spans=$(") + len("spans=$(")
+    end = src.index("' \"$dir/arm.json\"", start)
+    py = src[start:end]
+    assert "log_byte_end" in py, py[:200]
+    script = ('PYTHON=python3\ndir="$1"\nspans=$(' + py
+              + "' \"$dir/arm.json\" 2>\"$dir/spans.note\")\n"
+              # The block assigns; the caller is what reads $spans. Echo it so this
+              # test observes the value the harness would go on to pass as --window.
+              'printf "%s\\n" "$spans"')
+    r = subprocess.run(["bash", "-c", script, "_", str(d)], capture_output=True,
+                       text=True, timeout=60)
+    assert r.returncode == 0, (r.returncode, r.stderr)
+    got = r.stdout.split()
+    want = [f"{s}:{e}" for s, e in spans.values()]
+    assert got == want, (got, want)
+
+    # ... and that list, fed to the filter, keeps the warm ticks only. This is the
+    # assertion the shipped test could not make.
+    args = []
+    for s in got:
+        args += ["--window", s]
+    r = subprocess.run(["python3", str(REPO / "scripts" / "steady_filter.py"),
+                        "--log", str(d / "serve.log"), *args],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[-400:]
+    rec = json.loads(r.stdout)
+    assert rec["steady_n"] == 3, rec            # warm0, warm1a, warm1b
+    assert rec["ticks_total"] == 3, rec
+    assert rec["tail_n"] == 0, rec
+    assert rec["steady_p50_ms"] == 177.0, rec
+    assert rec["windows"] == [list(spans["rep0"]), list(spans["rep1"])], rec
+
+    # The construction the harness used to build -- [off_i, off_{i+1}), last to EOF
+    # -- on the same file. It reports fill1 (400 ms) as a tail tick, which is the
+    # live defect: a whole window's tail figures would have carried a fill.
+    old = [f"{spans['rep0'][0]}:{spans['rep1'][0]}", str(spans["rep1"][0])]
+    args = []
+    for s in old:
+        args += ["--window", s]
+    r = subprocess.run(["python3", str(REPO / "scripts" / "steady_filter.py"),
+                        "--log", str(d / "serve.log"), *args],
+                       capture_output=True, text=True, timeout=60)
+    bad_rec = json.loads(r.stdout)
+    assert bad_rec["tail_n"] == 1 and bad_rec["tail_max_ms"] == 400, bad_rec
+    assert bad_rec["ticks_total"] > rec["ticks_total"], (bad_rec, rec)
 
 
 def test_bg_arms_differ_only_in_the_depth_knob():
