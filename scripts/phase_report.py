@@ -117,22 +117,46 @@ def boundary_rank(ticks: list[dict]) -> int | None:
     return next((t["line"] for t in ticks if t["ssd_mmap"] > 0), None)
 
 
-def decfwd_identity(trace: list[dict], ticks: list[dict], slack: int = 2) -> dict:
-    """Is the trace→tick bridge sound for this pair of files?
+def decfwd_identity(trace: list[dict], ticks: list[dict],
+                    bracket: tuple[float, float] | None = None,
+                    slack: int = 2) -> dict:
+    """Is the trace→tick bridge sound for this pair?
 
-    ``cum_steady_ticks == Δdecode_forwards`` over the trace's span. If this does
-    not hold, a phase boundary cannot be placed on a tick and the report must say
-    so rather than placing it anyway.
+    ``steady ticks in the window == Δdecode_forwards over the same window``. Both
+    sides must describe the SAME span, and that is what the anchor decides.
+
+    **The anchor is the window's own `/health` bracket, not the trace's first
+    sample.** The sampler and the serve are separate processes, so either can
+    start first: on A2 the sampler happened to be recording from boot and its
+    first sample (decfwd 21) coincides with the bracket's start; on A1r the
+    sampler attached 13 forwards EARLIER (trace starts at 8, bracket at 21) —
+    those 13 belong to the serve's warmup and are not inside the client's window.
+    Anchoring on `trace[0]` therefore reported `ok=false` on a perfectly good arm
+    purely because the sampler won the race. A check that fires on good data is
+    as damaging as one that misses bad data: a tool that refuses too much gets
+    bypassed.
+
+    Without a bracket the trace is all we have, and the identity is checked over
+    the trace's own span — sound only when the window is the whole trace, which
+    is why `analyse` passes the bracket whenever it has one.
     """
-    base = trace[0]["decfwd"]
-    last = trace[-1]["decfwd"]
+    if bracket is not None:
+        base, last = bracket
+    else:
+        base, last = trace[0]["decfwd"], trace[-1]["decfwd"]
     inferred = base + len(ticks)
     return {
+        "anchor": "health-bracket" if bracket is not None else "trace-span",
         "base_decfwd": base,
-        "trace_last_decfwd": last,
+        "trace_first_decfwd": trace[0]["decfwd"],
+        "trace_last_decfwd": trace[-1]["decfwd"],
         "steady_ticks": len(ticks),
         "inferred_last": inferred,
         "diff": last - inferred,
+        # A sampler that started first is legitimate, so `trace_first < base` is
+        # NOT a failure and must not be reported as one; only a real mismatch
+        # between the two sides of the same span is.
+        "sampler_started_first": trace[0]["decfwd"] < base,
         "ok": abs(last - inferred) <= slack,
     }
 
@@ -156,19 +180,24 @@ def phase_boundary_from_trace(trace: list[dict], cap_gib: float) -> dict:
     }
 
 
-def cut_from_decfwd(trace: list[dict], ticks: list[dict], want: float) -> list[dict]:
+def cut_from_decfwd(trace: list[dict], ticks: list[dict], want: float,
+                    bracket: tuple[float, float] | None = None) -> list[dict]:
     """Ticks at or after the steady index the trace's `decfwd` names.
 
     `--from-decfwd` and `--from-line` are two spellings of "start here"; the
     conversion runs through the `decfwd` identity, which is checked first. The
     result is bounded by the trace's OWN last sample, so this route needs no
     explicit end: the trace says where the arm stopped.
+
+    `bracket` is the same anchor :func:`decfwd_identity` uses, for the same
+    reason: index 0 is the first steady tick after the CLIENT's window opened,
+    not after the sampler attached.
     """
-    base = trace[0]["decfwd"]
+    base = bracket[0] if bracket is not None else trace[0]["decfwd"]
     k = int(want - base)
     if k < 0:
         raise ValueError(
-            f"--from-decfwd {want} precedes the trace's first decfwd {base}; "
+            f"--from-decfwd {want} precedes the window's base decfwd {base}; "
             "the boundary is outside this pair of files"
         )
     return [t for t in ticks if t["line"] >= ticks[min(k, len(ticks) - 1)]["line"]]
@@ -215,13 +244,42 @@ def report(ticks: list[dict], lo: int | None, hi: int | None, tail_ms: int,
     }
 
 
+def _health_bracket(run_json: str) -> tuple[float, float] | None:
+    """`(decode_forwards before, after)` from an arm's run JSON, if it has both.
+
+    This is the anchor the decfwd identity needs: it brackets the CLIENT's window,
+    which is the span the steady ticks come from. The trace's first sample is not
+    a substitute — the sampler may attach before or after the serve.
+    """
+    import json as _json
+    with open(run_json, errors="replace") as fh:
+        d = _json.load(fh)
+    try:
+        return (float(d["health_before"]["stats"]["decode_forwards"]),
+                float(d["health_after"]["stats"]["decode_forwards"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{run_json}: no health_before/after decode_forwards bracket "
+            f"({type(exc).__name__}); the decfwd identity needs both ends"
+        ) from exc
+
+
 def analyse(trace_path: str, log_path: str, cap_gib: float = DEFAULT_CAP_GIB,
             tail_ms: int = TAIL_MS, from_line: int | None = None,
-            to_line: int | None = None, from_decfwd: float | None = None) -> dict:
+            to_line: int | None = None, from_decfwd: float | None = None,
+            run_json: str | None = None) -> dict:
     """The whole report as a dict.
 
     `--from-line`/`--to-line` are LOG LINE numbers (a half-open span), because a
     serve log accumulates across boots and the tick counter restarts on each one.
+
+    `run_json` is the arm's own `arm.json`/`a1_32k_n30.json`. Its
+    `health_before.decode_forwards` / `health_after.decode_forwards` bracket is
+    the correct anchor for the decfwd identity — the trace's first sample is not,
+    since the sampler and the serve are separate processes and either can start
+    first. Without it the identity falls back to the trace's own span, which is
+    only the same thing when the window IS the whole trace; the report says which
+    anchor it used.
     """
     if from_line is not None and from_decfwd is not None:
         raise ValueError("--from-line and --from-decfwd are mutually exclusive")
@@ -236,6 +294,7 @@ def analyse(trace_path: str, log_path: str, cap_gib: float = DEFAULT_CAP_GIB,
     ticks = _tick_rows(all_rows, mmap)
     if not ticks:
         raise ValueError(f"{log_path}: no steady ticks (the standard set matched nothing)")
+    bracket = _health_bracket(run_json) if run_json else None
 
     # The window FIRST, then everything derived -- a boundary computed outside the
     # window can fall outside it and empty both phases.
@@ -248,9 +307,9 @@ def analyse(trace_path: str, log_path: str, cap_gib: float = DEFAULT_CAP_GIB,
                 f"{to_line if to_line is not None else 'EOF'})"
             )
     elif from_decfwd is not None:
-        ticks = cut_from_decfwd(trace, ticks, from_decfwd)
+        ticks = cut_from_decfwd(trace, ticks, from_decfwd, bracket)
 
-    ident = decfwd_identity(trace, ticks)
+    ident = decfwd_identity(trace, ticks, bracket)
     ssd_first = boundary_rank(ticks)
     trace_hit = phase_boundary_from_trace(trace, cap_gib)
 
@@ -451,12 +510,66 @@ def _self_check() -> int:
         else:
             raise AssertionError("a decfwd cut was placed on a failed identity")
 
+        # The decfwd identity's anchor. The sampler and the serve are separate
+        # processes, so the trace's first sample may predate the client's window
+        # (measured: A1r's trace starts at decfwd 8, the bracket at 21; those 13
+        # forwards are serve warmup). Anchoring on trace[0] reported ok=false on a
+        # sound arm. The bracket is the anchor; the trace's first sample being
+        # LOWER is legitimate and must not be flagged.
+        #
+        # The bracket is built from `len(ticks)`, so its delta matches the window
+        # by construction and the only variable is where the SAMPLER attached.
+        n = len(ticks)
+        first = float(trace[0]["decfwd"])
+        # (a) sampler attached first: trace starts BELOW the bracket base.
+        early = decfwd_identity(trace, ticks, (first + 2.0, first + 2.0 + n))
+        assert early["sampler_started_first"], early
+        assert early["ok"], ("a sampler that started first was reported as a "
+                             "mismatch", early)
+        assert early["anchor"] == "health-bracket", early
+        # (b) symmetrical: attached late, trace starting ABOVE the base.
+        late = decfwd_identity(trace, ticks, (first - 5.0, first - 5.0 + n))
+        assert not late["sampler_started_first"], late
+        assert late["ok"], ("a sampler that attached late was reported as a "
+                            "mismatch", late)
+        # (c) a genuine inconsistency still fails: a bracket whose delta does not
+        # match the steady tick count is the thing this check is FOR.
+        bad = decfwd_identity(trace, ticks, (first, first + n + 20.0))
+        assert not bad["ok"], bad
+        assert bad["diff"] == 20.0, bad
+        # And the fallback anchor says which anchor it used.
+        assert decfwd_identity(trace, ticks)["anchor"] == "trace-span"
+
+        # The bracket is read from the run JSON by the same field path the arms
+        # use, and a JSON without it is an error, not a silent fallback.
+        sym = Path(d) / "sym.json"
+        sym.write_text(json.dumps({
+            "health_before": {"stats": {"decode_forwards": int(first + 2)}},
+            "health_after": {"stats": {"decode_forwards": int(first + 2 + n)}},
+        }))
+        assert _health_bracket(str(sym)) == (first + 2, first + 2 + n)
+        nostats = Path(d) / "nostats.json"
+        nostats.write_text(json.dumps({"health_before": {"stats": {}}}))
+        try:
+            _health_bracket(str(nostats))
+        except ValueError as exc:
+            assert "bracket" in str(exc), exc
+        else:
+            raise AssertionError("a run JSON without the bracket was accepted")
+
+        # End to end through the analyse path: with the bracket the A1r-shaped
+        # pair is ok, and the report says which anchor produced that.
+        rep_anchored = analyse(str(tp), str(lp), run_json=str(sym))
+        assert rep_anchored["decfwd_identity"]["anchor"] == "health-bracket", rep_anchored
+        assert rep_anchored["decfwd_identity"]["ok"], rep_anchored
+
         # A legacy trace reports a PARTIAL total, never a number that reads as the
         # tier's occupancy. The unrecorded `shared_ssd` is the difference between
         # 8.0 GiB (what the recorded keys sum to) and the 67.5 GiB A1 really held.
         lp2 = Path(d) / "legacy.txt"
         lp2.write_text(
-            "1000 cold=0.000 coldssd=0.000 shared=7.999 finished=1 decfwd=10 tok=20\n")
+            "1000 cold=0.000 coldssd=0.000 shared=7.999 finished=1 decfwd=10 tok=20 "
+            "hits=2 miss=39\n")
         rep = analyse(str(lp2), str(lp), cap_gib=8.0)
         assert rep["last_total_complete"] is False, rep
         assert rep["last_total_gib"] is None, rep
@@ -516,6 +629,12 @@ def main() -> int:
                     help="start at the steady tick the trace's decfwd names (converted "
                          "via the decfwd identity; bounded by the trace's own last "
                          "sample, so it needs no --to-line)")
+    ap.add_argument("--run-json", metavar="PATH",
+                    help="the arm's run JSON (a1_32k_n30.json etc). Its "
+                         "health_before/after decode_forwards bracket is the correct "
+                         "anchor for the decfwd identity; without it the check falls "
+                         "back to the trace's own span, which is only right when the "
+                         "window IS the whole trace.")
     ap.add_argument("--json", help="write the report here")
     ap.add_argument("--self-check", action="store_true")
     a = ap.parse_args()
@@ -525,7 +644,7 @@ def main() -> int:
         return rc
     try:
         rep = analyse(a.trace, a.log, a.cap_gib, a.tail_ms,
-                      a.from_line, a.to_line, a.from_decfwd)
+                      a.from_line, a.to_line, a.from_decfwd, a.run_json)
     except (ColdTraceError, ValueError) as exc:
         print(f"phase_report: {exc}", file=sys.stderr)
         return 1

@@ -110,6 +110,27 @@ def test_ignoring_the_window_upper_bound_fails_the_gate():
     )
 
 
+def test_anchoring_the_identity_on_the_trace_instead_of_the_bracket_fails_the_gate():
+    """The identity's anchor is the window's `/health` bracket, not the trace's
+    first sample.
+
+    The sampler and the serve are separate processes and either can start first.
+    Measured: A1r's trace begins at decfwd 8 while the client's bracket opens at
+    21, so anchoring on `trace[0]` reported `ok=false` with `diff=13` on an arm
+    whose real delta is exactly the steady tick count (1019). A check that fires
+    on sound data is as damaging as one that misses bad data -- a tool that
+    refuses too much gets bypassed -- and only the synthetic-early-sampler case
+    catches it, which is why the self-check builds one.
+
+    Flipping the anchor back to the trace must go red on that case.
+    """
+    _run_flipped(
+        '    if bracket is not None:\n        base, last = bracket',
+        '    if False:\n        base, last = bracket',
+        'early["sampler_started_first"]',
+    )
+
+
 def test_printing_a_partial_total_as_a_total_fails_the_gate():
     """A legacy trace's two unrecorded keys must not be silently filled.
 

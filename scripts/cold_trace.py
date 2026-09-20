@@ -22,9 +22,25 @@ vendored artifacts rather than assumed:
    carries no ``shared_ssd`` key: the tier really held 59.501 GiB and the trace
    simply did not sample it. Summing the trace's four keys under "missing = 0"
    gives **8.0 GiB against a true 67.5 GiB** — and 8.0 is a perfectly plausible
-   number, so nothing downstream would question it. Those two fields come back
-   as ``None`` and the row is tagged ``legacy``; only a caller doing arithmetic
-   decides what an unrecorded term means, and it has to say so.
+   number, so nothing downstream would question it. The field comes back
+   ``None``, the row lists it in ``unrecorded``, and only a caller doing
+   arithmetic decides what that means — and has to say so.
+
+   ``unrecorded`` is computed **per row, from what that row actually lacks**,
+   never from a per-format constant. A constant reported ``[]`` on a
+   current-format line missing ``shared_ssd``, contradicting the row's own
+   ``None`` — the summary overriding the row's evidence.
+
+   ``TOTAL`` is the one field that is genuinely derivable (it is the four keys
+   summed), so a line without it is recomputed rather than refused — but only
+   when all four terms are present. A written ``TOTAL`` is cross-checked against
+   the recorded terms, and the rule is: **the gap must be explainable by a
+   non-negative missing term.** With all four keys present, any gap outside the
+   write's rounding tolerance is damage. With a key unrecorded, the gap *is* that
+   key, so the row is unverifiable and any total is consistent with it — except
+   when the gap is negative, which would need a negative byte count and so is
+   decidable damage. A ``legacy`` line writing ``total`` never reaches here: its
+   key set is closed and the unknown key raises first.
 
 3. **`decfwd` is the only field in the same coordinate as the serve log's tick
    counter.** The identity is exact, not approximate: on A2 every one of the 30
@@ -49,39 +65,62 @@ import argparse
 import json
 import sys
 
-#: Keys both formats carry, under their own or an aliased name. A line missing
-#: any of these is not a trace line we can place in tick space, whatever its
-#: version, so they are REQUIRED.
+#: The two formats. `aliases` maps the on-disk key to a canonical field, and
+#: `expects` is the set of canonical fields the format WRITES -- declared here,
+#: never inferred from the data. Inferring "what may be missing" from a file lets
+#: a missing key justify itself, which is how this whole area went wrong once.
 #:
-#: `priv` and `ssd` are on this list, not on the unrecorded one: BOTH formats
-#: record them, the legacy one under `cold`/`coldssd`. A parser that only knows
-#: the current names and falls back to 0 reads EVERY key of a legacy line as 0 --
-#: measured, that yields 7.999 GiB where the tier really held 67.500, and 7.999
-#: is exactly the host cap, i.e. it reads as "cold tier just filled, SSD not yet
-#: in use". The alias map is a correctness requirement, not a convenience.
-REQUIRED = ("shared", "priv", "ssd", "decfwd")
-
-#: The two formats. `aliases` maps the on-disk key to the canonical field.
+#: `derivable` names fields a format does not write but that can be recomputed
+#: from ones it does, so their absence costs no information. `shared_ssd` is not
+#: among them: it is not a function of the other three, and its absence is
+#: permanent information loss (A1 really held 59.501 GiB of shared SSD bytes that
+#: its trace never wrote down).
 FORMATS = {
     "current": {
         "keys": {"priv", "ssd", "shared", "shared_ssd", "TOTAL", "fin", "decfwd", "tok"},
         "aliases": {"priv": "priv", "ssd": "ssd", "shared": "shared",
                     "shared_ssd": "shared_ssd", "TOTAL": "total",
                     "fin": "finished", "decfwd": "decfwd", "tok": "tok"},
-        #: Fields this format does not sample. Empty: it records all four keys.
-        "unrecorded": (),
+        "expects": ("priv", "ssd", "shared", "shared_ssd", "total",
+                    "finished", "decfwd", "tok"),
+        # `total` is the four keys summed, so a line without it loses nothing.
+        "derivable": ("total",),
+        # `shared_ssd` is the one four-key term that is neither always written nor
+        # recomputable, so a line lacking it is UNRECORDED rather than truncated:
+        # that is the fact this module exists to carry. The legacy format lacks it
+        # by construction; a current line can lack it too (a truncated write), and
+        # both must be reported as "this number does not exist" rather than
+        # silently summed as 0.
+        "never_sampled": ("shared_ssd",),
     },
     "legacy": {
         "keys": {"cold", "coldssd", "shared", "finished", "decfwd", "tok", "hits", "miss"},
         "aliases": {"cold": "priv", "coldssd": "ssd", "shared": "shared",
                     "finished": "finished", "decfwd": "decfwd", "tok": "tok",
                     "hits": "hits", "miss": "miss"},
-        #: Sampled by the current format but NOT by this one. They are None, never
-        #: 0 -- see the module docstring: A1 really held 59.5 GiB of shared SSD
-        #: bytes that its trace never wrote down.
-        "unrecorded": ("shared_ssd", "total"),
+        "expects": ("priv", "ssd", "shared", "finished", "decfwd", "tok",
+                    "hits", "miss"),
+        # `total` is derivable, but only on a line where every four-key term is
+        # recorded -- which the legacy format never is, so it stays None there.
+        "derivable": ("total",),
+        #: Sampled by the current format and NOT by this one, ever. Their absence
+        #: here is permanent information loss, not truncation: `shared_ssd` is not
+        #: a function of the other three (A1 held 59.501 GiB its trace never wrote
+        #: down), so it must not be mistaken for a corrupt line either.
+        "never_sampled": ("shared_ssd",),
     },
 }
+
+#: The four occupancy keys. `total` is their sum in the current format, which is
+#: what makes it derivable.
+FOUR_KEYS = ("priv", "ssd", "shared", "shared_ssd")
+
+#: Residual tolerance for the `TOTAL` cross-check. The trace writes 3 decimals,
+#: so summing five rounded numbers can be off by ~1.5e-3; measured on A2's 205
+#: rows the max residual is 1.4e-14 and 25 rows differ EXACTLY (25/205) while
+#: `round(sum, 3) == TOTAL` holds 205/205. A strict equality test would raise on
+#: a quarter of a sound file -- a gate that fires on good data.
+TOTAL_TOL = 1e-3
 
 #: Every canonical field a row can carry.
 FIELDS = ("ts", "priv", "ssd", "shared", "shared_ssd", "total",
@@ -119,14 +158,18 @@ def detect_format(pairs: dict[str, str]) -> str:
 
 
 def parse_line(line: str, lineno: int = 0) -> dict | None:
-    """One trace line -> a canonical row, or None if it is blank.
+    """One trace line -> a canonical row, or None if it is blank or a comment.
+
+    A `#` comment is skipped: the sampler's files carry a header, and a reader
+    that rejected it would fail on the file it was written for. A blank line is
+    skipped for the same reason.
 
     Raises :class:`ColdTraceError` (naming the key) rather than returning an
     empty row: "this file cannot be read" and "this arm was empty" must not share
     an appearance.
     """
     parts = line.split()
-    if not parts:
+    if not parts or parts[0].startswith("#"):
         return None
     pairs: dict[str, str] = {}
     for tok in parts[1:]:
@@ -157,19 +200,72 @@ def parse_line(line: str, lineno: int = 0) -> dict | None:
             raise ColdTraceError(
                 f"line {lineno}: {disk_key}={value!r} is not a number"
             ) from exc
-    # Required keys, after aliasing: `shared` and `decfwd` both exist in both
-    # formats under their own names, so a line missing one is truncated.
-    for key in REQUIRED:
-        if key not in row:
+    # Anything a format WRITES and this line lacks is truncation, unless the field
+    # is derivable or the format may legitimately never have sampled it. `expects`
+    # is declared per format, never inferred from the data: a missing key must not
+    # be able to justify itself, which is exactly how a dropped alias (`cold` read
+    # as an unknown key rather than as `priv`) once turned a legacy line into one
+    # with no occupancy at all.
+    missing = [f for f in spec["expects"] if f not in row]
+    for field in missing:
+        if field not in spec["derivable"] and field not in spec["never_sampled"]:
             raise ColdTraceError(
-                f"line {lineno}: {fmt} line is missing required key {key!r} "
+                f"line {lineno}: {fmt} line is missing required key {field!r}, "
+                f"which this format writes and which is not derivable "
                 f"(have {sorted(pairs)})"
             )
-    # Unrecorded fields are None, explicitly. Never 0.
+    # Whether the format WROTE a total, captured before the defaults below: the
+    # cross-check is about a written number disagreeing with the keys, so it must
+    # not be reachable by a value that merely landed in the field.
+    wrote_total = "total" in row
+    # Unrecorded/derived fields are None, explicitly. Never 0.
     for field in FIELDS:
         if field not in row:
             row[field] = None
-    row["unrecorded"] = [f for f in spec["unrecorded"]]
+    # PER ROW, from what THIS line lacks -- not a per-format constant. A constant
+    # said "nothing was unrecorded" on a current-format line missing both
+    # `shared_ssd` and `TOTAL`, contradicting its own None-valued fields.
+    row["unrecorded"] = sorted(
+        {f for f in missing if f not in spec["derivable"]}
+        | {f for f in spec["never_sampled"] if row[f] is None}
+    )
+    # `TOTAL` is the four keys summed, so a line without it loses nothing and the
+    # value is recomputed; a written total is cross-checked instead, since one that
+    # disagrees is a corrupt row rather than a missing one. Where a four-key term is
+    # UNRECORDED the sum is a PARTIAL and must not be written into `total`: filling
+    # it there is how 7.999 GiB would come to stand for a tier that held 67.5.
+    recorded = [k for k in FOUR_KEYS if row[k] is not None]
+    s = sum(row[k] for k in recorded)
+    row["total_derived"] = False
+    if wrote_total:
+        if not row["unrecorded"]:
+            # All four terms are here, so the total is fully checkable.
+            bad = abs(s - row["total"]) > TOTAL_TOL
+            detail = f"residual {abs(s - row['total']):.3e}"
+        else:
+            # A term is unrecorded, so the gap between the sum and the total IS
+            # that missing value -- we cannot see it, so the row is UNVERIFIABLE
+            # and any total is consistent with it. One direction is still
+            # decidable: a NEGATIVE gap would need a negative missing term, and
+            # the four keys are byte counts, non-negative on all three real
+            # traces. The tolerance applies here too -- without it a rounding
+            # write would read as damage.
+            bad = (row["total"] - s) < -TOTAL_TOL
+            detail = f"residual {row['total'] - s:.3e} is negative, so a four-key term would be"
+        if bad:
+            raise ColdTraceError(
+                f"line {lineno}: TOTAL={row['total']} disagrees with the four keys "
+                f"(sum {round(s, 3)} over the recorded terms, {detail} > "
+                f"tolerance {TOTAL_TOL:g})"
+            )
+    elif len(recorded) == len(FOUR_KEYS):
+        row["total"] = round(s, 3)
+        row["total_derived"] = True
+    else:
+        # A derivable field can still be unavailable: the total is the four
+        # keys summed, and one of them was never sampled. Then nothing is
+        # written into `total` and the field is unrecorded like the rest.
+        row["unrecorded"] = sorted(set(row["unrecorded"]) | {"total"})
     return row
 
 
@@ -236,13 +332,15 @@ def _self_check() -> int:
     # of "non-zero" against a real line would be flaky and one of "present" would
     # pass even if the alias were dropped. Construct the input instead.
     alias_row = parse_line(
-        "1789894551 cold=1.663 coldssd=2.5 shared=6.955 finished=23 decfwd=555 tok=1089", 1)
+        "1789894551 cold=1.663 coldssd=2.5 shared=6.955 finished=23 decfwd=555 "
+        "tok=1089 hits=2 miss=24", 1)
     assert alias_row["priv"] == 1.663, alias_row       # from `cold`
     assert alias_row["ssd"] == 2.5, alias_row          # from `coldssd`
     assert alias_row["shared"] == 6.955, alias_row
     # And the same fields through the current names.
     cur_row = parse_line(
-        "1 priv=1.663 ssd=2.5 shared=6.955 shared_ssd=59.501 TOTAL=70.619 fin=23 decfwd=555", 1)
+        "1 priv=1.663 ssd=2.5 shared=6.955 shared_ssd=59.501 TOTAL=70.619 fin=23 "
+        "decfwd=555 tok=1089", 1)
     assert (cur_row["priv"], cur_row["ssd"]) == (1.663, 2.5), cur_row
     # Both name the same field, so a legacy line and a current line with equal
     # values must agree on every shared field.
@@ -269,9 +367,11 @@ def _self_check() -> int:
     # Negative control: a truncated line (required key absent) must RAISE, naming
     # the key. `shared` and `decfwd` are the discriminators -- `TOTAL` is allowed
     # to be absent in the current format, so its absence discriminates nothing.
+    # No TOTAL on these: a line carrying one would trip the cross-check first and
+    # the assertion under test would never be reached.
     for label, text, key in (
-        ("missing shared", "1 priv=0.0 ssd=0.0 TOTAL=1.0 fin=1 decfwd=5 tok=1", "shared"),
-        ("missing decfwd", "1 priv=0.0 ssd=0.0 shared=1.0 TOTAL=1.0 fin=1 tok=1", "decfwd"),
+        ("missing shared", "1 priv=0.0 ssd=0.0 fin=1 decfwd=5 tok=1", "shared"),
+        ("missing decfwd", "1 priv=0.0 ssd=0.0 shared=1.0 fin=1 tok=1", "decfwd"),
         ("legacy missing decfwd", "1 cold=0.0 coldssd=0.0 shared=1.0 finished=1 tok=1", "decfwd"),
     ):
         try:
@@ -294,6 +394,95 @@ def _self_check() -> int:
 
     # A complete current line must NOT be tagged legacy.
     assert parse_line(a2, 1)["format"] == "current"
+
+    # --- P1: `unrecorded` must be a ROW fact, not a format constant -----------
+    # A current-format line missing `shared_ssd` AND `TOTAL` (still identifiable
+    # as current by fin/tok). The values are right -- both None -- but a
+    # format-level constant reported `unrecorded=[]`, so the summary printed
+    # "[] were never sampled" over a row whose own fields said two things were
+    # missing. The summary had overridden the row's evidence.
+    partial_cur = parse_line(
+        "1 priv=1.0 ssd=0.0 shared=2.0 fin=1 decfwd=4 tok=8", 5)
+    assert partial_cur["shared_ssd"] is None, partial_cur
+    assert partial_cur["total"] is None, partial_cur
+    assert partial_cur["unrecorded"] == ["shared_ssd", "total"], partial_cur
+    # ...and the row must agree with itself: every unrecorded field is None, and
+    # every non-None field is not listed.
+    for f in partial_cur["unrecorded"]:
+        assert partial_cur[f] is None, (f, partial_cur)
+
+    # `TOTAL` is derivable, so a current line without it loses NOTHING: the value
+    # is recomputed rather than the line being refused.
+    derived = parse_line(
+        "1 priv=1.0 ssd=0.0 shared=2.0 shared_ssd=3.0 fin=1 decfwd=4 tok=8", 6)
+    assert derived["total"] == 6.0, derived
+    assert derived["total_derived"] is True, derived
+    assert derived["unrecorded"] == [], derived
+    # ...and recomputation must not silently disagree with a WRITTEN total. This
+    # negative control is what proves the cross-check runs at all: the positive
+    # case above passes whether or not any check exists.
+    try:
+        parse_line("1 priv=1.0 ssd=0.0 shared=2.0 shared_ssd=3.0 TOTAL=999.000 "
+                   "fin=1 decfwd=4 tok=8", 7)
+    except ColdTraceError as exc:
+        assert "999" in str(exc) and "TOTAL" in str(exc), exc
+    else:
+        raise AssertionError("a TOTAL that contradicts the four keys was accepted")
+    # THE RULE, in the three shapes it can take when a term is unrecorded. The
+    # gap between the recorded sum and the written total IS the missing value, so
+    # it cannot be evidence for or against the total -- unless it is NEGATIVE,
+    # which would need a negative byte count and is therefore decidable damage.
+    # (b1 found the negative branch; the bound is verified non-negative on all
+    # three real traces.)
+    partial_total = parse_line(
+        "1 priv=1.0 ssd=0.0 shared=2.0 TOTAL=67.500 fin=1 decfwd=4 tok=8", 10)
+    assert partial_total["total"] == 67.5, partial_total
+    assert partial_total["unrecorded"] == ["shared_ssd"], partial_total
+    # A gap of exactly the missing term's size (implied shared_ssd = 64.5) and a
+    # zero gap (implied = 0) are both consistent, so both pass.
+    assert parse_line("1 priv=1.0 ssd=0.0 shared=2.0 TOTAL=3.0 "
+                      "fin=1 decfwd=4 tok=8", 11)["total"] == 3.0
+    # But a total BELOW the recorded sum implies a negative term.
+    try:
+        parse_line("1 priv=1.0 ssd=0.0 shared=2.0 TOTAL=1.0 "
+                   "fin=1 decfwd=4 tok=8", 12)
+    except ColdTraceError as exc:
+        assert "negative" in str(exc), exc
+    else:
+        raise AssertionError("a total implying a NEGATIVE byte count was accepted")
+    # And `legacy` never reaches the rule at all: its key set is closed, so a
+    # `total` on a legacy line is an unknown key and raises before any arithmetic.
+    # Pinned by a test because "the rule does not apply here" should not rest on
+    # reasoning alone.
+    try:
+        parse_line("1 cold=1.0 coldssd=0.0 shared=2.0 total=1.0 finished=1 "
+                   "decfwd=4 tok=8 hits=1 miss=1", 13)
+    except ColdTraceError as exc:
+        assert "not part of the legacy format" in str(exc), exc
+    else:
+        raise AssertionError("a legacy line carrying `total` was accepted")
+
+    # The tolerance is real, not slack: 1.4e-14 of float residue on rounded values
+    # must pass. This is A2's WORST row verbatim (the other 204 are exact), so a
+    # strict comparison would raise on the only sound line that tests it -- and the
+    # self-check carries it because a tolerance that is never exercised is not
+    # covered: a control that zeroes TOTAL_TOL must be able to go red here.
+    probe = parse_line(
+        "1789902584 priv=1.008 ssd=0.000 shared=6.992 shared_ssd=56.008 "
+        "TOTAL=64.008 fin=34 decfwd=981 tok=1840", 8)
+    assert probe["total"] == 64.008 and probe["unrecorded"] == [], probe
+    assert abs(probe["priv"] + probe["ssd"] + probe["shared"] + probe["shared_ssd"]
+               - probe["total"]) > 1e-15, "the fixture no longer carries a residue"
+
+    # A current line missing a field the format WRITES and cannot derive is
+    # truncation, and raises naming it. `fin` here.
+    try:
+        parse_line("1 priv=1.0 ssd=0.0 shared=2.0 shared_ssd=3.0 TOTAL=6.0 "
+                   "decfwd=4 tok=8", 9)
+    except ColdTraceError as exc:
+        assert "finished" in str(exc), exc
+    else:
+        raise AssertionError("a current line missing a written field was accepted")
 
     # Ambiguous / unidentifiable lines raise rather than guessing a format.
     for label, text in (

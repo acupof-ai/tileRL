@@ -1,0 +1,13 @@
+# Real cold-tier trace lines, excerpted verbatim from the A1 arm (H20, 2026-09-20).
+# Source: a1_artifacts/cold_trace.txt, an 84-sample file; these are 3 of its
+# lines, unmodified and in file order. Format 'legacy'.
+#
+# This is the format the parser exists for: it records priv/ssd under the names
+# cold/coldssd, and it has NO shared_ssd and NO TOTAL key at all -- the sampler
+# did not yet sample them. A1's own /health reported
+# kv_cold_shared_ssd_bytes = 63888556032 B = 59.501 GiB, so the missing key is
+# UNRECORDED, not zero: summing what the trace carries gives 8.0 GiB against a
+# true 67.5. This file is what holds that reading to account.
+1789894551 cold=1.035 coldssd=0.000 shared=6.955 finished=23 decfwd=555 tok=1089 hits=2 miss=24
+1789894942 cold=1.663 coldssd=0.000 shared=6.319 finished=30 decfwd=794 tok=1554 hits=2 miss=31
+1789895383 cold=0.000 coldssd=0.000 shared=7.999 finished=39 decfwd=1086 tok=2113 hits=2 miss=39
