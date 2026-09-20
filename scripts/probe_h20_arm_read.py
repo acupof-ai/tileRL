@@ -167,10 +167,13 @@ def health_delta(before: dict, after: dict) -> dict:
         "d_drafted": dd,
         "d_generated": dg,
         "d_decode_forwards": df,
-        # An acceptance ratio over a straddled bracket is not a number; None says so
-        # rather than emitting a negative rate that looks like a measurement.
+        # ALL THREE ratios carry the straddle guard. Guarding only the two that
+        # divide by `dd`/`df` when they are positive left this one bare, and a
+        # restart that drove `dd` negative while `df` stayed positive printed
+        # `-199.7` -- a number that reads like a measurement, in the same dict as
+        # two nulls. The ratios are one claim, so they fail as one.
         "straddled_restart": straddled,
-        "drafted_per_forward": round(dd / df, 3) if df > 0 else None,
+        "drafted_per_forward": round(dd / df, 3) if df > 0 and not straddled else None,
         "accept_rate": round(da / dd, 4) if dd > 0 and not straddled else None,
         # generated-per-FORWARD, the sweep probe's own ratio (n_gen / n_fwd)
         "accept_len": round(dg / df, 4) if df > 0 and not straddled else None,
@@ -272,6 +275,32 @@ def self_check() -> int:
     s = health_delta(a, restart)
     assert s["straddled_restart"] is True, s
     assert s["accept_rate"] is None and s["accept_len"] is None, s
+    # The shape the fixture above missed: `df` stays POSITIVE (the new engine ran
+    # some forwards) while `dd` goes negative. A guard written only on `df > 0`
+    # printed `drafted_per_forward = -199.7` here -- a number that reads like a
+    # measurement, sitting in the same dict as two nulls. The straddle nulls ALL
+    # THREE ratios, not only those whose divisor went negative. One fixture per
+    # shape of the bug, or the guard only covers the shape it was written for.
+    later = {
+        "stats": {
+            "spec_accepted": 2,
+            "spec_drafted": 30,
+            "tokens_generated": 4,
+            "decode_forwards": 9100,
+        }
+    }
+    big = {
+        "stats": {
+            "spec_accepted": 100,
+            "spec_drafted": 20000,
+            "tokens_generated": 5000,
+            "decode_forwards": 9000,
+        }
+    }
+    sr = health_delta(big, later)
+    assert sr["straddled_restart"] is True and sr["d_decode_forwards"] > 0, sr
+    assert sr["drafted_per_forward"] is None, sr
+    assert sr["accept_rate"] is None and sr["accept_len"] is None, sr
     print("h20_arm_read self-check ok")
     return 0
 
