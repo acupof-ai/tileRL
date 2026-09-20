@@ -45,6 +45,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -186,7 +188,8 @@ def self_check() -> int:
     """Fixture in the exact serve-log format; no torch, no card, no repo file."""
     lines = [
         "serve_h20: tree /work/tilerl-s-h20 sha d135a81b boot 0 "
-        "depth=1 sparse_k=128 decode_graph=on ctx=131072 slots=8 at 2026-09-20T10:00:00+08:00\n",
+        "depth=1 sparse_k=128 decode_graph=on ctx=131072 slots=8 w=0 "
+        "at 2026-09-20T10:00:00+08:00\n",
         "[step-timing] tick 1 total=900ms dec=0 pre=1 model=900ms\n",
         "[step-timing] tick 2 total=29ms dec=1 pre=0 graph=29ms path=graph sparse=0\n",
         "[step-timing] tick 3 total=29ms dec=1 pre=0 graph=29ms path=graph sparse=0\n",
@@ -206,9 +209,31 @@ def self_check() -> int:
     try:
         r = read_arm(path, 1, None, want_sparse=True)
         assert len(r["boots_in_window"]) == 1, r["boots_in_window"]
-        assert r["boots_in_window"][0]["arm"] == (
-            "depth=1 sparse_k=128 decode_graph=on ctx=131072 slots=8"
-        ), r["boots_in_window"]
+        arm = r["boots_in_window"][0]["arm"]
+        # `in`, not `==`: the descriptor has grown a tag before (w=, #763) and will
+        # grow more, and an equality against one spelling turns vacuous the moment
+        # the fixture drifts -- it then compares the fixture to itself and is green
+        # forever. Containment of the core fields is immune to an addition on
+        # EITHER side of them.
+        assert "depth=1 sparse_k=128 decode_graph=on ctx=131072 slots=8" in arm, arm
+        # ... and containment alone cannot see that drift, which is what this guard
+        # is for: the descriptor the fixture feeds the parser is the one
+        # scripts/serve_h20.sh actually prints. Skipped where the launcher is not
+        # beside us (this self-check takes no repo file and must stay runnable
+        # from a copy), and on a dry-run that cannot start.
+        launcher = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve_h20.sh")
+        if shutil.which("bash") and os.path.exists(launcher):
+            out = subprocess.run(
+                ["bash", launcher, "--dry-run"], capture_output=True, text=True
+            )
+            if out.returncode == 0:
+                live = next(
+                    (ln.split("arm:", 1)[1].strip()
+                     for ln in out.stdout.splitlines() if ln.startswith("arm:")),
+                    None,
+                )
+                assert live is not None, out.stdout
+                assert arm == live, f"fixture drifted from the launcher: {arm!r} != {live!r}"
         # the standard set drops the prefill and the two captured ticks
         assert r["steady_ticks"] == 3, r["steady_ticks"]
         assert r["excluded_path_graph_n"] == 2, r["excluded_path_graph_n"]
