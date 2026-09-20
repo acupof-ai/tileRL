@@ -113,7 +113,7 @@ The worker stays CUDA-free (the prior diagnosis stands): private reads are
     fails loud into RAM (never opens its own file, ≤4 sibling files). A cold and
     a warm page round-trip in both creation orders and a non-owned field reads
     as a clean miss, never KeyError.
-- Full CPU suite **1044 passed / 22 skipped / 1 xfailed** (rebased over #745).
+- Full CPU suite **1082 passed / 14 skipped / 1 xfailed** (merged over latest main incl. #749/#756).
 
 ## Rule
 
@@ -136,7 +136,7 @@ Steady decode (~166 ms/tick, ~9.4 tok/s) must hold.
 
 | date | machine | target | result |
 |---|---|---|---|
-| 2026-09-20 | CPU (hermetic) | SSD lift disk IO off `_tlock` | IO-off-lock + source-pin + rollback + hardening gates green (all mutation-red); 1044 passed |
+| 2026-09-20 | CPU (hermetic) | SSD lift disk IO off `_tlock` | IO-off-lock + source-pin + rollback + hardening gates green (all mutation-red); 1082 passed |
 | next V100 window | V100 sm70, pending-remote | close ssd_mmap ~3.3 s | target: real lock-wait removed; lock-vs-drain split to be measured |
 
 Raw artifacts: `tests/test_sparse_kv_tier.py`; changes `src/tilerl/kv_tiers.py`.

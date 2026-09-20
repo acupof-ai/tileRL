@@ -171,6 +171,10 @@ class ColdSsdFile:
     #: tail space.
     GROWTH_SLOTS = 64
 
+    #: Thread name of the background close-publish daemon (HostKvPages._start_publisher).
+    #: Used only to attribute spill-file IO to the worker instead of the step tick.
+    PUBLISH_THREAD = "tilerl-cold-publish"
+
     def __init__(
         self,
         path: str,
@@ -202,6 +206,11 @@ class ColdSsdFile:
         #: reader cannot silently go uncounted.
         self.step_timing = step_timing
         self.ssd_ms = 0.0
+        #: Spill IO performed on the background publish thread. drain_ssd_ms
+        #: returns only step-thread IO; the worker's share is read separately via
+        #: drain_worker_ssd_ms so its disk time cannot masquerade as a step-tick
+        #: stall (it runs with no engine/tick lock held by the step).
+        self.ssd_ms_worker = 0.0
         self._path = path
         self._spec = spec
         self.stride = sum(n for *_k, n in spec)
@@ -400,7 +409,13 @@ class ColdSsdFile:
         return True
 
     def _charge(self, t: float) -> None:
-        self.ssd_ms += (time.perf_counter() - t) * 1000.0
+        ms = (time.perf_counter() - t) * 1000.0
+        # Attribute worker-thread IO to its own bucket: draining it into the step
+        # tick would report cross-thread disk time as if the step thread blocked.
+        if threading.current_thread().name == self.PUBLISH_THREAD:
+            self.ssd_ms_worker += ms
+        else:
+            self.ssd_ms += ms
 
     def write(self, key, blob: dict) -> None:
         if self.step_timing is None:
@@ -1625,9 +1640,10 @@ class HostKvPages:
             return frozenset(self._shared) | frozenset(self._pub_pending)
 
     def drain_ssd_ms(self) -> float:
-        """Milliseconds spent touching the mmap'd spill files since the last
-        drain, across the private and shared files. The engine drains this into
-        the step timer at the end of the tick that paid it."""
+        """Milliseconds the STEP thread spent touching the mmap'd spill files
+        since the last drain, across the private and shared files. The engine
+        drains this into the step timer at the end of the tick that paid it.
+        Background-publish-worker IO is excluded (see drain_worker_ssd_ms)."""
         with self._tlock:
             ms = 0.0
             files = [self._ssd, *self._shared_ssds.values()]
@@ -1635,6 +1651,18 @@ class HostKvPages:
                 if f is not None:
                     ms += f.ssd_ms
                     f.ssd_ms = 0.0
+            return ms
+
+    def drain_worker_ssd_ms(self) -> float:
+        """Spill-file IO performed by the background publish thread since the
+        last drain. Read (not attached to any step tick) to tell a real
+        step-thread block from disk time that merely ran concurrently."""
+        with self._tlock:
+            ms = 0.0
+            for f in [self._ssd, *self._shared_ssds.values()]:
+                if f is not None:
+                    ms += f.ssd_ms_worker
+                    f.ssd_ms_worker = 0.0
             return ms
 
     def shared_bytes(self) -> int:

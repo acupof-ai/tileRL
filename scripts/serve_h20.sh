@@ -23,6 +23,7 @@
 #   SERVE_COLD_FORMAT (f16) SERVE_KV_COLD_BYTES / SERVE_COLD_SSD_BYTES (8 GiB)
 #   SERVE_SPARSE_K (128) SERVE_SPARSE_MIN (8192)
 #   SERVE_SLOTS (8) SERVE_BATCH (8) SERVE_CTX (131072) SERVE_DEPTH (1)
+#   SERVE_DECODE_GRAPH (1; set 0 for the graph-off measurement arm)
 #   MAX_RESTARTS (10) RESTART_FUSE_MAX (5) RESTART_FUSE_WINDOW_S (600)
 #
 # `--dry-run` prints the resolved serve argv and exits 0 without touching a GPU:
@@ -60,6 +61,8 @@ SLOTS=${SERVE_SLOTS:-8}
 BATCH=${SERVE_BATCH:-8}
 CTX=${SERVE_CTX:-131072}
 DEPTH=${SERVE_DEPTH:-1}
+# sm90 decode graph on by default; set SERVE_DECODE_GRAPH=0 for the graph-off arm.
+DECODE_GRAPH=${SERVE_DECODE_GRAPH:-1}
 MAX_RESTARTS=${MAX_RESTARTS:-10}
 RESTART_FUSE_MAX=${RESTART_FUSE_MAX:-5}
 RESTART_FUSE_WINDOW_S=${RESTART_FUSE_WINDOW_S:-600}
@@ -76,16 +79,27 @@ if [ -n "$COLD_SSD" ]; then
             --cold-ssd-path "$COLD_SSD" --cold-ssd-bytes "$COLD_SSD_BYTES")
 fi
 
+# SERVE_DECODE_GRAPH=0 drops --decode-graph (the graph-off measurement arm).
+GRAPH_ARGS=()
+[ "$DECODE_GRAPH" != 0 ] && GRAPH_ARGS=(--decode-graph)
+# One arm descriptor, logged on every boot line and printed by --dry-run so the
+# reader of /work/serve_h20.log can self-certify which arm served without relying
+# on a relayed command line.
+GRAPH_WORD=off; [ "$DECODE_GRAPH" != 0 ] && GRAPH_WORD=on
+ARM_DESC="depth=$DEPTH sparse_k=$SPARSE_K decode_graph=$GRAPH_WORD ctx=$CTX slots=$SLOTS"
+
 SERVE_ARGV=("$PYTHON" -u -m tilerl.cli serve --model qwen38-27b
   --host 0.0.0.0 --port "$PORT"
   --slots "$SLOTS" --max-batch "$BATCH" --max-ctx "$CTX"
   --sparse-k "$SPARSE_K" --sparse-min-tokens "$SPARSE_MIN"
   ${COLD_ARGS[@]+"${COLD_ARGS[@]}"}
-  --draft "$DRAFT" --depth "$DEPTH" --decode-graph)
+  --draft "$DRAFT" --depth "$DEPTH"
+  ${GRAPH_ARGS[@]+"${GRAPH_ARGS[@]}"})
 
 if [ "$DRY_RUN" = 1 ]; then
   printf '%s\n' "${SERVE_ARGV[@]}"
   echo "repo=$REPO ckpt=$CKPT log=$LOG cold_ssd=${COLD_SSD:-<disabled>}"
+  echo "arm: $ARM_DESC"
   command -v "$PYTHON" >/dev/null || { echo "python not on PATH: $PYTHON" >&2; exit 2; }
   exit 0
 fi
@@ -120,7 +134,7 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
     exit 2
   fi
   sha=$(cat "$REPO/.synced_commit" 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo unknown)
-  echo "serve_h20: tree $REPO sha ${sha:0:10} boot $n at $(date -Is)" >> "$LOG"
+  echo "serve_h20: tree $REPO sha ${sha:0:10} boot $n $ARM_DESC at $(date -Is)" >> "$LOG"
   started=$SECONDS
   "${SERVE_ARGV[@]}" >> "$LOG" 2>&1 &
   child=$!

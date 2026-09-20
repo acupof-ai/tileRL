@@ -2161,3 +2161,43 @@ def test_bg_publish_close_drains_before_closing_files():
     gate.set()
     cold.close()  # drains + joins; no hang
     assert thread is not None and not thread.is_alive()
+
+
+def test_spill_io_on_publish_thread_is_billed_separately(tmp_path):
+    """ColdSsdFile.ssd_ms keeps step-thread spill IO; IO done on the
+    tilerl-cold-publish thread accrues to ssd_ms_worker so the worker's disk
+    time cannot be drained into a step tick and masquerade as a close stall.
+    Thread identity is the only discriminator, so drive the real write/read on a
+    thread renamed to the worker."""
+    import threading
+
+    from tilerl.kv_tiers import ColdSsdFile
+
+    spec = [("x", (4,), "float32", 16)]
+    f = ColdSsdFile(str(tmp_path / "spill.bin"), spec, step_timing=object())
+    blob = {"x": torch.arange(4, dtype=torch.float32)}
+    try:
+        f.write(("a", 1), blob)
+        assert f.ssd_ms > 0.0 and f.ssd_ms_worker == 0.0
+        step_before = f.ssd_ms
+        got = {}
+
+        def _worker_io():
+            f.write(("b", 2), blob)
+            got["blob"] = f.read(("b", 2), False)["x"]
+            got["name"] = threading.current_thread().name
+
+        th = threading.Thread(target=_worker_io, name=ColdSsdFile.PUBLISH_THREAD)
+        th.start()
+        th.join()
+        assert got["name"] == ColdSsdFile.PUBLISH_THREAD
+        assert torch.equal(got["blob"], blob["x"])
+        # the worker's two IO calls did not touch the step bucket ...
+        assert f.ssd_ms == step_before
+        assert f.ssd_ms_worker > 0.0
+        # the two accumulators reset independently when read.
+        wms = f.ssd_ms_worker
+        f.ssd_ms_worker = 0.0
+        assert f.ssd_ms_worker == 0.0 and wms > 0.0
+    finally:
+        f.close()

@@ -33,22 +33,49 @@ _RELEASE_SEGMENTS = ("release_close_request", "release_cold_forget", "release_bl
 
 #: The per-page publish costs, split by fix (see transfer_to_shared). Each has
 #: a different remedy, which is why one close_request bucket is not enough.
-_PUBLISH_SEGMENTS = ("pub_bounds_d2h", "pub_draft_clone", "pub_cold_transfer",
-                     "pub_frame_d2h", "pub_share_hold")
+_PUBLISH_SEGMENTS = (
+    "pub_bounds_d2h",
+    "pub_draft_clone",
+    "pub_cold_transfer",
+    "pub_frame_d2h",
+    "pub_share_hold",
+)
 
 #: Every segment name the probe may emit. "forward" is an envelope (see its
 #: docstring); graph ticks carry "graph" instead of the eager inner set.
 _SEGMENTS = {
-    "plan", "stats", "forward", "charge", "graph",
-    "sparse_select", "prep", "model", "sparse_finalize", "sample",
-    "draft_blocks", "draft_step", "offers_pub",
-    "release_close_request", "release_cold_forget", "release_blocks",
-    "pub_bounds_d2h", "pub_draft_clone", "pub_cold_transfer", "pub_frame_d2h",
-    "pub_share_hold", "ssd_mmap",
+    "plan",
+    "stats",
+    "forward",
+    "charge",
+    "graph",
+    "sparse_select",
+    "prep",
+    "model",
+    "sparse_finalize",
+    "sample",
+    "draft_blocks",
+    "draft_step",
+    "offers_pub",
+    "release_close_request",
+    "release_cold_forget",
+    "release_blocks",
+    "pub_bounds_d2h",
+    "pub_draft_clone",
+    "pub_cold_transfer",
+    "pub_frame_d2h",
+    "pub_share_hold",
+    "ssd_mmap",
 }
 _INNER = {
-    "sparse_select", "prep", "model", "sparse_finalize", "sample",
-    "draft_blocks", "draft_step", "offers_pub",
+    "sparse_select",
+    "prep",
+    "model",
+    "sparse_finalize",
+    "sample",
+    "draft_blocks",
+    "draft_step",
+    "offers_pub",
 }
 
 _ENGINE_PY = Path(engine_mod.__file__)
@@ -104,7 +131,9 @@ def test_timing_on_segments_reconcile(monkeypatch, capsys):
         last_fwd = rows[-1][1].get("forward", 0.0) * 1000
         assert last_fwd > 0.0
         assert tm.fwd_host_ms > 0.0 and abs(tm.fwd_host_ms - last_fwd) < 5.0, (
-            tm.fwd_host_ms, last_fwd)
+            tm.fwd_host_ms,
+            last_fwd,
+        )
         assert tm.cuda is False and tm.fwd_gpu_ms is None
         assert tm.fwd_path == "eager"
         assert tm.last_why == "cpu"
@@ -225,11 +254,21 @@ def test_ssd_mmap_charges_only_when_the_spill_is_touched(monkeypatch, tmp_path):
 
     def run(budget: int) -> float:
         eng = build_engine(
-            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
-            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
-            kv_cold_bytes=budget, cold_ssd_path=str(tmp_path / "spill.bin"),
-            draft=_draft(cfg, build_random(cfg, seed=11)), spec_depth=1)
+            cfg=cfg,
+            model=build_random(cfg, seed=11),
+            backend=get_backend(),
+            num_blocks=64,
+            num_slots=4,
+            max_batch=1,
+            max_total_tokens=4096,
+            max_num_batched_tokens=512,
+            sparse_k=2,
+            scorer="bounds",
+            kv_cold_bytes=budget,
+            cold_ssd_path=str(tmp_path / "spill.bin"),
+            draft=_draft(cfg, build_random(cfg, seed=11)),
+            spec_depth=1,
+        )
         try:
             tm = eng._step_timing
             prompt = (np.arange(16 * _BT, dtype=np.int64) % 300) + 7
@@ -289,8 +328,7 @@ def test_added_perf_counter_reads_are_guarded():
                 and node.value.func.attr == "perf_counter"
             ):
                 guarded = any(
-                    isinstance(n, ast.If) and "_tm" in ast.unparse(n.test)
-                    for n in self.stack
+                    isinstance(n, ast.If) and "_tm" in ast.unparse(n.test) for n in self.stack
                 )
                 if not guarded:
                     self.bad.append(node.lineno)
@@ -310,8 +348,7 @@ def test_hollow_tick_probe_is_sync_free_and_uses_async_reads():
     and stay green with the real call deleted."""
     text = _ENGINE_PY.read_text()
     tree = ast.parse(text)
-    timer = next(n for n in tree.body if isinstance(n, ast.ClassDef)
-                 and n.name == "_StepTiming")
+    timer = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_StepTiming")
 
     calls: set[str] = set()
 
@@ -359,10 +396,81 @@ def test_hollow_tick_classifier_decisions():
     assert cls(200, num_sync_all_streams=2) == "alloc_reclaim"
     assert cls(900, **{"segment.all.allocated": 1}) == "dev_malloc"
     assert cls(900, num_device_alloc=1) == "dev_malloc"
-    assert cls(None) == "unknown"                       # end event still queued
-    assert cls(900, cur_finalize=0.7) == "finalize"     # >half the span
-    assert cls(850) == "gpu_drain"                      # >=0.85 host
-    assert cls(499) == "sync_wait"                     # <0.5 host
-    assert cls(500) == "host"                          # ==0.5 host (strict <)
+    assert cls(None) == "unknown"  # end event still queued
+    assert cls(900, cur_finalize=0.7) == "finalize"  # >half the span
+    assert cls(850) == "gpu_drain"  # >=0.85 host
+    assert cls(499) == "sync_wait"  # <0.5 host
+    assert cls(500) == "host"  # ==0.5 host (strict <)
     t.cuda = False
     assert t._classify(1000.0, 900, zero) == "cpu"
+
+
+def test_close_busyidle_bracket_is_off_by_default_and_pending_on_cpu():
+    """TILERL_CLOSE_BUSYIDLE is opt-in. Off: bracket methods no-op and the field
+    string is empty. On (CPU wheel, no cuda): the bracket opens/closes with a real
+    wall and resolves to close_dev=pending (the end event can never be queried)
+    rather than fabricating a device-busy number."""
+    from tilerl.engine import _StepTiming
+
+    off = _StepTiming(None)
+    assert off.close_busyidle is False
+    off.close_bracket_start()
+    off.close_bracket_end()
+    assert off._close_busyidle_fields() == ""
+
+    import os
+
+    os.environ["TILERL_CLOSE_BUSYIDLE"] = "1"
+    try:
+        on = _StepTiming(None)
+        assert on.close_busyidle is True
+        on.cuda = False
+        on.close_bracket_start()
+        on.close_bracket_end()
+        assert on._cl_wall_ms >= 0.0
+        f = on._close_busyidle_fields()
+        assert "close_wall=" in f and "close_dev=pending" in f and "close_dev=0" not in f
+    finally:
+        del os.environ["TILERL_CLOSE_BUSYIDLE"]
+
+
+def test_close_busyidle_splits_host_and_device_with_a_fake_event_pair():
+    """With fake non-blocking events, device=min(event_span, wall) and
+    host=wall-device. elapsed_time must be read via the events (the busy share),
+    never a blocking call."""
+    from tilerl.engine import _StepTiming
+
+    class _Ev:
+        def __init__(self, ms):
+            self._ms = ms
+            self.recorded = False
+
+        def record(self):
+            self.recorded = True
+
+        def query(self):
+            return True
+
+        def elapsed_time(self, other):
+            # CUDA semantics: self=start, other=end -> other.ms - self.ms.
+            return other._ms - self._ms
+
+    import os
+
+    os.environ["TILERL_CLOSE_BUSYIDLE"] = "1"
+    try:
+        t = _StepTiming(None)
+        t.cuda = True
+        t._cl_ev_s, t._cl_ev_e = _Ev(0.0), _Ev(200.0)  # 200 ms of stream work
+        t.close_bracket_start()
+        # force a known wall independent of scheduling:
+        t._cl_t0 = 0.0
+        import time as _t
+
+        t._cl_t0 = _t.perf_counter() - 0.5  # 500 ms host-anchored bracket
+        t.close_bracket_end()
+        f = t._close_busyidle_fields()
+        assert "close_dev=200ms" in f, f
+        assert "close_host=300ms" in f, f
+    finally:
+        del os.environ["TILERL_CLOSE_BUSYIDLE"]

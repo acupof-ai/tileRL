@@ -21,6 +21,14 @@ Design, carried over from ab_draft_depth.py:
   is think-off with no template knob; spec_depth=1.
 - COLD FILL is timed separately from decode (submit -> phase DECODE wall), and
   only the post-prefill decode window feeds draft ms / acceptance / tok-s.
+- PER-PROMPT SPREAD, because a cross-prompt median hides the variance a verdict
+  rests on. Each prompt's own decode ticks are kept individually, so the table
+  carries per-prompt p10/p50/p90/IQR and a cross-prompt distribution of the
+  per-prompt tok/s, not one median over prompts. The tick set is the serve-line
+  steady set (``dec=1 & sparse=1 & model>0 & sample>0``): idle/graph ticks and
+  the request's own closing sample tick are excluded, the latter single-listed
+  with its model/sample split so a misclassification is visible rather than
+  silent. ``TILERL_STEP_TIMING`` is armed in-process to read those segments.
 - Self-proof: after each step we read ``draft.read_window_stats()``. W=0 must
   never engage; W>0 at 9k+ must engage with a first-page >0 and a windowed
   seq_len that tracks W. The script REFUSES an arm whose self-proof contradicts
@@ -33,6 +41,8 @@ Design, carried over from ab_draft_depth.py:
 
 --dry-run resolves and prints the plan (arms, lengths, prompts, engine sizing)
 without building a model, so the argparse/plan path is exercisable on a CPU box.
+--self-check runs the hermetic spread/steady-set check on synthetic ticks (no
+card); tests/test_wsweep_prompt_spread.py calls it and controls it.
 """
 
 from __future__ import annotations
@@ -60,6 +70,61 @@ def _sync() -> None:
         torch.cuda.synchronize()
 
 
+# --- per-tick reading --------------------------------------------------------
+#
+# The steady set is the serve line's own reading discipline: dec=1 & sparse=1 &
+# model>0 & sample>0, path != graph. It drops idle/untimed ticks AND a request's
+# closing tick, whose sample segment takes over the whole tick; that one is
+# single-listed rather than dropped, because dropping it silently would flatter
+# the steady band it is being compared against.
+
+
+def _pct(xs, q: float) -> float:
+    """Nearest-rank percentile, the convention probe_headroom_coldtail reads the
+    same serve logs with, so the two instruments agree on a quantile."""
+    if not xs:
+        return 0.0
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(q * (len(xs) - 1)))]
+
+
+def spread(xs) -> dict:
+    """p10/p50/p90 + IQR over one sample. IQR is p75-p25 on the same
+    nearest-rank convention, so a 4-tick prompt still has a defined band
+    instead of a null."""
+    return {
+        "n": len(xs),
+        "p10": _pct(xs, 0.10),
+        "p50": _pct(xs, 0.50),
+        "p90": _pct(xs, 0.90),
+        "iqr": _pct(xs, 0.75) - _pct(xs, 0.25),
+    }
+
+
+def classify_tick(tm, want_sparse: bool) -> dict | None:
+    """One decode tick's segments, or None when it is not a steady serve tick.
+
+    ``tm`` is the engine's ``_StepTiming`` after ``step()`` returned: ``cur`` is
+    cleared in ``tick_start`` and re-read in ``tick_end``, so it still describes
+    the tick that just ran, with no engine hook.
+    """
+    if tm is None or not tm.phase_dec:
+        return None
+    if tm.fwd_path == "graph" or tm.fwd_sparse != want_sparse:
+        return None
+    model_ms = tm.cur.get("model", 0.0) * 1000.0
+    sample_ms = tm.cur.get("sample", 0.0) * 1000.0
+    if model_ms <= 0 or sample_ms <= 0:
+        return None
+    total_ms = tm.last_total * 1000.0
+    return {
+        "total_ms": total_ms,
+        "model_ms": model_ms,
+        "sample_ms": sample_ms,
+        "closing": sample_ms > 0.5 * total_ms,
+    }
+
+
 def _sha(path: str) -> str:
     import hashlib
 
@@ -73,7 +138,7 @@ def _engine_sha() -> str:
     return "no .synced_commit"
 
 
-def measure_one(eng, draft, prompt_ids, out_tokens):
+def measure_one(eng, draft, prompt_ids, out_tokens, want_sparse):
     """Submit one prompt; return (cold_fill_s, decode stats).
 
     Cold fill = submit -> the request is in DECODE. The decode window then runs
@@ -81,7 +146,10 @@ def measure_one(eng, draft, prompt_ids, out_tokens):
       draft_ms   per-draft-forward CUDA-event ms (only with the timing seam on),
       tick_ms    wall per decode forward (submission-to-submission, no per-tick sync),
       self-proof distinct engaged (sq, first, windowed_seq_len) shapes,
-      spec accepted/drafted deltas and generated-token count.
+      spec accepted/drafted deltas and generated-token count,
+      per-tick segments for the steady-set spread (``want_sparse`` is the arm's
+      own ``--sparse-k > 0``, so the filter asserts the engine ran what the arm
+      asked it to run rather than assuming it).
     """
     from tilerl.engine import _PHASE_DECODE, SamplingParams
 
@@ -113,6 +181,7 @@ def measure_one(eng, draft, prompt_ids, out_tokens):
     s0 = eng.stats()
     t0 = time.perf_counter()
     tick_ms, draft_ms, shapes = [], [], set()
+    steady_ms, closing = [], []
     done = {}
     while rid not in done:
         b0, k0 = eng.stats(), time.perf_counter()
@@ -123,9 +192,12 @@ def measure_one(eng, draft, prompt_ids, out_tokens):
             for i in range(len(st["sq"])):
                 shapes.add((tuple(st["sq"]), tuple(st["first"]), tuple(st["seq_len"])))
         nf = eng.stats()["decode_forwards"] - b0["decode_forwards"]
+        tk = classify_tick(eng._step_timing, want_sparse=want_sparse)
         if nf:
             tick_ms.append((time.perf_counter() - k0) * 1000 / nf)
             draft_ms.extend(ms for _, ms, _ in list(eng._draft_ms or ())[d0:])
+            if tk is not None:
+                (closing if tk["closing"] else steady_ms).append(tk)
         done.update({k: v for k, v in eng.poll().items() if k == rid})
     _sync()
     decode_s = time.perf_counter() - t0
@@ -135,9 +207,17 @@ def measure_one(eng, draft, prompt_ids, out_tokens):
     accepted = s1["spec_accepted"] - s0["spec_accepted"]
     n_gen = s1["tokens_generated"] - s0["tokens_generated"]
     n_fwd = s1["decode_forwards"] - s0["decode_forwards"]
+    # Per-prompt steady tick set -> this prompt's own tok/s band. tok/s is
+    # tokens-per-forward over the steady forward's own wall, so it is per-prompt
+    # by construction and does not inherit the whole-request decode span (which
+    # contains the closing tick the steady set excludes).
+    steady_tot = [t["total_ms"] for t in steady_ms]
+    per_fwd_tok = n_gen / n_fwd if n_fwd else 0.0
+    prompt_tok_s = [per_fwd_tok * 1000.0 / ms for ms in steady_tot if ms > 0]
     return cold_fill_s, {
         "n_gen": n_gen,
         "n_fwd": n_fwd,
+        "prompt_len": len(prompt_ids),
         "decode_s": decode_s,
         "tok_s": n_gen / decode_s if decode_s > 0 else 0.0,
         "tick_ms_med": statistics.median(tick_ms) if tick_ms else 0.0,
@@ -147,11 +227,29 @@ def measure_one(eng, draft, prompt_ids, out_tokens):
         "accept_rate": accepted / drafted if drafted else 0.0,
         "accept_len": n_gen / n_fwd if n_fwd else 0.0,
         "shapes": sorted(shapes),
+        "steady_ticks": len(steady_ms),
+        "closing_ticks": len(closing),
+        "tick_spread": spread(steady_tot),
+        "tok_s_spread": spread(prompt_tok_s),
+        # Closing ticks are reported, never folded into the band above. A
+        # classifying miss here (sample not dominant) would otherwise be
+        # invisible; the model/sample pair makes it readable.
+        "closing_sample": [
+            {"total_ms": round(t["total_ms"], 1), "model_ms": round(t["model_ms"], 1),
+             "sample_ms": round(t["sample_ms"], 1)}
+            for t in closing[:3]
+        ],
     }
 
 
 def aggregate(w, cold, dec, expect_engage):
-    """Median across prompts for one (length, W) arm, plus the self-proof verdict."""
+    """Cross-prompt summary for one (length, W) arm, plus the self-proof verdict.
+
+    Reports the per-prompt tok/s distribution, not just a median over prompts:
+    each prompt contributes its own steady-band median, and the arm's spread is
+    taken over those per-prompt values. A prompt whose steady set is empty is
+    counted and named rather than averaged in as a zero.
+    """
     if not dec:
         return None
     shapes = set()
@@ -166,6 +264,25 @@ def aggregate(w, cold, dec, expect_engage):
         proof = "FAIL:W0-engaged"
     else:
         proof = "ok"
+    per_prompt = [d["tok_s_spread"]["p50"] for d in dec if d["steady_ticks"]]
+    no_steady = len(dec) - len(per_prompt)
+    band = spread(per_prompt)
+    # The per-prompt rows themselves, not only their summary: a verdict that
+    # rests on the within-arm distribution has to be able to READ that
+    # distribution, and a later run has to be comparable prompt by prompt.
+    per_prompt_rows = [
+        {
+            "i": i,
+            "prompt_len": d.get("prompt_len", 0),
+            "steady_ticks": d["steady_ticks"],
+            "closing_ticks": d["closing_ticks"],
+            "tok_s": d["tok_s_spread"],
+            "tick_ms": d["tick_spread"],
+            "accept_rate": d["accept_rate"],
+            "accept_len": d["accept_len"],
+        }
+        for i, d in enumerate(dec)
+    ]
     return {
         "W": w,
         "cold_fill_s_med": statistics.median(cold),
@@ -173,6 +290,21 @@ def aggregate(w, cold, dec, expect_engage):
         "accept_rate": statistics.mean(d["accept_rate"] for d in dec),
         "accept_len": statistics.mean(d["accept_len"] for d in dec),
         "tok_s_med": statistics.median(d["tok_s"] for d in dec),
+        # The headline the verdict needs: how far apart the PROMPTS are, not how
+        # far apart the ticks within one prompt are. `prompt_tok_s` is the
+        # summary; `per_prompt` below is the evidence behind it.
+        "prompt_tok_s": band,
+        "prompt_tok_s_min": min(per_prompt) if per_prompt else 0.0,
+        "prompt_tok_s_max": max(per_prompt) if per_prompt else 0.0,
+        "prompt_tok_s_iqr_frac": band["iqr"] / band["p50"] if band["p50"] else 0.0,
+        "per_prompt": per_prompt_rows,
+        "steady_ticks_total": sum(d["steady_ticks"] for d in dec),
+        "steady_ticks_per_prompt_med": (
+            statistics.median([d["steady_ticks"] for d in dec if d["steady_ticks"]])
+            if per_prompt else 0
+        ),
+        "closing_ticks_total": sum(d["closing_ticks"] for d in dec),
+        "prompts_without_steady_ticks": no_steady,
         "proof": proof,
         "n_prompts": len(dec),
         "shapes_sample": [list(map(list, s)) for s in sorted(shapes)[:3]],
@@ -188,6 +320,113 @@ def _write_json(path, table) -> None:
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(json.dumps(table, indent=2))
     os.replace(tmp, p)
+
+
+def self_check() -> int:
+    """Hermetic: the spread/quantile logic and the steady-set filter, on
+    synthetic ticks. Imported and called by tests/test_wsweep_prompt_spread.py;
+    the module is not in the CI hermetic set (it names a backend), so this is the
+    only thing that runs it without a card."""
+    import types
+
+    def tm(dec=1, path="eager", sparse=True, model=0.165, sample=0.001, total=0.180):
+        return types.SimpleNamespace(
+            phase_dec=dec, fwd_path=path, fwd_sparse=sparse,
+            cur={"model": model, "sample": sample}, last_total=total,
+        )
+
+    # Quantile convention: nearest-rank, so a 4-sample prompt still has a band.
+    assert _pct([100, 200, 300, 400], 0.5) == 200
+    assert _pct([100, 200, 300, 400], 0.25) == 100
+    assert _pct([100, 200, 300, 400], 0.75) == 300
+    assert _pct([], 0.5) == 0.0
+    s = spread([100, 200, 300, 400])
+    # nearest-rank on 4 samples: p90 lands on index min(3, int(0.9*3)) = 2.
+    assert s == {"n": 4, "p10": 100, "p50": 200, "p90": 300, "iqr": 200}, s
+    # One sample is a degenerate band, not a crash and not an invented spread.
+    assert spread([250]) == {"n": 1, "p10": 250, "p50": 250, "p90": 250, "iqr": 0}
+
+    # The steady set: exactly the serve-line filter (dec=1 & sparse=1 &
+    # model>0 & sample>0, path != graph).
+    assert classify_tick(None, want_sparse=True) is None
+    assert classify_tick(tm(dec=0), want_sparse=True) is None          # prefill/idle
+    assert classify_tick(tm(path="graph"), want_sparse=True) is None   # captured tick
+    assert classify_tick(tm(sparse=False), want_sparse=True) is None   # dense arm tick
+    assert classify_tick(tm(sparse=True), want_sparse=False) is None
+    assert classify_tick(tm(sample=0.0), want_sparse=True) is None     # idle: no sample
+    assert classify_tick(tm(model=0.0), want_sparse=True) is None      # idle: no model
+    ok = classify_tick(tm(), want_sparse=True)
+    assert ok is not None and not ok["closing"]
+    # A request's closing tick: model steady, sample owns the tick. It must be
+    # flagged, because folding it into the band would drag the p90 down.
+    closing = classify_tick(tm(model=0.165, sample=5.440, total=5.700), want_sparse=True)
+    assert closing is not None and closing["closing"]
+
+    # The statistic the verdict needs is the PER-PROMPT median, and the toy data
+    # below is built so a mean-based substitute collapses to flat while the
+    # median does not. Two prompts are tight (ticks all 100 ms); two have three
+    # 10 ms ticks plus one 370 ms outlier: their MEAN tick is also 100 ms but
+    # their MEDIAN tick stays 10 ms (median tok/s 160 vs the tight prompts' 16).
+    # A per-prompt-median band separates the two groups; anything computed off
+    # the mean reports all four prompts as identical. Nearest-rank IQR needs four
+    # samples, hence four prompts.
+    def dec_row(ticks_ms, n_gen=32, n_fwd=20):
+        per_fwd_tok = n_gen / n_fwd
+        return {
+            "draft_ms_med": 11.0, "accept_rate": 0.73, "accept_len": 1.72,
+            "tok_s": per_fwd_tok * 1000 / (sum(ticks_ms) / len(ticks_ms)),
+            "shapes": [(tuple([8]), tuple([2048]), tuple([2048]))],
+            "steady_ticks": len(ticks_ms), "closing_ticks": 1,
+            "tick_spread": spread(ticks_ms),
+            "tok_s_spread": spread([per_fwd_tok * 1000 / m for m in ticks_ms]),
+        }
+
+    tight = [100, 100, 100, 100]      # median 100 ms, mean 100 ms
+    spiky = [10, 10, 10, 370]         # median 10 ms,  mean 100 ms
+    same_mean = aggregate(
+        2048, [3.0], [dec_row(tight), dec_row(tight), dec_row(spiky), dec_row(spiky)],
+        expect_engage=True,
+    )
+    all_tight = aggregate(2048, [3.0], [dec_row(tight)] * 4, expect_engage=True)
+
+    # Four prompts, identical MEAN tick in both arms -> the mean-based view can
+    # never separate them, which is what makes the assertion below load-bearing.
+    means = {round(dec_row(t)["tok_s"], 9) for t in (tight, spiky)}
+    assert len(means) == 1, means
+    assert all_tight["prompt_tok_s"]["iqr"] == 0.0, all_tight["prompt_tok_s"]
+    assert same_mean["prompt_tok_s"]["iqr"] > 0.0, same_mean["prompt_tok_s"]
+    assert same_mean["prompt_tok_s_max"] > same_mean["prompt_tok_s_min"]
+    assert same_mean["prompt_tok_s_iqr_frac"] > 0.1, same_mean["prompt_tok_s_iqr_frac"]
+    # Within a prompt the ticks are tight in the tight prompts: the separation
+    # above is BETWEEN prompts, not a within-prompt tail bleeding through.
+    assert spread(tight)["iqr"] == 0.0
+    # A prompt with no steady tick is counted, never averaged in as a zero.
+    none_steady = dec_row(tight)
+    none_steady["steady_ticks"] = 0
+    none_steady["tok_s_spread"] = spread([])
+    one_short = aggregate(2048, [3.0], [dec_row(tight), none_steady], expect_engage=True)
+    assert one_short["prompts_without_steady_ticks"] == 1, one_short
+    assert one_short["prompt_tok_s_min"] > 0
+    # The rendered table is part of the deliverable, so a key the printer reads
+    # but the row dict does not define must fail here, not on the card after a
+    # multi-hour sweep. Captured, because the printers write to stdout.
+    import contextlib
+    import io
+
+    for r in (same_mean, all_tight, one_short):
+        r["draft_ms_ratio_vs_W0"] = 1.0
+        r["tok_s_ratio_vs_W0"] = 1.0
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _print_length(32768, {2048: same_mean, 0: one_short}, (0, 2048))
+    out = buf.getvalue()
+    assert "per-prompt rows" in out and "prompt_len" in out, out
+    # Every per-prompt row is rendered, and the no-steady prompt in `one_short`
+    # renders as '-' on the band columns rather than as a zero.
+    assert out.count(" 2048 ") >= 4, out
+    assert out.count("      - ") >= 4, out
+    print("probe_draft_window_sweep self-check ok")
+    return 0
 
 
 def plan_corpus(stream, lengths, want):
@@ -218,6 +457,12 @@ def run(args) -> list[dict]:
     os.environ.setdefault("TILERL_TARGET", "cuda")
     os.environ.setdefault("TILERL_QWEN38_SOURCE", args.source)
     build.QWEN38_SOURCE = args.source
+    # The steady-set filter reads the engine's per-tick segments, which exist
+    # only when the timing seam is on. Armed before the build (Engine.__init__
+    # reads the env); SLOW_MS=0 so EVERY tick is recorded, not just the slow
+    # tail -- a >threshold-only log is not a distribution.
+    os.environ["TILERL_STEP_TIMING"] = "1"
+    os.environ["TILERL_STEP_TIMING_SLOW_MS"] = "0"
 
     # Sample-size gate BEFORE building the 27B: the corpus read needs only the
     # tokenizer, so a half-present split fails fast instead of after a long load.
@@ -294,7 +539,7 @@ def run(args) -> list[dict]:
                 draft.attn_window_tokens = w
                 cold, dec = [], []
                 for p in prompts:
-                    cf, d = measure_one(eng, draft, p, args.out_tokens)
+                    cf, d = measure_one(eng, draft, p, args.out_tokens, args.sparse_k > 0)
                     cold.append(cf)
                     if d is not None:
                         dec.append(d)
@@ -345,6 +590,56 @@ def _print_length(length, per_arm, windows):
             f"{r['tok_s_ratio_vs_W0']:8.3f}  {r['proof']}  "
             f"n={r['n_prompts']} {r['shapes_sample']}"
         )
+    # Per-prompt spread: the arm's tok/s band ACROSS PROMPTS, which the median
+    # above cannot show. An arm whose prompts disagree by more than the between-W
+    # gap being decided on is not a decision this table can carry.
+    print(
+        f"# {'W':>5} {'prompt tok/s':>28}  {'p10':>7} {'p50':>7} {'p90':>7} "
+        f"{'IQR/p50':>8} {'min':>7} {'max':>7}"
+    )
+    for w in windows:
+        r = per_arm.get(w)
+        if r is None:
+            continue
+        s = r["prompt_tok_s"]
+        print(
+            f"{w:>5} {'per-prompt band':>28}  {s['p10']:7.2f} {s['p50']:7.2f} "
+            f"{s['p90']:7.2f} {r['prompt_tok_s_iqr_frac']:8.3f} "
+            f"{r['prompt_tok_s_min']:7.2f} {r['prompt_tok_s_max']:7.2f}"
+            f"   ticks steady={r['steady_ticks_total']}"
+            f" closing={r['closing_ticks_total']}"
+            + (
+                f"  NO-STEADY-TICKS on {r['prompts_without_steady_ticks']} prompt(s)"
+                if r["prompts_without_steady_ticks"]
+                else ""
+            )
+        )
+    # The evidence behind the band above, one row per prompt: a verdict that
+    # rests on the within-arm distribution must be readable prompt by prompt.
+    print(f"# per-prompt rows (ctx={length}); '-' = no steady tick for that prompt")
+    print(
+        f"# {'W':>5} {'i':>3} {'prompt_len':>10} {'steady':>7} {'close':>6} "
+        f"{'p10':>7} {'p50':>7} {'p90':>7} {'IQR':>7} {'accept':>7} {'acc_len':>8}"
+    )
+    for w in windows:
+        r = per_arm.get(w)
+        if r is None:
+            continue
+        for row in r["per_prompt"]:
+            s, t = row["tok_s"], row["tick_ms"]
+            print(
+                f"{w:>5} {row['i']:>3} {row['prompt_len']:>10} "
+                f"{row['steady_ticks']:>7} {row['closing_ticks']:>6} "
+                + (
+                    f"{s['p10']:7.2f} {s['p50']:7.2f} {s['p90']:7.2f} "
+                    f"{s['iqr']:7.2f} {row['accept_rate']:7.3f} "
+                    f"{row['accept_len']:8.3f}"
+                    if row["steady_ticks"]
+                    else f"{'-':>7} {'-':>7} {'-':>7} {'-':>7} "
+                         f"{row['accept_rate']:7.3f} {row['accept_len']:8.3f}"
+                )
+                + (f"   tick p50={t['p50']:.0f}ms" if row["steady_ticks"] else "")
+            )
 
 
 def main() -> None:
@@ -414,9 +709,16 @@ def main() -> None:
         "has fewer than this many disjoint prompts, naming the real n_eff (0 = off).",
     )
     ap.add_argument(
+        "--self-check",
+        action="store_true",
+        help="run the hermetic spread/steady-set self-check and exit (no card)",
+    )
+    ap.add_argument(
         "--dry-run", action="store_true", help="resolve/validate the plan and exit; no model build"
     )
     args = ap.parse_args()
+    if args.self_check:
+        return self_check()
     args.lengths = tuple(int(x) for x in args.lengths.split(","))
     args.windows = tuple(int(x) for x in args.windows.split(","))
 
@@ -476,6 +778,12 @@ def main() -> None:
         "atomically after every length (full array, post-processing reads it directly)"
     )
     print(
+        "[dry-run] TILERL_STEP_TIMING=1 SLOW_MS=0 armed in-process: every tick is "
+        f"recorded so the steady set (dec=1 & sparse={int(bool(args.sparse_k))} & "
+        "model>0 & sample>0, path != graph) is a distribution, not a slow tail; "
+        "the closing tick is counted separately, never folded into the band."
+    )
+    print(
         "[dry-run] TODO(if requested): a W-only vs +page0-anchor arm needs a "
         "page0-attn switch the engine does not currently expose; add one before "
         "that comparison, do not fake it here."
@@ -488,4 +796,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

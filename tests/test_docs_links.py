@@ -27,6 +27,7 @@ in a throwaway clone of origin/main: the git-based version reports the 4 dead li
 sees, including the one the filesystem version could not.
 """
 
+import datetime
 import os
 import re
 import subprocess
@@ -48,6 +49,60 @@ _BARE = re.compile(r"`(20\d\d-\d\d-\d\d-[\w.-]+\.md)`")
 #: undated name: requiring `20\d\d` in _TICK also dropped three real hits on
 #: `TEMPLATE-bench.md`, which the gate should keep checking.
 _PLACEHOLDER = re.compile(r"\bYYYY-MM-DD\b")
+
+#: A size claim whose unit and divisor disagree on ONE line: a `GiB` label next to
+#: a decimal divisor (1e9 / 1000**3), or a `GB` label next to a binary one
+#: (2**30 / 1024**3 / <<30). #742 and #744 both shipped this shape.
+#:
+#: Deliberately one line, not one file: a file may legitimately hold disk GB and
+#: VRAM GiB side by side (measured on main: hundreds do), so a whole-file rule
+#: would be a false-positive machine. The narrow rule has zero hits on main today,
+#: which is the point -- it exists to catch the next mislabel, not to clean up.
+_GIB_LABEL = re.compile(r"\bGiB\b")
+_GB_LABEL = re.compile(r"\d\s?GB\b")
+_DECIMAL_DIVISOR = re.compile(r"1e9|10\s*\*\*\s*9|1000\s*\*\*\s*3")
+_BINARY_DIVISOR = re.compile(r"2\s*\*\*\s*30|1024\s*\*\*\s*3|<<\s*30")
+
+
+def _unit_divisor_conflicts(text: str) -> list[tuple[int, str]]:
+    """(lineno, line) where a GiB/GB label contradicts the divisor on that line."""
+    bad = []
+    for i, ln in enumerate(text.splitlines(), 1):
+        wrong = (
+            (_GIB_LABEL.search(ln) is not None and _DECIMAL_DIVISOR.search(ln) is not None)
+            or (_GB_LABEL.search(ln) is not None and _BINARY_DIVISOR.search(ln) is not None)
+        )
+        if wrong:
+            bad.append((i, ln.strip()))
+    return bad
+
+
+def test_no_size_claim_uses_the_wrong_divisor_for_its_unit():
+    """A `GiB` value divided by 1e9 (or a `GB` value by 2**30) is off by 7.4%.
+
+    Static and narrow on purpose: same line only, so a document that mentions
+    disk GB and VRAM GiB separately is untouched.
+    """
+    offenders = []
+    for path in _tracked():
+        if not path.endswith(".md"):
+            continue
+        bad = _unit_divisor_conflicts((ROOT / path).read_text(errors="ignore"))
+        offenders.extend(f"{path}:{n}: {ln}" for n, ln in bad)
+    assert not offenders, (
+        "a size claim's unit contradicts the divisor on the same line "
+        f"(GiB wants 2**30, GB wants 1e9): {offenders}"
+    )
+
+
+def test_the_unit_divisor_rule_fires_on_the_shape_it_exists_for():
+    """Red control, in both directions, plus the correct form passing."""
+    assert _unit_divisor_conflicts("held 12.8 GiB, from nib_tot/1e9")
+    assert _unit_divisor_conflicts("held 12.8 GB, from nib_tot/2**30")
+    assert not _unit_divisor_conflicts("held 12.8 GiB, from nib_tot/2**30")
+    assert not _unit_divisor_conflicts("held 12.8 GB, from nib_tot/1e9")
+    # The whole-file mixing this rule must NOT flag.
+    assert not _unit_divisor_conflicts("disk 500 GB\nvram 24 GiB")
 
 #: Pod tarballs have no .git — six tests here shell out to git and would fail with
 #: exit 128. Skip them there rather than fail; CI and dev machines always have .git.
@@ -529,6 +584,34 @@ def test_experience_counts_in_prose_match_the_tree():
     assert m, "docs/README.md lost its '<n> dated entries' line"
     assert int(m.group(1)) == total, (
         f"docs/README.md says {m.group(1)} dated entries, tree has {total}")
+
+
+def test_no_entry_is_dated_in_the_future():
+    """An entry named for a day that has not happened is a typo, not a measurement.
+
+    Only the filename is checked, against today in UTC. A name-dated entry that
+    was committed a day earlier is NOT flagged: that is an ordinary timezone or
+    cross-midnight artifact (one exists on main: 2026-09-14 named, committed
+    2026-09-13), and rewriting history over it would be worse than the noise.
+    """
+    today = datetime.datetime.now(datetime.UTC).date()
+    ahead = []
+    for path in _tracked():
+        m = re.search(r"/(?:wins|errors)/(\d{4}-\d{2}-\d{2})-", path)
+        if not m:
+            continue
+        if datetime.date.fromisoformat(m.group(1)) > today:
+            ahead.append(path)
+    assert not ahead, f"entries dated after today ({today}): {sorted(ahead)}"
+
+
+def test_the_future_date_rule_is_one_sided():
+    """The rule must not fire on the cross-midnight case, only on the future."""
+    today = datetime.datetime.now(datetime.UTC).date()
+    yesterday = (today - datetime.timedelta(days=1)).isoformat()
+    tomorrow = (today + datetime.timedelta(days=1)).isoformat()
+    assert not (datetime.date.fromisoformat(yesterday) > today)
+    assert datetime.date.fromisoformat(tomorrow) > today
 
 
 def test_root_readme_open_defect_count_matches_open_md():

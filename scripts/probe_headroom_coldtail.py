@@ -68,11 +68,35 @@ MODEL = "qwen38-27b"
 HOT_BLOCKS_PER_SLOT = 553
 
 _WORDS = [
-    "paged", "cache", "scheduler", "latency", "block", "allocation", "prefix",
-    "sharing", "cold", "tier", "migration", "attention", "kernel", "quantized",
-    "weight", "draft", "head", "graph", "capture", "ledger", "capacity",
-    "planning", "eviction", "promote", "demote", "resident", "window",
-    "selection", "decode",
+    "paged",
+    "cache",
+    "scheduler",
+    "latency",
+    "block",
+    "allocation",
+    "prefix",
+    "sharing",
+    "cold",
+    "tier",
+    "migration",
+    "attention",
+    "kernel",
+    "quantized",
+    "weight",
+    "draft",
+    "head",
+    "graph",
+    "capture",
+    "ledger",
+    "capacity",
+    "planning",
+    "eviction",
+    "promote",
+    "demote",
+    "resident",
+    "window",
+    "selection",
+    "decode",
 ]
 
 
@@ -92,8 +116,8 @@ def prompt_32k(n_tokens: int, seed: int) -> str:
 def _post(url: str, body: dict, timeout: float, stream: bool) -> dict:
     body = {**body, "stream": stream}
     req = urllib.request.Request(
-        url, data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"})
+        url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
+    )
     if not stream:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
@@ -116,14 +140,17 @@ def _post(url: str, body: dict, timeout: float, stream: bool) -> dict:
                     saw = True
                 t_last = now
                 n += 1
-    return {"chunks": n, "wall_s": t_last - t0,
-            "decode_s": (t_last - t_first) if saw else 0.0}
+    return {"chunks": n, "wall_s": t_last - t0, "decode_s": (t_last - t_first) if saw else 0.0}
 
 
 def _body(prompt: str, gen: int) -> dict:
-    return {"model": MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.0, "max_tokens": gen, "enable_thinking": False}
+    return {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "max_tokens": gen,
+        "enable_thinking": False,
+    }
 
 
 def health(url: str) -> dict:
@@ -154,7 +181,10 @@ def nvidia_free_mib() -> int | None:
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         return int(out.stdout.strip().splitlines()[0])
     except Exception:
         return None
@@ -184,13 +214,19 @@ def parse_tick(line: str) -> dict | None:
     offers = int(mo.group(1)) if mo else 0
     mf = _FREE.search(rest)
     hollow = offers == 0 and total >= 1100 and segs.get("model", 0) <= int(0.6 * total)
-    return {"n": n, "total_ms": total, "dec": dec, "pre": pre,
-            "is_decode": dec > 0,
-            "offers_pages": offers,
-            "finalize_ms": segs.get("sparse_finalize", 0),
-            "model_ms": segs.get("model", 0),
-            "free_mib": int(mf.group(1)) if mf else None,
-            "type1": dec > 0 and offers > 0, "type2": dec > 0 and hollow}
+    return {
+        "n": n,
+        "total_ms": total,
+        "dec": dec,
+        "pre": pre,
+        "is_decode": dec > 0,
+        "offers_pages": offers,
+        "finalize_ms": segs.get("sparse_finalize", 0),
+        "model_ms": segs.get("model", 0),
+        "free_mib": int(mf.group(1)) if mf else None,
+        "type1": dec > 0 and offers > 0,
+        "type2": dec > 0 and hollow,
+    }
 
 
 def observed_draft_window(log_path: str, byte_offset: int = 0) -> int | None:
@@ -246,10 +282,12 @@ def parse_log(log_path: str, byte_offset: int = 0) -> dict:
         "ticks_in_window": len(all_ticks),
         "decode_ticks": len(ticks),
         "dropped_prefill_ticks": len(all_ticks) - len(ticks),
-        "p50_ms": pct(totals, 0.50), "p90_ms": pct(totals, 0.90),
+        "p50_ms": pct(totals, 0.50),
+        "p90_ms": pct(totals, 0.90),
         "max_ms": max(totals, default=0),
         "frac_over_300": round(len([x for x in totals if x > 300]) / len(totals), 3)
-        if totals else 0.0,
+        if totals
+        else 0.0,
         "type1_finalize_ticks": len(t1),
         "type1_finalize_ms_median": pct(fin, 0.5),
         "type1_finalize_ms_max": max(fin, default=0),
@@ -261,6 +299,7 @@ def parse_log(log_path: str, byte_offset: int = 0) -> dict:
 
 
 # --- the one-command arm -----------------------------------------------------
+
 
 def _cold_tier_gb(h: dict) -> tuple[float, float, float, float, float]:
     # Cold occupancy across BOTH tiers: private/shared pages in pinned host RAM
@@ -280,14 +319,19 @@ def _fill_cold_tier(a, rep: int) -> tuple[dict, list[int]]:
     """Drive fill_n independent 32k sparse prompts; return (health, prompt tokens)."""
     rows = []
     for i in range(a.fill_n):
-        out = _post(a.url + "/v1/chat/completions",
-                    _body(prompt_32k(a.prompt_tokens, rep * 1000 + i + 1), a.fill_gen),
-                    a.timeout, stream=False)
+        out = _post(
+            a.url + "/v1/chat/completions",
+            _body(prompt_32k(a.prompt_tokens, rep * 1000 + i + 1), a.fill_gen),
+            a.timeout,
+            stream=False,
+        )
         pt = out.get("usage", {}).get("prompt_tokens", 0)
         rows.append(pt)
         if pt < a.prompt_tokens * 0.9:
-            print(f"WARN rep{rep} fill {i}: only {pt} prompt tokens "
-                  f"(want ~{a.prompt_tokens})", flush=True)
+            print(
+                f"WARN rep{rep} fill {i}: only {pt} prompt tokens (want ~{a.prompt_tokens})",
+                flush=True,
+            )
     return health(a.url), rows
 
 
@@ -295,52 +339,64 @@ def _one_warm(a, rep: int) -> dict | None:
     """One independent refill + primed-warm 32k, return the rep record or None on a
     fail-closed condition (caller counts it; None never yields a clean ARM_DONE)."""
     hfill, pt_rows = _fill_cold_tier(a, rep)
-    cold_priv_gb, cold_shared_gb, cold_priv_ssd_gb, cold_shared_ssd_gb, cold_gb = (
-        _cold_tier_gb(hfill))
+    cold_priv_gb, cold_shared_gb, cold_priv_ssd_gb, cold_shared_ssd_gb, cold_gb = _cold_tier_gb(
+        hfill
+    )
     if cold_gb < a.min_cold_gb:
-        print(f"REP{rep}-FILL-INSUFFICIENT cold_total={cold_gb:.2f}GiB "
-              f"(ram_priv={cold_priv_gb:.2f} ram_shared={cold_shared_gb:.2f} "
-              f"ssd_priv={cold_priv_ssd_gb:.2f} ssd_shared={cold_shared_ssd_gb:.2f}) "
-              f"< {a.min_cold_gb}GiB", flush=True)
+        print(
+            f"REP{rep}-FILL-INSUFFICIENT cold_total={cold_gb:.2f}GiB "
+            f"(ram_priv={cold_priv_gb:.2f} ram_shared={cold_shared_gb:.2f} "
+            f"ssd_priv={cold_priv_ssd_gb:.2f} ssd_shared={cold_shared_ssd_gb:.2f}) "
+            f"< {a.min_cold_gb}GiB",
+            flush=True,
+        )
         return None
     # hfill is the post-fill /health snapshot: it both carries the cold totals
     # and is the spec-counter baseline (fill drafts its own gen tokens), so the
     # warm accept rate is isolated to the warm request without a second poll.
     log_offset = _log_size(a.log)
-    s = _post(a.url + "/v1/chat/completions",
-              _body(prompt_32k(a.prompt_tokens, rep * 1000), a.warm_gen),
-              a.timeout, stream=True)
+    s = _post(
+        a.url + "/v1/chat/completions",
+        _body(prompt_32k(a.prompt_tokens, rep * 1000), a.warm_gen),
+        a.timeout,
+        stream=True,
+    )
     h_spec_after = health(a.url)
     if s["chunks"] < 2 or s["decode_s"] <= 0:
-        print(f"REP{rep}-NO-DECODE chunks={s['chunks']} decode_s={s['decode_s']}",
-              flush=True)
+        print(f"REP{rep}-NO-DECODE chunks={s['chunks']} decode_s={s['decode_s']}", flush=True)
         return None
     ticks = parse_log(a.log, log_offset)
     if ticks["decode_ticks"] < a.min_decode_ticks:
-        print(f"REP{rep}-TOO-FEW-DECODE-TICKS decode={ticks['decode_ticks']} "
-              f"window={ticks['ticks_in_window']} dropped_prefill="
-              f"{ticks['dropped_prefill_ticks']} < --min-decode-ticks "
-              f"{a.min_decode_ticks}", flush=True)
+        print(
+            f"REP{rep}-TOO-FEW-DECODE-TICKS decode={ticks['decode_ticks']} "
+            f"window={ticks['ticks_in_window']} dropped_prefill="
+            f"{ticks['dropped_prefill_ticks']} < --min-decode-ticks "
+            f"{a.min_decode_ticks}",
+            flush=True,
+        )
         return None
     # Build-time constant: read the engage line from the WHOLE log (offset 0),
     # since fill's same-shape decode already printed it and the engine logs each
     # shape once per boot. The warm offset would find nothing and false-fail.
     w_obs = observed_draft_window(a.log, 0)
     if a.expect_window > 0 and w_obs != a.expect_window:
-        print(f"REP{rep}-WINDOW-MISMATCH armed W={a.expect_window} "
-              f"serve engaged W={w_obs}; do not compare against a W=2048 baseline",
-              flush=True)
+        print(
+            f"REP{rep}-WINDOW-MISMATCH armed W={a.expect_window} "
+            f"serve engaged W={w_obs}; do not compare against a W=2048 baseline",
+            flush=True,
+        )
         return None
     if a.expect_window == 0 and w_obs not in (None, 0):
-        print(f"REP{rep}-WINDOW-MISMATCH armed W=0 but serve engaged W={w_obs}",
-              flush=True)
+        print(f"REP{rep}-WINDOW-MISMATCH armed W=0 but serve engaged W={w_obs}", flush=True)
         return None
     drafted_d = h_spec_after.get("spec_drafted", 0) - hfill.get("spec_drafted", 0)
     accepted_d = h_spec_after.get("spec_accepted", 0) - hfill.get("spec_accepted", 0)
     accept_rate = round(accepted_d / drafted_d, 4) if drafted_d > 0 else None
     return {
-        "rep": rep, "decode_tok_s": round((s["chunks"] - 1) / s["decode_s"], 3),
-        "content_chunks": s["chunks"], "first_to_last_s": round(s["decode_s"], 3),
+        "rep": rep,
+        "decode_tok_s": round((s["chunks"] - 1) / s["decode_s"], 3),
+        "content_chunks": s["chunks"],
+        "first_to_last_s": round(s["decode_s"], 3),
         "wall_s": round(s["wall_s"], 3),
         "engaged_draft_window_w": w_obs if a.expect_window > 0 else 0,
         "cold_total_gb": round(cold_gb, 3),
@@ -349,8 +405,10 @@ def _one_warm(a, rep: int) -> dict | None:
         "cold_private_ssd_gb": round(cold_priv_ssd_gb, 3),
         "cold_shared_ssd_gb": round(cold_shared_ssd_gb, 3),
         "fill_prompt_tokens": pt_rows,
-        "spec_drafted_delta": drafted_d, "spec_accepted_delta": accepted_d,
-        "spec_accept_rate": accept_rate, "ticks": ticks,
+        "spec_drafted_delta": drafted_d,
+        "spec_accepted_delta": accepted_d,
+        "spec_accept_rate": accept_rate,
+        "ticks": ticks,
         "device_free_mib": h_spec_after.get("device_free_bytes", 0) >> 20,
     }
 
@@ -370,8 +428,11 @@ def cmd_arm(a) -> int:
         reps.append(rec)
     # Fail closed: too few good reps must never print ARM_DONE or a clean median.
     if len(reps) < a.min_good_reps:
-        print(f"NO-GOOD-REPS good={len(reps)}/{a.warm_reps} "
-              f"< --min-good-reps {a.min_good_reps}; refusing ARM_DONE", flush=True)
+        print(
+            f"NO-GOOD-REPS good={len(reps)}/{a.warm_reps} "
+            f"< --min-good-reps {a.min_good_reps}; refusing ARM_DONE",
+            flush=True,
+        )
         return 13
     hw = health(a.url)
     blocks_total = hw.get("blocks_total", 0)
@@ -382,27 +443,30 @@ def cmd_arm(a) -> int:
         "arm_headroom_mib": a.headroom,
         "expect_draft_window_w": a.expect_window,
         "engaged_draft_window_w_values": windows,
-        "warm_reps": a.warm_reps, "good_reps": len(reps),
+        "warm_reps": a.warm_reps,
+        "good_reps": len(reps),
         "warm32k": {
             "decode_tok_s_median": fpct(toks, 0.5),
-            "decode_tok_s_min": min(toks), "decode_tok_s_max": max(toks),
+            "decode_tok_s_min": min(toks),
+            "decode_tok_s_max": max(toks),
             "decode_tok_s_spread": round(max(toks) - min(toks), 3),
             "per_rep_tok_s": toks,
         },
         "spec_accept_rate_median": fpct(rates, 0.5) if rates else None,
         "spec_accept_rate_per_rep": rates,
-        "fill": {"n_per_rep": a.fill_n,
-                 "cold_total_gb_first": reps[0]["cold_total_gb"],
-                 "cold_total_gb_last": reps[-1]["cold_total_gb"],
-                 "cold_private_gb_last": reps[-1]["cold_private_gb"],
-                 "cold_shared_gb_last": reps[-1]["cold_shared_gb"],
-                 "cold_private_ssd_gb_last": reps[-1]["cold_private_ssd_gb"],
-                 "cold_shared_ssd_gb_last": reps[-1]["cold_shared_ssd_gb"],
-                 "cold_total_before_gb": round(cold0_total, 3)},
+        "fill": {
+            "n_per_rep": a.fill_n,
+            "cold_total_gb_first": reps[0]["cold_total_gb"],
+            "cold_total_gb_last": reps[-1]["cold_total_gb"],
+            "cold_private_gb_last": reps[-1]["cold_private_gb"],
+            "cold_shared_gb_last": reps[-1]["cold_shared_gb"],
+            "cold_private_ssd_gb_last": reps[-1]["cold_private_ssd_gb"],
+            "cold_shared_ssd_gb_last": reps[-1]["cold_shared_ssd_gb"],
+            "cold_total_before_gb": round(cold0_total, 3),
+        },
         "health": {
             "sparse_headroom_bytes": hw.get("sparse_headroom_bytes", 0),
-            "sparse_headroom_dropped_blocks":
-                hw.get("sparse_headroom_dropped_blocks", 0),
+            "sparse_headroom_dropped_blocks": hw.get("sparse_headroom_dropped_blocks", 0),
             "blocks_total": blocks_total,
             "resident_slots_floor": blocks_total // HOT_BLOCKS_PER_SLOT,
             "slots_total_state_pool": hw.get("slots_total", 0),
@@ -415,8 +479,7 @@ def cmd_arm(a) -> int:
         json.dump(summary, fh, indent=1)
     print(json.dumps(summary, indent=1), flush=True)
     med = summary["warm32k"]["decode_tok_s_median"]
-    print(f"ARM_DONE {a.headroom} {med} reps={len(reps)}/{a.warm_reps} W={windows}",
-          flush=True)
+    print(f"ARM_DONE {a.headroom} {med} reps={len(reps)}/{a.warm_reps} W={windows}", flush=True)
     return 0
 
 
@@ -428,9 +491,14 @@ def cmd_compare(a) -> int:
         name, path = spec.split("=", 1)
         with open(path) as fh:
             arms[name] = json.load(fh)
-    base = {"full_tier_tok_s": [2.69, 4.25, 6.56], "empty_tier_tok_s": 7.86,
-            "full_finalize_ms": [629, 667], "empty_finalize_ms": [81, 186],
-            "full_frac_over_300": [0.40, 0.58], "empty_frac_over_300": 0.10}
+    base = {
+        "full_tier_tok_s": [2.69, 4.25, 6.56],
+        "empty_tier_tok_s": 7.86,
+        "full_finalize_ms": [629, 667],
+        "empty_finalize_ms": [81, 186],
+        "full_frac_over_300": [0.40, 0.58],
+        "empty_frac_over_300": 0.10,
+    }
     rows = {}
     for name, s in sorted(arms.items()):
         h, w3 = s["health"], s["warm32k"]
@@ -450,20 +518,25 @@ def cmd_compare(a) -> int:
         rows[name] = {
             "headroom_mib": s["arm_headroom_mib"],
             "draft_window_w": s.get("expect_draft_window_w"),
-            "warm32k_tok_s_median/min/max": [w3["decode_tok_s_median"],
-                                             w3["decode_tok_s_min"],
-                                             w3["decode_tok_s_max"]],
+            "warm32k_tok_s_median/min/max": [
+                w3["decode_tok_s_median"],
+                w3["decode_tok_s_min"],
+                w3["decode_tok_s_max"],
+            ],
             "tok_s_spread": w3["decode_tok_s_spread"],
             "per_rep_tok_s": w3["per_rep_tok_s"],
             "good_reps": s.get("good_reps"),
             "spec_accept_rate_median": s.get("spec_accept_rate_median"),
-            "p50/p90/max_ms_median_across_reps": [pct(all_p50, 0.5),
-                                                  pct(all_p90, 0.5),
-                                                  max(all_max)],
+            "p50/p90/max_ms_median_across_reps": [
+                pct(all_p50, 0.5),
+                pct(all_p90, 0.5),
+                max(all_max),
+            ],
             "frac_over_300_range": [min(all_frac), max(all_frac)] if all_frac else [],
             "finalize_med/max_ms": [pct(all_fin_med, 0.5), max(all_fin_max)],
             "offers_med/max_pages": [pct(all_off_med, 0.5), max(all_off_max)],
-            "type1_ticks_total": t1n, "type2_hollow_ticks_total": t2n,
+            "type1_ticks_total": t1n,
+            "type2_hollow_ticks_total": t2n,
             "blocks_total": h["blocks_total"],
             "resident_slots_floor": h["resident_slots_floor"],
             "slots_total": h["slots_total_state_pool"],
@@ -477,10 +550,12 @@ def cmd_compare(a) -> int:
 
 
 def _self_check(ns=None) -> int:
-    l1 = ("[step-timing] tick 7 total=1259ms dec=1 pre=0 plan=1ms stats=2ms "
-          "forward=1250ms sparse_select=3ms model=330ms sparse_finalize=629ms "
-          "sample=1ms [offers_pages=132] free=210MiB reserved=30000MiB path=eager "
-          "sparse=1 fwd_host=1250ms fwd_gpu=400ms why=sync_wait")
+    l1 = (
+        "[step-timing] tick 7 total=1259ms dec=1 pre=0 plan=1ms stats=2ms "
+        "forward=1250ms sparse_select=3ms model=330ms sparse_finalize=629ms "
+        "sample=1ms [offers_pages=132] free=210MiB reserved=30000MiB path=eager "
+        "sparse=1 fwd_host=1250ms fwd_gpu=400ms why=sync_wait"
+    )
     t = parse_tick(l1)
     assert t["is_decode"] and t["type1"] and not t["type2"]
     assert t["finalize_ms"] == 629 and t["offers_pages"] == 132 and t["free_mib"] == 210
@@ -488,13 +563,14 @@ def _self_check(ns=None) -> int:
     lp = l1.replace("dec=1 pre=0", "dec=0 pre=1")
     tp = parse_tick(lp)
     assert tp["is_decode"] is False and not tp["type1"]
-    l2 = ("[step-timing] tick 8 total=1303ms dec=1 pre=0 plan=1ms forward=1300ms "
-          "model=350ms sample=1ms  free=206MiB reserved=30000MiB path=eager "
-          "sparse=1 fwd_host=1300ms fwd_gpu=420ms why=sync_wait")
+    l2 = (
+        "[step-timing] tick 8 total=1303ms dec=1 pre=0 plan=1ms forward=1300ms "
+        "model=350ms sample=1ms  free=206MiB reserved=30000MiB path=eager "
+        "sparse=1 fwd_host=1300ms fwd_gpu=420ms why=sync_wait"
+    )
     t = parse_tick(l2)
     assert t["is_decode"] and t["type2"] and not t["type1"] and t["model_ms"] == 350
-    t = parse_tick("[step-timing] tick 9 total=180ms dec=1 pre=0 forward=176ms "
-                   "model=170ms why=cpu")
+    t = parse_tick("[step-timing] tick 9 total=180ms dec=1 pre=0 forward=176ms model=170ms why=cpu")
     assert t and t["is_decode"] and not t["type1"] and not t["type2"]
     # An untagged legacy line decodes as non-decode (fail-safe toward exclusion).
     t = parse_tick("[step-timing] tick 10 total=200ms forward=199ms model=199ms")
@@ -509,6 +585,7 @@ def _self_check(ns=None) -> int:
     # Window: fill prefill ticks BEFORE the offset and the warm request's own
     # prefill tick after it must both be dropped; only dec>0 ticks count.
     import tempfile
+
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
         fh.write("[step-timing] tick 1 total=900ms dec=0 pre=1 model=900ms\n")  # fill
         fh.write("[step-timing] tick 2 total=800ms dec=0 pre=1 model=800ms\n")  # fill
@@ -543,9 +620,9 @@ def _self_check(ns=None) -> int:
         wm_off = fh.tell()
         fh.write("[step-timing] tick 900 total=180ms dec=1 pre=0 model=170ms\n")
         logfw = fh.name
-    assert observed_draft_window(logfw, 0) == 2048       # whole-log: armed
-    assert observed_draft_window(logfw, wm_off) is None   # warm-offset: deduped
-    assert observed_draft_window(logfw, 10_000) is None   # past EOF: nothing
+    assert observed_draft_window(logfw, 0) == 2048  # whole-log: armed
+    assert observed_draft_window(logfw, wm_off) is None  # warm-offset: deduped
+    assert observed_draft_window(logfw, 10_000) is None  # past EOF: nothing
     os.unlink(logfw)
     # An off (W=0) run writes no engage line anywhere -> None.
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
@@ -561,21 +638,108 @@ def _self_check(ns=None) -> int:
         def fn(self, ns):
             self.got = ns
             return 0
+
     nschk = _NS()
     assert _dispatch(nschk) == 0 and nschk.got is nschk
     # Cold fullness spans RAM and SSD, private and shared: a 1GiB-RAM/8GiB-SSD
     # tier reads RAM near its cap with most bytes on SSD; gating on RAM alone,
     # or dropping one SSD key, false-fails the full-tier check.
     gb = 2**30
-    p, sh, ps, ss, tot = _cold_tier_gb({"kv_cold_bytes": int(0.5 * gb),
-                                        "kv_cold_shared_bytes": int(0.5 * gb),
-                                        "kv_cold_ssd_bytes": int(1.0 * gb),
-                                        "kv_cold_shared_ssd_bytes": int(5.5 * gb)})
+    p, sh, ps, ss, tot = _cold_tier_gb(
+        {
+            "kv_cold_bytes": int(0.5 * gb),
+            "kv_cold_shared_bytes": int(0.5 * gb),
+            "kv_cold_ssd_bytes": int(1.0 * gb),
+            "kv_cold_shared_ssd_bytes": int(5.5 * gb),
+        }
+    )
     assert (p, sh, ps, ss, tot) == (0.5, 0.5, 1.0, 5.5, 7.5), (p, sh, ps, ss, tot)
     _p, _sh, _ps, _ss, tot_no_ssd = _cold_tier_gb(
-        {"kv_cold_bytes": int(0.5 * gb), "kv_cold_shared_bytes": int(0.5 * gb)})
+        {"kv_cold_bytes": int(0.5 * gb), "kv_cold_shared_bytes": int(0.5 * gb)}
+    )
     assert tot_no_ssd == 1.0 and tot_no_ssd < 7, tot_no_ssd
+
+    # Reclaim sampler: a series that grows then truncates must report the true
+    # peak->last drop in GiB (2**30), and a plateau must NOT claim a shrink. The
+    # negative control guards against the #742 "8.6->8.1 GiB" unit/operand error.
+    gib = 2**30
+    grow_shrink = _reclaim_summary(
+        _reclaim_rows(iter([0, 4 * gib, 8 * gib, 5 * gib]).__next__, 4, 0)
+    )
+    assert grow_shrink["peak_apparent_gib"] == 8.0, grow_shrink
+    assert grow_shrink["last_apparent_gib"] == 5.0, grow_shrink
+    assert grow_shrink["reclaimed_off_peak_gib"] == 3.0, grow_shrink
+    assert grow_shrink["shrank_after_peak"] is True, grow_shrink
+    plateau = _reclaim_summary(_reclaim_rows(iter([8 * gib, 8 * gib]).__next__, 2, 0))
+    assert plateau["reclaimed_off_peak_gib"] == 0.0 and plateau["shrank_after_peak"] is False
+    empty = _reclaim_summary(_reclaim_rows(iter([0, 0]).__next__, 2, 0))
+    assert empty["first_nonzero_gib"] == 0.0 and empty["shrank_after_peak"] is False
+
     print("probe_headroom_coldtail self-check ok")
+    return 0
+
+
+def _reclaim_rows(size_provider, n_samples: int, interval_s: float):
+    """Pure sampler core: call size_provider() -> apparent bytes (or 0 if the
+    spill file does not exist yet) n_samples times, timestamped. Returns a list
+    of (iso_ts, apparent_bytes). The caller owns sleeping and the real fs call,
+    so the self-check drives it deterministically with no disk/time dependency.
+
+    One operand (apparent file size), one unit (GiB at 2**30 downstream) — the
+    #742/#744 unit errors came from mixing apparent vs logical_ssd and decimal GB
+    with binary GiB, so a reclaim claim is built only from this single series.
+    """
+    import datetime as _dt
+
+    rows = []
+    for _ in range(n_samples):
+        rows.append((_dt.datetime.now().strftime("%H:%M:%S.%f")[:-3], int(size_provider())))
+        if len(rows) < n_samples:
+            time.sleep(interval_s)
+    return rows
+
+
+def _reclaim_summary(rows):
+    """Peak -> last apparent bytes from a row series; reclaimed is the drop off
+    the peak (trailing-extent truncation). Returns the GiB figures the doc cites.
+    """
+    vals = [b for _, b in rows]
+    nz = [b for b in vals if b > 0]
+    gib = lambda b: round(b / 2**30, 3)  # noqa: E731
+    return {
+        "samples": len(vals),
+        "first_nonzero_gib": gib(nz[0]) if nz else 0.0,
+        "peak_apparent_gib": gib(max(vals)),
+        "last_apparent_gib": gib(vals[-1]),
+        "reclaimed_off_peak_gib": gib(max(vals) - vals[-1]),
+        "shrank_after_peak": bool(nz) and vals[-1] < max(vals),
+    }
+
+
+def cmd_reclaim_sample(a) -> int:
+    """Sample the shared-prefix spill apparent size across a request release to
+    capture #740 trailing-extent reclaim. Passive: drives no requests itself —
+    run it alongside an arm/follower whose publish refs release mid-window, keep
+    the spill until sampling ends, then stop the serve to delete. Timestamped
+    rows + a GiB summary go to --out. Spans release only if --duration-s covers
+    it; the printed shrink is honest 0 if the window ends on the plateau."""
+    import os
+
+    path = a.spill_path
+    rows = _reclaim_rows(
+        lambda: os.path.getsize(path) if os.path.exists(path) else 0,
+        max(1, a.samples),
+        max(0.0, a.interval_s),
+    )
+    summary = _reclaim_summary(rows)
+    summary["spill_path"] = path
+    with open(a.out, "w") as fh:
+        json.dump(
+            {"summary": summary, "rows": [{"t": t, "apparent_bytes": b} for t, b in rows]},
+            fh,
+            indent=1,
+        )
+    print("reclaim-sample", json.dumps(summary))
     return 0
 
 
@@ -600,35 +764,72 @@ def main() -> int:
     a.set_defaults(fn=_self_check)
     a = s.add_parser("arm")
     a.add_argument("--url", default="http://127.0.0.1:8000")
-    a.add_argument("--headroom", type=int, required=True,
-                   help="this arm's TILERL_DEVICE_HEADROOM_MIB (0/384/768)")
+    a.add_argument(
+        "--headroom",
+        type=int,
+        required=True,
+        help="this arm's TILERL_DEVICE_HEADROOM_MIB (0/384/768)",
+    )
     a.add_argument("--log", required=True, help="this arm's server stderr/stdout log")
     a.add_argument("--out", required=True, help="arm summary JSON path")
     a.add_argument("--fill-n", type=int, default=5)
     a.add_argument("--prompt-tokens", type=int, default=32000)
     a.add_argument("--fill-gen", type=int, default=8)
     a.add_argument("--warm-gen", type=int, default=32)
-    a.add_argument("--warm-reps", type=int, default=3,
-                   help="independent refill+warm repetitions per arm; reports the "
-                        "median and spread of warm-32k tok/s (not one shot)")
-    a.add_argument("--min-good-reps", type=int, default=2,
-                   help="fail closed (rc13) unless at least this many reps succeed; "
-                        "a 3-rep arm must have >=2 good reps")
-    a.add_argument("--expect-window", type=int, default=0,
-                   help="the TILERL_DRAFT_ATTN_WINDOW_TOKENS the serve was armed "
-                        "with (2048 for the baseline-comparable arms); cross-checked "
-                        "against the whole-log serve [draft-window] line, mismatch rc13")
+    a.add_argument(
+        "--warm-reps",
+        type=int,
+        default=3,
+        help="independent refill+warm repetitions per arm; reports the "
+        "median and spread of warm-32k tok/s (not one shot)",
+    )
+    a.add_argument(
+        "--min-good-reps",
+        type=int,
+        default=2,
+        help="fail closed (rc13) unless at least this many reps succeed; "
+        "a 3-rep arm must have >=2 good reps",
+    )
+    a.add_argument(
+        "--expect-window",
+        type=int,
+        default=0,
+        help="the TILERL_DRAFT_ATTN_WINDOW_TOKENS the serve was armed "
+        "with (2048 for the baseline-comparable arms); cross-checked "
+        "against the whole-log serve [draft-window] line, mismatch rc13",
+    )
     a.add_argument("--min-cold-gb", type=float, default=7.0)
-    a.add_argument("--min-decode-ticks", type=int, default=5,
-                   help="fail closed unless the warm window logs at least this "
-                        "many decode ticks (baseline n was 5-12)")
+    a.add_argument(
+        "--min-decode-ticks",
+        type=int,
+        default=5,
+        help="fail closed unless the warm window logs at least this "
+        "many decode ticks (baseline n was 5-12)",
+    )
     a.add_argument("--timeout", type=float, default=7200.0)
     a.add_argument("--ready-trials", type=int, default=600)
     a.set_defaults(fn=cmd_arm)
     c = s.add_parser("compare")
-    c.add_argument("--arms", nargs="+", required=True,
-                   help="name=path per arm, e.g. control=/r/0.json target=/r/768.json")
+    c.add_argument(
+        "--arms",
+        nargs="+",
+        required=True,
+        help="name=path per arm, e.g. control=/r/0.json target=/r/768.json",
+    )
     c.set_defaults(fn=cmd_compare)
+    r = s.add_parser("reclaim-sample")
+    r.add_argument(
+        "--spill-path", required=True, help="path to the shared .prefix.bin spill to sample"
+    )
+    r.add_argument("--out", required=True, help="timestamped rows + GiB summary JSON")
+    r.add_argument("--samples", type=int, default=120)
+    r.add_argument(
+        "--interval-s",
+        type=float,
+        default=20.0,
+        help="set so the window spans the publish refs' release",
+    )
+    r.set_defaults(fn=cmd_reclaim_sample)
     ns = ap.parse_args()
     return _dispatch(ns)
 

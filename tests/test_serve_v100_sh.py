@@ -5,30 +5,35 @@ asserts what the script says, not what it does. Both defects it caught were beha
 TERM stopped the supervisor without stopping the server (23466 MiB held, nothing
 watching), and the sandboxes landed in the repo checkout because the pod sets no TMPDIR.
 
-Skips where flock(1) is absent, which is every macOS row including CI's -- the supervisor
-refuses to run unlocked, so there is nothing to assert there. It fires on the linux row
-and on the pod.
+Runs on macOS too, where flock(1) is absent: `_flock_shim` puts a real
+fcntl-backed flock on PATH for the subprocesses. On Linux the shim is not built
+and the real binary is tested, `-n` argument form included.
 """
 
 import contextlib
+import os
 import pathlib
 import shutil
 import subprocess
 import tempfile
 import time
 
-import pytest
+from _flock_shim import flock_path
 
 SRC = pathlib.Path(__file__).parent.parent / "scripts" / "serve_v100.sh"
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("flock") is None, reason="flock(1) absent; the supervisor refuses to run unlocked"
-)
-
 
 @contextlib.contextmanager
-def sandbox(exit_code, sleep_s=0):
-    """The real script, pointed at a temp ROOT, with `python` stubbed."""
+def sandbox(exit_code, sleep_s=0, path=None):
+    """The real script, pointed at a temp ROOT, with `python` stubbed.
+
+    PATH is set on the environment for the duration, not passed per subprocess:
+    the tests below spawn bash directly, and the launcher's own `command -v
+    flock` must resolve the same flock the lock-holder test takes.
+    """
+    saved = os.environ.get("PATH")
+    if path is not None:
+        os.environ["PATH"] = path
     d = pathlib.Path(tempfile.mkdtemp(prefix="serve_v100_check."))
     try:
         (d / "tilerl-git").mkdir()
@@ -55,6 +60,8 @@ def sandbox(exit_code, sleep_s=0):
         script.chmod(0o755)
         yield d, script, boots
     finally:
+        if saved is not None:
+            os.environ["PATH"] = saved
         shutil.rmtree(d, ignore_errors=True)
 
 
@@ -63,7 +70,7 @@ def boots_of(path):
 
 
 def test_a_crash_restarts_and_the_cap_gives_up():
-    with sandbox(7) as (_, script, boots):
+    with flock_path() as path, sandbox(7, path=path) as (_, script, boots):
         rc = subprocess.run(["bash", str(script)], capture_output=True, timeout=120).returncode
         assert (boots_of(boots), rc) == (3, 1), (
             f"want 3 boots then give up, got {boots_of(boots)}/{rc}"
@@ -71,7 +78,7 @@ def test_a_crash_restarts_and_the_cap_gives_up():
 
 
 def test_a_clean_exit_is_not_restarted():
-    with sandbox(0) as (_, script, boots):
+    with flock_path() as path, sandbox(0, path=path) as (_, script, boots):
         rc = subprocess.run(["bash", str(script)], capture_output=True, timeout=120).returncode
         assert (boots_of(boots), rc) == (1, 0), (
             f"a clean exit must not restart, got {boots_of(boots)}/{rc}"
@@ -88,7 +95,7 @@ def test_killing_only_the_server_restarts_it():
     a signal aimed at the supervisor means stop, which the trap knows and the exit code
     does not.
     """
-    with sandbox(0, sleep_s=30) as (d, script, boots):
+    with flock_path() as path, sandbox(0, sleep_s=30, path=path) as (d, script, boots):
         sup = subprocess.Popen(["bash", str(script)])
         try:
             for _ in range(100):
@@ -119,7 +126,7 @@ def test_killing_only_the_server_restarts_it():
 def test_term_to_the_supervisor_reaches_the_server():
     """The defect this caught: the supervisor exited in 1s and left python holding
     23466 MiB of the card with nothing supervising it."""
-    with sandbox(0, sleep_s=30) as (d, script, boots):
+    with flock_path() as path, sandbox(0, sleep_s=30, path=path) as (d, script, boots):
         sup = subprocess.Popen(["bash", str(script)])
         try:
             for _ in range(100):
@@ -139,8 +146,12 @@ def test_term_to_the_supervisor_reaches_the_server():
 
 
 def test_a_second_supervisor_is_refused_and_the_lock_is_why():
-    with sandbox(0) as (d, script, _):
-        holder = subprocess.Popen(["bash", "-c", f"exec 9>{d}/.serve70.lock; flock -n 9; sleep 10"])
+    with flock_path() as path, sandbox(0, path=path) as (d, script, _):
+        # The holder takes the lock through the SAME flock the launcher resolves,
+        # so this test still means what it did when it only ran on Linux.
+        holder = subprocess.Popen(
+            ["bash", "-c", f"exec 9>{d}/.serve70.lock; flock -n 9; sleep 10"]
+        )
         try:
             time.sleep(0.5)
             r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=60)
@@ -158,7 +169,7 @@ def test_a_second_supervisor_is_refused_and_the_lock_is_why():
 def test_the_sandboxes_do_not_land_in_the_cwd():
     """The other defect this caught: the pod sets no TMPDIR, so `gettempdir()` falls
     back to the CWD and six sandboxes were left in the repo checkout."""
-    with sandbox(0) as (d, _, _boots):
+    with flock_path() as path, sandbox(0, path=path) as (d, _, _boots):
         assert d.exists()
     assert not d.exists(), "sandbox() did not remove its directory"
     assert not list(pathlib.Path.cwd().glob("serve_v100_check.*"))
