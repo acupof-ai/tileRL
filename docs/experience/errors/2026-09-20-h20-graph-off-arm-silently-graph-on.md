@@ -21,10 +21,17 @@ First A2 boot with `SERVE_DECODE_GRAPH=0`:
 
 - boot line printed `… decode_graph=off …` (the launcher echoed env INTENT);
 - the resolved argv contained neither `--decode-graph` nor any off flag;
-- `/health` reported **`"decode_graph": true`**, `blocks_total` = 4425 (the graph
-  build's pool sizing, identical to A1);
-- warmup still ran the `4x2k` decode-graph capture in **5.3 s** (the real graph-on
-  A1 capture was 311.9 s; both prove capture happened).
+- `/health` reported **`"decode_graph": true`**;
+- `blocks_total` = **4425**, the graph pool's build sizing (num_slots+1 padding)
+  — identical to the real graph-on A1 build.
+
+These two runtime facts are the evidence; together they say capture was live.
+
+The warmup timing is NOT evidence either way and must not be read as such:
+`serve_warmup_hybrid.py`'s `4x2k` phase is an unconditional four-request warmup,
+not a graph-capture step. The large timing spread across graph-on boots
+(311.9 s first, 67.4 s later) is cold-vs-warm TileLang JIT cache, not capture on
+vs off. Startup wall time is a build-cache effect, never a mode signal.
 
 So the "graph-off" arm was graph-on. Its ticks and acceptance counters would have
 been identical to A1, manufacturing a zero graph delta.
@@ -62,15 +69,19 @@ Rules this pins:
    constant; omission selects AUTO.
 2. A launcher's self-certification line is allowed to describe the ACTUAL argv,
    not the operator's intent — and even then, an arm's authoritative check is the
-   runtime state (`/health decode_graph: false`), the changed pool build
-   (`blocks_total` differs from the graph build), and the absence of graph-capture
-   warmup lines. A banner is only a log index.
+   runtime state (`/health decode_graph: false`) and the changed pool build
+   (`blocks_total` differs from the graph build). A banner is only a log index.
+   Startup/warmup wall time is never mode evidence (it is dominated by TileLang
+   JIT cache temperature), and warmup phase names like `4x2k` are unconditional
+   requests, not capture markers.
 
 ## Verification
 
 `tests/test_serve_h20_sh.py` dry-run gates assert the off argv contains
 `--no-decode-graph` and not `--decode-graph`, and the on argv the reverse;
 `--dry-run` on the host confirms both. Device acceptance for the real A2 is
-perf2's three runtime checks (health false, blocks differ from 4425, no `4x2k`
-capture), plus a zero-traffic `/health` counter freeze proving
-`LIVENESS_POLL_S=999999` stopped the guard's idle chat injection.
+perf2's two runtime discriminants (health false, `blocks_total` differing from
+4425 — `build.py` sizes the state pool `num_slots + pad`, `pad = _graph_on(...)`,
+so eager is a different-sized pool and cannot keep 4425), plus a zero-traffic
+`/health` counter freeze proving `LIVENESS_POLL_S=999999` stopped the guard's
+idle chat injection. Neither discriminant uses warmup phase names or wall time.
