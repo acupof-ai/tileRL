@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 
+import pytest
 import torch
 
 from tilerl.kv_cache import BLOCK_TOKENS, PagedKvPool
@@ -1148,6 +1149,114 @@ def test_bg_publish_ssd_lift_balances_private_mapping_borrow(tmp_path):
         assert cold._ssd._borrowed == 0 and not cold._ssd._pinned_keys
         assert shared_ssd._borrowed == 0 and not shared_ssd._reserved
     finally:
+        cold.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="#746 follow-up hardening: a non-OSError write failure leaves the "
+    "reserved shared slot and its mapping borrow unbalanced; remove when the "
+    "reserve->write->commit window rolls the slot back on ANY exception")
+def test_bg_publish_ssd_write_non_oserror_releases_reserved_slot(tmp_path):
+    """The phase-2 write only catches OSError: a non-OSError (bad copy /
+    RuntimeError) bypasses release_slot, and the worker top-level except only
+    unpins the source. The destination shared slot then stays _reserved forever
+    and its _borrowed mapping borrow stays >0 (stale mmap generations never
+    prune); the pending record is dropped as a miss. Hardening must release the
+    slot exactly once on ANY exception."""
+    ssd = str(tmp_path / "nonos.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+
+    def spill(key, fill):
+        b = pool.alloc_block()
+        pool.k_pool[:, b].fill_(fill)
+        pool.v_pool[:, b].fill_(-fill)
+        pool.demote_page(b, key=key)
+        return b
+
+    try:
+        spill(10, 10)
+        assert cold.offer_publish(10, 1010, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([1010])  # good page creates the shared file
+
+        spill(9, 9)
+        shared_ssd = cold._shared_ssd
+        assert shared_ssd is not None
+        real_write = shared_ssd.write_reserved
+
+        def raise_non_oserror(slot, blob, mapping):
+            raise RuntimeError("non-os copy failure")
+
+        shared_ssd.write_reserved = raise_non_oserror
+        assert cold.offer_publish(9, 990, {"bounds": torch.zeros(2)})
+        # must NOT hang: the failed job fires its future as a miss promptly
+        assert cold.wait_committed([990], 5) is False
+        shared_ssd.write_reserved = real_write
+
+        assert not shared_ssd._reserved
+        assert shared_ssd._borrowed == 0
+        assert cold._ssd._borrowed == 0
+        assert not cold._ssd._pinned_keys
+    finally:
+        cold.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="#746 follow-up hardening: an ftruncate failure in the phase-3 "
+    "trailing-extent shrink abandons the already-written reserved shared slot; "
+    "remove when the commit window rolls it back and shrinks best-effort")
+def test_bg_publish_ssd_shrink_failure_does_not_leak_reserved_slot(tmp_path, monkeypatch):
+    """Phase 3 consumes the private pinned slot (its reclaim path ftruncates the
+    freed trailing extent) BEFORE committing the shared destination slot. When
+    that ftruncate raises, commit never reaches commit_slot/release_slot, so the
+    shared slot stays _reserved with _borrowed >0. Hardening must still release
+    the shared slot exactly once and treat the source shrink as best-effort,
+    while the future still fires (a miss, never a hang)."""
+    import tilerl.kv_tiers as kv_tiers
+
+    monkeypatch.setenv("TILERL_COLD_PREFIX_SSD_CAP", "1")  # shared spill reclaim
+    ssd = str(tmp_path / "shrink.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+
+    def spill(key, fill):
+        b = pool.alloc_block()
+        pool.k_pool[:, b].fill_(fill)
+        pool.v_pool[:, b].fill_(-fill)
+        pool.demote_page(b, key=key)
+        return b
+
+    real_ftruncate = kv_tiers.os.ftruncate
+    try:
+        spill(10, 10)
+        assert cold.offer_publish(10, 1010, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([1010])  # creates the reclaim shared file
+
+        spill(9, 9)
+        shared_ssd = cold._shared_ssd
+        assert shared_ssd is not None
+        # make the private file's phase-3 consume take the reclaim/shrink path
+        cold._ssd._reclaim = True
+
+        def raise_on_shrink(fd, length):
+            raise OSError("simulated trailing-extent shrink failure")
+
+        monkeypatch.setattr(kv_tiers.os, "ftruncate", raise_on_shrink)
+        assert cold.offer_publish(9, 990, {"bounds": torch.zeros(2)})
+        # must NOT hang: the failed commit still fires its future as a miss
+        assert cold.wait_committed([990], 5) is False
+        monkeypatch.setattr(kv_tiers.os, "ftruncate", real_ftruncate)
+
+        assert not shared_ssd._reserved
+        assert shared_ssd._borrowed == 0
+        assert cold._ssd._borrowed == 0
+        assert not cold._ssd._pinned_keys
+    finally:
+        monkeypatch.setattr(kv_tiers.os, "ftruncate", real_ftruncate)
         cold.close()
 
 
