@@ -10,6 +10,7 @@
 #   SERVE_PYTHON ($ROOT/venv70/bin/python) SERVE_CKPT_DIR SERVE_DRAFT
 #   SERVE_COLD_SSD SERVE_LOG SERVE_LOCK
 #   MAX_RESTARTS (10) RESTART_FUSE_MAX (5) RESTART_FUSE_WINDOW_S (600)
+#   PYTORCH_CUDA_ALLOC_CONF (expandable_segments:True) -- sm70 only, see below
 # The fuse: the FUSE_MAX-th restart inside FUSE_WINDOW_S trips it and the
 # supervisor exits 2 with a marker -- a crash burst that fast is a finding, and
 # restarting through it hides it. Restarts spaced further apart than the window
@@ -43,6 +44,12 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$REPO" || exit 1
 export PATH=/usr/local/cuda-12.4/bin:$PATH
 export TILERL_TARGET=cuda
+# V100/sm70 only. Load-bearing here: on this card and torch build the same build
+# OOMs without it and runs with it, and it took free memory 396 MiB -> 1.11 GiB
+# (errors/2026-09-03-expandable-segments-is-load-bearing). It changes allocator
+# behaviour globally, so it is set in the sm70 launcher and NOT as a cross-backend
+# default; an existing value wins, so an operator can still override per run.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 mkdir -p "$ROOT/tmp"
 export TMPDIR=$ROOT/tmp TMP=$ROOT/tmp TEMP=$ROOT/tmp
 export PYTHONPATH=$REPO/src:$REPO/packages/tilerl-kernels/src
