@@ -148,12 +148,31 @@ def test_term_to_the_supervisor_reaches_the_server():
 def test_a_second_supervisor_is_refused_and_the_lock_is_why():
     with flock_path() as path, sandbox(0, path=path) as (d, script, _):
         # The holder takes the lock through the SAME flock the launcher resolves,
-        # so this test still means what it did when it only ran on Linux.
+        # so this test still means what it did when it only ran on Linux. It
+        # writes a marker file only after flock returns, which is what makes the
+        # hold observable instead of assumed.
+        ready = d / "holder.ready"
         holder = subprocess.Popen(
-            ["bash", "-c", f"exec 9>{d}/.serve70.lock; flock -n 9; sleep 10"]
+            [
+                "bash",
+                "-c",
+                f"exec 9>{d}/.serve70.lock; flock -n 9 || exit 9; : > {ready}; sleep 10",
+            ]
         )
         try:
-            time.sleep(0.5)
+            # Poll for the marker, never sleep a fixed interval: under `pytest -n
+            # auto` the holder's bash may not have reached flock yet when the
+            # second copy starts, and the lock is then legitimately free -- the
+            # second supervisor runs and the assertion fails on an unheld lock
+            # rather than on a broken one. Measured on this test: a fixed 0.5 s
+            # wait failed 4/30 runs under -n auto; polling passes 30/30.
+            deadline = time.monotonic() + 30
+            while not ready.exists():
+                assert holder.poll() is None, (
+                    f"the lock holder exited (rc={holder.returncode}) without taking the lock"
+                )
+                assert time.monotonic() < deadline, "the lock holder never signalled it held the lock"
+                time.sleep(0.05)
             r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=60)
             assert r.returncode == 1 and "already running" in r.stderr, r.stderr[:200]
             # Control: strip the guard and the second copy runs, so it is the lock
