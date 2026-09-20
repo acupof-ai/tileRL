@@ -209,24 +209,27 @@ def test_the_steady_filter_is_windowed_to_each_reps_warm_span():
     assert "steady.json NOT written" in src, "the no-span path degrades silently"
     assert "raise SystemExit(3)" in src, "a pre-fix arm.json is not refused"
     # `set -u` + an EMPTY array: `"${win_args[@]}"` is an unbound-variable abort on
-    # bash 3.2 (macOS's /bin/bash, which runs this on the laptop that starts the
-    # window), and the empty case is reachable -- it is the no-span branch. The
-    # guarded expansion is what makes that branch survive; run it, both ways.
+    # bash 3.2 (macOS's /bin/bash, which is what starts the window from the laptop),
+    # and the empty case is reachable -- it is the no-span branch. The guarded
+    # expansion is what makes that branch survive there.
+    #
+    # The negative direction is NOT asserted: bash 5 (the ubuntu-latest row) made an
+    # unguarded empty expansion a rc-0 no-op, so "it must fail" is a version
+    # artifact rather than the contract. That assertion is what failed CI here -- it
+    # was green on macOS bash 3.2 and red on Ubuntu bash 5. Removing the guard is
+    # still caught, by the version-independent textual assert above; what this runs
+    # is the positive contract, that the guarded form expands correctly on the
+    # interpreter running the gate.
     assert '${win_args[@]+"${win_args[@]}"}' in src, "unguarded empty-array expansion"
-    probe = (
-        "set -u\n"
-        'A=()\n'
-        'f() { printf "%s\\n" "$*"; }\n'
-        'f ${A[@]+"${A[@]}"}\n'
-        'B=(--window 5)\n'
-        'f ${B[@]+"${B[@]}"}\n'
-    )
-    r = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, timeout=30)
+    guarded = ("set -u\n"
+               'A=()\n'
+               'f() { printf "%s\\n" "$*"; }\n'
+               'f ${A[@]+"${A[@]}"}\n'
+               'B=(--window 5)\n'
+               'f ${B[@]+"${B[@]}"}\n')
+    r = subprocess.run(["bash", "-c", guarded], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
     assert r.stdout.splitlines() == ["", "--window 5"], r.stdout
-    bad = subprocess.run(["bash", "-c", 'set -u\nA=()\nf() { printf "%s\\n" "$*"; }\nf "${A[@]}"\n'],
-                         capture_output=True, text=True, timeout=30)
-    assert bad.returncode != 0 and "unbound" in bad.stderr, (bad.returncode, bad.stderr)
 
     # The exact multi-rep log: warmup, fill0, warm0, fill1, warm1a, warm1b. fill0 is
     # 178 ms and fill1 is 400 ms so one fill would land in the body and the other in
