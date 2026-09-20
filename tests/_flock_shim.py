@@ -19,7 +19,9 @@ here really does exclude a launcher that calls flock(1):
 * Linux already has flock(1) -- remove the shim from PATH and use it, so the
   linux row keeps testing the real binary, including the `-n` argument form.
 * macOS gets this shim, which implements the subset the launchers use: the
-  `-n`/`-s`/`-x` flags and a numeric fd carrying a shell redirection.
+  `-n` flag and a numeric fd carrying a shell redirection. The lock is always
+  exclusive, which is all a launcher needs; a shared (`-s`) request would need
+  LOCK_SH and has no caller in this repo.
 """
 
 from __future__ import annotations
@@ -30,8 +32,8 @@ import shutil
 import stat
 import tempfile
 
-#: Faithful subset of flock(1): lock the given fd, honouring -n/-s/-x. Exits 1
-#: on a held lock, like the real binary, so `flock -n 9 ||` still refuses.
+#: Faithful subset of flock(1): an exclusive lock on the given fd, honouring -n.
+#: Exits 1 on a held lock, like the real binary, so `flock -n 9 ||` still refuses.
 _SHIM = """\
 #!{python}
 import fcntl, sys
@@ -40,13 +42,9 @@ flags = 0
 for a in sys.argv[1:]:
     if a == "-n":
         flags |= fcntl.LOCK_NB
-    elif a == "-s":
-        flags |= fcntl.LOCK_SH
-    elif a == "-x":
-        flags |= fcntl.LOCK_EX
 fd = int(sys.argv[-1]) if sys.argv[-1].isdigit() else 0
 try:
-    fcntl.flock(fd, fcntl.LOCK_EX | (flags & fcntl.LOCK_NB))
+    fcntl.flock(fd, fcntl.LOCK_EX | flags)
 except OSError:
     sys.exit(1)
 """
