@@ -204,11 +204,27 @@ run_arm() {
   local arm_log=$dir/serve.log
   : > "$arm_log"
 
+  # One FUSE file per arm, for the same reason and with a worse failure mode.
+  # serve_hybrid_v100.sh appends a timestamp on every non-zero-exit restart and
+  # stays down (exit 2) once RESTART_FUSE_MAX land inside RESTART_FUSE_WINDOW_S.
+  # That state is $ROOT/.servehybridsse.fuse and $ROOT is shared by every arm, so
+  # without this an arm that crash-loops >=5 times inside the window leaves a
+  # tripped fuse behind and the NEXT arm's serve exits 2 without ever starting
+  # python -- which this harness would report as that arm's result (the health
+  # gate only says "never became ready"). A number from an arm that never ran is
+  # the exact failure this window exists to avoid.
+  #
+  # Cleared only for THIS arm's own file: the shared production fuse under $ROOT
+  # is not ours to delete.
+  local arm_fuse=$dir/serve.fuse
+  rm -f "$arm_fuse"
+
   # Every artifact from this arm lands in $dir; nothing writes outside it.
   local reclaim_pid=
   local env_line; env_line="$(instrument_env) ${env_delta}"
   # shellcheck disable=SC2086  # deliberate: the helpers emit VAR=val words to split
   ( export SERVE_REPO=$REPO SERVE_ROOT=$ROOT SERVE_PORT=$PORT SERVE_LOG=$arm_log
+    export SERVE_FUSE_STATE=$arm_fuse
     setsid nohup env $env_line scripts/serve_hybrid_v100.sh >/dev/null 2>&1 & )
   wait_ready || { log "arm $name: serve never became ready"; return 1; }
   health_gate || { log "arm $name: health gate failed"; stop_serve; return 1; }
@@ -400,10 +416,24 @@ restore() {
   stop_serve || return 1
   # LIVENESS back to its shipped 60 s, and NONE of the instrumentation vars: the
   # restore target is the serve the tree would boot with no window running.
+  #
+  # No SERVE_FUSE_STATE either, so this inherits the PRODUCTION fuse under $ROOT --
+  # deliberately, unlike an arm. A window that ended on a crash-looping arm can
+  # leave that file tripped, and then the official serve exits 2 without starting
+  # (the fuse is meant to stay down until an operator arms it again), which would
+  # present as "the restore did not come up". Say which it is instead of leaving
+  # the reader to guess, and do NOT delete the file: arming the prod fuse again is
+  # an operator decision, the same as when the fuse trips on its own.
+  local prod_fuse=${SERVE_FUSE_STATE:-$ROOT/.servehybridsse.fuse}
+  if [ -f "$prod_fuse" ] && [ "$(wc -l < "$prod_fuse")" -ge "${RESTART_FUSE_MAX:-5}" ]; then
+    log "restore: WARNING prod fuse $prod_fuse holds $(wc -l < "$prod_fuse") entries"
+    log "  (>= RESTART_FUSE_MAX ${RESTART_FUSE_MAX:-5}); the supervisor will stay down"
+    log "  by design. Arm it again with: rm $prod_fuse"
+  fi
   ( export SERVE_REPO=$REPO SERVE_ROOT=$ROOT SERVE_PORT=$PORT
     export LIVENESS_POLL_S=60
     setsid nohup scripts/serve_hybrid_v100.sh >/dev/null 2>&1 & )
-  wait_ready || { log "restore: serve never became ready"; return 1; }
+  wait_ready || { log "restore: serve never became ready (see the fuse warning above)"; return 1; }
   health_gate || log "restore: health gate differs from the expected baseline (check by hand)"
   "$PYTHON" - "$HEALTH_URL" <<'PY'
 import json, sys, urllib.request

@@ -439,3 +439,101 @@ def test_follower_outcomes_have_distinct_exit_codes():
     doc = (REPO / "docs" / "run-close-window-v100.md").read_text()
     for code in ("| 3 |", "| 4 |", "| 5 |", "| 6 |"):
         assert code in doc, code
+
+
+def test_the_shared_fuse_blocks_the_next_arm_and_per_arm_fuse_does_not():
+    """The supervisor's crash-burst fuse lives in `$ROOT/.servehybridsse.fuse` and,
+    once RESTART_FUSE_MAX restarts land inside RESTART_FUSE_WINDOW_S, it stays down
+    and exits 2 WITHOUT starting python. `$ROOT` is shared by every arm, so a
+    crash-looping arm left a tripped fuse that stopped the NEXT arm's serve from
+    ever running -- which this harness reports as that arm's result, since the
+    health gate can only say "never became ready".
+
+    RED first, then GREEN, both executed against the real launcher rather than
+    grepped:
+
+      RED   -- old behaviour (one shared fuse, nothing cleared): a pre-tripped fuse
+               makes the boot exit 2 and the stub python is never invoked.
+      GREEN -- per-arm fuse, cleared before boot: that arm starts, and a SECOND arm
+               with its own path starts too even though the first arm's fuse file
+               now holds entries.
+    """
+    import os as _os
+    import pathlib as _p
+    import subprocess as _sp
+    import tempfile as _tf
+
+    from _flock_shim import flock_path
+
+    src = SRC.read_text()
+    assert "SERVE_FUSE_STATE=$arm_fuse" in src, "the arm is not given its own fuse file"
+    assert 'rm -f "$arm_fuse"' in src, "the arm's fuse file is not cleared before boot"
+    assert 'rm -f "$ROOT/.servehybridsse.fuse"' not in src, "the prod fuse must not be deleted"
+
+    with flock_path() as path:
+        d = _p.Path(_tf.mkdtemp(prefix="fusegate."))
+        (d / "tilerl-v100-sse").mkdir()
+        (d / "venv70/bin").mkdir(parents=True)
+        (d / "models").mkdir()
+        (d / "mmlu-assets").mkdir()
+        boots = d / "boots"
+        stub = d / "venv70/bin/python"
+        stub.write_text(f'#!/bin/bash\necho x >> {boots}\nexit 7\n')
+        stub.chmod(0o755)
+        launcher = str((SRC.parent / "serve_hybrid_v100.sh").resolve())
+
+        def boot(fuse_path, tag):
+            env = dict(_os.environ)
+            env.update({"SERVE_ROOT": str(d), "SERVE_REPO": str(d / "tilerl-v100-sse"),
+                        "SERVE_PYTHON": str(stub), "SERVE_LOG": str(d / f"{tag}.log"),
+                        "SERVE_LOCK": str(d / f"{tag}.lock"),
+                        "SERVE_FUSE_STATE": str(fuse_path),
+                        "MAX_RESTARTS": "0", "PATH": path})
+            return _sp.run(["bash", launcher], capture_output=True, text=True,
+                           timeout=120, env=env, cwd=str(d / "tilerl-v100-sse"))
+
+        # ---- RED: the OLD wiring, i.e. one shared fuse that is never cleared.
+        # A pre-tripped shared fuse (>= RESTART_FUSE_MAX entries stamped "now") is
+        # exactly the state a crash-looping arm leaves behind.
+        shared = d / "shared.fuse"
+        shared.write_text("".join(f"{int(__import__('time').time())}\n" for _ in range(8)))
+        before = boots.read_text().count("x") if boots.exists() else 0
+        r = boot(shared, "red")
+        after = boots.read_text().count("x") if boots.exists() else 0
+        assert r.returncode == 2, f"expected the fuse to stay down, got rc={r.returncode}"
+        assert after == before, "python ran despite a tripped fuse; RED is vacuous"
+        log = (d / "red.log").read_text()
+        assert "FUSE:" in log, log[-300:]
+
+        # ---- GREEN: per-arm fuse paths, cleared before each boot (what the
+        # harness does now). Arm A starts even with A's own stale fuse present
+        # because the harness clears it; arm B starts with a different path.
+        for tag in ("armA", "armB"):
+            arm_fuse = d / f"{tag}.fuse"
+            arm_fuse.write_text("".join(f"{int(__import__('time').time())}\n" for _ in range(8)))
+            _sp.run(["bash", "-c", f'rm -f "{arm_fuse}"'])   # the shipped rm -f
+            before = boots.read_text().count("x") if boots.exists() else 0
+            r = boot(arm_fuse, tag)
+            after = boots.read_text().count("x") if boots.exists() else 0
+            assert r.returncode != 2, f"{tag}: fuse blocked a cleared per-arm fuse"
+            assert after > before, f"{tag}: python never started under its own fuse"
+
+
+def test_restore_uses_the_production_fuse_read_only():
+    """`--restore-only` targets the shipped serve, so it must inherit the PRODUCTION
+    fuse under $ROOT (no SERVE_FUSE_STATE export) and must never delete it -- arming
+    the prod fuse again is an operator decision, same as when it trips on its own.
+    It warns instead, and the warning has to name the file."""
+    src = SRC.read_text()
+    body = src.split("restore() {", 1)[1].split("\n}", 1)[0]
+    # Assertions are on CODE, not prose: a comment explaining why the fuse path is
+    # not overridden must not read as an override. Drop comment lines and the
+    # heredoc python block (which only prints), then assert on what executes.
+    code = "\n".join(ln for ln in body.splitlines()
+                     if not ln.lstrip().startswith("#"))
+    code = code.split("<<'PY'", 1)[0]
+    assert "export SERVE_FUSE_STATE" not in code, "restore overrides the fuse path"
+    for bad in ("rm -f", "unlink"):
+        assert bad not in code, f"restore mutates the prod fuse: {bad}"
+    assert "$ROOT/.servehybridsse.fuse" in code, "restore does not name the prod fuse"
+    assert "WARNING" in code, "restore does not warn when the prod fuse is tripped"

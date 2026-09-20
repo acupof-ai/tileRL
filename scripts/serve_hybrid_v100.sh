@@ -9,6 +9,9 @@
 #   SERVE_ROOT ($HOME) SERVE_REPO ($ROOT/tilerl-v100-sse) SERVE_PORT (8000)
 #   SERVE_PYTHON ($ROOT/venv70/bin/python) SERVE_CKPT_DIR SERVE_DRAFT
 #   SERVE_COLD_SSD SERVE_LOG SERVE_LOCK
+#   SERVE_FUSE_STATE ($ROOT/.servehybridsse.fuse) -- the crash-burst state file.
+#     Point it elsewhere to keep one run's fuse out of the production file (the
+#     close-window harness gives every arm its own); the default is unchanged.
 #   MAX_RESTARTS (10) RESTART_FUSE_MAX (5) RESTART_FUSE_WINDOW_S (600)
 #   PYTORCH_CUDA_ALLOC_CONF (expandable_segments:True) -- sm70 only, see below
 #   LIVENESS_POLL_S (60) -- the guard's poll period; set 999999 for a zero-traffic
