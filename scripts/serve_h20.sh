@@ -30,6 +30,9 @@
 #   SERVE_ARM_NAME (unset=omitted; a label like A4 carried in the boot line's
 #     arm= field, so an inspector reads the head it is looking at instead of
 #     inferring the arm from an argv it cannot see)
+#   SERVE_TRACE (unset=off; a per-arm file like /work/cold_trace_a4.txt the
+#     lifecycle-bound cold-tier sampler writes, started after health is up and
+#     killed with the serve -- never a standalone while loop)
 #   MAX_RESTARTS (10) RESTART_FUSE_MAX (5) RESTART_FUSE_WINDOW_S (600)
 #   LIVENESS_POLL_S (60) -- the guard's poll period; set 999999 for a zero-traffic
 #     baseline, since at this arm's slots=8 the guard injects a real 4-token chat
@@ -49,6 +52,17 @@
 #
 # ponytail: bash loop, not a systemd unit -- the pod has no init manager for a
 # job that lives and dies with one pod_run claim.
+#
+# STOPPING AN ARM: this supervisor RESTARTS the serve python when it exits, so
+# killing the python alone reboots the SAME arm with the SAME env (a graph-on
+# python killed under a live graph-on supervisor comes straight back graph-on,
+# which read as a "wrong A4 boot" on 2026-09-20). Switch arms by killing the
+# supervisor first (TERM the pod_run wrapper / this script), then confirm four
+# things are gone before the next pod_run: supervisor, serve python,
+# serve_liveness.py, and any serve_cold_trace.sh -- ps -o stat shows no
+# non-zombie survivor and nvidia-smi on the card reads 0 MiB. A wrapper killed
+# under pod_run can leave this script re-parented to pid 1, so find it with
+# `pgrep -f serve_h20.sh`, do not assume the wrapper took it.
 set -u
 
 DRY_RUN=0
@@ -90,6 +104,11 @@ DECODE_GRAPH=${SERVE_DECODE_GRAPH:-1}
 # is the common case and appends nothing -- a bare `arm=` would read as a field
 # with a missing value rather than an arm that was never named.
 ARM_NAME=${SERVE_ARM_NAME:-}
+# Per-arm cold-tier trace file. Set explicitly per arm (e.g.
+# /work/cold_trace_a4.txt); unset runs no sampler. The sampler is a child of
+# this supervisor, bound to the serve python pid, so it cannot survive a boot
+# and keep writing the next arm's samples into this arm's file.
+TRACE=${SERVE_TRACE:-}
 MAX_RESTARTS=${MAX_RESTARTS:-10}
 RESTART_FUSE_MAX=${RESTART_FUSE_MAX:-5}
 RESTART_FUSE_WINDOW_S=${RESTART_FUSE_WINDOW_S:-600}
@@ -138,6 +157,7 @@ SERVE_ARGV=("$PYTHON" -u -m tilerl.cli serve --model qwen38-27b
 if [ "$DRY_RUN" = 1 ]; then
   printf '%s\n' "${SERVE_ARGV[@]}"
   echo "repo=$REPO ckpt=$CKPT log=$LOG cold_ssd=${COLD_SSD:-<disabled>}"
+  echo "trace=${TRACE:-<off>}"
   echo "arm: $ARM_DESC"
   command -v "$PYTHON" >/dev/null || { echo "python not on PATH: $PYTHON" >&2; exit 2; }
   exit 0
@@ -155,8 +175,8 @@ export LIVENESS_BASE="http://127.0.0.1:$PORT"
 # serve_liveness.py, so this line changes no production behavior.
 export LIVENESS_POLL_S=${LIVENESS_POLL_S:-60}
 
-child=; guard=; stopping=
-trap 'stopping=1; [ -n "$guard" ] && { pkill -TERM -P "$guard" 2>/dev/null; kill -TERM "$guard" 2>/dev/null; }; pkill -TERM -f "serve_liveness.py $LOG" 2>/dev/null; pkill -TERM -f "serve_warmup_hybrid.py" 2>/dev/null; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait "$child"; fi; exit 143' TERM INT
+child=; guard=; sampler=; stopping=
+trap 'stopping=1; [ -n "$guard" ] && { pkill -TERM -P "$guard" 2>/dev/null; kill -TERM "$guard" 2>/dev/null; }; [ -n "$sampler" ] && kill -TERM "$sampler" 2>/dev/null; pkill -TERM -f "serve_liveness.py $LOG" 2>/dev/null; pkill -TERM -f "serve_warmup_hybrid.py" 2>/dev/null; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait "$child"; fi; exit 143' TERM INT
 
 # Rolling restart window. A timestamp is appended only on a real restart, so a
 # line is one restart: prune lines older than the window, trip at FUSE_MAX.
@@ -181,13 +201,20 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
   started=$SECONDS
   "${SERVE_ARGV[@]}" >> "$LOG" 2>&1 &
   child=$!
-  ( for ((i = 1; i <= READY_TRIALS; i++)); do kill -0 $child 2>/dev/null || exit 1
+  ( samp=
+    for ((i = 1; i <= READY_TRIALS; i++)); do kill -0 $child 2>/dev/null || exit 1
       curl -sf -m 3 -o /dev/null "http://127.0.0.1:$PORT/health" && break; sleep 2; done
+    if [ -n "$TRACE" ]; then
+      : > "$TRACE"
+      bash "$SCRIPT_DIR/serve_cold_trace.sh" "$TRACE" "$child" 10 >> "$TRACE" 2>&1 &
+      samp=$!
+    fi
     echo "serve_h20: warmup start at $(date -Is)" >> "$LOG"
     "$PYTHON" "$SCRIPT_DIR/serve_warmup_hybrid.py" >> "$LOG" 2>&1
     echo "serve_h20: warmup done at $(date -Is)" >> "$LOG"
     "$PYTHON" "$SCRIPT_DIR/serve_liveness.py" "$LOG" "$LIVENESS_BASE" >> "$LOG" 2>&1
     lrc=$?
+    [ -n "$samp" ] && kill -TERM "$samp" 2>/dev/null
     echo "serve_h20: liveness exit $lrc at $(date -Is), killing pid $child" >> "$LOG"
     kill -TERM "$child" 2>/dev/null
     gone=0

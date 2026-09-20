@@ -18,6 +18,7 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+import time
 
 SRC = pathlib.Path(__file__).parent.parent / "scripts" / "serve_h20.sh"
 
@@ -105,6 +106,39 @@ def test_an_empty_cold_path_drops_the_spill_tier_flags():
     assert "--cold-ssd-path" not in argv
     assert "--kv-cold-bytes" not in argv
     assert "cold_ssd=<disabled>" in out
+
+
+def test_dry_run_names_the_per_arm_trace_file():
+    rc, out, err = _dry_run({"SERVE_TRACE": "/work/cold_trace_a4.txt"})
+    assert rc == 0, err
+    assert "trace=/work/cold_trace_a4.txt" in out
+
+
+TRACE_SRC = pathlib.Path(__file__).parent.parent / "scripts" / "serve_cold_trace.sh"
+
+
+def test_cold_trace_sampler_dies_with_its_serve_pid(tmp_path):
+    # The sampler's only termination condition is the tracked serve pid: a
+    # standalone loop with a fixed iteration count died silent mid-matrix and
+    # kept writing across arms. Bound to a live pid, it must exit when that pid
+    # is gone (the curl against an absent /health adds nothing but must not end
+    # the loop while the serve still lives).
+    serve = subprocess.Popen(["sleep", "30"])
+    try:
+        samp = subprocess.Popen(
+            ["bash", str(TRACE_SRC), str(tmp_path / "trace.txt"), str(serve.pid), "1"])
+        time.sleep(2)
+        assert serve.poll() is None and samp.poll() is None, "sampler died with serve alive"
+        serve.terminate()
+        serve.wait()
+        for _ in range(30):
+            if samp.poll() is not None:
+                break
+            time.sleep(0.5)
+        assert samp.poll() is not None, "sampler outlived the serve it was bound to"
+    finally:
+        serve.kill()
+        samp.kill()
 
 
 def _fuse_sandbox(env_extra: dict[str, str]):
