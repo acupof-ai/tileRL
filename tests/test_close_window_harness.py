@@ -30,6 +30,33 @@ def _run(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["bash", str(SRC), *args], capture_output=True, text=True, timeout=60)
 
 
+def read_sources(root: pathlib.Path) -> str:
+    """Concatenated SOURCE text under `root` -- the only way a gate here reads `*.py`.
+
+    Going through `py_sources` is what keeps an AppleDouble sidecar out of the read;
+    a gate that globbed for itself would take `._evil.py` and die in UnicodeDecodeError.
+    """
+    return "\n".join(p.read_text() for p in py_sources(root)[0])
+
+
+def py_sources(root: pathlib.Path) -> tuple[list[pathlib.Path], list[str]]:
+    """`(source files, skipped sidecar names)` under `root`, recursively.
+
+    `._name` is AppleDouble: a resource fork written beside the real file when a
+    macOS tar/scp/copy touches a non-HFS volume. It matches `*.py` and is not
+    source. The skipped names are RETURNED, not dropped, so a caller can report
+    them -- the distinction between "not source" and "source that will not decode"
+    is the whole point.
+    """
+    src, skipped = [], []
+    for p in sorted(root.rglob("*.py")):
+        if p.name.startswith("._"):
+            skipped.append(p.name)
+        else:
+            src.append(p)
+    return src, skipped
+
+
 def _arm_envs() -> dict[str, str]:
     r = _run("--arms-env")
     assert r.returncode == 0, r.stderr
@@ -45,8 +72,7 @@ def test_every_arm_env_var_is_read_by_the_source():
     """The failure this prevents is silent: an unrecognized env var makes the arm
     identical to the one before it, so a window reports two baselines and a
     clean-looking delta of zero."""
-    text = "\n".join(p.read_text() for p in
-                     list((REPO / "src").rglob("*.py")) + list((REPO / "scripts").rglob("*.py")))
+    text = read_sources(REPO / "src") + read_sources(REPO / "scripts")
     seen = set()
     for env in _arm_envs().values():
         for tok in env.split():
