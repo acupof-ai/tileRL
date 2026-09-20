@@ -364,8 +364,9 @@ def self_check() -> int:
 
     # The statistic the verdict needs is the PER-PROMPT median, and the toy data
     # below is built so a mean-based substitute collapses to flat while the
-    # median does not. Two prompts are tight (ticks all 100 ms); two carry one
-    # 370 ms outlier, so their MEAN tick is 100 ms too but their MEDIAN is 10 ms.
+    # median does not. Two prompts are tight (ticks all 100 ms); two have three
+    # 10 ms ticks plus one 370 ms outlier: their MEAN tick is also 100 ms but
+    # their MEDIAN tick stays 10 ms (median tok/s 160 vs the tight prompts' 16).
     # A per-prompt-median band separates the two groups; anything computed off
     # the mean reports all four prompts as identical. Nearest-rank IQR needs four
     # samples, hence four prompts.
