@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import statistics
 import sys
 
 #: The standard steady set. Stated once; the doc and the harness cite it.
@@ -78,11 +79,39 @@ def is_standard(r: dict) -> bool:
             and r["sample"] > 0 and r["path"] != "graph")
 
 
-def _pct(xs: list[int], q: float) -> int | None:
+def median(xs: list[int]):
+    """The median as the rest of the tree reports one: `statistics.median`, the
+    true median that averages the middle pair on even n. `probe_draft_window_sweep`
+    reports its `tick_ms_med` this way and `probe_device_artifacts_crosscheck`
+    recomputes arm medians this way, so a headroom arm's median is only
+    comparable to a sweep arm's if it is this function.
+
+    Not nearest-rank: on n=2 `[176, 180]` that gives 176 against this 178, which
+    is the mismatch this whole script exists to avoid.
+
+    Which sweep field this aligns with matters, because sweep reports TWO p50s on
+    two conventions: `tick_ms_med` (a tick duration, `statistics.median`) and
+    `spread()["p50"]` (per-prompt tok/s, nearest-rank `_pct`). `steady_p50_ms` is
+    a tick duration, so it is the former -- comparing it to the latter would be
+    wrong twice over, on convention and on unit.
+    """
+    return float(statistics.median(xs)) if xs else None
+
+
+def pct(xs: list[int], q: float):
+    """Nearest-rank percentile -- `int(q*(n-1))`, the tree's convention for a
+    PERCENTILE (`probe_draft_window_sweep._pct` for p10/p90/iqr and
+    `probe_headroom_coldtail.pct`, which states the choice in its docstring so the
+    two instruments agree on a quantile).
+
+    Separate from :func:`median` on purpose: the tree uses a true median for
+    "median" and nearest-rank for "pNN", and collapsing them would put this
+    script back out of step with one of its two consumers.
+    """
     if not xs:
         return None
     xs = sorted(xs)
-    return xs[min(len(xs) - 1, int(q * len(xs)))]
+    return xs[min(len(xs) - 1, int(q * (len(xs) - 1)))]
 
 
 #: A tick this slow is the close tail, not steady state. 300 ms is the repo's
@@ -111,13 +140,13 @@ def summarise(rows: list[dict], tail_ms: int = TAIL_MS) -> dict:
         "filter": STANDARD_FILTER,
         "ticks_total": len(rows),
         "steady_n": len(body),
-        "steady_p50_ms": _pct([r["total"] for r in body], 0.5),
-        "steady_p90_ms": _pct([r["total"] for r in body], 0.9),
-        "steady_model_p50_ms": _pct([r["model"] for r in body], 0.5),
-        "steady_sample_p50_ms": _pct([r["sample"] for r in body], 0.5),
+        "steady_p50_ms": median([r["total"] for r in body]),
+        "steady_p90_ms": pct([r["total"] for r in body], 0.9),
+        "steady_model_p50_ms": median([r["model"] for r in body]),
+        "steady_sample_p50_ms": median([r["sample"] for r in body]),
         "tail_ms": tail_ms,
         "tail_n": len(tail),
-        "tail_p50_ms": _pct([r["total"] for r in tail], 0.5),
+        "tail_p50_ms": median([r["total"] for r in tail]),
         "tail_max_ms": max((r["total"] for r in tail), default=None),
         "tail_close_host_max_ms": max((r["close_host"] for r in tail), default=None),
         "excluded_n": len(rows) - len(steady),
@@ -171,7 +200,36 @@ def _self_check() -> int:
     assert s["tail_n"] == 1, s             # the 900, over the 300 ms threshold
     assert s["excluded_n"] == 3, s         # graph-total, graph-idle, prefill
     assert s["excluded_path_graph_n"] == 2, s
-    assert s["steady_p50_ms"] in (180, 182), s
+    # EXACT, not a set of acceptable values. An earlier version wrote
+    # `in (180, 182)`, which silently accepted both the true median (181) and the
+    # nearest-rank pick (180) -- the two conventions this file exists to keep
+    # apart. A tolerance here hides the bug it is meant to catch.
+    assert s["steady_p50_ms"] == 181.0, s
+
+    # The conventions, pinned on the sample sizes a warm window actually yields
+    # (5-12 ticks, so even n is common). `median` must equal statistics.median
+    # and must NOT equal nearest-rank; `pct` must be nearest-rank.
+    assert median([176, 180]) == 178.0, median([176, 180])
+    assert median([176, 180]) != 176, "median fell back to nearest-rank"
+    assert median([]) is None
+    assert pct([176, 180], 0.5) == 176, pct([176, 180], 0.5)
+    assert pct([176, 178, 180, 1000], 0.5) == 178
+    # n=4, q=0.9 -> int(0.9*3)=2 -> the 3rd of 4, NOT the max. Nearest-rank
+    # reaches the maximum only as q approaches 1; asserting the max here
+    # would have been a wrong expectation, not a stricter one.
+    assert pct([176, 178, 180, 1000], 0.9) == 180, pct([176, 178, 180, 1000], 0.9)
+    assert pct([1, 2, 3, 4, 5], 0.9) == 4
+    # Even-n body end to end, which is the shape rev flagged: 4 steady ticks plus
+    # one close-tail tick. The median is 179.0 -- the mean of the middle pair --
+    # where nearest-rank would say 178 and `int(q*n)` would say 180. The slow tick
+    # still lands in the body, because the split is an absolute threshold and it
+    # is under it.
+    five = [parse_line(line(i, t, 1, 0, t - 16, 3, "eager", 1))
+            for i, t in enumerate([176, 178, 180, 182, 1000], start=1)]
+    s5 = summarise(five, tail_ms=300)
+    assert s5["steady_n"] == 4 and s5["tail_n"] == 1, s5
+    assert s5["steady_p50_ms"] == 179.0, s5
+    assert s5["steady_p90_ms"] == 180, s5  # int(0.9*3)=2 -> 180, not the max
     # A log without the path/sparse tail cannot be classified: excluded, and said.
     # Each missing field is exercised on its own -- a row with `path` present and
     # `sparse` absent must still be undecidable, or the guard only holds for the

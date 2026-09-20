@@ -228,15 +228,23 @@ rec = {
     "kv_cold_drops_delta": h2.get("kv_cold_drops", 0) - h0.get("kv_cold_drops", 0),
     "blocks_within_total": bool(h2.get("blocks_used", 0) <= h2.get("blocks_total", 1)),
 }
-# Two independent failures with opposite meanings, so two assertions: a mismatch
-# is a correctness bug (stop), a zero hit is a store that did not serve (report).
+# Three outcomes with three meanings, and three DISTINCT exit codes so the
+# shell's rc says which one happened without reading the JSON:
+#   0  OK
+#   3  MISMATCH       -- the store answered, with the wrong tokens: a correctness
+#                        bug, the arm must not be reported as good.
+#   4  NO-PREFIX-HIT  -- same tokens, no hit: the store did not serve. Worth a
+#                        result, not a correctness failure.
+#   5  BLOCKS         -- a leak, independent of both.
 rec["verdict"] = ("MISMATCH" if not rec["tokens_identical"]
                   else "NO-PREFIX-HIT" if rec["prefix_hits_delta"] <= 0
                   else "OK")
 with open(out + "/follower.json", "w") as fh:
     json.dump(rec, fh, indent=1)
 print(json.dumps(rec))
-raise SystemExit(0 if rec["verdict"] == "OK" and rec["blocks_within_total"] else 1)
+if not rec["blocks_within_total"]:
+    raise SystemExit(5)
+raise SystemExit({"OK": 0, "MISMATCH": 3, "NO-PREFIX-HIT": 4}[rec["verdict"]])
 PY
   rc_f=$?
   log "arm $name: follower rc=$rc_f (verdict in $dir/follower.json)"
@@ -253,9 +261,13 @@ PY
     log "arm $name: reclaim rc=$?"
   fi
   stop_serve || true
+  # Exit codes, one meaning each, so a wrapper can branch without parsing logs:
+  #   probe's own rc (13 = fail-closed on reps, ...)   as-is
+  #   3 / 4 / 5   follower MISMATCH / NO-PREFIX-HIT / block leak
+  #   6           cancel smoke failed
   [ "$rc" != 0 ] && return "$rc"
-  [ "$rc_f" != 0 ] && return 20
-  [ "$rc_c" != 0 ] && return 21
+  [ "$rc_f" != 0 ] && return "$rc_f"
+  [ "$rc_c" != 0 ] && return 6
   return 0
 }
 

@@ -159,5 +159,57 @@ def test_steady_filter_splits_the_tail_by_threshold_not_quantile():
     rec = json.loads(r.stdout)
     assert rec["steady_n"] == 3, rec
     assert rec["tail_n"] == 1 and rec["tail_max_ms"] == 5000, rec
-    assert rec["steady_p50_ms"] in (179, 181), rec
+    # EXACT. `in (179, 181)` was written here first and is exactly the hole rev
+    # found: it accepts both the true median (179) and nearest-rank (181), which
+    # is the convention mismatch this script exists to prevent.
+    assert rec["steady_p50_ms"] == 179.0, rec
     assert rec["excluded_path_graph_n"] == 1, rec
+
+
+def test_steady_median_matches_the_tree_convention():
+    """The number must equal what the tree already calls a median, on the sample
+    sizes a warm window yields. `probe_draft_window_sweep` reports `tick_ms_med`
+    with `statistics.median` and `probe_device_artifacts_crosscheck` recomputes
+    arm medians the same way, so a headroom arm is only comparable to a sweep arm
+    if this agrees with both -- on EVEN n, where nearest-rank and `int(q*n)`
+    differ from it."""
+    import importlib.util
+    import statistics
+
+    spec = importlib.util.spec_from_file_location("sf", REPO / "scripts" / "steady_filter.py")
+    sf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sf)
+    for xs in ([176, 180], [176, 178, 180, 1000], [176, 178, 180, 182]):
+        assert sf.median(xs) == statistics.median(xs), xs
+    # ... and it must NOT be either of the two conventions it is distinguished from.
+    assert sf.median([176, 180]) != 176, "median fell back to nearest-rank"
+    assert sf.median([176, 180]) != 180, "median fell back to int(q*n)"
+    assert sf.median([]) is None
+    # A percentile is nearest-rank, deliberately: that is the tree's pNN rule,
+    # and it must agree with BOTH tree helpers that use it.
+    assert sf.pct([176, 180], 0.5) == 176, sf.pct([176, 180], 0.5)
+    import importlib.util as _u
+    for name, path in (("probe_draft_window_sweep", "probe_draft_window_sweep.py"),
+                       ("probe_headroom_coldtail", "probe_headroom_coldtail.py")):
+        sp = _u.spec_from_file_location(name, REPO / "scripts" / path)
+        mod = _u.module_from_spec(sp)
+        sp.loader.exec_module(mod)
+        tree_pct = getattr(mod, "_pct", None) or getattr(mod, "pct")
+        for xs in ([176, 180], [176, 178, 180, 1000], [100, 200, 300, 400, 500]):
+            for q in (0.1, 0.5, 0.9):
+                assert sf.pct(xs, q) == tree_pct(xs, q), (name, xs, q)
+
+
+def test_follower_outcomes_have_distinct_exit_codes():
+    """MISMATCH and NO-PREFIX-HIT are different findings, so the shell rc must not
+    collapse them: a caller branching on rc alone has to be able to tell a
+    correctness bug from a store that did not serve."""
+    src = SRC.read_text()
+    for code, why in ((3, "MISMATCH"), (4, "NO-PREFIX-HIT"), (5, "block leak"), (6, "cancel")):
+        assert re.search(rf"raise SystemExit\(\{{.*?{why}.*?\}}\[", src) or str(code) in src, code
+    assert '"MISMATCH": 3' in src and '"NO-PREFIX-HIT": 4' in src
+    assert "[ \"$rc_c\" != 0 ] && return 6" in src
+    # The doc and the script must state the same table.
+    doc = (REPO / "docs" / "run-close-window-v100.md").read_text()
+    for code in ("| 3 |", "| 4 |", "| 5 |", "| 6 |"):
+        assert code in doc, code

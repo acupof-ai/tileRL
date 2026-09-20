@@ -16,8 +16,22 @@ Per arm, in order: stop any serve → boot `serve_hybrid_v100.sh` under that arm
 env → wait for `/health` → **assert the health body** → start the passive
 reclaim sampler → run `probe_headroom_coldtail.py arm` → follower correctness
 smoke → cancel-immediacy smoke → stop the serve. Artifacts land in
-`$OUT/<arm>/` (`arm.json`, `reclaim.json`, `follower.json`, `cancel.log`, and a
-log per step).
+`$OUT/<arm>/` (`arm.json`, `steady.json`, `reclaim.json`, `follower.json`,
+`cancel.log`, and a log per step).
+
+A failed smoke fails the arm, and the exit code says which:
+
+| rc | meaning |
+|---:|---|
+| probe's own | passed through (13 = fail-closed on too few good reps) |
+| 3 | follower **MISMATCH** — the store answered with the wrong tokens |
+| 4 | follower **NO-PREFIX-HIT** — same tokens, no hit; the store did not serve |
+| 5 | follower **block leak** — `blocks_used > blocks_total` |
+| 6 | cancel smoke failed |
+
+MISMATCH and NO-PREFIX-HIT are different findings with different responses — a
+mismatch is a correctness bug, a missing hit is a store that did not serve — so
+they do not share a code.
 
 ### The health gate
 
