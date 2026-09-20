@@ -7,8 +7,8 @@ apart than the window must age out and never trip. Runs the real script with a
 stub python that crashes immediately; the readiness guard exits on its first
 kill -0, so warmup/liveness never start.
 
-Skips where flock(1) is absent (every macOS row, including CI macos); fires on
-the linux CI row, the same split as test_serve_v100_sh.py.
+Runs on macOS too, where flock(1) is absent, via the same `_flock_shim` helper
+`test_serve_v100_sh.py` uses; the linux row keeps the real binary.
 """
 
 from __future__ import annotations
@@ -20,44 +20,47 @@ import shutil
 import subprocess
 import tempfile
 
-import pytest
+from _flock_shim import flock_path
 
 SRC = pathlib.Path(__file__).parent.parent / "scripts" / "serve_hybrid_v100.sh"
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("flock") is None, reason="flock(1) absent; the supervisor refuses to run unlocked"
-)
-
-
 @contextlib.contextmanager
 def sandbox(env_extra):
-    d = pathlib.Path(tempfile.mkdtemp(prefix="serve_hybrid_fuse."))
-    try:
-        repo = d / "tilerl-v100-sse"
-        (repo / "src").mkdir(parents=True)
-        (d / "venv70/bin").mkdir(parents=True)
-        (d / "models").mkdir()
-        (d / "mmlu-assets").mkdir()
-        # Crashes immediately, no matter the serve argv; sleeps make boots distinct.
-        # Dumps its own environment first, so a gate can read what the supervisor
-        # actually handed the child (the extra write is harmless to the fuse tests,
-        # which only count boots and read the log).
-        stub = d / "venv70/bin/python"
-        stub.write_text('#!/bin/bash\nexport > "$SERVE_ROOT/childenv.txt"\nexit 7\n')
-        stub.chmod(0o755)
-        env = dict(os.environ)
-        env.update(
-            {
-                "SERVE_ROOT": str(d),
-                "MAX_RESTARTS": "10",
-                "RESTART_FUSE_MAX": "2",
-                "RESTART_FUSE_WINDOW_S": "600",
-            }
-        )
-        env.update(env_extra)
-        yield d, env
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
+    """PATH in the yielded env carries flock(1), real or shimmed.
+
+    Inside sandbox, not at each call site: a test added here later would
+    otherwise run the launcher with no flock and fail for a reason unrelated to
+    what it checks.
+    """
+    with flock_path() as path:
+        d = pathlib.Path(tempfile.mkdtemp(prefix="serve_hybrid_fuse."))
+        try:
+            repo = d / "tilerl-v100-sse"
+            (repo / "src").mkdir(parents=True)
+            (d / "venv70/bin").mkdir(parents=True)
+            (d / "models").mkdir()
+            (d / "mmlu-assets").mkdir()
+            # Crashes immediately, no matter the serve argv; sleeps make boots distinct.
+            # Dumps its own environment first, so a gate can read what the supervisor
+            # actually handed the child (the extra write is harmless to the fuse tests,
+            # which only count boots and read the log).
+            stub = d / "venv70/bin/python"
+            stub.write_text('#!/bin/bash\nexport > "$SERVE_ROOT/childenv.txt"\nexit 7\n')
+            stub.chmod(0o755)
+            env = dict(os.environ)
+            env.update(
+                {
+                    "SERVE_ROOT": str(d),
+                    "PATH": path,
+                    "MAX_RESTARTS": "10",
+                    "RESTART_FUSE_MAX": "2",
+                    "RESTART_FUSE_WINDOW_S": "600",
+                }
+            )
+            env.update(env_extra)
+            yield d, env
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def test_a_crash_burst_trips_the_fuse_and_stays_down():
