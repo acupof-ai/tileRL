@@ -499,6 +499,46 @@ def test_batched_close_publishes_match_the_per_page_path(tmp_path, monkeypatch):
     assert ts == ts_miss, f"batched follower {ts} != per-page miss {ts_miss}"
 
 
+def test_bg_publish_depth_and_byte_cap_derive_from_context(monkeypatch):
+    """Task A (#743 device follow-up): the 512 default overflows one real close
+    (~2350 jobs for a 37.6k context, 34% degraded). With the gate on,
+    build_engine sizes the queue as (num_slots+1)*ceil(ctx/16) — one full
+    context per slot plus a spare wave — and caps queued hold-frame bytes at the
+    cold budget so a worker lag cannot pin >2x budget. Explicit env vars win."""
+    import math
+
+    monkeypatch.setenv("TILERL_CLOSE_BG_PUBLISH", "1")
+    ctx = 4096
+    slots = 4
+    budget = 1 << 30
+
+    def build():
+        eng = build_engine(
+            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+            num_blocks=64, num_slots=slots, max_batch=1, max_total_tokens=ctx,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=budget)
+        return eng
+
+    eng = build()
+    try:
+        pages = math.ceil(ctx / BLOCK_TOKENS)
+        assert eng._kv.cold.bg_depth == (slots + 1) * pages
+        assert eng._kv.cold.bg_max_bytes == budget
+    finally:
+        eng.shutdown()
+
+    # explicit operator override wins over the derivation
+    monkeypatch.setenv("TILERL_CLOSE_BG_DEPTH", "8192")
+    monkeypatch.setenv("TILERL_CLOSE_BG_MAX_BYTES", "4096")
+    eng = build()
+    try:
+        assert eng._kv.cold.bg_depth == 8192
+        assert eng._kv.cold.bg_max_bytes == 4096
+    finally:
+        eng.shutdown()
+
+
 def test_bg_publish_close_path_follower_hits_after_async_transfer(monkeypatch):
     """TILERL_CLOSE_BG_PUBLISH=1 on top of the 1PR batch: a publisher close hands
     every page transfer to the cold tier's background worker and returns with the

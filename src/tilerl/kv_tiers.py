@@ -317,7 +317,8 @@ class HostKvPages:
     def __init__(self, budget_bytes: int = 4 << 30, ssd_path: str = "",
                  ssd_capacity_bytes: int = 0, step_timing=None,
                  bg_publish: bool | None = None, bg_depth: int | None = None,
-                 bg_wait_s: float | None = None) -> None:
+                 bg_wait_s: float | None = None,
+                 bg_max_payload_bytes: int | None = None) -> None:
         # Fail fast: both the private spill and its shared-prefix sibling must be
         # writable now, because the failure used to surface only after the host
         # budget bound mid-decode (V100 /data00 root-owned, 2026-09-14).
@@ -389,10 +390,30 @@ class HostKvPages:
         #: remove them before the worker consumes the job (bounded by queue depth).
         self._pub_private: set = set()
         self.bg_enabled = _close_bg_publish() if bg_publish is None else bool(bg_publish)
-        self.bg_depth = (int(os.environ.get("TILERL_CLOSE_BG_DEPTH", "512"))
-                         if bg_depth is None else bg_depth)
+        # Default queue depth when neither the caller nor TILERL_CLOSE_BG_DEPTH
+        # gives one. 512 is enough for a small CPU test; build_engine replaces it
+        # with a context-derived depth for serving. The env var always wins so an
+        # operator can bound object count without a code change.
+        self.bg_depth = (
+            int(os.environ["TILERL_CLOSE_BG_DEPTH"])
+            if "TILERL_CLOSE_BG_DEPTH" in os.environ and bg_depth is None
+            else (512 if bg_depth is None else bg_depth))
         self.bg_wait_s = (float(os.environ.get("TILERL_CLOSE_BG_WAIT_S", "30"))
                           if bg_wait_s is None else bg_wait_s)
+        #: Hard cap on host bytes held by queued job payloads ABOVE the pinned
+        #: cold budget (0 = off). Two payloads are allocated before commit but
+        #: enter the shared budget (and its LRU spill) only then: the "hold"
+        #: frame blob the 1PR batch made, and a warm-spec "kv" job's attached
+        #: draft dk/dv host snapshots (a cold page and its draft block overlap, so
+        #: a close burst can attach them to nearly every page). The kv base blob
+        #: is already budgeted/on-disk and is not charged. The cap keeps
+        #: budget + queued <= 2x budget; an over-cap offer commits inline, which
+        #: spills immediately, so a worker lag cannot pin unbounded bytes.
+        self.bg_max_bytes = (
+            int(os.environ["TILERL_CLOSE_BG_MAX_BYTES"])
+            if "TILERL_CLOSE_BG_MAX_BYTES" in os.environ and bg_max_payload_bytes is None
+            else (0 if bg_max_payload_bytes is None else bg_max_payload_bytes))
+        self._pub_payload_bytes = 0
         self.bg_queued = 0
         self.bg_degraded = 0  # queue full -> caller transferred inline
         self.bg_timeouts = 0
@@ -427,6 +448,9 @@ class HostKvPages:
                 kind, private_key, shared_key, payload = job
                 event = None
                 with self._tlock:
+                    # The payload either enters the shared budget below or is
+                    # dropped on failure; either way it stops being queued.
+                    self._pub_payload_bytes -= self._job_payload_n(job)
                     ok = True
                     try:
                         if kind == "kv":
@@ -700,17 +724,44 @@ class HostKvPages:
         return self._enqueue(("hold", None, shared_key, (blob, nbytes)),
                              None, shared_key)
 
+    def _job_payload_n(self, job) -> int:
+        """Host bytes a queued job pins ABOVE the pinned cold budget until the
+        worker commits it:
+
+        - "hold": the whole frame blob (1PR batch made it; it enters the shared
+          budget and its LRU spill only at commit).
+        - "kv": the base blob is already budgeted (RAM) or on disk (SSD), but a
+          warm-spec job's ``extra`` carries freshly-snapshotted host draft K/V
+          (dk/dv, hundreds of KiB per warm page) plus bounds. Those tensors are
+          NOT in the cold budget until commit, so they ARE charged; a cold page
+          and its draft block overlap almost entirely, so a close burst can
+          attach dk/dv to nearly every page.
+        Over-cap offers degrade inline, which spills at once — the bound is
+        payload, not object count."""
+        if job[0] == "hold":
+            return int(job[3][1])
+        extra = job[3]
+        if not extra:
+            return 0
+        return sum(t.numel() * t.element_size() for t in extra.values()
+                   if torch.is_tensor(t))
+
     def _enqueue(self, job, private_key, shared_key: int) -> bool:
         with self._tlock:
             if not self.bg_enabled or self._pub_q is None:
                 return False
             if shared_key in self._shared or shared_key in self._pub_pending:
                 return False
+            payload_n = self._job_payload_n(job)
+            if self.bg_max_bytes and self._pub_payload_bytes + payload_n > self.bg_max_bytes:
+                self.bg_degraded += 1
+                return False
             try:
                 self._pub_q.put_nowait(job)
             except queue.Full:
                 self.bg_degraded += 1
                 return False
+            self._pub_payload_bytes += payload_n
             self._pub_pending[shared_key] = threading.Event()
             self._pub_pending_refs[shared_key] = 0
             if private_key is not None:

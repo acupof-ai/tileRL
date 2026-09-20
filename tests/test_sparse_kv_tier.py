@@ -1246,6 +1246,67 @@ def test_bg_publish_budget_evictor_reparks_a_queued_source():
         cold.close()
 
 
+def test_bg_publish_payload_byte_cap_degrades_hold_and_draft_extra_inline():
+    """The byte guard bounds every late-accounting queued payload, not just hold
+    frames: a warm-spec kv job's attached draft dk/dv host snapshots are NOT in
+    the cold budget until commit, so they count; an over-cap offer (hold frame
+    OR oversized draft extra) returns False for an inline commit that spills
+    immediately, so pinned bytes can't grow unbounded — never OOM. A kv job with
+    only tiny bounds is essentially free and is still admitted."""
+    import threading
+
+    blob_n = 128
+    cold = HostKvPages(
+        budget_bytes=1 << 30, bg_publish=True, bg_depth=64,
+        bg_max_payload_bytes=blob_n)  # room for exactly one hold blob
+    gate = threading.Event()
+    _gate_worker(cold, gate)
+    try:
+        assert cold.offer_hold(1000, {"k": torch.zeros(blob_n // 2,
+                                dtype=torch.uint8)}, blob_n)
+        # a second hold blob would exceed the cap -> inline fallback
+        assert cold.offer_hold(1001, {"k": torch.zeros(blob_n // 2,
+                                dtype=torch.uint8)}, blob_n) is False
+        assert cold.stats()["kv_cold_bg_degraded"] == 1
+        assert cold._pub_payload_bytes == blob_n
+        # a warm kv job carrying a draft-sized extra over the (spent) cap is
+        # charged for that extra and degrades inline too
+        _hold_private(cold, 91, 1.0)
+        big_dk = torch.zeros(blob_n, dtype=torch.uint8)
+        assert cold.offer_publish(91, 910, {"dk": big_dk}) is False
+        assert cold.stats()["kv_cold_bg_degraded"] == 2
+        # a kv job with only a tiny bounds extra needs ~no headroom; the cap is
+        # spent so even it degrades here — but with a separate budget it is free.
+        gate.set()
+        assert cold.drain_publishes(5)
+        assert cold._pub_payload_bytes == 0  # the hold charged back down
+    finally:
+        cold.close()
+
+    # With a fresh cap: a big draft extra is charged and a small-bounds kv job is
+    # admitted alongside it, separating actual queued bytes from the cap.
+    cold2 = HostKvPages(budget_bytes=1 << 30, bg_publish=True, bg_depth=64,
+                        bg_max_payload_bytes=1024)
+    gate2 = threading.Event()
+    _gate_worker(cold2, gate2)
+    try:
+        _hold_private(cold2, 1, 1.0)
+        _hold_private(cold2, 2, 1.0)
+        dk = torch.zeros(100, dtype=torch.uint8)  # 100 bytes of draft snapshot
+        assert cold2.offer_publish(1, 100, {"dk": dk, "dv": dk})  # 200 charged
+        # tiny-bounds kv job fits in the remaining headroom
+        assert cold2.offer_publish(2, 200, {"bounds": torch.zeros(2)})
+        # an oversized draft extra over the cap degrades
+        _hold_private(cold2, 3, 1.0)
+        assert cold2.offer_publish(3, 300, {"dk": torch.zeros(2000,
+                                        dtype=torch.uint8)}) is False
+        gate2.set()
+        assert cold2.drain_publishes(5)
+        assert cold2._pub_payload_bytes == 0
+    finally:
+        cold2.close()
+
+
 def test_bg_publish_close_drains_before_closing_files():
     """shutdown join: a queued job commits in close() even when the worker is
     still parked; the worker thread is stopped, no hang."""
