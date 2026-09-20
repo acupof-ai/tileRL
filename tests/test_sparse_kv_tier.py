@@ -1454,6 +1454,145 @@ def test_bg_publish_mixed_success_and_failure_leaves_no_borrow_or_reservation(tm
         cold.close()
 
 
+def _cold_blob(fill=1.0):
+    return {
+        "k": torch.full((2, 4), fill, dtype=torch.float16),
+        "v": torch.full((2, 4), -fill, dtype=torch.float16),
+        "bounds": torch.zeros(2),
+    }
+
+
+def _warm_blob(fill=2.0):
+    b = _cold_blob(fill)
+    b["dk"] = torch.full((2, 4), fill, dtype=torch.float16)
+    b["dv"] = torch.full((2, 4), -fill, dtype=torch.float16)
+    return b
+
+
+@pytest.mark.xfail(strict=True, reason="SSD phase-3 commit must re-check an inline-committed record and fold refs instead of overwriting it / double-charging / orphaning the inline slot")
+def test_bg_publish_ssd_phase2_race_does_not_reset_inline_record(tmp_path):
+    """While the queued worker is in its lock-free phase-2 write, the step thread
+    publishes a SECOND private page of the SAME content key inline (ref=1, own
+    shared slot S0). The worker's phase-3 commit must re-check _shared and fold
+    (release its own destination slot, ref++), not overwrite the record. Current
+    SSD _commit_ssd_publish blindly reassigns: refs reset to 1, its own bytes are
+    charged AGAIN (_shared_ssd_bytes ~3 pages for 2 pages), and the inline slot
+    S0 becomes an orphan (live extent with no key mapping)."""
+    ssd = str(tmp_path / "duprace.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    try:
+        _bg_spill_page(pool, 1, 1)
+        cold.offer_publish(1, 101, {"bounds": torch.zeros(2)})
+        cold.wait_committed([101])  # creates the shared spill file
+        page_n = cold._ssd.stride
+
+        _bg_spill_page(pool, 9, 9)
+        assert cold.offer_publish(9, 700, {"bounds": torch.zeros(2)})
+        inline_slot = []
+        real_write = cold._shared_ssd.write_reserved
+
+        def inline_during_lockfree_write(slot, blob, mapping):
+            real_write(slot, blob, mapping)  # worker destination bytes are in
+            # step thread concurrently publishes a 2nd private page of key 700
+            _bg_spill_page(pool, 11, 11)
+            cold.share_hold_kv(11, 700, {"bounds": torch.zeros(2)})
+            inline_slot.append(cold._shared_ssd._slot_of[("s", 700)])
+
+        cold._shared_ssd.write_reserved = inline_during_lockfree_write
+        assert cold.wait_committed([700], 5)
+        del cold._shared_ssd.write_reserved
+
+        rec = cold._shared.get(700)
+        assert rec is not None and rec[1] == 2  # inline 1 + queued 1, never reset
+        # two private pages consumed -> two pages of shared bytes, not three
+        assert cold._shared_ssd_bytes == 2 * page_n
+        # the inline slot S0 is still mapped and live; no orphan reserved slot
+        assert ("s", 700) in cold._shared_ssd._slot_of
+        assert not cold._shared_ssd._reserved
+        # every live slot is reachable through a key (no orphan extent slot)
+        live_slots = set(cold._shared_ssd._slot_of.values())
+        assert live_slots
+        assert sum(cold._shared_ssd._extent_live) == len(live_slots)
+    finally:
+        cold.close()
+
+
+def test_bg_publish_ram_phase2_race_folds_inline_ref_without_double_ram(tmp_path):
+    """The RAM variant of the phase-2 race already commits through share_hold
+    (ref++ on an existing key): refs fold to 2 and _shared_ram is charged once.
+    Regression guard so the SSD rework does not regress the RAM path."""
+    import threading
+
+    cold = HostKvPages(budget_bytes=1 << 30, bg_publish=True, bg_wait_s=5)
+    gate = threading.Event()
+    cold._pub_before_job = lambda job: gate.wait(5)
+    try:
+        blob1 = {"k": torch.full((2, 4), 1.0, dtype=torch.float16)}
+        cold.hold(1, blob1, 8)
+        assert cold.offer_publish(1, 700, None)
+        blob2 = {"k": torch.full((2, 4), 2.0, dtype=torch.float16)}
+        cold.hold(2, blob2, 8)
+        cold.share_hold_kv(2, 700, None)  # inline record ref=1 while job queued
+        gate.set()
+        assert cold.wait_committed([700], 5)
+        assert cold._shared[700][1] == 2
+        assert cold._shared_ram == 8  # one page, never charged twice
+    finally:
+        gate.set()
+        cold.close()
+
+
+@pytest.mark.xfail(strict=True, reason="the shared spill file layout is frozen at first-creation, dropping warm dk/dv (cold-first) or KeyErroring cold blobs (warm-first); needs signature-bucketed storage")
+def test_shared_spill_holds_heterogeneous_warm_and_cold_blobs(tmp_path):
+    """A 3-field cold blob (k/v/bounds) and a 5-field warm blob (plus dk/dv)
+    share the SAME prefix spill file. The file layout is frozen from whichever
+    blob first created it, so today:
+      cold-first -> the warm blob's dk/dv are silently dropped, share_take_field
+                    returns a wrong-value/absent field instead of a clean miss;
+      warm-first -> spilling the cold blob raises KeyError('dk').
+    A bucketed/signature-tagged layout must store both: a missing field on a
+    record that does not own it reads as None (cache miss), never KeyError, and
+    owned fields round-trip their own bytes in both creation orders."""
+    def nbytes(b):
+        return sum(t.numel() * t.element_size() for t in b.values())
+
+    # --- cold-first ---
+    d = tmp_path / "coldfirst"
+    d.mkdir()
+    cold = HostKvPages(budget_bytes=64, ssd_path=str(d / "x.bin"))
+    try:
+        cold.share_hold(100, _cold_blob(1.0), nbytes(_cold_blob()))
+        cold.share_hold(200, _warm_blob(2.0), nbytes(_warm_blob()))
+        assert cold._shared[100][2] is None and cold._shared[200][2] is None
+        # a field the cold record does not own is a clean miss, not a KeyError
+        assert cold.share_take_field(100, "dk") is None
+        # the warm record owns dk/dv and must read them back (fill 2.0)
+        dk = cold.share_take_field(200, "dk")
+        assert dk is not None and torch.all(dk == 2.0)
+        warm = cold.share_take(200)
+        assert torch.all(warm["k"] == 2.0) and torch.all(warm["dk"] == 2.0)
+    finally:
+        cold.close()
+
+    # --- warm-first ---
+    d2 = tmp_path / "warmfirst"
+    d2.mkdir()
+    warmfirst = HostKvPages(budget_bytes=64, ssd_path=str(d2 / "y.bin"))
+    try:
+        warmfirst.share_hold(300, _warm_blob(2.0), nbytes(_warm_blob()))
+        warmfirst.share_hold(400, _cold_blob(3.0), nbytes(_cold_blob()))
+        assert warmfirst._shared[300][2] is None
+        c400 = warmfirst.share_take(400)  # must not KeyError on the 3->5 layout
+        assert c400 is not None and torch.all(c400["k"] == 3.0)
+        # the cold record owns no dk/dv -> miss, not a KeyError
+        assert warmfirst.share_take_field(400, "dk") is None
+        assert torch.all(warmfirst.share_take(300)["dk"] == 2.0)
+    finally:
+        warmfirst.close()
+
+
 def test_bg_publish_dup_content_ssd_consumes_private_slot(tmp_path):
     """Two publishers with the SAME content key both spilled privately: the
     second inline commit creates the shared record while the first sits queued,
