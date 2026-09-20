@@ -27,6 +27,9 @@
 #     prefix = the CLI default, so 0 adds no flag. 2048 is the V100 W-sweep
 #     candidate, opt-in)
 #   SERVE_DECODE_GRAPH (1; set 0 for the graph-off measurement arm)
+#   SERVE_ARM_NAME (unset=omitted; a label like A4 carried in the boot line's
+#     arm= field, so an inspector reads the head it is looking at instead of
+#     inferring the arm from an argv it cannot see)
 #   MAX_RESTARTS (10) RESTART_FUSE_MAX (5) RESTART_FUSE_WINDOW_S (600)
 #   LIVENESS_POLL_S (60) -- the guard's poll period; set 999999 for a zero-traffic
 #     baseline, since at this arm's slots=8 the guard injects a real 4-token chat
@@ -82,6 +85,11 @@ DRAFT_WINDOW=${SERVE_DRAFT_WINDOW:-0}
 # (cli.py --decode-graph is store_const default None; the only off switch is
 # --no-decode-graph, const=False).
 DECODE_GRAPH=${SERVE_DECODE_GRAPH:-1}
+# The arm's own name (e.g. A4), carried into the boot line so a reader of the log
+# knows which arm a boot belongs to without reconstructing it from the env. Unset
+# is the common case and appends nothing -- a bare `arm=` would read as a field
+# with a missing value rather than an arm that was never named.
+ARM_NAME=${SERVE_ARM_NAME:-}
 MAX_RESTARTS=${MAX_RESTARTS:-10}
 RESTART_FUSE_MAX=${RESTART_FUSE_MAX:-5}
 RESTART_FUSE_WINDOW_S=${RESTART_FUSE_WINDOW_S:-600}
@@ -111,7 +119,12 @@ WINDOW_ARGS=()
 # reader of /work/serve_h20.log can self-certify which arm served without relying
 # on a relayed command line.
 GRAPH_WORD=off; [ "$DECODE_GRAPH" != 0 ] && GRAPH_WORD=on
-ARM_DESC="depth=$DEPTH sparse_k=$SPARSE_K decode_graph=$GRAPH_WORD ctx=$CTX slots=$SLOTS w=$DRAFT_WINDOW"
+# The name goes FIRST, not appended: the boot line's `arm=...` is what an
+# inspector greps for, and a trailing optional field is the one a truncated log
+# line loses.
+ARM_DESC=""
+[ -n "$ARM_NAME" ] && ARM_DESC="arm=$ARM_NAME "
+ARM_DESC="${ARM_DESC}depth=$DEPTH sparse_k=$SPARSE_K decode_graph=$GRAPH_WORD ctx=$CTX slots=$SLOTS w=$DRAFT_WINDOW"
 
 SERVE_ARGV=("$PYTHON" -u -m tilerl.cli serve --model qwen38-27b
   --host 0.0.0.0 --port "$PORT"
