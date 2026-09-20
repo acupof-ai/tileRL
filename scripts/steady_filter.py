@@ -13,6 +13,8 @@ same log under the standard set, so a headroom arm and a sweep arm can be placed
 side by side, or not placed at all when the log cannot support it.
 
     python3 scripts/steady_filter.py --log ~/servehybridsse.log --out steady.json
+    python3 scripts/steady_filter.py --log ~/closewin/bg1/serve.log \
+        --window 194540:489409 --window 489409     # this arm's warm spans only
 
 Read-only. Every field it prints is derived from the tick lines; nothing is
 inferred. When the exclusion reason cannot be recovered from an older log format
@@ -60,10 +62,31 @@ def parse_line(line: str) -> dict | None:
     }
 
 
-def parse_rows(log_path: str, offset: int = 0) -> list[dict]:
+def parse_rows(log_path: str, offset: int = 0, until: int | None = None) -> list[dict]:
+    """Tick rows in ``[offset, until)`` bytes.
+
+    The window matters as much as the start. `probe_headroom_coldtail` records
+    one ``log_byte_offset`` per rep, taken after that rep's cold fill and before
+    its warm POST; the reps' warm windows are DISJOINT, with the next rep's fill
+    in between -- and a fill emits short-context decode ticks that pass the
+    standard set. Starting at the first rep's offset and reading to EOF therefore
+    admits every later rep's fill into the steady set. `until` is the next rep's
+    offset (or EOF for the last one).
+    """
+    out = []
     with open(log_path, errors="replace") as fh:
         fh.seek(offset)
-        return [r for line in fh if (r := parse_line(line))]
+        while True:
+            pos = fh.tell()
+            if until is not None and pos >= until:
+                break
+            line = fh.readline()
+            if not line:
+                break
+            r = parse_line(line)
+            if r is not None:
+                out.append(r)
+    return out
 
 
 def is_standard(r: dict) -> bool:
@@ -120,7 +143,8 @@ def pct(xs: list[int], q: float):
 TAIL_MS = 300
 
 
-def summarise(rows: list[dict], tail_ms: int = TAIL_MS) -> dict:
+def summarise(rows: list[dict], tail_ms: int = TAIL_MS,
+              windows: list[tuple[int, int | None]] | None = None) -> dict:
     """Steady median with the long tail split out.
 
     The close-tail ticks are the subject of this window, so folding them into
@@ -138,6 +162,11 @@ def summarise(rows: list[dict], tail_ms: int = TAIL_MS) -> dict:
     unclassifiable = [r for r in rows if r["path"] is None or r["sparse"] is None]
     return {
         "filter": STANDARD_FILTER,
+        # The spans this summary is over, or `[[0, null]]` for the whole file --
+        # never empty from the CLI. It is the reader's check that a windowed arm
+        # really was windowed: a `[[0, null]]` on a close-window arm means the
+        # median includes the supervisor's warmup.
+        "windows": [list(w) for w in (windows or [(0, None)])],
         "ticks_total": len(rows),
         "steady_n": len(body),
         "steady_p50_ms": median([r["total"] for r in body]),
@@ -158,22 +187,49 @@ def summarise(rows: list[dict], tail_ms: int = TAIL_MS) -> dict:
     }
 
 
+def _parse_windows(specs: list[str] | None) -> list[tuple[int, int | None]]:
+    """`["194540:489409", "489409"]` -> [(194540, 489409), (489409, None)]."""
+    if not specs:
+        return [(0, None)]
+    out = []
+    for spec in specs:
+        off, _, until = spec.partition(":")
+        out.append((int(off), int(until) if until else None))
+    return sorted(out)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--log", required=True)
     ap.add_argument("--out", help="write the summary JSON here")
+    ap.add_argument("--window", action="append", default=None,
+                    metavar="OFF[:UNTIL]",
+                    help="byte span to read, repeatable. Each rep's warm POST "
+                         "offset (arm.json reps[].ticks.log_byte_offset) starts "
+                         "one; the next rep's offset ends it (the last runs to "
+                         "EOF). Repeat it -- an arm has several reps, and the "
+                         "spans are disjoint with each rep's cold fill in "
+                         "between, whose short-context decode ticks pass the "
+                         "standard set. Default: the whole file (offset 0).")
     ap.add_argument("--tail-ms", type=int, default=TAIL_MS,
                     help="a steady-set tick slower than this is reported as close tail")
     ap.add_argument("--self-check", action="store_true")
     a = ap.parse_args()
     if a.self_check:
         return _self_check()
-    rows = parse_rows(a.log)
+    spans = _parse_windows(a.window)
+    rows = []
+    for off, until in spans:
+        rows.extend(parse_rows(a.log, off, until))
+    # The window is a filter, not a sibling series: ticks from different spans
+    # are one sample, so the median is taken over their union rather than
+    # averaged per span (which would weight a 2-tick rep like an 8-tick one).
+    rows.sort(key=lambda r: r["n"])
     if not rows:
-        print(f"no tick lines in {a.log}", file=sys.stderr)
+        print(f"no tick lines in {a.log} within {spans}", file=sys.stderr)
         return 1
-    rec = summarise(rows, a.tail_ms)
+    rec = summarise(rows, a.tail_ms, spans)
     if a.out:
         with open(a.out, "w") as fh:
             json.dump(rec, fh, indent=1)
@@ -243,6 +299,49 @@ def _self_check() -> int:
         assert s2["steady_n"] == 0, (label, s2)
         assert s2["excluded_undecidable_n"] == 1, (label, s2)
         assert "predates" in s2["excluded_undecidable_note"], (label, s2)
+
+    # The window. A warm window is not "the log from the first rep's offset on":
+    # the supervisor's warmup and each rep's cold fill write standard-set ticks
+    # too. Prove both halves on a synthetic log laid out the way the harness
+    # windows a real one -- two reps with a fill between them, and warmup before
+    # the first offset.
+    import tempfile
+    plain = line(1, 175, 1, 0, 155, 3, "eager", 1)      # supervisor warmup
+    fill0 = line(2, 178, 1, 0, 158, 3, "eager", 1)      # rep0 fill
+    warm0 = line(3, 176, 1, 0, 156, 3, "eager", 1)      # rep0 warm
+    fill1 = line(4, 400, 1, 0, 380, 3, "eager", 1)      # rep1 fill (also standard)
+    warm1a, warm1b = (line(5, 177, 1, 0, 157, 3, "eager", 1),
+                      line(6, 179, 1, 0, 159, 3, "eager", 1))
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+        fh.write("\n".join([plain, fill0, warm0, fill1, warm1a, warm1b]) + "\n")
+        lpath = fh.name
+    # Byte offsets as the probe would record them: after the fill, before the warm.
+    marks, pos = [], 0
+    for text in [plain, fill0, warm0, fill1, warm1a, warm1b]:
+        pos += len(text) + 1
+        marks.append(pos)
+    # marks[i] = byte just past the i-th line. rep0's warm window is
+    # [past fill0, past warm0); rep1's runs from past fill1 to EOF. fill1 lies
+    # in neither.
+    spans = [(marks[1], marks[2]), (marks[3], None)]
+    got = []
+    for off, until in spans:
+        got.extend(parse_rows(lpath, off, until))
+    sw = summarise(got, tail_ms=300, windows=spans)
+    # The fill (400 ms) is standard-set and would land in the TAIL if the window
+    # were "from the first offset to EOF"; the warmup tick would land in the
+    # median. Both are outside the spans, so neither does.
+    assert sw["steady_n"] == 3, sw
+    assert sw["ticks_total"] == 3, sw
+    assert sw["tail_n"] == 0, sw
+    assert sw["steady_p50_ms"] == 177.0, sw
+    # Negative control: without the windows the same log reports the warmup and
+    # the fill, so the assertion above is failing for the windowing and not
+    # because those ticks were never steady to begin with.
+    un = summarise(parse_rows(lpath), tail_ms=300)
+    assert un["ticks_total"] == 6 and un["steady_n"] == 5, un
+    assert un["tail_n"] == 1 and un["tail_max_ms"] == 400, un
+
     print("steady_filter: standard-set split OK")
     return 0
 

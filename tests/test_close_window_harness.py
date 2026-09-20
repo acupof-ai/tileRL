@@ -66,17 +66,134 @@ def test_the_instrumentation_preset_disables_liveness_polling():
     assert "LIVENESS_POLL_S=999999" in env, env
     assert "TILERL_STEP_TIMING=1" in env, env
     assert "TILERL_STEP_TIMING_SLOW_MS=0" in env, env
+    # The draft READ window is instrumentation, not a treatment, and the probe
+    # asserts it (--expect-window 2048). Without it the loader default is W=0 and
+    # every arm exits rc13 before producing a number.
+    assert "TILERL_DRAFT_ATTN_WINDOW_TOKENS=2048" in env, env
 
 
 def test_arm_list_is_stable_and_the_unmerged_arm_is_refused():
     r = _run("--list")
     names = r.stdout.split()
-    assert names == ["baseline", "batch", "bg1", "bg2", "bg3", "locksplit"], names
+    assert names == ["baseline", "batch", "bg1", "bg2", "bg3", "bgcap", "locksplit"], names
     # #746 is not merged: the arm must refuse rather than boot a serve that
     # ignores an unknown flag and report a no-op as a result.
     assert _arm_envs()["locksplit"] == "PENDING_746"
     src = SRC.read_text()
     assert "PENDING_746" in src and "SKIPPED" in src
+
+
+def test_bgcap_is_the_only_arm_with_the_spill_cap():
+    """The cap changes what the engine does, so it is an arm and not shared
+    instrumentation: on every arm it would make them incomparable on the thing
+    they are compared on. bg2 is its control (same bg config, no cap)."""
+    arms = _arm_envs()
+    assert "TILERL_COLD_PREFIX_SSD_CAP=1" in arms["bgcap"], arms["bgcap"]
+    for a, env in arms.items():
+        if a != "bgcap":
+            assert "TILERL_COLD_PREFIX_SSD_CAP" not in env, (a, env)
+    # bgcap differs from bg2 by exactly the cap.
+    a, b = arms["bgcap"].split(), arms["bg2"].split()
+    assert set(a) - set(b) == {"TILERL_COLD_PREFIX_SSD_CAP=1"}, (a, b)
+    assert set(b) - set(a) == set(), (a, b)
+
+
+def test_reclaim_samples_the_shared_spill_not_the_private_one():
+    """The #740 trailing truncation reclaims `<cold-ssd-path>.prefix.bin`
+    (kv_tiers._shared_ssd_path). Sampling the private `$COLD_SSD` measured a file
+    the effect does not touch, so the reading could only ever be a plateau."""
+    src = SRC.read_text()
+    assert "${COLD_SSD%.bin}.prefix.bin" in src, src[:200]
+    assert '--spill-path "$shared_spill"' in src
+    # ... and the sampler is NOT gated on that file existing. The shared spill is
+    # created by this window's own first publish, so an existence gate would skip
+    # sampling on exactly the arm that creates it; the sampler reads a missing
+    # path as size 0, which is what the first rows of a real run look like.
+    assert '[ -f "$shared_spill" ]' not in src, "the sampler is gated on existence"
+
+
+def test_each_arm_gets_its_own_log():
+    """steady_filter and the probe read from offset 0, and the supervisor only
+    truncates a log already over LOG_CAP at boot -- so a shared fixed path made
+    arm N's statistic cover arms 1..N-1 too."""
+    src = SRC.read_text()
+    assert "SERVE_LOG=$arm_log" in src, "the serve is not given a per-arm log"
+    assert '--log "$arm_log"' in src, "the probe does not read the per-arm log"
+    assert 'steady_filter.py --log "$arm_log"' in src
+    # ... and no reader still points at the shared path
+    assert '--log "$LOG"' not in src, "a reader still uses the shared log"
+
+
+def test_the_steady_filter_is_windowed_to_each_reps_warm_span():
+    """A per-arm log is not enough: the supervisor's warmup (dense 7000 + sparse
+    9000, 8-token decodes) and each rep's cold FILL write short-context decode
+    ticks that PASS the standard set, so reading the whole file reports warmup and
+    fill in the steady median. A single start offset is also not enough -- the
+    reps' warm windows are disjoint with the next rep's fill in between.
+
+    Executed, not grepped: the shell builds the --window list and the filter
+    consumes it, so the check runs the filter on a synthetic log the way the
+    harness does and asserts nothing outside the spans is counted."""
+    import json
+    import subprocess
+    import tempfile
+
+    src = SRC.read_text()
+    assert "log_byte_offset" in src, "the harness does not read the rep offsets"
+    assert 'win_args+=(--window "$prev:$o")' in src and 'win_args+=(--window "$prev")' in src
+    # The offsets come from arm.json, one per rep, so the window count is the rep
+    # count -- not a single [first_offset, EOF) that would admit every later fill.
+    assert "--offset" not in src and "--until" not in src, "stale single-window wiring"
+    # No offsets (the probe finished no rep) means no warm span to filter to; the
+    # filter must NOT then be run unwindowed, which would write a steady.json
+    # whose median contains the supervisor's warmup and reads like the others.
+    assert "steady.json NOT written" in src, "the no-offset path degrades silently"
+    # `set -u` + an EMPTY array: `"${win_args[@]}"` is an unbound-variable abort on
+    # bash 3.2 (macOS's /bin/bash, which is what runs this on the laptop that
+    # starts the window), and the empty case is reachable -- it is the no-rep
+    # branch two lines above. The guarded expansion is what makes that branch
+    # survive; run it, both ways.
+    assert '${win_args[@]+"${win_args[@]}"}' in src, "unguarded empty-array expansion"
+    probe = (
+        "set -u\n"
+        'A=()\n'
+        'f() { printf "%s\\n" "$*"; }\n'
+        'f ${A[@]+"${A[@]}"}\n'
+        'B=(--window 5)\n'
+        'f ${B[@]+"${B[@]}"}\n'
+    )
+    r = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == ["", "--window 5"], r.stdout
+    bad = subprocess.run(["bash", "-c", 'set -u\nA=()\nf() { printf "%s\\n" "$*"; }\nf "${A[@]}"\n'],
+                         capture_output=True, text=True, timeout=30)
+    assert bad.returncode != 0 and "unbound" in bad.stderr, (bad.returncode, bad.stderr)
+
+    sf = REPO / "scripts" / "steady_filter.py"
+    warm = "[step-timing] tick 3 total=176ms dec=1 pre=0 model=156ms sample=3ms path=eager sparse=1"
+    warmup = "[step-timing] tick 1 total=175ms dec=1 pre=0 model=155ms sample=3ms path=eager sparse=1"
+    fill = "[step-timing] tick 2 total=400ms dec=1 pre=0 model=380ms sample=3ms path=eager sparse=1"
+    lines = [warmup, fill, warm]
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+        fh.write("\n".join(lines) + "\n")
+        path = fh.name
+    off = len(warmup) + 1 + len(fill) + 1
+    r = subprocess.run(["python3", str(sf), "--log", path, "--window", str(off)],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[-400:]
+    rec = json.loads(r.stdout)
+    assert rec["steady_n"] == 1 and rec["ticks_total"] == 1, rec
+    assert rec["windows"] == [[off, None]], rec
+    # Negative control: the same log unwindowed admits the warmup into the median
+    # and reports the fill as a tail tick, which is what the window's absence
+    # would do to a real arm.
+    r = subprocess.run(["python3", str(sf), "--log", path], capture_output=True,
+                       text=True, timeout=60)
+    un = json.loads(r.stdout)
+    assert un["steady_n"] == 2 and un["tail_n"] == 1 and un["tail_max_ms"] == 400, un
+    # `windows` says which read produced the number: [[0, null]] is the whole
+    # file, so a close-window arm reading that is reporting warmup in its median.
+    assert un["windows"] == [[0, None]], un
 
 
 def test_bg_arms_differ_only_in_the_depth_knob():

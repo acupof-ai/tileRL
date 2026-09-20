@@ -13,11 +13,11 @@ scripts/run_close_window_v100.sh --all                  # every arm, then prompt
 ```
 
 Per arm, in order: stop any serve → boot `serve_hybrid_v100.sh` under that arm's
-env → wait for `/health` → **assert the health body** → start the passive
-reclaim sampler → run `probe_headroom_coldtail.py arm` → follower correctness
-smoke → cancel-immediacy smoke → stop the serve. Artifacts land in
-`$OUT/<arm>/` (`arm.json`, `steady.json`, `reclaim.json`, `follower.json`,
-`cancel.log`, and a log per step).
+env **with its own `SERVE_LOG`** → wait for `/health` → **assert the health body**
+→ start the passive reclaim sampler → run `probe_headroom_coldtail.py arm` →
+re-window the steady filter → follower correctness smoke → cancel-immediacy smoke
+→ stop the serve. Artifacts land in `$OUT/<arm>/` (`serve.log`, `arm.json`,
+`steady.json`, `reclaim.json`, `follower.json`, `cancel.log`, and a log per step).
 
 A failed smoke fails the arm, and the exit code says which:
 
@@ -45,11 +45,16 @@ window genuinely runs a different shape.
 ### Instrumentation every arm gets
 
 `LIVENESS_POLL_S=999999 TILERL_STEP_TIMING=1 TILERL_STEP_TIMING_SLOW_MS=0
-TILERL_CLOSE_BUSYIDLE=1`.
+TILERL_CLOSE_BUSYIDLE=1 TILERL_DRAFT_ATTN_WINDOW_TOKENS=2048`.
 
 `LIVENESS_POLL_S` is the load-bearing one: the supervisor's liveness probe sends
 a **real chat every 60 s**, which lands inside the decode window being measured.
 Set it back to 60 only in `--restore-only`.
+
+`TILERL_DRAFT_ATTN_WINDOW_TOKENS` is instrumentation, not a treatment: the probe
+asserts the window (`--expect-window 2048`) and refuses the arm (rc 13) when it
+does not match, and the loader default is `W=0`. The shipped serve passes no such
+flag, so this env is injected per arm by the harness and never by the launcher.
 
 ## Arms
 
@@ -60,10 +65,15 @@ Set it back to 60 only in `--restore-only`.
 | `bg1` | `+ TILERL_CLOSE_BG_PUBLISH=1 TILERL_CLOSE_BG_DEPTH=512` | #743's background publisher at its own default depth |
 | `bg2` | `+ TILERL_CLOSE_BG_PUBLISH=1` | the publisher with #745's **derived** depth (`(num_slots+1)·ceil(max_ctx/16)`) |
 | `bg3` | `+ TILERL_CLOSE_BG_PUBLISH=1 TILERL_CLOSE_BG_DEPTH=8192` | the depth the 2026-09-20 window measured clean |
+| `bgcap` | `+ TILERL_CLOSE_BG_PUBLISH=1 TILERL_COLD_PREFIX_SSD_CAP=1` | #740's trailing truncation, sampled from the shared prefix spill. `bg2` is its control |
 | `locksplit` | — | **refused**: #746 is not merged, and a flag nothing reads would report a no-op as a measured result |
 
 `bg1` vs `bg2` is the depth question, not a second flag: `bg2` leaves the depth
 unset so `build.py` derives it from the shape.
+
+`bgcap` carries the cap because the cap **changes what the engine does** — put on
+every arm it would make them incomparable on the thing they are compared on. The
+reclaim sampler runs on every arm regardless; only the cap is arm-specific.
 
 ## Reading the result
 
@@ -89,13 +99,13 @@ with ticks over 300 ms listed as tail rather than folded into the median. Those
 are **different statistics**, so a headroom arm's `p50_ms` and a sweep arm's p50
 must not sit in the same before/after table.
 
-The harness runs `scripts/steady_filter.py --log … --out $OUT/<arm>/steady.json`
+The harness runs `scripts/steady_filter.py --log $OUT/<arm>/serve.log --window …`
 on each arm for exactly this: it re-reads the same log under the standard set and
 reports `steady_p50_ms` with the tail split out (`tail_n`, `tail_p50_ms`,
 `tail_max_ms`). Each arm therefore carries both, and the one that matches the
 sweep's口径 is `steady.json`.
 
-Two properties worth knowing before trusting it:
+Three properties worth knowing before trusting it:
 
 - The tail split is an **absolute** 300 ms threshold, not a quantile. At the
   ~5-12 steady ticks a warm window yields, a 0.95 quantile cut separates nothing
@@ -105,6 +115,19 @@ Two properties worth knowing before trusting it:
   steady. `steady_filter.py` reports those rows as
   `excluded_undecidable_n` with a note rather than counting them; the clause that
   rejects them is `sparse == 1`, not a separate absence check.
+- **The read is windowed to the arm's warm spans, and both ends matter.** Standard
+  set is not the same as steady state: the supervisor's warmup (dense 7000 +
+  sparse 9000, 8-token decodes) and each rep's cold **fill** write short-context
+  decode ticks that pass the standard set — the fill's land in the tail, the
+  warmup's in the median. The reps' warm windows are disjoint with the next rep's
+  fill between them, so `arm.json`'s one `log_byte_offset` per rep becomes one
+  `--window off_i[:off_{i+1}]`, and the filter takes the median over the union of
+  those spans in a single call. Averaging per-rep medians instead would weight a
+  2-tick rep the same as an 8-tick one.
+
+  Consequence for reading `steady.json` at all: `windows` records the spans the
+  median is over. `[[0, null]]` means the whole file was read, so on a close-window
+  arm that number includes the supervisor's warmup and is not the steady figure.
 
 ### Depth changes are two boots
 
@@ -121,6 +144,19 @@ means two full windows.
 - `ssd_mmap_worker` subtracted from `ssd_mmap` — how much of the step charge was
   cross-thread disk accounting;
 - `reclaim.json` — the #740 trailing truncation, from apparent bytes only.
+
+### The reclaim sampler is the arm's clock
+
+`RECLAIM_SAMPLES=120` at `RECLAIM_INTERVAL_S=20` is `(120-1)·20 = 2380 s` — 39.7
+minutes — and the arm `wait`s on it before stopping the serve. The probe's own
+work finishes well inside that, so **every arm costs the sampler's full duration**
+(7 arms ≈ 4.6 h of wall clock, most of it idle). Set the two together to the
+release being watched rather than leaving the default: the shrink to capture is
+one release, and rows past it only extend the plateau.
+
+Raising `RECLAIM_INTERVAL_S` is the cheap knob (fewer, further-apart rows for the
+same span); lowering `--samples` shortens the span and risks ending on the
+plateau, which the probe reports honestly as a zero shrink rather than failing.
 
 ## Recovery checklist
 
