@@ -82,6 +82,7 @@ non-zero means SUPERSEDED, not delete.
 | Doc | Answers |
 |---|---|
 | [serve-v100.md](serve-v100.md) | Running the 27B on the pod with the chat UI on a laptop — the SSH tunnel, the exact server command, and why warmup captures the decode graphs up front. |
+| [run-close-window-v100.md](run-close-window-v100.md) | The one-key V100 close-tail window harness: the arm table, the health-body gate that refuses a wrong server, the instrumentation preset, and the recovery checklist. |
 | [serve-h20.md](serve-h20.md) | The sm90 sparse+d1+decode-graph supervisor run through `pod_run.sh` — the `/work/tl013` cu129 interpreter (not `uv run`), the in-checkpoint draft, and the parameterized cold-spill path. Frozen with H20 (stopped 2026-09-16). |
 | [serve-cold-prefill-cap.md](serve-cold-prefill-cap.md) | When to raise the sparse prefill chunk from the shared-server default 192 to 512 (dedicated/offline long-context cold fill), the two zero-code ways to do it, and why concurrent serving must keep 192. First-token latency only. |
 | [api-compat-surface.md](api-compat-surface.md) | The completion routes sharing one engine — OpenAI Chat Completions, Anthropic Messages, OpenAI Responses and the playground's own WS transport — the vendor shape each presents, and the named deviations. |
