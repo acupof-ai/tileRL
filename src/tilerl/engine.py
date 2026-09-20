@@ -185,9 +185,15 @@ def _step_seed(seed: int, generated: int) -> int:
 #: segments; num_* count caching-allocator events; sync_all_streams is the
 #: cross-stream event sync a forced reclaim does.
 _MEM_KEYS = (
-    "num_sync_all_streams", "num_device_alloc", "num_device_free",
-    "num_alloc_retries", "num_ooms", "num_oom_rejections",
-    "segment.all.allocated", "segment.all.freed", "reserved_bytes.all.current",
+    "num_sync_all_streams",
+    "num_device_alloc",
+    "num_device_free",
+    "num_alloc_retries",
+    "num_ooms",
+    "num_oom_rejections",
+    "segment.all.allocated",
+    "segment.all.freed",
+    "reserved_bytes.all.current",
 )
 
 
@@ -231,13 +237,50 @@ class _StepTiming:
     drains already finished it.
     """
 
-    __slots__ = ("slow_s", "tot", "count", "cur", "t0", "n", "last_total", "note",
-                 "_eng", "cuda", "ev_s", "ev_e", "mem0", "fwd_t0", "fwd_host_ms",
-                 "fwd_gpu_ms", "fwd_path", "fwd_sparse", "last_why", "alloc_conf",
-                 "phase_dec", "phase_pre")
+    __slots__ = (
+        "slow_s",
+        "tot",
+        "count",
+        "cur",
+        "t0",
+        "n",
+        "last_total",
+        "note",
+        "_eng",
+        "cuda",
+        "ev_s",
+        "ev_e",
+        "mem0",
+        "fwd_t0",
+        "fwd_host_ms",
+        "fwd_gpu_ms",
+        "fwd_path",
+        "fwd_sparse",
+        "last_why",
+        "alloc_conf",
+        "phase_dec",
+        "phase_pre",
+        "close_busyidle",
+        "_cl_ev_s",
+        "_cl_ev_e",
+        "_cl_wall_ms",
+        "_cl_open",
+        "_cl_t0",
+    )
 
     def __init__(self, engine=None) -> None:
         self.slow_s = float(os.environ.get("TILERL_STEP_TIMING_SLOW_MS", "500")) / 1000.0
+        #: TILERL_CLOSE_BUSYIDLE=1: bracket release_close_request with a pair of
+        #: async CUDA events so a slow close splits into device-busy (the stream
+        #: ran work) vs host-blocked (the step thread waited off-stream — on a
+        #: lock or a host mmap). Only resolves non-blocking at tick_end; never
+        #: synchronizes. Requires TILERL_STEP_TIMING=1.
+        self.close_busyidle = os.environ.get("TILERL_CLOSE_BUSYIDLE", "").strip() not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
         self.tot: dict[str, float] = {}
         self.count: dict[str, int] = {}
         self.cur: dict[str, float] = {}
@@ -251,6 +294,12 @@ class _StepTiming:
         self.cuda: bool | None = None
         self.ev_s = None
         self.ev_e = None
+        # close busy/idle bracket (TILERL_CLOSE_BUSYIDLE): events reused across
+        # ticks, populated in close_start, resolved non-blocking in tick_end.
+        self._cl_ev_s = None
+        self._cl_ev_e = None
+        self._cl_wall_ms = 0.0
+        self._cl_open = False
         self.mem0: dict[str, int] = {}
         self.fwd_t0 = 0.0
         self.fwd_host_ms = 0.0
@@ -278,6 +327,49 @@ class _StepTiming:
         self.fwd_path = "eager"
         self.fwd_sparse = False
         self.mem0 = {}
+        self._cl_open = False
+        self._cl_wall_ms = 0.0
+
+    def close_bracket_start(self) -> None:
+        """Open the release_close_request busy/idle bracket. Host anchor plus a
+        non-blocking start event; no sync."""
+        if not self.close_busyidle:
+            return
+        self._cl_t0 = time.perf_counter()
+        self._cl_open = True
+        if self.cuda is None:
+            self.cuda = torch.cuda.is_available()
+        if self.cuda:
+            if self._cl_ev_s is None:
+                self._cl_ev_s = torch.cuda.Event(enable_timing=True)
+                self._cl_ev_e = torch.cuda.Event(enable_timing=True)
+            self._cl_ev_s.record()
+
+    def close_bracket_end(self) -> None:
+        """Close the bracket: host wall and a non-blocking end event. The device
+        span is read at tick_end; query() only, never a blocking wait."""
+        if not self.close_busyidle or not self._cl_open:
+            return
+        self._cl_wall_ms = (time.perf_counter() - self._cl_t0) * 1000.0
+        if self.cuda:
+            self._cl_ev_e.record()
+
+    def _close_busyidle_fields(self) -> str:
+        """Resolve the close bracket non-blocking. device_ms is stream work that
+        completed within the bracket; host_ms = wall - device is the off-stream
+        wait. device=pending means the end event had not drained (still running
+        on-stream at tick_end) — honest, not a forced sync."""
+        if not self.close_busyidle or not self._cl_open:
+            return ""
+        wall = max(0.0, self._cl_wall_ms)
+        device = None
+        if self.cuda and self._cl_ev_e is not None and self._cl_ev_e.query():
+            device = self._cl_ev_s.elapsed_time(self._cl_ev_e)
+        self._cl_open = False
+        if device is None:
+            return f" close_wall={wall:.0f}ms close_dev=pending"
+        device = max(0.0, min(device, wall))
+        return f" close_wall={wall:.0f}ms close_dev={device:.0f}ms close_host={wall - device:.0f}ms"
 
     def mark(self, seg: str, t: float) -> None:
         self.cur[seg] = self.cur.get(seg, 0.0) + time.perf_counter() - t
@@ -345,6 +437,12 @@ class _StepTiming:
         cold = getattr(getattr(eng, "_kv", None), "cold", None) if eng is not None else None
         if cold is not None:
             self.charge_ms("ssd_mmap", cold.drain_ssd_ms())
+            # Drain the worker bucket on every tick so it cannot accumulate; it
+            # only shows on the line under the busy/idle gate (default path
+            # unchanged, and the worker exists solely behind its own opt-in flag).
+            wms = cold.drain_worker_ssd_ms() / 1000.0
+            if self.close_busyidle and wms:
+                self.cur["ssd_mmap_worker"] = wms
         for k, v in self.cur.items():
             self.tot[k] = self.tot.get(k, 0.0) + v
             self.count[k] = self.count.get(k, 0) + 1
@@ -356,14 +454,21 @@ class _StepTiming:
             # phase tag for the whole-tick distribution.
             phase = f" dec={self.phase_dec} pre={self.phase_pre}"
             tail = self._slow_tail(dt * 1000)
-            print(f"[step-timing] tick {self.n} total={dt * 1000:.0f}ms{phase} {parts}"
-                  f"{extra} {tail}", file=sys.stderr, flush=True)
+            close_bi = self._close_busyidle_fields()
+            print(
+                f"[step-timing] tick {self.n} total={dt * 1000:.0f}ms{phase} {parts}"
+                f"{extra} {tail}{close_bi}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _slow_tail(self, dt_ms: float) -> str:
         """Device span + allocator deltas for one slow forward. Never syncs:
         elapsed_time runs only when query() says the end event already completed
         (the tick drained its stream inside the measured region)."""
-        base = f"path={self.fwd_path} sparse={int(self.fwd_sparse)} fwd_host={self.fwd_host_ms:.0f}ms"
+        base = (
+            f"path={self.fwd_path} sparse={int(self.fwd_sparse)} fwd_host={self.fwd_host_ms:.0f}ms"
+        )
         if not self.cuda:
             self.last_why = "cpu"
             return f"{base} why=cpu"
@@ -374,8 +479,11 @@ class _StepTiming:
         # Cumulative counters -> tick deltas. reserved_bytes.all.current is a
         # GAUGE (bytes held now), not cumulative: print its absolute post-forward
         # level next to free=, not a delta.
-        d = {k: m1.get(k, 0) - self.mem0.get(k, 0)
-             for k in _MEM_KEYS if k != "reserved_bytes.all.current"}
+        d = {
+            k: m1.get(k, 0) - self.mem0.get(k, 0)
+            for k in _MEM_KEYS
+            if k != "reserved_bytes.all.current"
+        }
         seg_alloc = d["segment.all.allocated"]
         seg_free = d["segment.all.freed"]
         eng = self._eng()
@@ -390,17 +498,20 @@ class _StepTiming:
         else:
             gpu = f"fwd_gpu={dev:.0f}ms"
             stall = f" stall={max(0.0, self.fwd_host_ms - dev):.0f}ms"
-        return (f"free={free_mib}MiB reserved={reserved_mib}MiB {base} {gpu}{stall} "
-                f"d_malloc={d['num_device_alloc']} d_free={d['num_device_free']} "
-                f"seg+={seg_alloc} seg-={seg_free} retries={d['num_alloc_retries']} "
-                f"sync_streams={d['num_sync_all_streams']} oom={d['num_ooms']} "
-                f"reject={d['num_oom_rejections']} alloc_conf={self.alloc_conf} why={why}")
+        return (
+            f"free={free_mib}MiB reserved={reserved_mib}MiB {base} {gpu}{stall} "
+            f"d_malloc={d['num_device_alloc']} d_free={d['num_device_free']} "
+            f"seg+={seg_alloc} seg-={seg_free} retries={d['num_alloc_retries']} "
+            f"sync_streams={d['num_sync_all_streams']} oom={d['num_ooms']} "
+            f"reject={d['num_oom_rejections']} alloc_conf={self.alloc_conf} why={why}"
+        )
 
     def report(self) -> None:
         if not self.n:
             return
         parts = " ".join(
-            f"{k}={self.tot[k] / self.count[k] * 1000:.1f}ms" for k in sorted(self.tot))
+            f"{k}={self.tot[k] / self.count[k] * 1000:.1f}ms" for k in sorted(self.tot)
+        )
         print(f"[step-timing] {self.n} ticks avg: {parts}", file=sys.stderr, flush=True)
 
 
@@ -643,7 +754,7 @@ class Engine:
         # ran while no dense row existed -- that global-debt design gave ~0.08
         # dense/sparse tick ratio on the V100 (short min 1.5 tok/s, 29 s TTFT).
         self._hybrid_sparse_wall = 0.0  # sparse wall time in the current window
-        self._hybrid_dense_wall = 0.0   # dense wall time in the current window
+        self._hybrid_dense_wall = 0.0  # dense wall time in the current window
         #: test seam: (sparse_dt, dense_dt) replaces the perf_counter measurement
         self._hybrid_fake_dt: tuple[float, float] | None = None
         self._hybrid_t0 = 0.0
@@ -654,8 +765,7 @@ class Engine:
         # 191 tok/s (errors/2026-09-13-v100-256k), so 192 tokens ~= 1 s and is a
         # whole 3x64-token bucket above the forced 8-page (128-token) window.
         # Applied to sparse rows in HYBRID mode only (pure sparse is unchanged).
-        self._sparse_prefill_cap = sparse_prefill_tokens or (
-            192 if sparse_min_tokens else 0)
+        self._sparse_prefill_cap = sparse_prefill_tokens or (192 if sparse_min_tokens else 0)
         #: decode ticks build the packed table with pure device selection (no host
         #: sync) — the capture-ready path; valid only with the pin steady state.
         sparse_device_on = sparse_device_select and sparse_tracker is not None
@@ -686,7 +796,8 @@ class Engine:
         # keeps the capacity the caller asked for whole instead of removing one
         # request's worth of it partway through a run.
         self._graph_capture = GraphCapture(
-            state_pool.alloc_slot, kv_pool.alloc_block, reserve=self._decode_graph_on)
+            state_pool.alloc_slot, kv_pool.alloc_block, reserve=self._decode_graph_on
+        )
         # Resolve the in-flight cap against usable_slots (known only after the
         # pad row is reserved). build_engine passes the AUTO sentinel for its
         # two-wave default; an explicit int is honored; None stays unbounded.
@@ -852,7 +963,8 @@ class Engine:
         #: TILERL_STEP_TIMING: this probe synchronizes the device around every
         #: draft step, so it must not arm together with the near-zero wall timer.
         self._draft_ms: list[tuple[int, float, int]] | None = (
-            [] if os.environ.get("TILERL_DRAFT_TIMING") else None)
+            [] if os.environ.get("TILERL_DRAFT_TIMING") else None
+        )
         self._finished_logprobs: dict[int, list[float]] = {}
         self._taken_logprobs: set[int] = set()
         self._last_logprobs: list[float] | None = None
@@ -1021,22 +1133,24 @@ class Engine:
                 raise EngineOverloaded(
                     f"engine is saturated: {len(self._running) + len(self._waiting)} "
                     f"in-flight requests and the cap is {cap} (running + waiting); "
-                    f"retry later")
+                    f"retry later"
+                )
 
             # Unallocated: allocating here refuses permanently, since `submit` has no later
             # tick to retry on. The prefix match moves to `_admit` with the allocation.
             # Hybrid sparse engine: short prompts run dense and pin their whole context
             # (no sparse sharing); a prompt that could never fit that pin even with the
             # pool empty routes sparse instead of queueing on an impossible admit.
-            sparse_on = (
-                self._sparse is not None
-                and (self._sparse_min_tokens == 0
-                     or len(tokens) > self._sparse_min_tokens)
+            sparse_on = self._sparse is not None and (
+                self._sparse_min_tokens == 0 or len(tokens) > self._sparse_min_tokens
             )
-            if (not sparse_on and self._sparse is not None and params.max_new_tokens > 0
-                    and self._kv.blocks_for_tokens(
-                        total + self._width - 1)
-                    > self._kv.num_blocks - (self._graph_capture.pad_block is not None)):
+            if (
+                not sparse_on
+                and self._sparse is not None
+                and params.max_new_tokens > 0
+                and self._kv.blocks_for_tokens(total + self._width - 1)
+                > self._kv.num_blocks - (self._graph_capture.pad_block is not None)
+            ):
                 # A dense row cannot use the sparse cold tier: its pin has to fit
                 # the DEVICE pool (usable_blocks counts cold for sparse rows), so a
                 # prompt that would head-of-line block on a permanent _admit False
@@ -1145,8 +1259,9 @@ class Engine:
         if cold is None or not getattr(cold, "bg_enabled", False) or not cold.has_pending():
             return
         with self._lock:
-            waiting = [(r.req_id, tuple(int(t) for t in r.tokens))
-                       for r in self._waiting if r.sparse_on][: self.limits.max_batch]
+            waiting = [
+                (r.req_id, tuple(int(t) for t in r.tokens)) for r in self._waiting if r.sparse_on
+            ][: self.limits.max_batch]
         if self._sparse is None or self._sparse.prefix is None:
             return
         for _rid, tokens in waiting:
@@ -1185,8 +1300,7 @@ class Engine:
                 # Before the forward too: without this the FIRST forward has no snapshot and
                 # `stats()` falls back to the locking path.
                 self._stats_snapshot = self._build_stats()
-                tick_sparse = bool(
-                    (decodes + prefills) and (decodes + prefills)[0].sparse_on)
+                tick_sparse = bool((decodes + prefills) and (decodes + prefills)[0].sparse_on)
                 if _tm is not None:
                     _tm.mark("stats", _t)
                     _t = time.perf_counter()
@@ -1238,8 +1352,7 @@ class Engine:
         total_blocks = (len(req.tokens) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
         # Sparse rows share through the tracker's SparsePrefixCache, never the
         # dense block-retaining store; skip the lookup entirely.
-        matched, hit_blocks, snap = (
-            (0, (), None) if sparse else self._match_prefix(req.tokens))
+        matched, hit_blocks, snap = (0, (), None) if sparse else self._match_prefix(req.tokens)
         boot_len = 0
         # A bulk boot allocates EVERY context block against the device pool up
         # front; the sparse hot pool holds only k+window+chunk per slot and grows
@@ -1395,17 +1508,20 @@ class Engine:
                 # this tick — the entry stays on the chains and a later tick
                 # adopts once committed; right now it is a full prefill miss.
                 entry = None
-            if entry is not None and self._draft is not None and (
-                    entry.get("hidden") is None or any(
-                        self._kv.cold.share_take_field(k, "dk") is None
-                        for k in entry["keys"])):
+            if (
+                entry is not None
+                and self._draft is not None
+                and (
+                    entry.get("hidden") is None
+                    or any(self._kv.cold.share_take_field(k, "dk") is None for k in entry["keys"])
+                )
+            ):
                 # field probes avoid pinning the whole trunk blob to check warmness
                 entry = None
             if entry is not None:
                 matched = len(entry["tokens"])
                 req.seq_len = matched
-                if (matched == len(req.tokens)
-                        and matched % BLOCK_TOKENS == 0):
+                if matched == len(req.tokens) and matched % BLOCK_TOKENS == 0:
                     # A follower whose prompt matches a page-aligned prefix in
                     # WHOLE has zero residual tokens, so no chunk would forward
                     # and the row stuck in PREFILL with no first-token logits.
@@ -1680,8 +1796,11 @@ class Engine:
                 "sparse_mode_ticks": self._sparse_mode_ticks,
                 # hybrid: live sparse residency stays visible even though the
                 # memory ledger reconciles the dense view (rev-30 item 4).
-                **(self._sparse_live_stats()
-                  if self._sparse is not None and self._sparse_min_tokens else {}),
+                **(
+                    self._sparse_live_stats()
+                    if self._sparse is not None and self._sparse_min_tokens
+                    else {}
+                ),
                 "tokens_generated": self._tokens_generated,
                 "spec_drafted": self._spec_drafted,
                 "spec_accepted": self._spec_accepted,
@@ -1732,7 +1851,6 @@ class Engine:
                 n += t.numel() * t.element_size()
         return n
 
-
     def _measured_peak_bytes(self) -> int | None:
         peak = measured_peak_bytes(self._backend)
         return peak if peak is not None else sum(self._held_storage().values())
@@ -1771,23 +1889,25 @@ class Engine:
             # allocation, so it stays a budget row (out of the peak = Σstatic +
             # transient invariant). The fraction caps mem_get_info and turns an
             # over-fence cudaMalloc into catchable OOM; build cuts no blocks.
-            rows.append({
-                "tier": "device", "owner": "device_reserve", "kind": "budget",
-                "derived": self._device_reserve_bytes,
-                "note": "held by set_per_process_memory_fraction; no KV blocks cut",
-                "measured": None, "delta": None,
-            })
+            rows.append(
+                {
+                    "tier": "device",
+                    "owner": "device_reserve",
+                    "kind": "budget",
+                    "derived": self._device_reserve_bytes,
+                    "note": "held by set_per_process_memory_fraction; no KV blocks cut",
+                    "measured": None,
+                    "delta": None,
+                }
+            )
         if hybrid or (
-            self._sparse is None
-            and self._boot is None
-            and getattr(self._kv, "cold", None) is None
+            self._sparse is None and self._boot is None and getattr(self._kv, "cold", None) is None
         ):
             self._mem_rows = (n_params, rows)
         return rows
 
     def sparse_retier(self, keep: frozenset[int]) -> tuple[int, int]:
         return sparse_retier_pages(self._kv, keep, self._running, self._waiting)
-
 
     # -------------------------------------------------------------- internals
 
@@ -1819,7 +1939,6 @@ class Engine:
 
     def _run_sparse_decode_graph(self, reqs, chains) -> bool:
         return self._sparse.run_decode_graph(reqs, chains)
-
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0, sf=None) -> BatchKv:
         sparse = sf is not None
@@ -1888,8 +2007,7 @@ class Engine:
                 c.extend([c[-1]] * (w - len(c)))
         q_dec = [len(c) for c in chains] if chains else [1] * len(decodes)
         growth = sum(
-            _decode_extra_blocks(r.seq_len, q, len(r.blocks))
-            for r, q in zip(decodes, q_dec)
+            _decode_extra_blocks(r.seq_len, q, len(r.blocks)) for r, q in zip(decodes, q_dec)
         )
         if growth:
             self._prefix.evict_until_free(growth)
@@ -1968,9 +2086,11 @@ class Engine:
                 # attention table (the sporadic 1.3-1.5s 32k ticks). All three
                 # are host-side ints, so this adds no device sync.
                 _table = getattr(sf, "table", None)
-                _tm.note = (f"sparse cmax={getattr(sf, 'cmax', '?')} "
-                            f"own_w={getattr(sf, 'own_w', '?')} "
-                            f"table_w={_table.shape[1] if _table is not None else '?'}")
+                _tm.note = (
+                    f"sparse cmax={getattr(sf, 'cmax', '?')} "
+                    f"own_w={getattr(sf, 'own_w', '?')} "
+                    f"table_w={_table.shape[1] if _table is not None else '?'}"
+                )
                 _t = time.perf_counter()
         # Bucket a prefill width: kernels specialize per shape (MMLU compiled
         # 662 variants). A verify width is exact, at most 1+depth.
@@ -2007,8 +2127,7 @@ class Engine:
         if sparse:
             promote_ctx.__exit__(None, None, None)
             try:
-                sparse_offers = self._sparse_finalize(
-                    sf, rows, None if hid is None else hid[-1])
+                sparse_offers = self._sparse_finalize(sf, rows, None if hid is None else hid[-1])
             except SpillWriteError as e:
                 # A private cold page this tick demoted could not be spilled; the
                 # batched demotions() exit cannot say which row owns it, so fail
@@ -2122,12 +2241,14 @@ class Engine:
         from .memory import sparse_hot_pages_per_slot
 
         ceil = sparse_hot_pages_per_slot(
-            self._model.cfg, self._sparse_k, self.limits.max_num_batched_tokens)
+            self._model.cfg, self._sparse_k, self.limits.max_num_batched_tokens
+        )
         resident = self._sparse.resident
         return sum(
             max(0, ceil - len(resident.get(r.req_id, ())))
             for r in self._running
-            if r.sparse_on and r.phase != _PHASE_DONE)
+            if r.sparse_on and r.phase != _PHASE_DONE
+        )
 
     def _hybrid_charge(self, sparse: bool) -> None:
         """Per-mode counters and rolling-window wall-time accounting.
@@ -2141,9 +2262,11 @@ class Engine:
         if self._sparse_min_tokens == 0:
             return
         other_present = any(r.sparse_on != sparse for r in self._running)
-        dt = (self._hybrid_fake_dt[1 if not sparse else 0]
-              if self._hybrid_fake_dt is not None
-              else time.perf_counter() - self._hybrid_t0)
+        dt = (
+            self._hybrid_fake_dt[1 if not sparse else 0]
+            if self._hybrid_fake_dt is not None
+            else time.perf_counter() - self._hybrid_t0
+        )
         if sparse:
             self._sparse_mode_ticks += 1
             if other_present:
@@ -2182,9 +2305,11 @@ class Engine:
                 if pf.interior_published == 1:
                     if not pf.sparse_on:
                         self._publish_prefix(pf, pf.prefill_from)
-                elif (not pf.sparse_on
-                        and len(pf.tokens) % BLOCK_TOKENS
-                        and pf.prefill_from >= predicted):
+                elif (
+                    not pf.sparse_on
+                    and len(pf.tokens) % BLOCK_TOKENS
+                    and pf.prefill_from >= predicted
+                ):
                     # Tail window [predicted, n): at most two aligned chunk ends, so
                     # this holds <=2 snapshots per ragged prompt and keeps only the
                     # deepest the actual schedule reached. Not predicted: a decode
@@ -2192,8 +2317,10 @@ class Engine:
                     # Published at completion -- at most 32 tokens later, one tick.
                     pf.pending_prefix = (
                         pf.prefill_from,
-                        (self._states.states[pf.state_slot].clone(),
-                         self._states.window_snapshot(pf.state_slot)),
+                        (
+                            self._states.states[pf.state_slot].clone(),
+                            self._states.window_snapshot(pf.state_slot),
+                        ),
                     )
         if not done:
             return
@@ -2203,13 +2330,13 @@ class Engine:
             prompt_len = len(pf.tokens) - len(pf.output)
             if not pf.sparse_on and pf.phase != _PHASE_DONE and prompt_len % BLOCK_TOKENS == 0:
                 self._publish_prefix(pf, prompt_len)
-            elif (not pf.sparse_on and pf.phase != _PHASE_DONE
-                    and pf.pending_prefix is not None):
+            elif not pf.sparse_on and pf.phase != _PHASE_DONE and pf.pending_prefix is not None:
                 # Ragged prompt: the held boundary snapshot is exact and its
                 # blocks are still live; insert it at completion.
                 pos, snap = pf.pending_prefix
                 self._prefix_published += self._prefix.insert(
-                    pf.tokens[:pos], pf.blocks[: pos // BLOCK_TOKENS], snap)
+                    pf.tokens[:pos], pf.blocks[: pos // BLOCK_TOKENS], snap
+                )
             pf.pending_prefix = None
             if pf.phase != _PHASE_DONE:
                 if len(pf.output) >= pf.params.max_new_tokens:
@@ -2231,8 +2358,16 @@ class Engine:
         if g is not None:
             return g
         g, self._graph_capture.pool, err = make_decode_graph(
-            self._model, self._backend, self._kv, self._states, B, W, keep,
-            self._aux_layers, self._graph_capture.pool)
+            self._model,
+            self._backend,
+            self._kv,
+            self._states,
+            B,
+            W,
+            keep,
+            self._aux_layers,
+            self._graph_capture.pool,
+        )
         if g is None:
             warnings.warn(err)
             self._decode_graph_on = False
@@ -2397,8 +2532,8 @@ class Engine:
                 # another row for the shared draft pool.
                 end = r.seq_len - 1 + self._width - 1
                 assert len(r.draft_blocks) * BLOCK_TOKENS > end, (
-                    f"draft needs position {end} but admit reserved "
-                    f"{len(r.draft_blocks)} blocks")
+                    f"draft needs position {end} but admit reserved {len(r.draft_blocks)} blocks"
+                )
                 continue
             need = max(0, (r.seq_len + BLOCK_TOKENS - 1) // BLOCK_TOKENS - len(r.blocks))
             if need > self._kv.free_blocks:
@@ -2432,8 +2567,9 @@ class Engine:
             t0 = time.perf_counter()
             max_seq = max((r.seq_len for r in rows), default=0)
             self._draft.step(rows)
-            self._draft_ms.append((self._draft.forwards, (time.perf_counter() - t0) * 1000,
-                                   max_seq))
+            self._draft_ms.append(
+                (self._draft.forwards, (time.perf_counter() - t0) * 1000, max_seq)
+            )
 
     def _draft_step_timed(self, rows: list[_Req]) -> None:
         """``_draft.step`` with CUDA events around it, recording (forwards, ms).
@@ -2460,8 +2596,11 @@ class Engine:
         b.synchronize()
         gpu_ms = a.elapsed_time(b)
         self._draft_ms.append((self._draft.forwards - f0, gpu_ms, max_seq))
-        print(f"[draft-timing] fwd={self._draft.forwards - f0} gpu={gpu_ms:.2f}ms "
-              f"max_seq={max_seq}", file=sys.stderr, flush=True)
+        print(
+            f"[draft-timing] fwd={self._draft.forwards - f0} gpu={gpu_ms:.2f}ms max_seq={max_seq}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _verify(self, rows, chains, logits, hidden) -> None:
         """Accept the leading run of drafts the trunk agrees with, adopt the
@@ -2492,7 +2631,8 @@ class Engine:
             self._spec_drafted += drafted
             cap = r.params.max_think_tokens
             crosses_cap = (
-                cap is not None and not r.thought_closed
+                cap is not None
+                and not r.thought_closed
                 and len(r.output) < cap <= len(r.output) + drafted
             )
             if r.thought_closed:
@@ -2651,6 +2791,8 @@ class Engine:
         if req.state_slot is None:
             return  # never admitted; blocks and slot are taken together in `_admit`
         if req.sparse_on and self._sparse is not None:
+            if _tm is not None:
+                _tm.close_bracket_start()
             # pages belong to another publisher's blobs) forces its prompt-end
             # frontier closure while device frames and draft blocks are still
             # live: pages a hot pool never dropped get snapshotted from the live
@@ -2671,10 +2813,13 @@ class Engine:
                 _deferred: list = []
                 with self._kv.close_publishes() as _cb:
                     keys = self._sparse.prefix.close_request(
-                        req.req_id, req.tokens, self._sparse.bounds_view(req.req_id))
-                    written_page = ((req.draft_pos + 1) // BLOCK_TOKENS
-                                    if self._draft is not None and req.draft_blocks
-                                    else -1)
+                        req.req_id, req.tokens, self._sparse.bounds_view(req.req_id)
+                    )
+                    written_page = (
+                        (req.draft_pos + 1) // BLOCK_TOKENS
+                        if self._draft is not None and req.draft_blocks
+                        else -1
+                    )
                     for p, content_key in keys.items():
                         draft_block = req.draft_blocks[p] if p <= written_page else None
                         self._sparse.transfer_to_shared(req, p, content_key, draft_block)
@@ -2688,6 +2833,7 @@ class Engine:
                 for content_key in self._sparse.prefix.take_freeze_refs():
                     self._kv.cold.share_ref(content_key)
             if _tm is not None:
+                _tm.close_bracket_end()
                 _tm.mark("release_close_request", _t)
                 _t = time.perf_counter()
             # Sparse: drop this request's host-held cold blobs, keyed (req, logical

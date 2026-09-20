@@ -45,7 +45,11 @@ def _prefix_spill_bounded() -> bool:
     TILERL_COLD_PREFIX_SSD_CAP=1 to bound it by --cold-ssd-bytes and return
     freed trailing extents to the filesystem."""
     return os.environ.get("TILERL_COLD_PREFIX_SSD_CAP", "").strip() not in (
-        "", "0", "false", "False")
+        "",
+        "0",
+        "false",
+        "False",
+    )
 
 
 def _close_bg_publish() -> bool:
@@ -54,8 +58,7 @@ def _close_bg_publish() -> bool:
     path onto one bounded single-consumer thread. Default OFF: the transfer
     stays inline on the step thread, byte-identical. Set
     TILERL_CLOSE_BG_PUBLISH=1 to enable."""
-    return os.environ.get("TILERL_CLOSE_BG_PUBLISH", "").strip() not in (
-        "", "0", "false", "False")
+    return os.environ.get("TILERL_CLOSE_BG_PUBLISH", "").strip() not in ("", "0", "false", "False")
 
 
 def assert_spill_writable(path: str) -> None:
@@ -97,8 +100,17 @@ class ColdSsdFile:
     #: tail space.
     GROWTH_SLOTS = 64
 
-    def __init__(self, path: str, spec: list[tuple[str, tuple, str, int]],
-                 step_timing=None, reclaim: bool = False) -> None:
+    #: Thread name of the background close-publish daemon (HostKvPages._start_publisher).
+    #: Used only to attribute spill-file IO to the worker instead of the step tick.
+    PUBLISH_THREAD = "tilerl-cold-publish"
+
+    def __init__(
+        self,
+        path: str,
+        spec: list[tuple[str, tuple, str, int]],
+        step_timing=None,
+        reclaim: bool = False,
+    ) -> None:
         import json
         import mmap
 
@@ -123,6 +135,11 @@ class ColdSsdFile:
         #: reader cannot silently go uncounted.
         self.step_timing = step_timing
         self.ssd_ms = 0.0
+        #: Spill IO performed on the background publish thread. drain_ssd_ms
+        #: returns only step-thread IO; the worker's share is read separately via
+        #: drain_worker_ssd_ms so its disk time cannot masquerade as a step-tick
+        #: stall (it runs with no engine/tick lock held by the step).
+        self.ssd_ms_worker = 0.0
         self._path = path
         self._spec = spec
         self.stride = sum(n for *_k, n in spec)
@@ -191,7 +208,13 @@ class ColdSsdFile:
         self._remap(cap)
 
     def _charge(self, t: float) -> None:
-        self.ssd_ms += (time.perf_counter() - t) * 1000.0
+        ms = (time.perf_counter() - t) * 1000.0
+        # Attribute worker-thread IO to its own bucket: draining it into the step
+        # tick would report cross-thread disk time as if the step thread blocked.
+        if threading.current_thread().name == self.PUBLISH_THREAD:
+            self.ssd_ms_worker += ms
+        else:
+            self.ssd_ms += ms
 
     def write(self, key, blob: dict) -> None:
         if self.step_timing is None:
@@ -213,8 +236,8 @@ class ColdSsdFile:
             # (offset, not a bytes copy) takes the bytes via copy_, with no
             # t.numpy().tobytes() double copy or a per-page bytes allocation.
             dst = torch.from_numpy(
-                self._np.frombuffer(self._map, dtype=self._np.uint8,
-                                    count=n, offset=off))
+                self._np.frombuffer(self._map, dtype=self._np.uint8, count=n, offset=off)
+            )
             dst.copy_(t.contiguous().view(torch.uint8).reshape(-1))
             off += n
         self._slot_of[key] = slot
@@ -236,14 +259,13 @@ class ColdSsdFile:
         off = self.HEADER + slot * self.stride
         blob = {}
         for k, shape, dt, n in self._spec:
-            t = torch.empty(shape, dtype=getattr(torch, dt), device="cpu",
-                            pin_memory=pin)
+            t = torch.empty(shape, dtype=getattr(torch, dt), device="cpu", pin_memory=pin)
             # flat byte views: view(uint8) changes the trailing dim, never numel,
             # so both sides flatten first. A numpy view of the WHOLE writable mmap
             # (offset, not a read-only bytes slice) feeds copy_ with zero copies.
             src = torch.from_numpy(
-                self._np.frombuffer(self._map, dtype=self._np.uint8,
-                                    count=n, offset=off))
+                self._np.frombuffer(self._map, dtype=self._np.uint8, count=n, offset=off)
+            )
             t.view(torch.uint8).reshape(-1).copy_(src)
             blob[k] = t
             off += n
@@ -265,11 +287,10 @@ class ColdSsdFile:
         off = self.HEADER + slot * self.stride
         for k, shape, dt, n in self._spec:
             if k == field:
-                t = torch.empty(shape, dtype=getattr(torch, dt), device="cpu",
-                                pin_memory=pin)
+                t = torch.empty(shape, dtype=getattr(torch, dt), device="cpu", pin_memory=pin)
                 src = torch.from_numpy(
-                    self._np.frombuffer(self._map, dtype=self._np.uint8,
-                                        count=n, offset=off))
+                    self._np.frombuffer(self._map, dtype=self._np.uint8, count=n, offset=off)
+                )
                 t.view(torch.uint8).reshape(-1).copy_(src)
                 return t
             off += n
@@ -297,8 +318,10 @@ class ColdSsdFile:
 
 def _blob_spec(blob: dict) -> list[tuple[str, tuple, str, int]]:
     """The deterministic per-slot layout: key, shape, dtype name, bytes."""
-    return [(k, tuple(t.shape), str(t.dtype).replace("torch.", ""),
-             t.numel() * t.element_size()) for k, t in blob.items()]
+    return [
+        (k, tuple(t.shape), str(t.dtype).replace("torch.", ""), t.numel() * t.element_size())
+        for k, t in blob.items()
+    ]
 
 
 class HostKvPages:
@@ -314,11 +337,17 @@ class HostKvPages:
     (they stay read-only wherever they live); :meth:`demote_page` refuses them.
     """
 
-    def __init__(self, budget_bytes: int = 4 << 30, ssd_path: str = "",
-                 ssd_capacity_bytes: int = 0, step_timing=None,
-                 bg_publish: bool | None = None, bg_depth: int | None = None,
-                 bg_wait_s: float | None = None,
-                 bg_max_payload_bytes: int | None = None) -> None:
+    def __init__(
+        self,
+        budget_bytes: int = 4 << 30,
+        ssd_path: str = "",
+        ssd_capacity_bytes: int = 0,
+        step_timing=None,
+        bg_publish: bool | None = None,
+        bg_depth: int | None = None,
+        bg_wait_s: float | None = None,
+        bg_max_payload_bytes: int | None = None,
+    ) -> None:
         # Fail fast: both the private spill and its shared-prefix sibling must be
         # writable now, because the failure used to surface only after the host
         # budget bound mid-decode (V100 /data00 root-owned, 2026-09-14).
@@ -397,9 +426,13 @@ class HostKvPages:
         self.bg_depth = (
             int(os.environ["TILERL_CLOSE_BG_DEPTH"])
             if "TILERL_CLOSE_BG_DEPTH" in os.environ and bg_depth is None
-            else (512 if bg_depth is None else bg_depth))
-        self.bg_wait_s = (float(os.environ.get("TILERL_CLOSE_BG_WAIT_S", "30"))
-                          if bg_wait_s is None else bg_wait_s)
+            else (512 if bg_depth is None else bg_depth)
+        )
+        self.bg_wait_s = (
+            float(os.environ.get("TILERL_CLOSE_BG_WAIT_S", "30"))
+            if bg_wait_s is None
+            else bg_wait_s
+        )
         #: Hard cap on host bytes held by queued job payloads ABOVE the pinned
         #: cold budget (0 = off). Two payloads are allocated before commit but
         #: enter the shared budget (and its LRU spill) only then: the "hold"
@@ -412,7 +445,8 @@ class HostKvPages:
         self.bg_max_bytes = (
             int(os.environ["TILERL_CLOSE_BG_MAX_BYTES"])
             if "TILERL_CLOSE_BG_MAX_BYTES" in os.environ and bg_max_payload_bytes is None
-            else (0 if bg_max_payload_bytes is None else bg_max_payload_bytes))
+            else (0 if bg_max_payload_bytes is None else bg_max_payload_bytes)
+        )
         self._pub_payload_bytes = 0
         self.bg_queued = 0
         self.bg_degraded = 0  # queue full -> caller transferred inline
@@ -430,7 +464,8 @@ class HostKvPages:
     def _start_publisher(self) -> None:
         self._pub_q = queue.Queue(maxsize=self.bg_depth)
         self._pub_thread = threading.Thread(
-            target=self._publish_worker, name="tilerl-cold-publish", daemon=True)
+            target=self._publish_worker, name="tilerl-cold-publish", daemon=True
+        )
         self._pub_thread.start()
 
     def _publish_worker(self) -> None:
@@ -454,8 +489,7 @@ class HostKvPages:
                     ok = True
                     try:
                         if kind == "kv":
-                            ok = bool(
-                                self.share_hold_kv(private_key, shared_key, payload))
+                            ok = bool(self.share_hold_kv(private_key, shared_key, payload))
                         else:  # "hold": a host frame blob already folded with bounds
                             blob, n = payload
                             self.share_hold(shared_key, blob, n)
@@ -599,13 +633,15 @@ class HostKvPages:
         SpillWriteError the engine turns into a request failure (not a wedge)."""
         try:
             if self._ssd is None:
-                self._ssd = ColdSsdFile(self._ssd_path, _blob_spec(blob),
-                                        step_timing=self.step_timing)
+                self._ssd = ColdSsdFile(
+                    self._ssd_path, _blob_spec(blob), step_timing=self.step_timing
+                )
             self._ssd.write(key, blob)
         except OSError as e:
             raise SpillWriteError(
                 f"private cold spill write to {self._ssd_path!r} failed for key "
-                f"{key!r} (errno {e.errno}: {e.strerror})") from e
+                f"{key!r} (errno {e.errno}: {e.strerror})"
+            ) from e
         self._ssd_bytes += nbytes
         self._ssd_page_bytes[key] = nbytes
 
@@ -714,15 +750,13 @@ class HostKvPages:
         or the bounded queue is full: the caller then transfers inline, which
         bounds queue memory and never drops a publish. Reservation and enqueue are
         one locked step, so a key can never be reserved without its job queued."""
-        return self._enqueue(("kv", private_key, shared_key, extra),
-                             private_key, shared_key)
+        return self._enqueue(("kv", private_key, shared_key, extra), private_key, shared_key)
 
     def offer_hold(self, shared_key: int, blob: dict, nbytes: int) -> bool:
         """Enqueue one already-host frame blob's shared hold (the device-resident
         close page whose D2H the 1PR batch synced before its frame freed). Same
         reservation/future contract as :meth:`offer_publish`."""
-        return self._enqueue(("hold", None, shared_key, (blob, nbytes)),
-                             None, shared_key)
+        return self._enqueue(("hold", None, shared_key, (blob, nbytes)), None, shared_key)
 
     def _job_payload_n(self, job) -> int:
         """Host bytes a queued job pins ABOVE the pinned cold budget until the
@@ -743,8 +777,7 @@ class HostKvPages:
         extra = job[3]
         if not extra:
             return 0
-        return sum(t.numel() * t.element_size() for t in extra.values()
-                   if torch.is_tensor(t))
+        return sum(t.numel() * t.element_size() for t in extra.values() if torch.is_tensor(t))
 
     def _enqueue(self, job, private_key, shared_key: int) -> bool:
         with self._tlock:
@@ -848,8 +881,7 @@ class HostKvPages:
         with self._tlock:
             return all(k in self._shared for k in keys)
 
-    def share_hold_kv(self, private_key, shared_key: int,
-                      extra: dict | None = None) -> int:
+    def share_hold_kv(self, private_key, shared_key: int, extra: dict | None = None) -> int:
         """Transfer one private blob to a shared content key (no clone): pop it
         from the private namespace (RAM or private spill file), fold in ``extra``
         (the small host bounds), and hand it to the shared namespace. The blob
@@ -886,8 +918,9 @@ class HostKvPages:
                 self._ssd_bytes -= n
                 if extra:
                     blob.update(extra)
-                    n += sum(t.numel() * t.element_size()
-                             for t in extra.values() if torch.is_tensor(t))
+                    n += sum(
+                        t.numel() * t.element_size() for t in extra.values() if torch.is_tensor(t)
+                    )
                 self._shared[shared_key] = [n, 1, None]
                 self._ram_order.pop(("s", shared_key), None)  # starts spilled
                 if not self._write_shared_ssd(shared_key, blob, n):
@@ -899,11 +932,9 @@ class HostKvPages:
                 return n
             if extra:
                 blob.update(extra)
-                n += sum(t.numel() * t.element_size()
-                         for t in extra.values() if torch.is_tensor(t))
+                n += sum(t.numel() * t.element_size() for t in extra.values() if torch.is_tensor(t))
             self.share_hold(shared_key, blob, n)
             return n
-
 
     def _shared_evict_ram(self, key: int) -> bool:
         """Try to spill one RAM-resident shared page to the prefix file.
@@ -939,16 +970,21 @@ class HostKvPages:
         try:
             if self._shared_ssd is None:
                 self._shared_ssd = ColdSsdFile(
-                    _shared_ssd_path(self._ssd_path), _blob_spec(blob),
+                    _shared_ssd_path(self._ssd_path),
+                    _blob_spec(blob),
                     step_timing=self.step_timing,
-                    reclaim=self.prefix_spill_bounded)
+                    reclaim=self.prefix_spill_bounded,
+                )
             self._shared_ssd.write(("s", key), blob)
         except OSError as e:
             self.shared_spill_disabled = True
             self.shared_spill_error = f"errno {e.errno}: {e.strerror}"
-            print(f"[cold] shared-prefix spill to {_shared_ssd_path(self._ssd_path)!r} "
-                  f"failed once ({self.shared_spill_error}); shared SSD spill disabled "
-                  f"for this process, shared pages stay in RAM", flush=True)
+            print(
+                f"[cold] shared-prefix spill to {_shared_ssd_path(self._ssd_path)!r} "
+                f"failed once ({self.shared_spill_error}); shared SSD spill disabled "
+                f"for this process, shared pages stay in RAM",
+                flush=True,
+            )
             return False
         self._shared_ssd_bytes += nbytes
         return True
@@ -1031,9 +1067,10 @@ class HostKvPages:
             return frozenset(self._shared) | frozenset(self._pub_pending)
 
     def drain_ssd_ms(self) -> float:
-        """Milliseconds spent touching the mmap'd spill files since the last
-        drain, across the private and shared files. The engine drains this into
-        the step timer at the end of the tick that paid it."""
+        """Milliseconds the STEP thread spent touching the mmap'd spill files
+        since the last drain, across the private and shared files. The engine
+        drains this into the step timer at the end of the tick that paid it.
+        Background-publish-worker IO is excluded (see drain_worker_ssd_ms)."""
         with self._tlock:
             ms = 0.0
             for f in (self._ssd, self._shared_ssd):
@@ -1042,11 +1079,22 @@ class HostKvPages:
                     f.ssd_ms = 0.0
             return ms
 
+    def drain_worker_ssd_ms(self) -> float:
+        """Spill-file IO performed by the background publish thread since the
+        last drain. Read (not attached to any step tick) to tell a real
+        step-thread block from disk time that merely ran concurrently."""
+        with self._tlock:
+            ms = 0.0
+            for f in (self._ssd, self._shared_ssd):
+                if f is not None:
+                    ms += f.ssd_ms_worker
+                    f.ssd_ms_worker = 0.0
+            return ms
+
     def shared_bytes(self) -> int:
         """Pinned RAM held for shared prefix blobs (test/ledger diagnostic)."""
         with self._tlock:
             return self._shared_ram
-
 
 
 class DramSnapshots:
@@ -1150,7 +1198,6 @@ def _to_device(state: Any, device: torch.device) -> Any:
     return tuple(None if s is None else _to_device(s, device) for s in state)
 
 
-
 def _crc32(data: bytes) -> int:
     import zlib
 
@@ -1220,8 +1267,10 @@ class KvBootStore:
             return False
         try:
             m = self._read_manifest(h)
-            return (m["tokens"] == [int(t) for t in tokens]
-                    and m.get("fingerprint") == self._fingerprint)
+            return (
+                m["tokens"] == [int(t) for t in tokens]
+                and m.get("fingerprint") == self._fingerprint
+            )
         except (OSError, ValueError, KeyError):
             return False
 
@@ -1238,21 +1287,26 @@ class KvBootStore:
         for name in os.listdir(self._root):
             p = os.path.join(self._root, name)
             if os.path.isdir(p):
-                total += sum(os.path.getsize(os.path.join(p, f))
-                             for f in os.listdir(p) if f != self.MANIFEST)
+                total += sum(
+                    os.path.getsize(os.path.join(p, f)) for f in os.listdir(p) if f != self.MANIFEST
+                )
         return total
 
     def entries(self) -> int:
-        return sum(1 for n in os.listdir(self._root)
-                   if os.path.isdir(os.path.join(self._root, n))) if os.path.isdir(self._root) else 0
+        return (
+            sum(1 for n in os.listdir(self._root) if os.path.isdir(os.path.join(self._root, n)))
+            if os.path.isdir(self._root)
+            else 0
+        )
 
     @staticmethod
     def _dt(name: str):
         return getattr(torch, name)
 
     # ------------------------------------------------------------------ save
-    def save(self, tokens: Sequence[int], pool: PagedKvPool, blocks: Sequence[int],
-             state: Any) -> int:
+    def save(
+        self, tokens: Sequence[int], pool: PagedKvPool, blocks: Sequence[int], state: Any
+    ) -> int:
         """Write one full context (the pages named by ``blocks`` in sequence order) and
         its recurrent snapshot. Pages are gathered to the host in the pool's cold dtype.
         Returns bytes written. Atomic: the manifest is written last, so a crash leaves
@@ -1287,23 +1341,28 @@ class KvBootStore:
             # interleave per page so one page's CRC/checksum covers its K, V, k_scale
             # AND v_scale contiguously.
             scale_bytes = b"".join(
-                ksb[i * ssk:(i + 1) * ssk] + vsb[i * ssv:(i + 1) * ssv]
-                for i in range(nblk))
+                ksb[i * ssk : (i + 1) * ssk] + vsb[i * ssv : (i + 1) * ssv] for i in range(nblk)
+            )
             sstep = ssk + ssv
         written = 0
         tmp = tempfile.mkdtemp(prefix=".kvboot-", dir=d)
         try:
             with open(os.path.join(tmp, "k.bin"), "wb") as f:
-                f.write(kb); written += len(kb)
+                f.write(kb)
+                written += len(kb)
             with open(os.path.join(tmp, "v.bin"), "wb") as f:
-                f.write(vb); written += len(vb)
+                f.write(vb)
+                written += len(vb)
             if scale_bytes:
                 with open(os.path.join(tmp, "scale.bin"), "wb") as f:
-                    f.write(scale_bytes); written += len(scale_bytes)
+                    f.write(scale_bytes)
+                    written += len(scale_bytes)
             crcs = [
-                _crc32(kb[i * kstep:(i + 1) * kstep]
-                       + vb[i * vstep:(i + 1) * vstep]
-                       + (scale_bytes[i * sstep:(i + 1) * sstep] if sstep else b""))
+                _crc32(
+                    kb[i * kstep : (i + 1) * kstep]
+                    + vb[i * vstep : (i + 1) * vstep]
+                    + (scale_bytes[i * sstep : (i + 1) * sstep] if sstep else b"")
+                )
                 for i in range(nblk)
             ]
             if state is not None:
@@ -1332,8 +1391,7 @@ class KvBootStore:
             for fn in sorted(os.listdir(tmp)):
                 if fn != self.MANIFEST:
                     os.replace(os.path.join(tmp, fn), os.path.join(d, fn))
-            os.replace(os.path.join(tmp, self.MANIFEST),
-                       os.path.join(d, self.MANIFEST))
+            os.replace(os.path.join(tmp, self.MANIFEST), os.path.join(d, self.MANIFEST))
         finally:
             with contextlib.suppress(OSError):
                 os.rmdir(tmp)
@@ -1370,9 +1428,11 @@ class KvBootStore:
             sb = read_raw("scale.bin") if mf.get("kv_fp8") else b""
             sstep = len(sb) // nblk if nblk else 0
             for i, want in enumerate(mf["page_crc32"]):
-                seg = (kb[i * kstep:(i + 1) * kstep]
-                       + vb[i * vstep:(i + 1) * vstep]
-                       + (sb[i * sstep:(i + 1) * sstep] if sstep else b""))
+                seg = (
+                    kb[i * kstep : (i + 1) * kstep]
+                    + vb[i * vstep : (i + 1) * vstep]
+                    + (sb[i * sstep : (i + 1) * sstep] if sstep else b"")
+                )
                 if _crc32(seg) != want:
                     raise ValueError(f"page {i} checksum mismatch")
 
@@ -1388,8 +1448,8 @@ class KvBootStore:
                 npl = mf["n_planes"]
                 # one scale page = [plane, head, token] for k then v, f32
                 per = npl * nh * BLOCK_TOKENS * 4
-                ksf = b"".join(sb[i * sstep:i * sstep + per] for i in range(nblk))
-                vsf = b"".join(sb[i * sstep + per:(i + 1) * sstep] for i in range(nblk))
+                ksf = b"".join(sb[i * sstep : i * sstep + per] for i in range(nblk))
+                vsf = b"".join(sb[i * sstep + per : (i + 1) * sstep] for i in range(nblk))
                 sshape = (nblk, npl, nh, BLOCK_TOKENS)
                 ks = as_tensor(ksf, sshape, torch.float32)
                 vs = as_tensor(vsf, sshape, torch.float32)
@@ -1407,6 +1467,7 @@ class KvBootStore:
             idx = torch.as_tensor(out_blocks, device=pool.device)
             dev = pool.device
             nb = pool.k_pool.is_cuda
+
             # block-major [B,plane,H,T,D] -> plane-major [plane,B,H,T,D], widening the
             # narrow cold dtype to the pool dtype via copy_ (same as promote_page).
             def copy_pages(host, dst, fp8: bool):
@@ -1415,6 +1476,7 @@ class KvBootStore:
                     dst[:, idx] = x  # no index_copy_ for fp8 on CPU
                 else:
                     dst.index_copy_(1, idx, x.to(dst.dtype))
+
             copy_pages(k, pool.k_pool, pool.kv_fp8 is not None)
             copy_pages(v, pool.v_pool, pool.kv_fp8 is not None)
             if scales is not None:
