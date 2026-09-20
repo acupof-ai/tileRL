@@ -117,3 +117,53 @@ def test_crashes_outside_the_window_age_out_and_give_up_not_trip():
     log = (d / "serve.log").read_text()
     assert "FUSE:" not in log
     assert "gave up after 2 restarts" in log
+
+
+def _guard_env(env_extra: dict[str, str]) -> str:
+    """Run the real launcher with an interpreter that dumps its environment, and
+    return that dump -- the environment serve_liveness.py would read.
+
+    The launcher exports LIVENESS_POLL_S before spawning the serve, and the guard is
+    a sibling under the same shell, so what the child receives is what the guard
+    receives. `LIVENESS_POLL_S` is dropped from the inherited environment first: the
+    "unset" case must be unset whatever this machine happens to carry."""
+    d, env = _fuse_sandbox(env_extra)
+    env.pop("LIVENESS_POLL_S", None)
+    env.update(env_extra)
+    stub = d / "dumppy"
+    stub.write_text('#!/bin/bash\nexport > "$SERVE_LOG.childenv"\nexit 7\n')
+    stub.chmod(0o755)
+    env["SERVE_PYTHON"] = str(stub)
+    subprocess.run(["bash", str(SRC)], capture_output=True, text=True, timeout=120, env=env)
+    return (d / "serve.log.childenv").read_text()
+
+
+def test_the_guard_poll_period_is_passed_through_and_defaults_to_60():
+    """LIVENESS_POLL_S must reach the guard, and unset must stay 60 -- the shipped
+    poll period. At slots=8 the guard injects a real 4-token chat every poll, which
+    is what poisoned a zero-traffic baseline, so the override has to survive the
+    launcher rather than being clobbered by it."""
+    # Unset: the guard's own default (serve_liveness.py) is 60, and the launcher
+    # must not turn that into anything else.
+    env_txt = _guard_env({})
+    assert 'LIVENESS_POLL_S="60"' in env_txt, [ln for ln in env_txt.splitlines()
+                                               if "LIVENESS" in ln]
+    # A caller's value wins -- this is the zero-traffic-baseline override.
+    env_txt = _guard_env({"LIVENESS_POLL_S": "999999"})
+    assert 'LIVENESS_POLL_S="999999"' in env_txt, [ln for ln in env_txt.splitlines()
+                                                   if "LIVENESS" in ln]
+    # An EMPTY value is the one case the export changes: float('') would raise in
+    # the guard, so it falls back to 60 instead of crashing the liveness loop.
+    env_txt = _guard_env({"LIVENESS_POLL_S": ""})
+    assert 'LIVENESS_POLL_S="60"' in env_txt, [ln for ln in env_txt.splitlines()
+                                               if "LIVENESS" in ln]
+
+
+def test_the_header_names_the_argv_prefix_route_not_a_caller_export():
+    """pod_run bakes the CMD into a runner executed inside the container and does not
+    forward the caller's environment, so `export LIVENESS_POLL_S=... ` on the laptop
+    never arrives. The header has to say so or the next person loses the same window."""
+    text = SRC.read_text()
+    assert "LIVENESS_POLL_S (60)" in text, "the header does not document the knob"
+    assert "LIVENESS_POLL_S=999999 bash scripts/serve_h20.sh" in text, text[-600:]
+    assert "argv PREFIX" in text and "does not" in text

@@ -25,6 +25,15 @@
 #   SERVE_SLOTS (8) SERVE_BATCH (8) SERVE_CTX (131072) SERVE_DEPTH (1)
 #   SERVE_DECODE_GRAPH (1; set 0 for the graph-off measurement arm)
 #   MAX_RESTARTS (10) RESTART_FUSE_MAX (5) RESTART_FUSE_WINDOW_S (600)
+#   LIVENESS_POLL_S (60) -- the guard's poll period; set 999999 for a zero-traffic
+#     baseline, since at this arm's slots=8 the guard injects a real 4-token chat
+#     per poll and that lands inside the decode window being measured. Set it as an
+#     argv PREFIX on the pod_run command, not as a caller `export`:
+#       pod_run.sh h20serve <card> -- LIVENESS_POLL_S=999999 bash scripts/serve_h20.sh
+#     pod_run bakes the CMD into a runner executed inside the container and does not
+#     forward the caller's environment (measured: POD_RUN_EMIT_RUNNER=1 output
+#     carries no LIVENESS_POLL_S while CUDA_VISIBLE_DEVICES is present). An empty
+#     value falls back to 60.
 #
 # `--dry-run` prints the resolved serve argv and exits 0 without touching a GPU:
 # the hermetic gate. The fuse: the FUSE_MAX-th restart inside FUSE_WINDOW_S trips
@@ -116,6 +125,10 @@ mkdir -p "$TMP" 2>/dev/null && export TMPDIR=$TMP TMP=$TMP TEMP=$TMP
 export PYTHONPATH=$REPO/src:$REPO/packages/tilerl-kernels/src${PYTHONPATH:+:$PYTHONPATH}
 export TILERL_QWEN38_SOURCE=$CKPT
 export LIVENESS_BASE="http://127.0.0.1:$PORT"
+# Only a guard against an empty value (`float('')` would raise in the guard). A set
+# value is passed through untouched and the unset case is already 60 in
+# serve_liveness.py, so this line changes no production behavior.
+export LIVENESS_POLL_S=${LIVENESS_POLL_S:-60}
 
 child=; guard=; stopping=
 trap 'stopping=1; [ -n "$guard" ] && { pkill -TERM -P "$guard" 2>/dev/null; kill -TERM "$guard" 2>/dev/null; }; pkill -TERM -f "serve_liveness.py $LOG" 2>/dev/null; pkill -TERM -f "serve_warmup_hybrid.py" 2>/dev/null; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait "$child"; fi; exit 143' TERM INT

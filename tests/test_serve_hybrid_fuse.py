@@ -115,3 +115,28 @@ def test_only_the_sm70_launcher_sets_it():
     for name in ("serve_h20.sh", "serve_v100_dense.sh", "serve_v100.sh"):
         text = (here / name).read_text()
         assert "PYTORCH_CUDA_ALLOC_CONF" not in text, f"{name} sets the sm70 allocator flag"
+
+
+def test_the_guard_poll_period_is_passed_through_and_defaults_to_60():
+    """The liveness guard injects a real 4-token chat every poll while a slot is
+    free, so a zero-traffic baseline needs LIVENESS_POLL_S raised. The launcher must
+    pass a caller's value through and leave the shipped 60 s in place otherwise.
+
+    `sandbox`'s stub dumps the environment the supervisor hands its child; the guard
+    is a sibling under the same shell, so that dump is what serve_liveness.py reads.
+    """
+    for extra, want, why in (
+        ({"LIVENESS_POLL_S": "999999"}, '"999999"', "a caller's override"),
+        ({}, '"60"', "the shipped default when unset"),
+        ({"LIVENESS_POLL_S": ""}, '"60"',
+         "an empty value must not reach float('') in the guard"),
+    ):
+        with sandbox({"MAX_RESTARTS": "0", **extra}) as (d, env):
+            env.pop("LIVENESS_POLL_S", None)
+            env.update(extra)
+            subprocess.run(["bash", str(SRC)], capture_output=True, text=True,
+                           timeout=120, env=env)
+            child = (d / "childenv.txt").read_text()
+            line = f'LIVENESS_POLL_S={want}'
+            assert line in child, (why, [ln for ln in child.splitlines()
+                                         if "LIVENESS" in ln])

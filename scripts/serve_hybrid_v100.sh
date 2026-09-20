@@ -11,6 +11,11 @@
 #   SERVE_COLD_SSD SERVE_LOG SERVE_LOCK
 #   MAX_RESTARTS (10) RESTART_FUSE_MAX (5) RESTART_FUSE_WINDOW_S (600)
 #   PYTORCH_CUDA_ALLOC_CONF (expandable_segments:True) -- sm70 only, see below
+#   LIVENESS_POLL_S (60) -- the guard's poll period; set 999999 for a zero-traffic
+#     baseline, since at slots > 1 the guard injects a real 4-token chat per poll
+#     and that lands inside the decode window being measured. Set it on THIS
+#     script's environment (it is exec'd directly, so a caller's value arrives);
+#     an empty value falls back to 60.
 # The fuse: the FUSE_MAX-th restart inside FUSE_WINDOW_S trips it and the
 # supervisor exits 2 with a marker -- a crash burst that fast is a finding, and
 # restarting through it hides it. Restarts spaced further apart than the window
@@ -56,6 +61,11 @@ export PYTHONPATH=$REPO/src:$REPO/packages/tilerl-kernels/src
 export TILERL_QWEN38_SOURCE=$CKPT
 export TILERL_MESSAGES_RECORD=$ROOT/messages_requests.jsonl
 export LIVENESS_BASE="http://127.0.0.1:$PORT"
+# Only a guard against an empty value (`float('')` would raise in the guard, and an
+# empty var is easy to produce with `VAR=` or an unset shell expansion). A set value
+# is passed through untouched and the unset case is already 60 in serve_liveness.py,
+# so this line changes no production behavior.
+export LIVENESS_POLL_S=${LIVENESS_POLL_S:-60}
 
 child=; guard=; stopping=
 trap 'stopping=1; [ -n "$guard" ] && { pkill -TERM -P "$guard" 2>/dev/null; kill -TERM "$guard" 2>/dev/null; }; pkill -TERM -f "serve_liveness.py $LOG" 2>/dev/null; pkill -TERM -f "serve_warmup_hybrid.py" 2>/dev/null; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait "$child"; fi; exit 143' TERM INT
