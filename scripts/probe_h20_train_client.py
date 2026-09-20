@@ -45,6 +45,12 @@ import urllib.request
 #: scripts/ is on the path rather than from the caller's cwd.
 sys.path.insert(0, "scripts")
 
+#: Wall seconds below which a fresh prefill cannot have run, so the request was
+#: served from a resident prefix. Tuned for 32k (measured: a fresh 32k prefill is
+#: ~50 s, a hit 3.3 s); `--hit-s` overrides it for another context length, where a
+#: shorter prompt would prefill under the default and be misread as a hit.
+_HIT_S = 10.0
+
 
 def post(url: str, body: dict, timeout: float) -> dict:
     req = urllib.request.Request(
@@ -60,15 +66,28 @@ def health(base: str) -> dict:
 
 
 def body_for(text: str, gen: int) -> dict:
+    """One chat request pinning thinking OFF.
+
+    `enable_thinking` must be sent, not omitted. The 27B template treats it as
+    TRUE when unset (`prompt.py:thinking_enabled`), and with no `reasoning_effort`
+    nothing else turns it off -- `think_cap(None)` is None, so the cap == 0 branch
+    never fires. An omitted flag therefore runs a thinking distribution: the
+    generation spends its budget inside the trace, acceptance is measured on
+    thinking text (a different population -- thinking MMLU reads ~19%), and the
+    arm is not comparable to the engine-driven V100 arms, which bypass the
+    template entirely (`probe_draft_window_sweep.py`: "think-off with no template
+    knob"). Every other probe that hits a serve pins it False.
+    """
     return {
         "model": "qwen38-27b",
         "messages": [{"role": "user", "content": text}],
         "max_tokens": gen,
         "temperature": 0.0,
+        "enable_thinking": False,
     }
 
 
-def summarise(h0: dict, h1: dict, rows: list[dict]) -> dict:
+def summarise(h0: dict, h1: dict, rows: list[dict], hit_s: float = _HIT_S) -> dict:
     """The arm's bracket deltas plus the wall split that keeps prefill out of it.
 
     A wall median over every request mixes two populations -- a fresh 32k prefill
@@ -76,27 +95,39 @@ def summarise(h0: dict, h1: dict, rows: list[dict]) -> dict:
     line. They are split by measured finish time, not by a flag, because the
     client cannot see which requests hit.
     """
+    ok = [r for r in rows if "error" not in r]
+    walls = sorted(r["wall_s"] for r in ok)
+    # The acceptance arithmetic is `probe_h20_arm_read.health_delta`'s, not a
+    # second copy: that function owns the straddled-restart guard (a restart
+    # between the reads zeroes the counters, and the subtraction would otherwise
+    # print a negative rate that reads like a measurement). The two scripts sit in
+    # the same directory and are always run together.
+    sys.path.insert(0, "scripts")
+    from probe_h20_arm_read import health_delta  # noqa: E402
+
+    hd = health_delta(h0, h1)
 
     def g(d: dict, k: str) -> int:
         return (d.get("stats") or d).get(k, 0)
 
-    ok = [r for r in rows if "error" not in r]
-    walls = sorted(r["wall_s"] for r in ok)
-    #: Below this a 32k prefill cannot have run (measured: ~50 s), so the request
-    #: was served from a resident prefix. A split point, not a claim about speed.
-    HIT_S = 10.0
     return {
         "n_ok": len(ok),
         "n_total": len(rows),
         "delta": {
-            "accepted": g(h1, "spec_accepted") - g(h0, "spec_accepted"),
-            "drafted": g(h1, "spec_drafted") - g(h0, "spec_drafted"),
-            "generated": g(h1, "tokens_generated") - g(h0, "tokens_generated"),
-            "decode_forwards": g(h1, "decode_forwards") - g(h0, "decode_forwards"),
+            "accepted": hd["d_accepted"],
+            "drafted": hd["d_drafted"],
+            "generated": hd["d_generated"],
+            "decode_forwards": hd["d_decode_forwards"],
             "prefix_hits": g(h1, "prefix_hits") - g(h0, "prefix_hits"),
         },
-        "wall_hit_s": [w for w in walls if w < HIT_S],
-        "wall_prefill_s": [w for w in walls if w >= HIT_S],
+        # Carried through so a caller cannot read an acceptance ratio that the
+        # guard nulled without seeing why.
+        "straddled_restart": hd["straddled_restart"],
+        "accept_rate": hd["accept_rate"],
+        "accept_len": hd["accept_len"],
+        "wall_hit_s": [w for w in walls if w < hit_s],
+        "wall_prefill_s": [w for w in walls if w >= hit_s],
+        "hit_s": hit_s,
         "prompt_tokens": sorted({r["prompt_tokens"] for r in ok}),
     }
 
@@ -140,6 +171,33 @@ def self_check() -> int:
     b = body_for("hello", 8)
     assert b["messages"] == [{"role": "user", "content": "hello"}], b
     assert b["max_tokens"] == 8 and b["temperature"] == 0.0, b
+    # thinking MUST be pinned off. Omitting it is not the same request: the 27B
+    # template defaults it TRUE, so an arm measured without this key runs a
+    # thinking distribution and is not comparable to the engine-driven arms.
+    assert b["enable_thinking"] is False, b
+    # a straddled bracket must null the ratios, carried from health_delta rather
+    # than recomputed here -- the guard lives in one place
+    straddle_before = {
+        "stats": {
+            "spec_accepted": 100,
+            "spec_drafted": 20000,
+            "tokens_generated": 5000,
+            "decode_forwards": 9000,
+        }
+    }
+    straddle_after = {
+        "stats": {
+            "spec_accepted": 2,
+            "spec_drafted": 30,
+            "tokens_generated": 4,
+            "decode_forwards": 9100,
+        }
+    }
+    ss = summarise(straddle_before, straddle_after, [])
+    assert ss["straddled_restart"] is True, ss
+    assert ss["accept_rate"] is None and ss["accept_len"] is None, ss
+    # --hit-s reaches the split, so a non-32k length can retune it
+    assert summarise(h0, h1, rows, hit_s=100.0)["wall_hit_s"] == [3.309, 53.29], ss
     print("h20_train_client self-check ok")
     return 0
 
@@ -160,6 +218,13 @@ def main() -> int:
     ap.add_argument("--source", default="/data00/Qwen3.8-27B-NVFP4")
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--out", required=True)
+    ap.add_argument(
+        "--hit-s",
+        type=float,
+        default=_HIT_S,
+        help="wall seconds under which a request was a prefix hit "
+        "(a fresh prefill cannot have run); retune per context length",
+    )
     a = ap.parse_args(argv)
 
     from tilerl.tokenizer import get_tokenizer
@@ -224,7 +289,7 @@ def main() -> int:
         "health_after": h1,
         "rows": rows,
     }
-    rec["summary"] = summarise(h0, h1, rows)
+    rec["summary"] = summarise(h0, h1, rows, a.hit_s)
     with open(a.out, "w") as fh:
         json.dump(rec, fh, indent=1)
     s = rec["summary"]
