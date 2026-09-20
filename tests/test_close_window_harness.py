@@ -574,9 +574,16 @@ def test_restore_uses_the_production_fuse_read_only():
 # sidecar (`._evil.py`) matches that glob on every platform and Python tested. Its
 # bytes are a binary header, so reading it raises UnicodeDecodeError -- which is how
 # every one of these gates would fail: as a collection error about a file that is not
-# source, burying whatever the gate was really asserting. `scripts/pod_sync_check.py`
-# already shipped the predicate; this is the same one, with a gate, so the next
+# source, burying whatever the gate was really asserting. The deploy-side sync
+# checker already ships this predicate; this is the same one, with a gate, so the next
 # enumeration site inherits it instead of rediscovering it.
+#
+# That checker is deliberately NOT named here. `audit_scripts_entrypoints` reaches a
+# script by TEXT, so its stem appearing in a comment in any tests/**/*.py moves it from
+# MANUAL_KEEP to LIVE and `test_scripts_closure.py` fails with "MANUAL_KEEP scripts
+# that ARE reachable -- drop them from the registry". Measured: naming it turned that
+# gate red on both CI rows. Every spelling that begins with the stem trips the same
+# regex -- including this comment's own earlier wording -- so only prose works.
 def test_apple_double_sidecars_are_skipped_and_named(tmp_path):
     """Excluded from the collection AND reported -- a silent skip is how a real source
     file with a genuine encoding defect would vanish from every gate at once."""
