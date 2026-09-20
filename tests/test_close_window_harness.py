@@ -695,29 +695,35 @@ def test_clean_spill_refuses_while_the_supervisor_is_between_restarts(tmp_path):
         assert _sp.run(["pgrep", "-f", "tilerl.cli serve"], capture_output=True).returncode != 0, \
             "precondition failed: a serve python is running, so this is not the gap"
 
-        # RED: the guard text as it was before this PR, read from the base commit.
-        base = _sp.run(["git", "-C", str(REPO), "rev-parse", "origin/main"],
-                       capture_output=True, text=True, check=True).stdout.strip()
-        old_src = _sp.run(["git", "-C", str(REPO), "show",
-                           f"{base}:scripts/run_close_window_v100.sh"],
-                          capture_output=True, text=True, check=True).stdout
-        # Slice inside clean_spill, not across the whole file: `pgrep -f
-        # "tilerl.cli serve"` also appears in stop_serve, which is earlier, and
-        # slicing from there silently produced a 255-line "guard" that matched
-        # nothing.
-        def guard_of(text):
-            fn = text[text.index("clean_spill() {"):]
-            start = fn.index("  local pat") if "  local pat" in fn else \
-                fn.index('  pgrep -f "tilerl.cli serve"')
-            end = fn.index("  # The list arrives on fd 3") if "  # The list arrives" in fn \
-                else fn.index('  for f in "$COLD_SSD"')
-            return fn[start:end]
-
-        new_guard, old_guard = guard_of(SRC.read_text()), guard_of(old_src)
-        assert "serve_hybrid_v100.sh" not in old_guard, "the RED arm is not the old guard"
+        # RED: the guard narrowed to ONE pattern, which is the old guard's semantics
+        # exactly -- `pgrep -f "tilerl.cli serve" >/dev/null 2>&1 && { ...; return 1; }`
+        # and a one-element `for pat in` loop are the same program.
+        #
+        # Derived by narrowing rather than by reading the old file out of git. CI runs
+        # `actions/checkout@v4` with no fetch-depth, i.e. `--depth 1`, where NEITHER
+        # `origin/main` NOR the PR's base sha resolves -- both measured on a depth-1 clone
+        # (`fatal: invalid object name 'origin/main'`, `fatal: bad object <base>`), so every
+        # git-based route exits 128 in CI. An earlier version used `git show origin/main:`
+        # and would have raised CalledProcessError on both CI rows while passing locally.
+        #
+        # The narrowing is the old guard's semantics exactly, and that was checked rather
+        # than assumed: with pgrep stubbed on a synthetic process set, the real old guard
+        # (read from the base object locally) and the narrowed guard agree in all three
+        # discriminating states -- nothing: NOT-REFUSED / serve python: REFUSED /
+        # supervisor only: NOT-REFUSED. That table is in the PR because it cannot live
+        # here: the base object does not exist in a CI checkout.
+        _full = SRC.read_text()
+        # Slice inside clean_spill, not across the whole file: `pgrep -f "tilerl.cli
+        # serve"` also appears in stop_serve, which is earlier, and slicing from there
+        # silently produced a 255-line "guard" that matched nothing.
+        fn = _full[_full.index("clean_spill() {"):]
+        new_guard = fn[fn.index("  local pat"):fn.index("  # The list arrives on fd 3")]
+        pats = 'for pat in "tilerl.cli serve" "serve_hybrid_v100.sh" "serve_liveness.py"; do'
+        assert pats in new_guard, "the guard's pattern list moved; RED would not narrow"
+        red_guard = new_guard.replace(pats, 'for pat in "tilerl.cli serve"; do')
         red = root / "red.sh"
-        red.write_text(SRC.read_text().replace(new_guard, old_guard))
-        assert old_guard in red.read_text(), "the substitution did not apply"
+        red.write_text(_full.replace(new_guard, red_guard))
+        assert red_guard in red.read_text(), "the narrowing did not apply"
         assert new_guard not in red.read_text(), "new and old guard are the same text"
 
         seed()
