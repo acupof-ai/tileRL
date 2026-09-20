@@ -140,6 +140,25 @@ class ColdSsdFile:
             self._f.flush()
         self._map = None
         self._cap = (os.path.getsize(path) - self.HEADER) // self.stride
+        #: Metadata lock, SEPARATE from the owning tier's _tlock. Slot allocation,
+        #: the key->slot map, free list, extent live counts and the mmap rotation
+        #: all run under it. Lock order is tier _tlock -> this lock, always; the
+        #: background publish worker takes it for a short reserve/commit only and
+        #: does the slow disk bytes with NEITHER lock held.
+        self._mlock = threading.Lock()
+        #: Keys a background lift is reading / about to consume. While pinned the
+        #: slot is NOT returned to the free list by forget and is invisible to
+        #: allocation, so the step thread cannot recycle (or a reclaim truncate
+        #: the extent of) the source bytes a lock-outside lift still needs. The
+        #: lift unpins in its phase-3 commit or in its failure rollback.
+        self._pinned_keys: set = set()
+        self._reserved: set = set()
+        #: Count of lock-outside readers/writers currently using a mapping that a
+        #: concurrent grow must not munmap. Only the single publish worker borrows
+        #: (once per 3-phase lift); _remap leaves the borrowed mapping alive and a
+        #: later prune closes the stale generations.
+        self._borrowed = 0
+        self._maps: list = []
         # A reopened file's slots are all FREE (the slot map is in-memory; a
         # reopened serving spill resolves nothing), so it starts with zero live
         # extents regardless of its on-disk high-water size.
@@ -147,37 +166,116 @@ class ColdSsdFile:
         self._remap(self._cap)
 
     def _remap(self, cap: int) -> None:
-        """Map exactly ``cap`` fixed-stride slots (the file already holds them)."""
-        if self._map is not None:
-            self._map.close()
-            self._map = None
+        """Map exactly ``cap`` fixed-stride slots (the file already holds them).
+        Called under _mlock. Old mappings are kept in _maps rather than closed so
+        a lock-outside IO borrowing one is never munmapped mid-copy;
+        _prune_maps_locked reaps stale generations once no borrow is active."""
         self._cap = cap
         n_ext = (cap + self.GROWTH_SLOTS - 1) // self.GROWTH_SLOTS
         if n_ext > len(self._extent_live):
             self._extent_live.extend([0] * (n_ext - len(self._extent_live)))
         if cap:
-            self._map = self._mmap.mmap(self._f.fileno(), self.HEADER + cap * self.stride)
+            new_map = self._mmap.mmap(self._f.fileno(), self.HEADER + cap * self.stride)
+            self._maps.append(new_map)
+            self._map = new_map
+            self._prune_maps_locked()
 
-    def _alloc_slot(self) -> int:
-        if self._free_slots:
-            return self._free_slots.pop()
+    def _prune_maps_locked(self) -> None:
+        """Close every mapping generation except the newest, unless a lock-outside
+        IO is borrowing one (then keep them all; the commit path prunes again once
+        the borrow returns). Held mappings cost address space, not RSS."""
+        if self._borrowed or len(self._maps) <= 1:
+            return
+        for old in self._maps[:-1]:
+            with contextlib.suppress(ValueError):
+                old.close()
+        self._maps = self._maps[-1:]
+
+    def _alloc_slot_locked(self) -> int:
+        """Allocate a slot that is neither free-nor-reusable nor reserved."""
+        free = [s for s in self._free_slots if s not in self._reserved]
+        if free:
+            slot = free[-1]
+            del self._free_slots[self._free_slots.index(slot)]
+            return slot
         slot = self._next_slot
-        self._next_slot += 1
+        while slot in self._reserved:  # reserved slots past the cursor
+            self._next_slot += 1
+            slot = self._next_slot
+        self._next_slot = slot + 1
         if slot >= self._cap:
-            # Grow one extent with a single ftruncate + one remap. ftruncate grows
-            # the shared file object in place; the next mapping spans the new size.
             cap = self._cap + self.GROWTH_SLOTS
             os.ftruncate(self._f.fileno(), self.HEADER + cap * self.stride)
             self._remap(cap)
         return slot
 
+    def reserve_slot(self):
+        """Allocate + grow under the file lock, mark reserved, and return
+        (slot, mapping). Nobody else can read or allocate the slot until
+        commit_slot/release_slot; ``mapping`` is borrow-protected and is what the
+        caller writes its bytes through with NO lock held (write_reserved)."""
+        with self._mlock:
+            slot = self._alloc_slot_locked()
+            self._reserved.add(slot)
+            self._borrowed += 1
+            return slot, self._map
+
+    def release_borrow(self) -> None:
+        """End one lock-outside IO's mapping borrow (its copy finished; the
+        mapping generation may now be pruned)."""
+        with self._mlock:
+            self._borrowed = max(0, self._borrowed - 1)
+            self._prune_maps_locked()
+
+    def _copy_into(self, mapping, slot: int, blob: dict) -> None:
+        """Byte copy into a reserved slot through its borrow-protected mapping.
+        NO lock: the slot is reserved (no other writer) and the mapping cannot be
+        munmapped while borrowed."""
+        off = self.HEADER + slot * self.stride
+        for k, _shape, _dt, n in self._spec:
+            t = blob[k].detach()
+            if t.is_cuda:
+                t = t.cpu()  # numpy/mmap needs a host tensor; bounds may arrive on device
+            dst = torch.from_numpy(
+                self._np.frombuffer(mapping, dtype=self._np.uint8,
+                                    count=n, offset=off))
+            dst.copy_(t.contiguous().view(torch.uint8).reshape(-1))
+            off += n
+
+    def write_reserved(self, slot: int, blob: dict, mapping) -> None:
+        """The slow disk bytes of one reserved slot, copied with NO lock held."""
+        self._copy_into(mapping, slot, blob)
+
+    def commit_slot(self, key, slot: int) -> None:
+        """Publish a reserved slot whose bytes were written by write_reserved:
+        under the file lock install key->slot, unreserve, count the extent, and
+        end the borrow."""
+        with self._mlock:
+            self._slot_of[key] = slot
+            self._reserved.discard(slot)
+            self._extent_live[slot // self.GROWTH_SLOTS] += 1
+            self._borrowed = max(0, self._borrowed - 1)
+            self._prune_maps_locked()
+
+    def release_slot(self, slot: int) -> None:
+        """Roll a reserved slot back after a failed lock-outside IO: return it to
+        the free list and drop the borrow. No key ever saw it."""
+        with self._mlock:
+            self._reserved.discard(slot)
+            self._free_slots.append(slot)
+            self._borrowed = max(0, self._borrowed - 1)
+            self._prune_maps_locked()
+
     def _shrink_trailing_extents(self) -> None:
         """Release physical disk of every fully-free extent at the high-water end:
         lower _next_slot into the last extent that still holds a live slot and
         truncate the file to it, one remap. Does nothing mid-file (those slots
-        cycle through the LIFO free list)."""
+        cycle through the LIFO free list). An extent with a slot a lock-outside IO
+        has RESERVED (live count not yet incremented) is treated as occupied, so
+        truncation can never SIGBUS a borrowed mapping's bytes."""
         e = len(self._extent_live) - 1
-        while e >= 0 and self._extent_live[e] == 0:
+        while e >= 0 and self._extent_live[e] == 0 and not any(
+                s // self.GROWTH_SLOTS == e for s in self._reserved):
             self._extent_live.pop()
             e -= 1
         cap = 0 if e < 0 else (e + 1) * self.GROWTH_SLOTS
@@ -203,22 +301,11 @@ class ColdSsdFile:
             self._charge(t)
 
     def _write(self, key, blob: dict) -> None:
-        slot = self._alloc_slot()
-        off = self.HEADER + slot * self.stride
-        for k, _shape, _dt, n in self._spec:
-            t = blob[k].detach()
-            if t.is_cuda:
-                t = t.cpu()  # numpy/mmap needs a host tensor; bounds may arrive on device
-            # Zero-copy write, mirroring _read: a numpy view of the WRITABLE mmap
-            # (offset, not a bytes copy) takes the bytes via copy_, with no
-            # t.numpy().tobytes() double copy or a per-page bytes allocation.
-            dst = torch.from_numpy(
-                self._np.frombuffer(self._map, dtype=self._np.uint8,
-                                    count=n, offset=off))
-            dst.copy_(t.contiguous().view(torch.uint8).reshape(-1))
-            off += n
-        self._slot_of[key] = slot
-        self._extent_live[slot // self.GROWTH_SLOTS] += 1
+        with self._mlock:
+            slot = self._alloc_slot_locked()
+            self._copy_into(self._map, slot, blob)
+            self._slot_of[key] = slot
+            self._extent_live[slot // self.GROWTH_SLOTS] += 1
         # No per-page flush: the page cache writes this back; the serving spill
         # is an in-process capacity tier, not a durability log (KvBootStore is).
 
@@ -232,17 +319,82 @@ class ColdSsdFile:
             self._charge(t)
 
     def _read(self, key, pin: bool) -> dict:
-        slot = self._slot_of[key]
+        with self._mlock:
+            slot = self._slot_of[key]
+            off = self.HEADER + slot * self.stride
+            mapping = self._map
+            blob = {}
+            for k, shape, dt, n in self._spec:
+                t = torch.empty(shape, dtype=getattr(torch, dt), device="cpu",
+                                pin_memory=pin)
+                # flat byte views: view(uint8) changes the trailing dim, never numel,
+                # so both sides flatten first. A numpy view of the WHOLE writable mmap
+                # (offset, not a read-only bytes slice) feeds copy_ with zero copies.
+                src = torch.from_numpy(
+                    self._np.frombuffer(mapping, dtype=self._np.uint8,
+                                        count=n, offset=off))
+                t.view(torch.uint8).reshape(-1).copy_(src)
+                blob[k] = t
+                off += n
+            return blob
+
+    def borrow_read(self, key, pin: bool):
+        """Resolve key -> (slot, mapping) under the file lock, borrow the mapping
+        AND pin the source key, so the slow bytes can be read with NO lock held
+        (read_borrowed). The mapping borrow ends with release_mapping_borrow once
+        the bytes are in the caller's blob, but the KEY STAYS PINNED until
+        consume_pinned (phase 3) or rollback_pinned (failure): forget skips a
+        pinned key, so the step thread cannot recycle the source slot mid-lift.
+        None when the key is gone."""
+        with self._mlock:
+            slot = self._slot_of.get(key)
+            if slot is None or key in self._pinned_keys:
+                return None
+            self._borrowed += 1
+            self._pinned_keys.add(key)
+            shapes = [(k, shape, dt, n) for k, shape, dt, n in self._spec]
+            return slot, self._map, pin, shapes
+
+    def release_mapping_borrow(self) -> None:
+        """End the mapping borrow after read_borrowed finished copying; the
+        source key remains pinned until consume/rollback."""
+        with self._mlock:
+            self._borrowed = max(0, self._borrowed - 1)
+            self._prune_maps_locked()
+
+    def consume_pinned(self, key) -> bool:
+        """Phase 3: the lift finished with this source — forget its slot and
+        unpin it. Returns False if the key vanished (already consumed), in which
+        case nothing is freed."""
+        with self._mlock:
+            if key not in self._pinned_keys:
+                return key in self._slot_of
+            self._pinned_keys.discard(key)
+            slot = self._slot_of.pop(key, None)
+            if slot is None:
+                return False
+            self._free_slots.append(slot)
+            self._extent_live[slot // self.GROWTH_SLOTS] -= 1
+            if self._reclaim:
+                self._shrink_trailing_extents()
+            return True
+
+    def rollback_pinned(self, key) -> None:
+        """A lift failed after borrow_read: unpin the source without consuming
+        it so a later forget/evict can reclaim the slot normally."""
+        with self._mlock:
+            self._pinned_keys.discard(key)
+
+    def read_borrowed(self, borrowed) -> dict:
+        """Copy one slot's bytes via a borrow from borrow_read; NO file lock."""
+        slot, mapping, pin, spec = borrowed
         off = self.HEADER + slot * self.stride
         blob = {}
-        for k, shape, dt, n in self._spec:
+        for k, shape, dt, n in spec:
             t = torch.empty(shape, dtype=getattr(torch, dt), device="cpu",
                             pin_memory=pin)
-            # flat byte views: view(uint8) changes the trailing dim, never numel,
-            # so both sides flatten first. A numpy view of the WHOLE writable mmap
-            # (offset, not a read-only bytes slice) feeds copy_ with zero copies.
             src = torch.from_numpy(
-                self._np.frombuffer(self._map, dtype=self._np.uint8,
+                self._np.frombuffer(mapping, dtype=self._np.uint8,
                                     count=n, offset=off))
             t.view(torch.uint8).reshape(-1).copy_(src)
             blob[k] = t
@@ -261,38 +413,51 @@ class ColdSsdFile:
     def _read_field(self, key, field: str, pin: bool = False):
         """Read ONE tensor of a slot by its spec name (partial read: adopting a
         prefix needs the small bounds plane without pulling the slot's K/V)."""
-        slot = self._slot_of[key]
-        off = self.HEADER + slot * self.stride
-        for k, shape, dt, n in self._spec:
-            if k == field:
-                t = torch.empty(shape, dtype=getattr(torch, dt), device="cpu",
-                                pin_memory=pin)
-                src = torch.from_numpy(
-                    self._np.frombuffer(self._map, dtype=self._np.uint8,
-                                        count=n, offset=off))
-                t.view(torch.uint8).reshape(-1).copy_(src)
-                return t
-            off += n
+        with self._mlock:
+            slot = self._slot_of[key]
+            off = self.HEADER + slot * self.stride
+            for k, shape, dt, n in self._spec:
+                if k == field:
+                    t = torch.empty(shape, dtype=getattr(torch, dt), device="cpu",
+                                    pin_memory=pin)
+                    src = torch.from_numpy(
+                        self._np.frombuffer(self._map, dtype=self._np.uint8,
+                                            count=n, offset=off))
+                    t.view(torch.uint8).reshape(-1).copy_(src)
+                    return t
+                off += n
         raise KeyError(field)
 
     def forget(self, key) -> None:
-        slot = self._slot_of.pop(key, None)
-        if slot is not None:
-            self._free_slots.append(slot)
-            self._extent_live[slot // self.GROWTH_SLOTS] -= 1
-            if self._reclaim:
-                self._shrink_trailing_extents()
+        with self._mlock:
+            if key in self._pinned_keys:
+                # A background lift is reading/consuming this slot: do not
+                # recycle it or shrink its extent out from under the lock-outside
+                # IO. consume_pinned frees it when the lift finishes.
+                return
+            slot = self._slot_of.pop(key, None)
+            if slot is not None:
+                self._free_slots.append(slot)
+                self._extent_live[slot // self.GROWTH_SLOTS] -= 1
+                if self._reclaim:
+                    self._shrink_trailing_extents()
 
     def __contains__(self, key) -> bool:
-        return key in self._slot_of
+        with self._mlock:
+            return key in self._slot_of
 
     def __len__(self) -> int:
-        return len(self._slot_of)
+        with self._mlock:
+            return len(self._slot_of)
 
     def close(self) -> None:
-        if self._map is not None:
-            self._map.close()
-        self._f.close()
+        with self._mlock:
+            for mapping in self._maps:
+                with contextlib.suppress(ValueError):
+                    mapping.close()
+            self._maps = []
+            self._map = None
+            self._f.close()
 
 
 def _blob_spec(blob: dict) -> list[tuple[str, tuple, str, int]]:
@@ -435,10 +600,16 @@ class HostKvPages:
 
     def _publish_worker(self) -> None:
         """Single consumer: run each page's private->shared transfer off the
-        step thread. The worker is the ONLY other thread touching this tier and
-        takes _tlock for the transfer. Never touches CUDA: every source byte is
-        already host-resident (a RAM blob handed with the job, a RAM private
-        blob, or the private spill file)."""
+        step thread. It is the ONLY other thread touching this tier. Never
+        touches CUDA: every source byte is already host-resident or on disk.
+
+        Lock shape (the point of 3PR): a private-SSD lift does two slow disk
+        passes (private read + shared write). Those run with NO _tlock and NO
+        SSD metadata lock held — only the short prepare (reserve/pop under
+        _tlock, then the SSD files' own locks) and commit (publish the record
+        under _tlock) take locks. Lock order everywhere is _tlock -> a
+        ColdSsdFile._mlock, one direction; the IO borrows a mapping protected
+        against remap, so a concurrent grow cannot munmap the bytes in flight."""
         while True:
             job = self._pub_q.get()
             try:
@@ -447,38 +618,37 @@ class HostKvPages:
                 self._pub_before_job(job)  # test seam: runs with NO tier lock held
                 kind, private_key, shared_key, payload = job
                 event = None
+                # The payload bytes stop being queued as soon as the job is taken
+                # (#745 byte cap): they enter the shared budget on commit below or
+                # are dropped on failure, and the slow SSD IO copies bytes this
+                # thread has already pulled into its local blob.
                 with self._tlock:
-                    # The payload either enters the shared budget below or is
-                    # dropped on failure; either way it stops being queued.
                     self._pub_payload_bytes -= self._job_payload_n(job)
-                    ok = True
-                    try:
-                        if kind == "kv":
-                            ok = bool(
-                                self.share_hold_kv(private_key, shared_key, payload))
-                        else:  # "hold": a host frame blob already folded with bounds
-                            blob, n = payload
+                try:
+                    if kind == "kv":
+                        # prepare() runs the slow disk IO outside both locks and
+                        # returns a committer that publishes under _tlock.
+                        committer = self._publish_prepare_kv(
+                            private_key, shared_key, payload)
+                        if committer is None:
+                            with self._tlock:
+                                self.bg_failed += 1
+                                self._pub_private.discard(private_key)
+                                event = self._pub_pending.pop(shared_key, None)
+                        else:
+                            event = committer()  # short _tlock commit
+                    else:  # "hold": a host frame blob already folded with bounds
+                        blob, n = payload
+                        with self._tlock:
                             self.share_hold(shared_key, blob, n)
-                        # The key is committed now: leave the pending tables BEFORE
-                        # folding the delta, so a delta that hits zero goes through
-                        # the ordinary share_release pop, not back into pending.
-                        delta = self._pub_pending_refs.pop(shared_key, 0)
-                        self._pub_private.discard(private_key)
-                        event = self._pub_pending.pop(shared_key, None)
-                        if ok and delta:
-                            rec = self._shared.get(shared_key)
-                            if rec is not None:
-                                rec[1] += delta
-                                if rec[1] <= 0:
-                                    self.share_release(shared_key)
-                        elif not ok:
-                            # The private source was dropped before the worker ran
-                            # (host budget, no spill file): nothing to serve.
-                            self.bg_failed += 1
-                    except Exception:
-                        # A failed background publish is a cache miss, never a
-                        # wedged follower: drop the pending refs and fire the
-                        # event so a waiting share_take returns None.
+                            event = self._fold_and_event(shared_key)
+                except Exception:
+                    # A failed background publish is a cache miss, never a
+                    # wedged follower: unpin an SSD source this lift may have
+                    # borrowed, drop the pending refs and fire the event.
+                    if kind == "kv" and self._ssd is not None:
+                        self._ssd.rollback_pinned(private_key)
+                    with self._tlock:
                         self.bg_failed += 1
                         self._pub_pending_refs.pop(shared_key, None)
                         self._pub_private.discard(private_key)
@@ -487,6 +657,177 @@ class HostKvPages:
                     event.set()
             finally:
                 self._pub_q.task_done()
+
+    def _publish_prepare_kv(self, private_key, shared_key, extra):
+        """Phase 1+2 of the background lift. A RAM source has no disk IO and gets
+        a trivial committer. A private-SSD source is, under _tlock, popped and
+        its kind resolved; then with NO _tlock held it borrows the private page
+        through that file's own lock, reads its bytes, reserves a shared slot and
+        copies the bytes in — the two slow disk passes never hold _tlock. Returns
+        a zero-arg phase-3 committer (takes _tlock), or None when the source is
+        gone. Reserved slots and borrows roll back on failure (no extent/slot
+        leak). Lock order is _tlock -> ColdSsdFile._mlock everywhere; the IO
+        itself holds neither."""
+        # ---- phase 1a: short _tlock section: resolve RAM vs SSD ----
+        with self._tlock:
+            n = self._held.pop(private_key, None)
+            blob = self._blobs.pop(private_key, None)
+            self._ram_order.pop(("p", private_key), None)
+            # RAM source: its bytes are in hand and _pub_private already pins it
+            # against the RAM evictor/forget; drop that marker now. An SSD source
+            # keeps the marker AND gets a per-key pin on the spill file that
+            # lasts to phase 3, so its slot cannot be recycled during IO.
+            if blob is not None:
+                self._pub_private.discard(private_key)
+            ram_blob = blob is not None
+            if n is not None:
+                self._used -= n
+            existing = self._shared.get(shared_key) if not ram_blob else None
+            if not ram_blob and (self._ssd is None
+                                or private_key not in self._ssd):
+                self._pub_private.discard(private_key)
+                return None  # source dropped before the worker ran
+            dup = not ram_blob and existing is not None
+
+        # ---- phase 2: slow disk bytes, NO _tlock ----
+        if ram_blob:
+            if extra:
+                blob.update(extra)
+                n += sum(t.numel() * t.element_size()
+                         for t in extra.values() if torch.is_tensor(t))
+            return lambda: self._commit_ram_publish(shared_key, blob, n)
+        if dup:
+            # Consume the private copy and ref++ the existing record.
+            return lambda: self._commit_dup_ssd_publish(private_key, shared_key)
+
+        src = self._ssd.borrow_read(private_key, False)
+        if src is None:
+            return self._ssd_lift_miss(shared_key, private_key)
+        try:
+            blob = self._ssd.read_borrowed(src)
+        except Exception:
+            self._ssd.rollback_pinned(private_key)  # unpin source on read failure
+            raise
+        # bytes are now in the local blob; the mapping borrow ended inside the
+        # read's finally, and the source KEY stays pinned until phase 3.
+        if extra:
+            blob.update(extra)
+        pn = self._ssd_page_bytes.get(private_key, self._ssd.stride)
+        pn += sum(t.numel() * t.element_size()
+                  for t in extra.values() if torch.is_tensor(t)) if extra else 0
+
+        dest_slot = None
+        over_cap = (not self._ssd_path or self.shared_spill_disabled
+                    or (self.prefix_spill_bounded
+                        and self._shared_ssd_bytes + pn > self.ssd_capacity_bytes))
+        if not over_cap:
+            try:
+                shared_ssd = self._ensure_shared_ssd(blob)
+                dest_slot, dest_map = shared_ssd.reserve_slot()
+                try:
+                    shared_ssd.write_reserved(dest_slot, blob, dest_map)  # IO, no lock
+                except OSError:
+                    shared_ssd.release_slot(dest_slot)
+                    self._disable_shared_spill()
+                    dest_slot = None
+            except OSError:
+                self._disable_shared_spill()
+                dest_slot = None
+        return lambda: self._commit_ssd_publish(
+            private_key, shared_key, blob, pn, dest_slot)
+
+    def _commit_ram_publish(self, shared_key, blob, n):
+        """Phase 3 for a RAM-source job: ordinary share_hold under _tlock."""
+        with self._tlock:
+            self.share_hold(shared_key, blob, n)
+            return self._fold_and_event(shared_key)
+
+    def _commit_dup_ssd_publish(self, private_key, shared_key):
+        """Phase 3 for a duplicate content key whose PRIVATE copy is on SSD:
+        consume that pinned copy (consume_pinned frees+unpins under the file
+        lock) and ref++ the existing record, under _tlock for the byte total."""
+        with self._tlock:
+            existing = self._shared.get(shared_key)
+            pn = self._ssd_page_bytes.pop(private_key, self._ssd.stride)
+            if self._ssd.consume_pinned(private_key):
+                self._ssd_bytes -= pn
+            self._pub_private.discard(private_key)
+            if existing is not None:
+                existing[1] += 1
+            return self._fold_and_event(shared_key)
+
+    def _fold_and_event(self, shared_key):
+        """Fold the pre-commit ref delta into a committed record and return the
+        future event (the worker fires it after releasing _tlock)."""
+        # Pop the pending marker BEFORE folding: a delta that drives refs to 0
+        # calls share_release, which must take the committed-record branch rather
+        # than re-enter the pending table (the key is no longer queued).
+        event = self._pub_pending.pop(shared_key, None)
+        delta = self._pub_pending_refs.pop(shared_key, 0)
+        rec = self._shared.get(shared_key)
+        if rec is not None:
+            rec[1] += delta
+            if rec[1] <= 0:
+                self.share_release(shared_key)
+        return event
+
+    def _commit_ssd_publish(self, private_key, shared_key, blob, n, dest_slot):
+        """Phase 3 for an SSD-source job: the bytes are already copied (or the
+        spill was over-cap/failed and blob stays in RAM). Under _tlock consume
+        the private spill slot, install the shared spilled/RAM record and the
+        shared-SSD byte total, then fold the ref delta. The reserved shared slot
+        is committed here; if anything past the copy still fails it is released,
+        never leaked."""
+        with self._tlock:
+            # consume the pinned private spill slot (frees + unpins under the
+            # private file's own lock); the pin held it across the lock-outside IO
+            pn = self._ssd_page_bytes.pop(private_key, self._ssd.stride)
+            if self._ssd.consume_pinned(private_key):
+                self._ssd_bytes -= pn
+            self._pub_private.discard(private_key)
+            if dest_slot is not None:
+                self._shared_ssd.commit_slot(("s", shared_key), dest_slot)
+                self._shared_ssd_bytes += n
+                self._shared[shared_key] = [n, 1, None]
+                self._ram_order.pop(("s", shared_key), None)
+            else:
+                self._shared[shared_key] = [n, 1, blob]
+                self._shared_ram += n
+                self._ram_order[("s", shared_key)] = n
+                self._enforce_budget()
+            return self._fold_and_event(shared_key)
+
+    def _ssd_lift_miss(self, shared_key, private_key):
+        """Phase 3 when the private source is already gone (borrow_read returned
+        None, so it was never pinned): count a miss, clear the pin marker and
+        fire the future."""
+        with self._tlock:
+            self.bg_failed += 1
+            self._pub_private.discard(private_key)
+            self._pub_pending_refs.pop(shared_key, None)
+            return self._pub_pending.pop(shared_key, None)
+
+    def _ensure_shared_ssd(self, blob: dict):
+        """Lazily open the shared prefix spill file under _tlock-free access.
+        Construction mutates only this file's own handle; serialise it with the
+        tier lock to avoid two workers racing the one-time open."""
+        with self._tlock:
+            if self._shared_ssd is None:
+                self._shared_ssd = ColdSsdFile(
+                    _shared_ssd_path(self._ssd_path), _blob_spec(blob),
+                    step_timing=self.step_timing,
+                    reclaim=self.prefix_spill_bounded)
+            return self._shared_ssd
+
+    def _disable_shared_spill(self) -> None:
+        with self._tlock:
+            if self.shared_spill_disabled:
+                return
+            self.shared_spill_disabled = True
+            self.shared_spill_error = "background lift write failure"
+            print(f"[cold] shared-prefix spill to {_shared_ssd_path(self._ssd_path)!r} "
+                  "failed once in a background lift; shared SSD spill disabled "
+                  "for this process, shared pages stay in RAM", flush=True)
 
     @property
     def bytes_held(self) -> int:
