@@ -41,15 +41,15 @@ trap 'stopping=1; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait
 for ((n = 0; n <= MAX_RESTARTS; n++)); do
   # An unbounded log once filled a disk; truncate past the cap before each boot.
   if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "$LOG_CAP" ]; then : > "$LOG"; fi
-  echo "serve70: tree $REPO sha $(cut -c1-10 "$REPO/.synced_commit" 2>/dev/null || git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown) boot $n at $(date -Is)" >> "$LOG"
+  echo "serve70: tree $REPO sha $(cut -c1-10 "$REPO/.synced_commit" 2>/dev/null || git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown) boot $n at $(date +%Y-%m-%dT%H:%M:%S%z)" >> "$LOG"
   started=$SECONDS
   "$ROOT/venv70/bin/python" -u -m tilerl.cli serve --model qwen38-27b \
       --host 0.0.0.0 --port $PORT \
       --slots 4 --max-batch 4 --max-ctx 8192 >> "$LOG" 2>&1 &
   child=$!
   wait "$child"; rc=$?; child=
-  echo "=== exit rc=$rc after $((SECONDS - started))s at $(date -Is) ===" >> "$LOG"
+  echo "=== exit rc=$rc after $((SECONDS - started))s at $(date +%Y-%m-%dT%H:%M:%S%z) ===" >> "$LOG"
   [ -n "$stopping" ] && exit 0
   sleep 5
 done
-echo "=== gave up after $MAX_RESTARTS restarts at $(date -Is) ===" >> "$LOG"
+echo "=== gave up after $MAX_RESTARTS restarts at $(date +%Y-%m-%dT%H:%M:%S%z) ===" >> "$LOG"

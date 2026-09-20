@@ -192,12 +192,12 @@ fuse_tripped() {
 for ((n = 0; n <= MAX_RESTARTS; n++)); do
   if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "$LOG_CAP" ]; then : > "$LOG"; fi
   if fuse_tripped; then
-    echo "=== FUSE: $RESTART_FUSE_MAX restarts within ${RESTART_FUSE_WINDOW_S}s, staying down at $(date -Is) ===" >> "$LOG"
+    echo "=== FUSE: $RESTART_FUSE_MAX restarts within ${RESTART_FUSE_WINDOW_S}s, staying down at $(date +%Y-%m-%dT%H:%M:%S%z) ===" >> "$LOG"
     echo "=== remove $FUSE_STATE to arm again ===" >> "$LOG"
     exit 2
   fi
   sha=$(cat "$REPO/.synced_commit" 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo unknown)
-  echo "serve_h20: tree $REPO sha ${sha:0:10} boot $n $ARM_DESC at $(date -Is)" >> "$LOG"
+  echo "serve_h20: tree $REPO sha ${sha:0:10} boot $n $ARM_DESC at $(date +%Y-%m-%dT%H:%M:%S%z)" >> "$LOG"
   started=$SECONDS
   "${SERVE_ARGV[@]}" >> "$LOG" 2>&1 &
   child=$!
@@ -210,13 +210,13 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
       bash "$SCRIPT_DIR/serve_cold_trace.sh" "$TRACE" "$child" 10 &
       samp=$!
     fi
-    echo "serve_h20: warmup start at $(date -Is)" >> "$LOG"
+    echo "serve_h20: warmup start at $(date +%Y-%m-%dT%H:%M:%S%z)" >> "$LOG"
     "$PYTHON" "$SCRIPT_DIR/serve_warmup_hybrid.py" >> "$LOG" 2>&1
-    echo "serve_h20: warmup done at $(date -Is)" >> "$LOG"
+    echo "serve_h20: warmup done at $(date +%Y-%m-%dT%H:%M:%S%z)" >> "$LOG"
     "$PYTHON" "$SCRIPT_DIR/serve_liveness.py" "$LOG" "$LIVENESS_BASE" >> "$LOG" 2>&1
     lrc=$?
     [ -n "$samp" ] && kill -TERM "$samp" 2>/dev/null
-    echo "serve_h20: liveness exit $lrc at $(date -Is), killing pid $child" >> "$LOG"
+    echo "serve_h20: liveness exit $lrc at $(date +%Y-%m-%dT%H:%M:%S%z), killing pid $child" >> "$LOG"
     kill -TERM "$child" 2>/dev/null
     gone=0
     for k in $(seq 1 30); do
@@ -225,7 +225,7 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
     [ "$gone" != 1 ] && { kill -9 "$child" 2>/dev/null; sleep 3; }
     st=$(ps -o stat= -p "$child" 2>/dev/null) && echo "serve_h20: WARN pid $child still present: $st" >> "$LOG"
     gpu=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d " ")
-    echo "serve_h20: post-kill GPU ${gpu}MiB at $(date -Is)" >> "$LOG"
+    echo "serve_h20: post-kill GPU ${gpu}MiB at $(date +%Y-%m-%dT%H:%M:%S%z)" >> "$LOG"
     exit 12 ) &
   guard=$!
   wait "$child"; rc=$?; child=
@@ -239,11 +239,11 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
   fi
   guard=
   ran=$((SECONDS - started))
-  echo "=== exit rc=$rc after ${ran}s at $(date -Is) ===" >> "$LOG"
+  echo "=== exit rc=$rc after ${ran}s at $(date +%Y-%m-%dT%H:%M:%S%z) ===" >> "$LOG"
   [ -n "$stopping" ] && exit 0
   [ "$rc" = 0 ] && exit 0
   date +%s >> "$FUSE_STATE"
   sleep 5
 done
-echo "=== gave up after $MAX_RESTARTS restarts at $(date -Is) ===" >> "$LOG"
+echo "=== gave up after $MAX_RESTARTS restarts at $(date +%Y-%m-%dT%H:%M:%S%z) ===" >> "$LOG"
 exit 1

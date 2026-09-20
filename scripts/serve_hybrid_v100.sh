@@ -87,12 +87,12 @@ fuse_tripped() {
 for ((n = 0; n <= MAX_RESTARTS; n++)); do
   if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "$LOG_CAP" ]; then : > "$LOG"; fi
   if fuse_tripped; then
-    echo "=== FUSE: $RESTART_FUSE_MAX restarts within ${RESTART_FUSE_WINDOW_S}s, staying down at $(date -Is) ===" >> "$LOG"
+    echo "=== FUSE: $RESTART_FUSE_MAX restarts within ${RESTART_FUSE_WINDOW_S}s, staying down at $(date +%Y-%m-%dT%H:%M:%S%z) ===" >> "$LOG"
     echo "=== remove $FUSE_STATE to arm again ===" >> "$LOG"
     exit 2
   fi
   sha=$(cat "$REPO/.synced_commit" 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo unknown)
-  echo "servehybrid: tree $REPO sha ${sha:0:10} boot $n at $(date -Is)" >> "$LOG"
+  echo "servehybrid: tree $REPO sha ${sha:0:10} boot $n at $(date +%Y-%m-%dT%H:%M:%S%z)" >> "$LOG"
   started=$SECONDS
   "$PYTHON" -u -m tilerl.cli serve --model qwen38-27b \
       --host 0.0.0.0 --port "$PORT" \
@@ -104,12 +104,12 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
   child=$!
   ( for ((i = 1; i <= READY_TRIALS; i++)); do kill -0 $child 2>/dev/null || exit 1
       curl -sf -m 3 -o /dev/null "http://127.0.0.1:$PORT/health" && break; sleep 2; done
-    echo "servehybrid: warmup start at $(date -Is)" >> "$LOG"
+    echo "servehybrid: warmup start at $(date +%Y-%m-%dT%H:%M:%S%z)" >> "$LOG"
     "$PYTHON" "$SCRIPT_DIR/serve_warmup_hybrid.py" >> "$LOG" 2>&1
-    echo "servehybrid: warmup done at $(date -Is)" >> "$LOG"
+    echo "servehybrid: warmup done at $(date +%Y-%m-%dT%H:%M:%S%z)" >> "$LOG"
     "$PYTHON" "$SCRIPT_DIR/serve_liveness.py" "$LOG" "$LIVENESS_BASE" >> "$LOG" 2>&1
     lrc=$?
-    echo "servehybrid: liveness exit $lrc at $(date -Is), killing pid $child" >> "$LOG"
+    echo "servehybrid: liveness exit $lrc at $(date +%Y-%m-%dT%H:%M:%S%z), killing pid $child" >> "$LOG"
     kill -TERM "$child" 2>/dev/null
     gone=0
     for k in $(seq 1 30); do
@@ -120,7 +120,7 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
     # Record held MiB after the pid is gone; informational only -- NOT a gate on
     # the GPU reading 0 (another process or a slow release is for ops to see).
     gpu=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d " ")
-    echo "servehybrid: post-kill GPU ${gpu}MiB at $(date -Is)" >> "$LOG"
+    echo "servehybrid: post-kill GPU ${gpu}MiB at $(date +%Y-%m-%dT%H:%M:%S%z)" >> "$LOG"
     exit 12 ) &
   guard=$!
   wait "$child"; rc=$?; child=
@@ -134,11 +134,11 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
   fi
   guard=
   ran=$((SECONDS - started))
-  echo "=== exit rc=$rc after ${ran}s at $(date -Is) ===" >> "$LOG"
+  echo "=== exit rc=$rc after ${ran}s at $(date +%Y-%m-%dT%H:%M:%S%z) ===" >> "$LOG"
   [ -n "$stopping" ] && exit 0
   [ "$rc" = 0 ] && exit 0
   date +%s >> "$FUSE_STATE"
   sleep 5
 done
-echo "=== gave up after $MAX_RESTARTS restarts at $(date -Is) ===" >> "$LOG"
+echo "=== gave up after $MAX_RESTARTS restarts at $(date +%Y-%m-%dT%H:%M:%S%z) ===" >> "$LOG"
 exit 1
