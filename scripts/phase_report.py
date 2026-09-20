@@ -53,7 +53,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cold_trace import ColdTraceError, known_total  # noqa: E402
 from cold_trace import rows as trace_rows  # noqa: E402
-from steady_filter import TAIL_MS, is_standard, median, parse_rows, pct  # noqa: E402
+from steady_filter import TAIL_MS, is_standard, median, parse_line, pct  # noqa: E402
 
 #: Default host cold budget the boundary is corroborated against: the V100/H20
 #: hybrid serve runs `--kv-cold-bytes 8 GiB`. A parameter, never a constant --
@@ -67,37 +67,54 @@ DEFAULT_CAP_GIB = 8.0
 CAP_FRACTION = 0.995
 
 
-def ssd_mmap_by_tick(log_path: str) -> dict[int, int]:
-    """`tick number -> ssd_mmap ms`, from the same lines `parse_rows` reads.
+def _scan_log(log_path: str) -> tuple[list[dict], dict[int, int]]:
+    """`(rows keyed by line number, ssd_mmap by line number)` for one log.
+
+    **Line number, not tick number.** A serve log is cumulative across boots --
+    the A2 file holds five -- and the engine's tick counter restarts at 1 on each
+    boot, so a tick number is NOT unique in the file (measured on A2: 2085 steady
+    ticks, 2036 distinct tick numbers). Keying by tick would splice one boot's
+    segments onto another's rows.
 
     `steady_filter.parse_line` keeps a fixed field list and drops the rest, so
-    `ssd_mmap` is not on its rows; this reads that one segment without widening
-    that module's schema for a single report. `is_standard` stays the only
-    definition of "steady".
+    `ssd_mmap` is not on its rows; this reads that one segment off the same lines
+    without widening that module's schema for a single report. `is_standard`
+    stays the only definition of "steady".
     """
     import re
     tick = re.compile(r"\[step-timing\] tick (\d+) ")
     kv = re.compile(r"(\w+)=(-?\d+)ms")
-    out: dict[int, int] = {}
+    rows: list[dict] = []
+    mmap: dict[int, int] = {}
     with open(log_path, errors="replace") as fh:
-        for line in fh:
+        for i, line in enumerate(fh, 1):
             m = tick.search(line)
             if not m:
                 continue
+            row = parse_line(line)
+            if row is None:
+                continue
+            row["line"] = i
+            rows.append(row)
             segs = dict(kv.findall(line))
             if "ssd_mmap" in segs:
-                out[int(m.group(1))] = int(segs["ssd_mmap"])
-    return out
+                mmap[i] = int(segs["ssd_mmap"])
+    return rows, mmap
 
 
 def _tick_rows(rows: list[dict], ssd_mmap: dict[int, int]) -> list[dict]:
-    """Steady ticks, carrying the one extra segment this report reads."""
-    return [{**r, "ssd_mmap": ssd_mmap.get(r["n"], 0)} for r in rows if is_standard(r)]
+    """Steady ticks, carrying the one extra segment this report reads.
+
+    `line` is the row's identity here, not `n` -- see :func:`_scan_log`.
+    """
+    return [{**r, "ssd_mmap": ssd_mmap.get(r["line"], 0)}
+            for r in rows if is_standard(r)]
 
 
-def boundary_tick(ticks: list[dict]) -> int | None:
-    """First steady tick with `ssd_mmap > 0` -- the phase boundary in tick space."""
-    return next((t["n"] for t in ticks if t["ssd_mmap"] > 0), None)
+def boundary_rank(ticks: list[dict]) -> int | None:
+    """First steady tick with `ssd_mmap > 0` -- the phase boundary, as a LINE
+    number (the row's identity; not the engine's per-boot tick counter)."""
+    return next((t["line"] for t in ticks if t["ssd_mmap"] > 0), None)
 
 
 def decfwd_identity(trace: list[dict], ticks: list[dict], slack: int = 2) -> dict:
@@ -143,7 +160,9 @@ def cut_from_decfwd(trace: list[dict], ticks: list[dict], want: float) -> list[d
     """Ticks at or after the steady index the trace's `decfwd` names.
 
     `--from-decfwd` and `--from-line` are two spellings of "start here"; the
-    conversion runs through the `decfwd` identity, which is checked first.
+    conversion runs through the `decfwd` identity, which is checked first. The
+    result is bounded by the trace's OWN last sample, so this route needs no
+    explicit end: the trace says where the arm stopped.
     """
     base = trace[0]["decfwd"]
     k = int(want - base)
@@ -152,17 +171,34 @@ def cut_from_decfwd(trace: list[dict], ticks: list[dict], want: float) -> list[d
             f"--from-decfwd {want} precedes the trace's first decfwd {base}; "
             "the boundary is outside this pair of files"
         )
-    return [t for t in ticks if t["n"] >= ticks[min(k, len(ticks) - 1)]["n"]]
+    return [t for t in ticks if t["line"] >= ticks[min(k, len(ticks) - 1)]["line"]]
 
 
-def report(ticks: list[dict], lo: int | None, hi: int | None, tail_ms: int) -> dict:
-    """One phase's tick stats. The long tail is reported apart from the body --
-    at these sample counts a quantile cut separates nothing, so the split is the
-    absolute `tail_ms` threshold the rest of the tree uses."""
-    sub = [t for t in ticks if (lo is None or t["n"] >= lo) and (hi is None or t["n"] < hi)]
+def report(ticks: list[dict], lo: int | None, hi: int | None, tail_ms: int,
+           window: tuple[int | None, int | None] = (None, None)) -> dict:
+    """One phase's tick stats, over the ticks whose LINE falls in ``[lo, hi)``.
+
+    Line number is the identity; see :func:`_scan_log` for why the engine's tick
+    counter cannot be. `lo`/`hi` are the phase's own edges and the window's are
+    intersected in, so a window that ends before the boundary empties phase B
+    rather than handing it a bound the caller supplied.
+
+    The long tail is reported apart from the body -- at these sample counts a
+    quantile cut separates nothing, so the split is the absolute `tail_ms`
+    threshold the rest of the tree uses.
+    """
+    wlo, whi = window
+    if wlo is not None:
+        lo = wlo if lo is None else max(lo, wlo)
+    if whi is not None:
+        hi = whi if hi is None else min(hi, whi)
+    if lo is not None and hi is not None and hi <= lo:
+        return {"n": 0}          # the phase lies entirely outside the window
+    sub = [t for t in ticks if (lo is None or t["line"] >= lo) and (hi is None or t["line"] < hi)]
     if not sub:
         return {"n": 0}
     body = [t for t in sub if t["total"] <= tail_ms]
+    nonzero = [t["ssd_mmap"] for t in sub if t["ssd_mmap"] > 0]
     return {
         "n": len(sub),
         "body_n": len(body),
@@ -170,26 +206,52 @@ def report(ticks: list[dict], lo: int | None, hi: int | None, tail_ms: int) -> d
         "total_p90_ms": pct([t["total"] for t in body], 0.9),
         "model_p50_ms": median([t["model"] for t in sub]),
         "total_max_ms": max(t["total"] for t in sub),
-        "ssd_mmap_nonzero": len([t for t in sub if t["ssd_mmap"] > 0]),
-        "ssd_mmap_p50_ms": median([t["ssd_mmap"] for t in sub if t["ssd_mmap"] > 0]),
+        "ssd_mmap_nonzero": len(nonzero),
+        # Denominator is the NONZERO subset, not the phase. Named so a reader
+        # cannot take it for the phase's own p50 (which would be ~0 and hide the
+        # stalls this split exists to show).
+        "ssd_mmap_nonzero_p50_ms": median(nonzero),
         "tok_s": round(1000 / statistics.median([t["total"] for t in body]), 2) if body else None,
     }
 
 
 def analyse(trace_path: str, log_path: str, cap_gib: float = DEFAULT_CAP_GIB,
             tail_ms: int = TAIL_MS, from_line: int | None = None,
-            from_decfwd: float | None = None, log_rows: list[dict] | None = None) -> dict:
-    """The whole report as a dict. `log_rows` is a test seam (pre-parsed ticks)."""
+            to_line: int | None = None, from_decfwd: float | None = None) -> dict:
+    """The whole report as a dict.
+
+    `--from-line`/`--to-line` are LOG LINE numbers (a half-open span), because a
+    serve log accumulates across boots and the tick counter restarts on each one.
+    """
     if from_line is not None and from_decfwd is not None:
         raise ValueError("--from-line and --from-decfwd are mutually exclusive")
+    if to_line is not None and from_decfwd is not None:
+        raise ValueError("--to-line and --from-decfwd are mutually exclusive")
+    if to_line is not None and from_line is None:
+        raise ValueError("--to-line needs --from-line")
+    if from_line is not None and to_line is not None and to_line <= from_line:
+        raise ValueError(f"--to-line {to_line} is not after --from-line {from_line}")
     trace = trace_rows(trace_path)
-    raw = log_rows if log_rows is not None else parse_rows(log_path)
-    ticks = _tick_rows(raw, ssd_mmap_by_tick(log_path))
+    all_rows, mmap = _scan_log(log_path)
+    ticks = _tick_rows(all_rows, mmap)
     if not ticks:
         raise ValueError(f"{log_path}: no steady ticks (the standard set matched nothing)")
 
+    # The window FIRST, then everything derived -- a boundary computed outside the
+    # window can fall outside it and empty both phases.
+    if from_line is not None:
+        ticks = [t for t in ticks
+                 if t["line"] >= from_line and (to_line is None or t["line"] < to_line)]
+        if not ticks:
+            raise ValueError(
+                f"{log_path}: no steady ticks in lines [{from_line}, "
+                f"{to_line if to_line is not None else 'EOF'})"
+            )
+    elif from_decfwd is not None:
+        ticks = cut_from_decfwd(trace, ticks, from_decfwd)
+
     ident = decfwd_identity(trace, ticks)
-    ssd_first = boundary_tick(ticks)
+    ssd_first = boundary_rank(ticks)
     trace_hit = phase_boundary_from_trace(trace, cap_gib)
 
     if from_decfwd is not None and not ident["ok"]:
@@ -202,11 +264,6 @@ def analyse(trace_path: str, log_path: str, cap_gib: float = DEFAULT_CAP_GIB,
             f"ticks = {ident['inferred_last']}, trace ends at {ident['trace_last_decfwd']}, "
             f"diff {ident['diff']})"
         )
-    if from_line is not None:
-        ticks = [t for t in ticks if t["n"] >= from_line]
-    elif from_decfwd is not None:
-        ticks = cut_from_decfwd(trace, ticks, from_decfwd)
-        ssd_first = boundary_tick(ticks)
 
     total, complete = known_total(trace[-1])
     return {
@@ -216,6 +273,10 @@ def analyse(trace_path: str, log_path: str, cap_gib: float = DEFAULT_CAP_GIB,
         "trace_samples": len(trace),
         "cap_gib": cap_gib,
         "tail_ms": tail_ms,
+        # The span this report covers, in LOG LINES -- the reader's check that a
+        # windowed run really was windowed, and that its end is the arm's own end
+        # rather than the next boot's first ticks.
+        "window": [from_line, to_line],
         # The trace's values are ALREADY GiB (A2's `shared_ssd=59.501` is the
         # /health `kv_cold_shared_ssd_bytes` 63888556032 B = 59.501 GiB), so no
         # byte conversion happens here. The four-key total only when every term
@@ -230,11 +291,15 @@ def analyse(trace_path: str, log_path: str, cap_gib: float = DEFAULT_CAP_GIB,
         "last_total_complete": complete,
         "unrecorded_keys": trace[0]["unrecorded"],
         "decfwd_identity": ident,
-        "boundary_tick": ssd_first,
-        "boundary_source": "first steady tick with ssd_mmap > 0",
+        "boundary_line": ssd_first,
+        "boundary_source": "first steady tick with ssd_mmap > 0, as a log line number",
         "trace_corroboration": trace_hit,
-        "phase_a": report(ticks, None, ssd_first, tail_ms),
-        "phase_b": report(ticks, ssd_first, None, tail_ms),
+        "phase_a": report(ticks, None, ssd_first, tail_ms, (from_line, to_line)),
+        # No boundary inside the window means phase B did not happen here -- not
+        # that it spans the window. Reporting it as the whole window is how a
+        # truncated arm reads as a complete two-phase run.
+        "phase_b": (report(ticks, ssd_first, None, tail_ms, (from_line, to_line))
+                    if ssd_first is not None else {"n": 0}),
     }
 
 
@@ -275,45 +340,87 @@ def _self_check() -> int:
         lp.write_text("\n".join(log_lines) + "\n")
 
         # The parser must carry `ssd_mmap`; steady_filter's row schema does not,
-        # so re-read the raw segment line for it. Assert that plumbing works.
-        raw = parse_rows(str(lp))
+        # so re-read the raw segment line for it. Assert that plumbing works, and
+        # that the identity is the LINE number -- a cumulative log restarts the
+        # engine's tick counter per boot, so `n` repeats and cannot key a row.
+        raw, mmap = _scan_log(str(lp))
         assert raw and len(raw) == 55, len(raw)
-        mmap = ssd_mmap_by_tick(str(lp))
-        assert len(mmap) == 55, len(mmap)
-        # The fixture writes ssd_mmap=0 for ticks 1..39 and 120 for 40..55, so the
+        assert [r["line"] for r in raw] == list(range(1, 56)), raw[:3]
+        # The fixture writes ssd_mmap=0 for lines 1..39 and 120 for 40..55, so the
         # split below is what makes "boundary = first NONZERO" load-bearing: a
-        # `>= 0` test would put the boundary at tick 1.
-        assert set(n for n, v in mmap.items() if v > 0) == set(range(40, 56)), mmap
+        # `>= 0` test would put the boundary at line 1.
+        assert set(k for k, v in mmap.items() if v > 0) == set(range(40, 56)), mmap
         ticks = _tick_rows(raw, mmap)
         assert len(ticks) == 55, len(ticks)
-        assert boundary_tick(ticks) == 40, boundary_tick(ticks)
+        assert boundary_rank(ticks) == 40, boundary_rank(ticks)
 
-        # The decfwd bridge: base 10, so steady tick #k <-> decfwd 10+k.
+        # The decfwd bridge: base 10, so steady index k <-> decfwd 10+k.
         trace = trace_rows(str(tp))
         ident = decfwd_identity(trace, ticks)
         assert ident["ok"], ident
 
-        # `--from-decfwd` is a DIFFERENT unit from `--from-line`, and this fixture
-        # makes that visible: the trace's first sample is already at decfwd 10, so
+        # THE control for the line identity, on a log that RESETS its tick
+        # counter partway -- the cumulative-log shape. With `n` as the key, the
+        # second segment's segments splice onto the first's rows.
+        reboot = Path(d) / "reboot.log"
+        seg1 = [tick(n, 100, ssd_mmap=0) for n in range(1, 11)]
+        seg2 = [tick(n, 110, ssd_mmap=120) for n in range(1, 11)]
+        reboot.write_text("\n".join(seg1 + seg2) + "\n")
+        rraw, rmmap = _scan_log(str(reboot))
+        rticks = _tick_rows(rraw, rmmap)
+        # 20 rows, even though the tick numbers run 1..10 twice.
+        assert len(rticks) == 20, len(rticks)
+        assert len({t["n"] for t in rticks}) == 10, "fixture does not reset n"
+        # Keyed by n, the first segment would inherit the second's ssd_mmap and
+        # the boundary would land at line 1 instead of line 11.
+        assert boundary_rank(rticks) == 11, boundary_rank(rticks)
+        assert rticks[0]["ssd_mmap"] == 0, rticks[0]
+
+        # `--from-decfwd` is a different unit from `--from-line`, and this fixture
+        # makes it visible: the trace's first sample is already at decfwd 10, so
         # decfwd 40 is the 30th decode forward after the base -> steady index 30 ->
-        # tick 31, not tick 40. Asserting the two spellings coincide would encode
+        # line 31, not line 40. Asserting the two spellings coincide would encode
         # the sample-index confusion this whole file exists to avoid.
         k = 40 - int(trace[0]["decfwd"])              # 30
         a = cut_from_decfwd(trace, ticks, 40)
-        assert a[0]["n"] == ticks[k]["n"] == 31, (a[0]["n"], ticks[k]["n"])
-        assert a[0]["n"] != 40, "decfwd was read as a tick number"
+        assert a[0]["line"] == ticks[k]["line"] == 31, (a[0]["line"], ticks[k]["line"])
 
-        # THE control: the wrong placement. Slicing by trace SAMPLE index (the
-        # first version's bug) puts the boundary at the sample's POSITION, not at
-        # the forward it names. Trace sample index 3 names decfwd 40; slicing by
-        # that index would cut at tick 4.
-        by_sample_index = ticks[3]["n"]
+        # THE other control: the wrong placement. Slicing by trace SAMPLE index
+        # (the first version's bug) puts the boundary at the sample's POSITION,
+        # not at the forward it names. Trace sample index 3 names decfwd 40;
+        # slicing by that index would cut at line 4.
+        by_sample_index = ticks[3]["line"]
         assert by_sample_index == 4, by_sample_index
-        assert by_sample_index != a[0]["n"], (
+        assert by_sample_index != a[0]["line"], (
             "the sample-index placement coincided with the decfwd placement, so "
             "this control proves nothing"
         )
-        assert by_sample_index != boundary_tick(ticks)
+        assert by_sample_index != boundary_rank(ticks)
+
+        # The window is half-open on LOG LINES, and everything derived respects
+        # it: a window that ENDS before the boundary leaves phase B empty rather
+        # than borrowing ticks from outside.
+        win = analyse(str(tp), str(lp), from_line=1, to_line=20)
+        assert win["window"] == [1, 20], win
+        assert win["phase_a"]["n"] == 19 and win["phase_b"]["n"] == 0, win
+        assert win["boundary_line"] is None, win["boundary_line"]
+        # And the end is what stops the next boot's ticks being counted: on a
+        # cumulative log, an unbounded window silently includes them.
+        assert win["phase_a"]["n"] == 19, "the window's upper bound was ignored"
+
+        # `--to-line` needs `--from-line`, must be after it, and is exclusive
+        # with the decfwd route.
+        for kwargs, frag in (
+            ({"to_line": 5}, "needs --from-line"),
+            ({"from_line": 10, "to_line": 10}, "not after"),
+            ({"from_decfwd": 10, "to_line": 50}, "mutually exclusive"),
+        ):
+            try:
+                analyse(str(tp), str(lp), **kwargs)
+            except ValueError as exc:
+                assert frag in str(exc), (kwargs, exc)
+            else:
+                raise AssertionError(f"{kwargs}: no error raised")
 
         # The boundary MOVES LATER as the cap grows: at a 16 GiB cap the trace
         # never saturates, and the corroboration says so instead of inventing one.
@@ -360,7 +467,7 @@ def _self_check() -> int:
 
         # The report itself, end to end, with the phase split by the boundary.
         rep2 = analyse(str(tp), str(lp), cap_gib=8.0)
-        assert rep2["boundary_tick"] == 40, rep2
+        assert rep2["boundary_line"] == 40, rep2
         assert rep2["phase_a"]["n"] == 39 and rep2["phase_b"]["n"] == 16, rep2
         assert rep2["phase_a"]["ssd_mmap_nonzero"] == 0, rep2
         assert rep2["phase_b"]["ssd_mmap_nonzero"] == 16, rep2
@@ -396,11 +503,19 @@ def main() -> int:
     ap.add_argument("--cap-gib", type=float, default=DEFAULT_CAP_GIB,
                     help="the host cold budget this arm ran with (--kv-cold-bytes)")
     ap.add_argument("--tail-ms", type=int, default=TAIL_MS)
-    ap.add_argument("--from-line", type=int,
-                    help="start at this tick number (mutually exclusive with --from-decfwd)")
+    ap.add_argument("--from-line", type=int, metavar="N",
+                    help="start at LOG LINE N (1-based, as a text editor numbers it). "
+                         "A serve log accumulates across boots and the engine's tick "
+                         "counter restarts on each, so the window is in lines, not "
+                         "ticks. Mutually exclusive with --from-decfwd.")
+    ap.add_argument("--to-line", type=int, metavar="N",
+                    help="stop before LOG LINE N (half-open). REQUIRED in practice on "
+                         "a cumulative log: without it the window runs to EOF and the "
+                         "next boot's ticks are counted into this arm. Needs --from-line.")
     ap.add_argument("--from-decfwd", type=float,
-                    help="start at the tick the trace's decfwd names (converted via the "
-                         "decfwd identity)")
+                    help="start at the steady tick the trace's decfwd names (converted "
+                         "via the decfwd identity; bounded by the trace's own last "
+                         "sample, so it needs no --to-line)")
     ap.add_argument("--json", help="write the report here")
     ap.add_argument("--self-check", action="store_true")
     a = ap.parse_args()
@@ -409,7 +524,8 @@ def main() -> int:
         assert rc == 0
         return rc
     try:
-        rep = analyse(a.trace, a.log, a.cap_gib, a.tail_ms, a.from_line, a.from_decfwd)
+        rep = analyse(a.trace, a.log, a.cap_gib, a.tail_ms,
+                      a.from_line, a.to_line, a.from_decfwd)
     except (ColdTraceError, ValueError) as exc:
         print(f"phase_report: {exc}", file=sys.stderr)
         return 1
@@ -417,6 +533,13 @@ def main() -> int:
         with open(a.json, "w") as fh:
             json.dump(rep, fh, indent=1)
     print(json.dumps(rep, indent=1, default=str))
+    if a.from_line is not None and a.to_line is None:
+        print(
+            "# WARNING: no --to-line, so the window ran to EOF. On a cumulative "
+            "serve log that includes the next boot's ticks, and the decfwd identity "
+            "check is what would catch it.",
+            file=sys.stderr,
+        )
     return 0
 
 

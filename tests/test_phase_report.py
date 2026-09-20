@@ -72,9 +72,41 @@ def test_a_zero_threshold_boundary_fails_the_gate():
     to `>= 0` must be caught: every steady tick carries the segment at 0 before
     the crossing, so the boundary would move to the first tick of the arm."""
     _run_flipped(
-        '    return next((t["n"] for t in ticks if t["ssd_mmap"] > 0), None)',
-        '    return next((t["n"] for t in ticks if t["ssd_mmap"] >= 0), None)',
-        "boundary_tick",
+        '    return next((t["line"] for t in ticks if t["ssd_mmap"] > 0), None)',
+        '    return next((t["line"] for t in ticks if t["ssd_mmap"] >= 0), None)',
+        "boundary_rank",
+    )
+
+
+def test_keying_by_tick_number_instead_of_line_fails_the_gate():
+    """The identity is the LOG LINE, not the engine's tick number.
+
+    A serve log is cumulative across boots and the tick counter restarts at 1 on
+    each, so `n` repeats: measured on the A2 file, 2085 steady ticks carry only
+    2036 distinct tick numbers. Keying the `ssd_mmap` lookup by `n` splices one
+    boot's segments onto another's rows, which moves the boundary to the first
+    line of the arm. The self-check's reboot fixture asserts exactly that.
+    """
+    _run_flipped(
+        'ssd_mmap.get(r["line"], 0)',
+        'ssd_mmap.get(r["n"], 0)',
+        "boundary_rank(rticks) == 11",
+    )
+
+
+def test_ignoring_the_window_upper_bound_fails_the_gate():
+    """`--to-line` is what stops a warm window running into the next boot's ticks
+    on a cumulative log. Dropping the upper bound must be caught.
+
+    It trips on the boundary assertion rather than the phase counts: unbounded,
+    the window reaches the fixture's own ssd_mmap crossing at line 40, so a
+    boundary appears where the bounded window correctly reported none.
+    """
+    _run_flipped(
+        '        ticks = [t for t in ticks\n'
+        '                 if t["line"] >= from_line and (to_line is None or t["line"] < to_line)]',
+        '        ticks = [t for t in ticks if t["line"] >= from_line]',
+        'win["boundary_line"] is None',
     )
 
 
