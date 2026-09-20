@@ -194,7 +194,32 @@ engine-reported rule stays, because a banner that *can* disagree is not evidence
 2. **The boot line `tilerl serve: N decode graphs in Ns`** (printed by
    `cli.py`'s serve path from `engine.precapture()`) — `0` is off, `8` is on.
    `precapture()` returns 0 immediately when the graph is off, so the count is
-   the engine's own, printed before any traffic.
+   the engine's own, printed before any traffic. At `--depth 3` the count is
+   **16**, not 8: the bucket set scales with depth.
+
+A third reading is available, and it is the **allocation result** rather than the
+engine's own boolean — so the two can falsify each other:
+
+3. **`/health`'s `memory` rows: the `kv_pool` note's block count.** The pool is
+   built `num_blocks + pad`, and the note reports that **gross** figure, so it
+   carries the graph's padding row: **`4426 blocks` is graph-on, `4425` is
+   graph-off** (measured at **d1** on two independent graph-on boots and one
+   graph-off). The paired `state_slots` `derived` bytes separate too — the padding
+   row holds a slot as well as a block, **476 MiB apart at d1**, and at this
+   configuration that state-slot is the bulk of the cost against a KV block's
+   ~1 MiB.
+
+   The count is a **d1 observation**: at `--depth 3` the draft layer count differs,
+   so the absolute figures are to be read per arm rather than assumed. What must
+   hold at any depth is the **relation** — graph-on's gross KV-pool blocks are
+   graph-off's **plus exactly one** (the padding row). Check it before taking an
+   arm's numbers: if the two arms' gross counts differ by anything else, the
+   configuration is wrong and the arm is not readable.
+
+Note this is the *gross* figure, and the reason the caution below is about
+`blocks_total` specifically: `blocks_total` is the **net** `usable_blocks`, which
+subtracts the same pad, so it is invariant. Two views of one pool, one
+discriminating and one not — read the `memory` note, not `blocks_total`.
 
 Two candidates were tried and are both wrong:
 
@@ -329,6 +354,25 @@ is ever replayed** — which is why it shows up on an arm whose sparse decode ne
 enters the captured path. Report it as its own finding; it does not need the tick
 attribution to stand.
 
+**`--decode-graph` also changes the eager sparse tick's code path, and that is a
+separate fact from the memory above.** `build.py` resolves
+`sparse_device_select = _graph_on(backend, decode_graph)` whenever the caller did
+not set it, and the serve sets neither this nor the CLI's own switch; on sm90
+`_graph_on` is True. So **turning the graph on silently turns sparse device
+selection on**, and a purely-decode tick then runs the device-resident-table path
+(`SparseRuntime` → `_init_device_tables`, fixed-width capture-ready buffers, a
+re-score every 8th tick) instead of rebuilding the packed `[selected; own]` table
+and re-resolving logical→physical per row, per group, per plane on the host.
+
+**Read the two together.** The graph flag carries a path change *and* a memory
+change; neither is evidence for the other, and the memory cost does **not** mean
+the path is slower — on the A1r/A2 single-variable contrast (same tree, same
+thinking setting, `decode_graph` the only difference) the **graph-on** arm's clean
+phase-B median is **14 ms lower**. Whether that 14 ms is the whole of the path
+change's contribution is what the `--depth 3` pair is there to replicate: if d3
+reproduces the same sign, the magnitude is stable; if it reverses or vanishes, the
+branch is still there but the d1 magnitude is a single boot's observation.
+
 ### A5's cold tier is off for a different reason than k=0
 
 `SERVE_SPARSE_K=0` alone does **not** disable the cold tier. The engine attaches
@@ -360,10 +404,9 @@ python3 scripts/probe_h20_train_client.py --url http://127.0.0.1:8000 \
     --ctx 32768 --n 30 --gen 64 --split train --out <tree>/runs/<arm>_32k_n30.json
 ```
 
-**Merge order:** this client is #761, which is approved but not on `main` at the
-time of writing. An A1–A5 arm cannot run until it lands, because the headroom
-probe cannot stand in (see below). `probe_h20_arm_read.py` is #759, which **is**
-on `main`.
+**Both probes are on `main`** (`probe_h20_train_client.py` = #761, merged; the
+arm reader = #759). An A1–A5 arm needs the client, not the headroom probe, and the
+headroom probe cannot stand in (see below).
 
 It is not `probe_headroom_coldtail.py`: that probe talks to a live serve but
 synthesises its 32k prompt (a uuid lead plus a word stream), so it cannot answer a
@@ -458,6 +501,68 @@ state, and the difference *is* the cold-tier fill. Model segment 77 ms against
 the V100's 168 ms is 2.18x, but the two ran different W, so the comparison is
 labeled, not bare.
 
+## The graph flag as a result: five arms, and what replicated
+
+A1–A4 ran 2026-09-20, n=30, 0-start, one serve per boot. `clean` below is the
+steady-B median over the `ssd_mmap == 0` subset — the verdict column, since
+cold-relocation ticks sit inside the same steady set and their count differs per
+arm (A2 carries 102, A1r 56). Every arm's `Δdecode_forwards` equals its window's
+steady tick count, diff 0.
+
+| arm | depth | graph | steady | boundary | **clean B p50 (n)** | B p90 | model | accept | tok/fwd | tick tok/s | eff tok/s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| A1 | 1 | on | 992 | 935 | **85 (811)** | 103 | 77 | — | 1.9355 | 11.76 | 22.77 |
+| **A1r** | 1 | **on** | 1019 | 866 | **82 (826)** | 95 | 74 | 0.8695 | 1.8842 | 12.20 | 22.98 |
+| **A2** | 1 | **off** | 1028 | 846 | **96 (809)** | 106 | 81 | 0.8551 | 1.8677 | 10.42 | 19.46 |
+| **A3** | 3 | **on** | 639 | 797 | **100 (514)** | 119 | 85 | 0.6641 | 3.0047 | 10.00 | 30.05 |
+| **A4** | 3 | **off** | 642 | 795 | **119 (497)** | — | 97 | 0.6651 | 2.9907 | 8.40 | 25.13 |
+
+**The single-variable contrasts.** A1r/A2 differ only in `decode_graph` (same
+tree `96040093`, same thinking setting, same 0-start). A3/A4 differ the same way
+at depth 3:
+
+| pair | contrast | ms | % |
+|---|---|---|---|
+| d1 | A1r(on) 82 vs A2(off) 96 | **−14** | **−14.6%** |
+| d3 | A3(on) 100 vs A4(off) 119 | **−19** | **−16.0%** |
+
+**Both signs and both magnitudes replicate.** Graph-on is *faster* on the 32k
+sparse decode tick, by about 15% at either depth. Quote the **percentage**: the
+absolute gaps differ (14 vs 19 ms) only because the d3 baseline is higher, and
+that is the reason both are reported.
+
+The band was fixed before A4 ran and was not moved after: request-block
+bootstrap halfwidth ≤1.5 ms and split-half drift ≤3.0 ms on every arm, all under
+the pre-registered ±4 ms. A4 landed 15 ms clear of the nearer threshold.
+
+**The mechanism is a code path, not the graph replaying.** `build.py` resolves
+`sparse_device_select = _graph_on(backend, decode_graph)` when the caller leaves
+it unset, and the serve sets neither that nor the CLI's switch — so on sm90
+**turning the graph on also turns sparse device selection on**, and a
+pure-decode tick runs the device-resident-table path instead of rebuilding its
+packed table and re-resolving logical→physical on the host, per row, per group,
+per plane. Neither arm replays a graph at 32k sparse: `sparse_min_tokens` is set,
+so `sparse_graph_on` is False and both decode eagerly. What the flag buys here is
+the device-select path, which is why the effect is a tick *rate* and not a
+latency spike.
+
+**Two costs the same flag carries, which are not evidence about the tick.** The
+capture-time `ensure_pad` reservation is resident on graph-on arms: driver
+`device_free` 52.886 vs 54.560 GiB, allocator `reserved` 42746 vs 41506 MiB. And
+the padding row holds a **state slot** as well as a block — at d1, 476 MiB of
+state against a KV block's ~1 MiB. **The d1 state figure does not extrapolate:**
+d3 measured **754 MiB**, so read the pad's state cost per arm rather than
+scaling it. (A prediction scaled from d1's 454 MiB to d3 was wrong, which is why
+it was demoted from a gate to an observation.)
+
+**A4 ran without a cold trace.** The previous sampler had stopped (13:19, ~40 min
+earlier than its own `sleep`-based estimate — its real period exceeds its sleep
+interval) and none was started for A4, by ruling: attaching a sampler mid-window
+would be a second lifecycle misalignment, and it would only catch the tail of the
+fill. So A4's phase boundary comes from the tick lines' own `ssd_mmap`, and its
+cold state from the closing `/health`. **Its fill curve is missing and the A/B
+split has no trace corroboration** — the tick measurement does not depend on it.
+
 ## Rule
 
 An arm matrix is only a matrix if every arm's env is pinned the same way, every
@@ -466,3 +571,13 @@ which one ran. A banner is a log cut; the resolved value is the evidence. A rate
 without its cold fill state is not a rate. And the delta a report quotes is
 `/health`'s, read over a span whose tick count agrees — if the two disagree, the
 span bracketed a restart and the number is not an arm.
+
+A contrast needs its variable to be the *only* one: two arms that differ in depth
+and graph at once are not a contrast, and two that ran different trees are not
+one either — A1 sits on an earlier tree than A1r/A2, so its `model` column is
+labelled, not compared. And a checklist's items can all be true while the list
+answers the neighbouring question: verify the *resolved* flag, not the requested
+one; verify the flag's *identity*, not that its substring appears; and before
+sending traffic, count the client processes, because "this serve is configured
+correctly" and "nothing is already running on it" are different questions.
+

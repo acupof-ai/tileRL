@@ -1,0 +1,11 @@
+# Real cold-tier trace lines, excerpted verbatim from the A2 arm (H20, 2026-09-20).
+# Source: a2_artifacts/cold_trace_a2.txt, a 205-sample file; these are 4 of its
+# lines, unmodified and in file order. Format 'current': all four keys plus TOTAL.
+#
+# Kept as a real sample, not a synthetic fixture: only a real line can catch a
+# sampler-version drift (a renamed or dropped key) that a fixture written from
+# the same reading as the parser would reproduce instead of reveal.
+1789900769 priv=0.000 ssd=0.000 shared=0.000 shared_ssd=0.000 TOTAL=0.000 fin=6 decfwd=21 tok=48
+1789901762 priv=0.031 ssd=0.000 shared=7.968 shared_ssd=21.282 TOTAL=29.281 fin=19 decfwd=464 tok=880
+1789902263 priv=0.940 ssd=0.000 shared=7.059 shared_ssd=42.441 TOTAL=50.440 fin=28 decfwd=769 tok=1456
+1789902815 priv=0.000 ssd=0.000 shared=7.999 shared_ssd=59.501 TOTAL=67.500 fin=36 decfwd=1049 tok=1968
