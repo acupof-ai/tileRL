@@ -2232,13 +2232,15 @@ def test_spill_io_on_publish_thread_is_billed_separately(tmp_path):
 
 def test_bg_publish_inflight_reservation_counts_toward_shared_cap(tmp_path):
     """Defect A (cap overrun): while the single worker sits in the lock-free
-    write_reserved its page is RESERVED but uncommitted; an inline step-thread
-    spill must count that reservation in admission, so committed + in-flight can
-    never exceed the cap. Deterministic: cap = 2 pages, worker parks holding one,
-    two inline pages attempt — only one reaches a bucket slot, the other stays in
-    RAM; after the worker commits the shared total is exactly the cap, not 1.5x.
-    Mutation-red on not adding the reservation (the second inline page spills and
-    the final total overshoots)."""
+    write_reserved its page is RESERVED but uncommitted. The shared-cap admission
+    must count that reservation, so committed + in-flight can never exceed the
+    cap. This gate bypasses the host RAM LRU (which under budget=1 only ever
+    evicts one old page and would limit on the host budget, masking the bug) and
+    drives _write_shared_ssd — the exact cap gate — directly while the worker is
+    parked holding one page: cap = 2 pages, ok1 admits (1 in-flight + 1
+    committed == cap), ok2 must be refused. After the worker commits the shared
+    total is exactly the cap. Mutation-red on removing the pending reservation:
+    ok2 then returns True and the final total is 1.5x the cap (12288 > 8192)."""
     import threading
 
     from tilerl.kv_tiers import ColdSsdFile
@@ -2276,29 +2278,29 @@ def test_bg_publish_inflight_reservation_counts_toward_shared_cap(tmp_path):
 
         ColdSsdFile.write_reserved = hooked
         try:
-            assert cold.offer_publish(1, 1001, {})  # worker page charges per
+            assert cold.offer_publish(1, 1001, {})  # worker holds one in-flight
             assert parked.wait(15)
             with cold._tlock:
-                # the worker's in-flight page (logical per bytes) is reserved
                 assert cold._shared_ssd_pending == per
-            # two inline admissions against a 2-page cap with one page reserved:
-            # the first fits (pending 1 + committed 1 == cap), the second must
-            # fall back to RAM rather than overshoot.
-            cold.share_hold(102, page(2), per)
-            cold.share_hold(103, page(3), per)
+                sig = tuple(sorted(page(0).keys()))
+                # direct cap gate, bypassing the host LRU:
+                # 1 in-flight + first committed == cap -> admitted ...
+                ok1 = cold._write_shared_ssd(501, page(2), per, sig)
+                # ... 1 in-flight + 2 committed would exceed cap -> refused
+                ok2 = cold._write_shared_ssd(502, page(3), per, sig)
+                assert ok1 is True and ok2 is False
+                assert cold._shared_ssd_bytes == per  # only the one committed
             gate.set()
             assert cold.drain_publishes(15)
         finally:
             ColdSsdFile.write_reserved = real_write
 
+        # the worker's reservation flipped to committed: total exactly the cap,
+        # never 1.5x; nothing reserved/borrowed left.
         assert cold._shared_ssd_bytes == cap
         assert cold._shared_ssd_pending == 0
-        # exactly two bucket slots: worker's + one admitted inline; the other
-        # inline page is RAM-resident, never a third spill slot.
         bucket = cold._shared_ssd
         assert sum(bucket._extent_live) == 2
-        ram_keys = [k for k in (102, 103) if k in cold._shared_blobs]
-        assert len(ram_keys) == 1
         assert not bucket._reserved and bucket._borrowed == 0
     finally:
         cold.close()
@@ -2362,6 +2364,49 @@ def test_shared_bucket_rejects_dtype_and_shape_mismatch_to_ram(tmp_path):
         assert 300 in cold._shared_blobs
     finally:
         cold.close()
+
+
+def test_cold_spill_file_check_blob_spec_raises_at_the_source(tmp_path):
+    """Defect B assertion anchored at the ColdSsdFile raise point itself (rev
+    nit): the two end-to-end gates above prove the RAM-fallback behaviour, but
+    this pins the exact validator — a frozen spec rejects an equal-width dtype
+    swap and a shape mismatch with SpillSpecError, and accepts an exact match —
+    so a refactor that only relaxed the host-level catch could not silently drop
+    the real check."""
+    import pytest
+
+    from tilerl.kv_tiers import ColdSsdFile, SpillSpecError, _blob_spec
+
+    base = {
+        "k": torch.zeros(2, 4, dtype=torch.float16),
+        "v": torch.zeros(2, 4, dtype=torch.float16),
+        "bounds": torch.zeros(2),
+    }
+    f = ColdSsdFile(str(tmp_path / "b.bin"), _blob_spec(base))
+    try:
+        f._check_blob_spec(base)  # exact match: no raise
+        same_shape_other_dtype = {
+            "k": torch.zeros(2, 4, dtype=torch.bfloat16),
+            "v": torch.zeros(2, 4, dtype=torch.bfloat16),
+            "bounds": torch.zeros(2),
+        }
+        other_shape = {
+            "k": torch.zeros(2, 8, dtype=torch.float16),
+            "v": torch.zeros(2, 8, dtype=torch.float16),
+            "bounds": torch.zeros(2),
+        }
+        missing_field = {
+            "k": torch.zeros(2, 4, dtype=torch.float16),
+            "v": torch.zeros(2, 4, dtype=torch.float16),
+        }
+        with pytest.raises(SpillSpecError):
+            f._check_blob_spec(same_shape_other_dtype)
+        with pytest.raises(SpillSpecError):
+            f._check_blob_spec(other_shape)
+        with pytest.raises(SpillSpecError):
+            f._check_blob_spec(missing_field)
+    finally:
+        f.close()
 
 
 def test_bg_publish_phase3_commit_error_rolls_token_back_not_leak(tmp_path):

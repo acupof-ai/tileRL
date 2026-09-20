@@ -149,8 +149,14 @@ The worker stays CUDA-free (the prior diagnosis stands): private reads are
     raises `SpillSpecError`; both the worker lift and the inline spill reject a
     non-matching layout to RAM (counted `shared_spec_failures`, exposed in
     stats) rather than corrupt a read or wedge the tick. A non-owned field still
-    reads as a clean miss.
-- Full CPU suite **1086 passed / 14 skipped / 1 xfailed** (merged over latest main; second adversarial pass C/A/B/D fixed).
+    reads as a clean miss. The raise point itself is pinned by a direct
+  `ColdSsdFile._check_blob_spec` gate (dtype swap / shape / missing field all
+  raise `SpillSpecError`), so relaxing only the host-level catch cannot drop
+  the check; the cap gate is pinned by driving `_write_shared_ssd` directly
+  while the worker parks holding an in-flight page (bypassing the host LRU,
+  which under a one-page budget only ever evicts one page and would mask the
+  over-subscription).
+- Full CPU suite **1088 passed / 14 skipped / 1 xfailed** (merged over latest main; second adversarial pass C/A/B/D fixed).
 
 ## Rule
 
@@ -173,7 +179,7 @@ Steady decode (~166 ms/tick, ~9.4 tok/s) must hold.
 
 | date | machine | target | result |
 |---|---|---|---|
-| 2026-09-20 | CPU (hermetic) | SSD lift disk IO off `_tlock` | IO-off-lock + source-pin + rollback + hardening + C/A/B/D concurrency gates green (all mutation-red); 1086 passed |
+| 2026-09-20 | CPU (hermetic) | SSD lift disk IO off `_tlock` | IO-off-lock + source-pin + rollback + hardening + C/A/B/D concurrency gates green (all mutation-red); 1088 passed |
 | next V100 window | V100 sm70, pending-remote | close ssd_mmap ~3.3 s | target: real lock-wait removed; lock-vs-drain split to be measured |
 
 Raw artifacts: `tests/test_sparse_kv_tier.py`; changes `src/tilerl/kv_tiers.py`.
