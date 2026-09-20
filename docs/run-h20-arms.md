@@ -227,19 +227,107 @@ not continuous across boots — see the cold-tier rule above.
 | A5 | `SERVE_SPARSE_K=0 SERVE_COLD_SSD=""` | the dense engine, no sparse, no cold tier (#759 merged) |
 | A6 | A1 + `SERVE_DRAFT_WINDOW=2048` | the V100 W=2048 arm, cold-filled, V100 wall protocol |
 
-### Every arm fills the cold tier before it is measured
+### A6 fills the cold tier first; A1–A5 start cold
 
-Because the spill does not survive a boot (above), each arm's order is fixed:
-**boot → fill inside that process until the host tier saturates + two confirming
-requests → then run the n=30 warm**. Fill-phase ticks are discarded, exactly as in
-the V100 `fill2/warm2` protocol — this is that protocol's shape with a reachable
-target, not a new one. The fill count is not a constant to copy: it is whatever
-crosses the boundary on that arm, read from the four keys while filling.
-`probe_headroom_coldtail.py arm` performs this shape for A6; for A1–A5 the fill is
-the arm runner's own step before the corpus pass.
+The spill does not survive a boot (above), so an arm's cold state is built inside
+its own process. **A6 gets there before it measures**, because it mirrors the V100
+wall protocol: fill, then measure warm, `probe_headroom_coldtail.py arm` performs
+that shape and reports a plateau rate.
 
-An arm that never saturates says so rather than reporting a rate — a
-cold-sensitive number taken mid-fill is a number from an unknown condition.
+**A1–A5 do not fill.** They run the n=30 corpus pass from a cold start, and the
+against-A2 comparison is taken **per phase**, not over the whole arm. The reason is
+that filling first would delete the phase the comparison needs.
+
+The cold tier's four-key total has **no plateau** on these arms: with the SSD
+budget effectively unbounded and one independent 32k request at a time, it grows
+until the disk fills. What *is* reproducible across boots is the moment the **host
+budget saturates** — `kv_cold_shared_bytes` reaches its 8 GiB cap, after which cold
+grows only on the SSD side. That is a fixed configuration point, so every arm
+crosses it at the same occupancy, and it splits each arm into two phases:
+
+| phase | condition | meaning |
+|---|---|---|
+| **A host-filling** | `shared < cap` | cold is still being absorbed in RAM |
+| **B host-full** | `shared >= cap` | RAM full; only the SSD tier grows |
+
+**The split is read from the log, not from a sampling threshold.** The host cap is
+reached between two 10 s samples of the cold trace, so a `shared >= 0.995*cap` test
+on that trace lands a whole request late (measured on A2: the sample before the
+crossing reads `shared=6.750, ssd=0`, the one on it reads `7.935 / 1.065`, and the
+threshold fires one request after that). The **action count is the boundary**: the
+first steady tick whose `ssd_mmap > 0` — the SSD tier engaging is the same event,
+counted where it happens. On A2 and A1r that boundary falls inside arm request 3
+(A2 tick 846, A1 tick 935); on A1 it is tick 935.
+
+A phase boundary in the *cold trace* maps onto a tick index by `decfwd`, the one
+field the trace shares with the serve log's tick counter — and it is an identity,
+not an estimate: on A2 every one of the 30 request boundaries satisfies
+`cumulative steady ticks == Δdecode_forwards`, diff 0, total 1028 = 1028. Nothing
+else in the trace is in tick coordinates; a slice taken on sample index cuts
+inside the wrong request.
+
+Compare arms **phase B against phase B** (the sample is the larger one: A2 n=884 of
+996) and report phase A beside it. A whole-arm p50 mixes the two cold states and
+must not meet another arm's phase number in a table.
+
+An arm whose host tier **never** saturates is the anomaly and says so: an 8 GiB cap
+under a single 32k stream is reached every time, so failing to reach it means the
+arm did not run the configuration it claims.
+
+### The tick p50 band is ±3 ms, and bootstrap alone understates it
+
+Deciding whether two arms differ on tick p50 needs a band that was measured, not
+assumed. Three layers, only the middle one of which resampling can correct:
+
+| layer | estimator | measured halfwidth |
+|---|---|---|
+| sampling error | iid tick bootstrap (n≈1000) | **0.00 ms** |
+| within-request correlation | **bootstrap whole requests** (30 blocks) | **1.00 ms** |
+| state drift | same-boot, different-phase control | **5 ms** |
+
+The iid bootstrap returns **0**, which is false: ticks inside one request share a
+page-residency state (32–37 ticks per request here), so resampling them as
+independent units collapses the variance to nothing. Take the request-block figure.
+Cross-check by splitting odd/even requests: A1 differs 0.0 ms, A2 2.0 ms.
+
+Resampling cannot see the third layer at all. On A1 the same boot's warmup probe
+(2 requests, cold tier still near empty) measured p50 = 80 ms against the arm's own
+85 ms — a 5 ms drift with no configuration change. The band is therefore **±3 ms**,
+not the bootstrap's 1.
+
+**The decision is pre-registered, so the result cannot pick the rule afterwards:**
+
+- A1r in **82–88** → think has no effect on tick; the A1-vs-A2 11 ms gap is
+  attributed to the capture pool's memory layout, and the fourth cell is not run.
+  88 is the boundary and falls on the no-effect side: the mechanism prior is that a
+  decode forward's per-token work does not depend on content, and evidence against
+  a prior has to be stronger than the boundary.
+- A1r in **93–99** → content-driven; run the fourth cell (think-ON, graph-OFF) to
+  fix the interaction.
+- A1r in **89–92 or outside both** → the two effects are not separable; run the
+  fourth cell.
+
+Acceptance rate needs no fourth cell: the graph does not execute at 32k sparse on
+either arm (A1's `path=graph` ticks are 20, all before the steady span and all
+non-sparse), so the A1 `.9194` (think-ON) against A2 `.8551` (think-off) gap can
+only be the thinking knob.
+
+### The graph's cost here is memory, not a tick path
+
+A1 (graph-on) and A2 (graph-off) both run 32k sparse decode **eagerly**, yet
+graph-on holds consistently more memory:
+
+| quantity | A1 graph-on | A2 graph-off | delta |
+|---|---|---|---|
+| driver `device_free` | 52.886 GiB | 54.560 GiB | **+1.67** |
+| in-tick allocator `free` | 54149 MiB | 55593 MiB | +1.44 |
+| in-tick `reserved` | 42746 MiB | 41506 MiB | −1.24 |
+
+The cause is `decode_graph.py`'s `ensure_pad`, which reserves the padding row when
+capture is set up. **That is a capture-time cost, independent of whether the graph
+is ever replayed** — which is why it shows up on an arm whose sparse decode never
+enters the captured path. Report it as its own finding; it does not need the tick
+attribution to stand.
 
 ### A5's cold tier is off for a different reason than k=0
 
@@ -313,9 +401,17 @@ Tick level, `steady_filter.py` on that window
 |---|---|
 | steady ticks (n) | 992 |
 | tick median | 85.0 ms → **11.8 tok/s** per forward |
+| tick median, phase B (host-full) | **85.0 ms** (n=836 body) |
+| tick median, phase A (host-filling) | **86.0 ms** (n=128 body) |
 | p90 | 104 ms |
 | model-segment median | 77.0 ms |
 | close tail | 28 ticks, max 208 ms (the runner's count; `steady_filter`'s own `total > 300 ms` tail is empty) |
+
+The two phase medians are 1 ms apart on this arm, which is why A1's whole-arm 85.0
+is quotable at all — but A2's two phases are **92.0 against 96.0**, 4 ms apart, and
+phase A there is only 112 body ticks. Compare phase B against phase B. `n >= 461`
+and the 992 above are the same window: the two 2-sample-probe request groups are 65
+ticks, and 1057 − 65 = 992 = Δdecode_forwards.
 
 Spec effective rate, `probe_h20_arm_read.py health` over the n=30 bracket
 (`{"d_accepted": 912, "d_drafted": 992, "d_generated": 1920,
@@ -336,7 +432,9 @@ the phase is part of the number:
 
 - **The median does not track cold growth.** The 30 per-request p50s sit in
   80–92 ms with no trend against request index (r ≈ −0.2), so `11.8 tok/s` stands
-  as a reading of that phase.
+  as a reading of that phase. Phases A and B differ by 1 ms (86.0 vs 85.0), so on
+  this arm the phase label does not move the median — **it does on A2** (92.0 vs
+  96.0), which is why the label is mandatory rather than decorative.
 - **The tail is set by the cold tier.** The per-request maxima hold near
   1200–1346 ms from the second request on — the phase where `ssd_mmap` first
   appears (52 of the 992 steady ticks carry a nonzero `ssd_mmap`, the first at
