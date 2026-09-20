@@ -194,7 +194,32 @@ engine-reported rule stays, because a banner that *can* disagree is not evidence
 2. **The boot line `tilerl serve: N decode graphs in Ns`** (printed by
    `cli.py`'s serve path from `engine.precapture()`) — `0` is off, `8` is on.
    `precapture()` returns 0 immediately when the graph is off, so the count is
-   the engine's own, printed before any traffic.
+   the engine's own, printed before any traffic. At `--depth 3` the count is
+   **16**, not 8: the bucket set scales with depth.
+
+A third reading is available, and it is the **allocation result** rather than the
+engine's own boolean — so the two can falsify each other:
+
+3. **`/health`'s `memory` rows: the `kv_pool` note's block count.** The pool is
+   built `num_blocks + pad`, and the note reports that **gross** figure, so it
+   carries the graph's padding row: **`4426 blocks` is graph-on, `4425` is
+   graph-off** (measured at **d1** on two independent graph-on boots and one
+   graph-off). The paired `state_slots` `derived` bytes separate too — the padding
+   row holds a slot as well as a block, **476 MiB apart at d1**, and at this
+   configuration that state-slot is the bulk of the cost against a KV block's
+   ~1 MiB.
+
+   The count is a **d1 observation**: at `--depth 3` the draft layer count differs,
+   so the absolute figures are to be read per arm rather than assumed. What must
+   hold at any depth is the **relation** — graph-on's gross KV-pool blocks are
+   graph-off's **plus exactly one** (the padding row). Check it before taking an
+   arm's numbers: if the two arms' gross counts differ by anything else, the
+   configuration is wrong and the arm is not readable.
+
+Note this is the *gross* figure, and the reason the caution below is about
+`blocks_total` specifically: `blocks_total` is the **net** `usable_blocks`, which
+subtracts the same pad, so it is invariant. Two views of one pool, one
+discriminating and one not — read the `memory` note, not `blocks_total`.
 
 Two candidates were tried and are both wrong:
 
@@ -329,6 +354,25 @@ is ever replayed** — which is why it shows up on an arm whose sparse decode ne
 enters the captured path. Report it as its own finding; it does not need the tick
 attribution to stand.
 
+**`--decode-graph` also changes the eager sparse tick's code path, and that is a
+separate fact from the memory above.** `build.py` resolves
+`sparse_device_select = _graph_on(backend, decode_graph)` whenever the caller did
+not set it, and the serve sets neither this nor the CLI's own switch; on sm90
+`_graph_on` is True. So **turning the graph on silently turns sparse device
+selection on**, and a purely-decode tick then runs the device-resident-table path
+(`SparseRuntime` → `_init_device_tables`, fixed-width capture-ready buffers, a
+re-score every 8th tick) instead of rebuilding the packed `[selected; own]` table
+and re-resolving logical→physical per row, per group, per plane on the host.
+
+**Read the two together.** The graph flag carries a path change *and* a memory
+change; neither is evidence for the other, and the memory cost does **not** mean
+the path is slower — on the A1r/A2 single-variable contrast (same tree, same
+thinking setting, `decode_graph` the only difference) the **graph-on** arm's clean
+phase-B median is **14 ms lower**. Whether that 14 ms is the whole of the path
+change's contribution is what the `--depth 3` pair is there to replicate: if d3
+reproduces the same sign, the magnitude is stable; if it reverses or vanishes, the
+branch is still there but the d1 magnitude is a single boot's observation.
+
 ### A5's cold tier is off for a different reason than k=0
 
 `SERVE_SPARSE_K=0` alone does **not** disable the cold tier. The engine attaches
@@ -360,10 +404,9 @@ python3 scripts/probe_h20_train_client.py --url http://127.0.0.1:8000 \
     --ctx 32768 --n 30 --gen 64 --split train --out <tree>/runs/<arm>_32k_n30.json
 ```
 
-**Merge order:** this client is #761, which is approved but not on `main` at the
-time of writing. An A1–A5 arm cannot run until it lands, because the headroom
-probe cannot stand in (see below). `probe_h20_arm_read.py` is #759, which **is**
-on `main`.
+**Both probes are on `main`** (`probe_h20_train_client.py` = #761, merged; the
+arm reader = #759). An A1–A5 arm needs the client, not the headroom probe, and the
+headroom probe cannot stand in (see below).
 
 It is not `probe_headroom_coldtail.py`: that probe talks to a live serve but
 synthesises its 32k prompt (a uuid lead plus a word stream), so it cannot answer a
