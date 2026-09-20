@@ -58,7 +58,10 @@ WARM_REPS=${WARM_REPS:-3}
 RECLAIM_SAMPLES=${RECLAIM_SAMPLES:-90}
 RECLAIM_INTERVAL_S=${RECLAIM_INTERVAL_S:-15}
 
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+# The header comment block, by RULE not by line number: a fixed `sed -n '2,26p'`
+# silently printed the wrong lines (and lost the examples) the first time a header
+# line was added. Every leading comment line until the first line of code.
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0; }
 
 # ---------------------------------------------------------------- arm table
 # Each arm is the env delta over the shared serve command. Order is deliberate:
@@ -107,6 +110,25 @@ instrument_env() {
   echo "LIVENESS_POLL_S=999999 TILERL_STEP_TIMING=1 TILERL_STEP_TIMING_SLOW_MS=0 TILERL_CLOSE_BUSYIDLE=1 TILERL_DRAFT_ATTN_WINDOW_TOKENS=$WINDOW_TOKENS"
 }
 
+# The shared-prefix spill is a SET of siblings, not one file. kv_tiers
+# `_shared_bucket_path` sends the cold layout (sig = 3 fields) to the plain
+# `.prefix.bin` and every OTHER recognized layout to
+# `<base>.prefix.w<field-count>.bin` -- w is followed by the signature's FIELD
+# COUNT, not a length. Today exactly one exists: the warm spec page, whose sig is
+# (bounds,dk,dv,k,v) = 5 fields, so `.prefix.w5.bin`. (_MAX_SHARED_BUCKETS=4 caps
+# the bucket count INCLUDING the cold one, so it is not "up to 4 warm files".)
+#
+# Globbing the stem covers a layout added later without this list learning its
+# name, and the stem keeps the match scoped to THIS arm's spill: a sibling under a
+# different stem (another arm's, or the model-named one) can never match. Printed
+# in the order they are offered for deletion; one per line, so a caller can read
+# the list without executing the prompt (`--spill-files` is how the gate does it).
+spill_files() {
+  local stem="${COLD_SSD%.bin}"
+  printf '%s\n' "$COLD_SSD" "$stem.prefix.bin" "$stem".prefix.w*.bin \
+                "$ROOT/$EXPECT_MODEL.prefix.bin"
+}
+
 ARMS=()
 ALL=0
 RESTORE_ONLY=0
@@ -121,6 +143,7 @@ while [ $# -gt 0 ]; do
     --list) printf '%s\n' "${ARM_NAMES[@]}"; exit 0 ;;
     --arms-env) for _a in "${ARM_NAMES[@]}"; do printf '%s|%s\n' "$_a" "$(arm_env "$_a")"; done; exit 0 ;;
     --instrument-env) printf '%s\n' "$(instrument_env)"; exit 0 ;;
+    --spill-files) spill_files; exit 0 ;;
     -h|--help) usage ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -454,14 +477,30 @@ PY
 # separate, confirmed, and only ever after the serve is confirmed down.
 clean_spill() {
   log "spill cleanup requested. Checking the serve is really down first."
-  pgrep -f "tilerl.cli serve" >/dev/null 2>&1 && {
-    log "REFUSING: a serve is still running; stop it before deleting the spill"; return 1; }
-  for f in "$COLD_SSD" "$COLD_SSD.prefix.bin" "$ROOT/$EXPECT_MODEL.prefix.bin"; do
+  # The same three patterns stop_serve signals, so the guard and the stop cannot
+  # disagree. Checking only the serve python misses the case that matters: the
+  # supervisor RESTARTS a killed python, so a cleanup run between the kill and
+  # the reboot would find no `tilerl.cli serve` and delete a spill the incoming
+  # boot is about to read.
+  local pat
+  for pat in "tilerl.cli serve" "serve_hybrid_v100.sh" "serve_liveness.py"; do
+    pgrep -f "$pat" >/dev/null 2>&1 && {
+      log "REFUSING: a serve is still running ($pat); stop it before deleting the spill"; return 1; }
+  done
+  # The list arrives on fd 3, NOT on stdin: `done < <(spill_files)` redirects the
+  # whole loop's stdin, so the body's `read -r ans` consumes the next NAME off the
+  # list instead of the operator's answer and every file is silently "kept"
+  # including ones answered y. Keeping the list on its own fd leaves stdin alone,
+  # and the here-string keeps quoting (a path with a space survives).
+  local f ans files
+  files=$(spill_files)
+  while IFS= read -r f <&3; do
     [ -e "$f" ] || continue
+    ans=
     printf 'delete %s (%s)? [y/N] ' "$f" "$(du -h "$f" | cut -f1)"
     read -r ans
     [ "$ans" = "y" ] && rm -f "$f" && log "deleted $f" || log "kept $f"
-  done
+  done 3<<< "$files"
 }
 
 # ------------------------------------------------------------------------ main

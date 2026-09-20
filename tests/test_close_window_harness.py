@@ -18,9 +18,13 @@ no locking of its own.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import re
 import subprocess
+import time
+
+import pytest
 
 SRC = pathlib.Path(__file__).parent.parent / "scripts" / "run_close_window_v100.sh"
 REPO = SRC.parent.parent
@@ -28,6 +32,33 @@ REPO = SRC.parent.parent
 
 def _run(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["bash", str(SRC), *args], capture_output=True, text=True, timeout=60)
+
+
+def read_sources(root: pathlib.Path) -> str:
+    """Concatenated SOURCE text under `root` -- the only way a gate here reads `*.py`.
+
+    Going through `py_sources` is what keeps an AppleDouble sidecar out of the read;
+    a gate that globbed for itself would take `._evil.py` and die in UnicodeDecodeError.
+    """
+    return "\n".join(p.read_text() for p in py_sources(root)[0])
+
+
+def py_sources(root: pathlib.Path) -> tuple[list[pathlib.Path], list[str]]:
+    """`(source files, skipped sidecar names)` under `root`, recursively.
+
+    `._name` is AppleDouble: a resource fork written beside the real file when a
+    macOS tar/scp/copy touches a non-HFS volume. It matches `*.py` and is not
+    source. The skipped names are RETURNED, not dropped, so a caller can report
+    them -- the distinction between "not source" and "source that will not decode"
+    is the whole point.
+    """
+    src, skipped = [], []
+    for p in sorted(root.rglob("*.py")):
+        if p.name.startswith("._"):
+            skipped.append(p.name)
+        else:
+            src.append(p)
+    return src, skipped
 
 
 def _arm_envs() -> dict[str, str]:
@@ -45,8 +76,7 @@ def test_every_arm_env_var_is_read_by_the_source():
     """The failure this prevents is silent: an unrecognized env var makes the arm
     identical to the one before it, so a window reports two baselines and a
     clean-looking delta of zero."""
-    text = "\n".join(p.read_text() for p in
-                     list((REPO / "src").rglob("*.py")) + list((REPO / "scripts").rglob("*.py")))
+    text = read_sources(REPO / "src") + read_sources(REPO / "scripts")
     seen = set()
     for env in _arm_envs().values():
         for tok in env.split():
@@ -537,3 +567,191 @@ def test_restore_uses_the_production_fuse_read_only():
         assert bad not in code, f"restore mutates the prod fuse: {bad}"
     assert "$ROOT/.servehybridsse.fuse" in code, "restore does not name the prod fuse"
     assert "WARNING" in code, "restore does not warn when the prod fuse is tripped"
+
+
+# ------------------------------------------------------------------ *.py collection
+# Every gate here that reads SOURCE starts by enumerating `*.py`, and an AppleDouble
+# sidecar (`._evil.py`) matches that glob on every platform and Python tested. Its
+# bytes are a binary header, so reading it raises UnicodeDecodeError -- which is how
+# every one of these gates would fail: as a collection error about a file that is not
+# source, burying whatever the gate was really asserting. The deploy-side sync
+# checker already ships this predicate; this is the same one, with a gate, so the next
+# enumeration site inherits it instead of rediscovering it.
+#
+# That checker is deliberately NOT named here. `audit_scripts_entrypoints` reaches a
+# script by TEXT, so its stem appearing in a comment in any tests/**/*.py moves it from
+# MANUAL_KEEP to LIVE and `test_scripts_closure.py` fails with "MANUAL_KEEP scripts
+# that ARE reachable -- drop them from the registry". Measured: naming it turned that
+# gate red on both CI rows. Every spelling that begins with the stem trips the same
+# regex -- including this comment's own earlier wording -- so only prose works.
+def test_apple_double_sidecars_are_skipped_and_named(tmp_path):
+    """Excluded from the collection AND reported -- a silent skip is how a real source
+    file with a genuine encoding defect would vanish from every gate at once."""
+    (tmp_path / "._evil.py").write_bytes(b"\x00\x01\xff\xfe com.apple.provenance \x80\n")
+    (tmp_path / "evil.py").write_text("real = 1\n")
+    src, skipped = py_sources(tmp_path)
+    assert [p.name for p in src] == ["evil.py"], [p.name for p in src]
+    assert skipped == ["._evil.py"], skipped
+
+
+def test_the_apple_double_guard_is_what_keeps_the_collection_readable(tmp_path):
+    """Negative control: without the guard the same tree raises. Removing the
+    `startswith` from `py_sources` must turn this gate red."""
+    (tmp_path / "._evil.py").write_bytes(b"\x00\x01\xff\xfe com.apple.provenance \x80\n")
+    (tmp_path / "evil.py").write_text("real = 1\n")
+    raw = sorted(tmp_path.rglob("*.py"))
+    assert [p.name for p in raw] == ["._evil.py", "evil.py"], [p.name for p in raw]
+    with pytest.raises(UnicodeDecodeError):
+        "".join(p.read_text() for p in raw)   # the unguarded collection
+    # ... and the guarded one has to be what this test would catch: strip the
+    # predicate from `py_sources` and `read_sources` raises here.
+    assert read_sources(tmp_path) == "real = 1\n"
+
+
+def test_clean_spill_deletes_every_sibling_of_this_arms_stem(tmp_path):
+    """The shared-prefix spill is a SET, not one file: the cold bucket is plain
+    `.prefix.bin`, and a warm bucket is `<base>.prefix.w<field-count>.bin` (today
+    `.prefix.w5.bin`, the (bounds,dk,dv,k,v) warm spec page). Cleaning only the two
+    the old list named left the warm sibling on disk -- the biggest of the three --
+    so the next window started against a partially-filled spill and its cold-tier
+    gate read a state nobody intended.
+
+    Driven through the REAL script, and that matters here: an earlier version of this
+    loop was `while read ... done < <(spill_files)`, which redirects the loop's stdin
+    so `read -r ans` ate the next FILENAME instead of the operator's answer. Every
+    file was silently "kept", y or not, and a grep-based gate would have passed it.
+    """
+    root = tmp_path
+    for name in ("sparse_cold_128k.bin", "sparse_cold_128k.prefix.bin",
+                 "sparse_cold_128k.prefix.w5.bin", "otherstem.prefix.w5.bin",
+                 "qwen38-27b.prefix.bin"):
+        (root / name).write_text("x")
+    # `--arm locksplit` is refused (PENDING_746) before any serve work, so the end-of-run
+    # prompts are reached without a card: n to the restore, y to each of three deletes.
+    r = subprocess.run(["bash", str(SRC), "--arm", "locksplit"],
+                       input="n\ny\ny\ny\ny\n", capture_output=True, text=True, timeout=120,
+                       env={**os.environ, "SERVE_ROOT": str(root),
+                            "SERVE_PYTHON": "/nonexistent"})
+    left = sorted(p.name for p in root.iterdir() if p.name != "closewin")
+    assert left == ["otherstem.prefix.w5.bin", "qwen38-27b.prefix.bin"], (
+        f"this arm's stem must lose all three of its files and no other stem any: {left}")
+    assert r.stdout.count("deleted ") == 3, r.stdout[-600:]
+
+
+def test_clean_spill_refuses_while_the_supervisor_is_between_restarts(tmp_path):
+    """The guard's failure mode is a DELETION, so it is driven, not grepped.
+
+    `serve_hybrid_v100.sh` RESTARTS a serve python that exits, so there is a window
+    where the supervisor is alive and `tilerl.cli serve` is not. A guard that checks
+    only the python finds nothing there, logs "serve is down", and deletes a spill the
+    incoming boot is about to read. The guard has to check what `stop_serve` signals.
+
+    Both arms run the REAL script with `--arm locksplit`, which is refused before any
+    serve work, so the end-of-run prompts are reached without a card:
+
+      RED   -- the OLD single-pattern guard, same tree, same gap: it deletes.
+      GREEN -- the shipped guard: it REFUSES and leaves every file on disk.
+      GREEN2-- decoy stopped, so no pattern matches: it reaches the prompts and the
+               deletion is real, which is what makes the refusal above mean
+               something rather than "this code path never deletes".
+
+    The RED arm substitutes the guard TEXT from the pre-fix revision (taken with
+    `git show <base>:scripts/...`, not retyped here), so it cannot drift from what
+    actually shipped. The substitution is asserted, so a stale base turns the arm
+    red instead of silently making GREEN and RED the same program.
+    """
+    import subprocess as _sp
+
+    root = tmp_path
+    files = ["sparse_cold_128k.bin", "sparse_cold_128k.prefix.bin",
+             "sparse_cold_128k.prefix.w5.bin", "qwen38-27b.prefix.bin"]
+
+    def seed():
+        for name in files:
+            (root / name).write_text("x")
+
+    def survivors():
+        return sorted(p.name for p in root.iterdir() if p.name in files)
+
+    decoy = root / "serve_hybrid_v100.sh"
+    decoy.write_text("#!/usr/bin/env bash\nsleep 120\n")
+    decoy.chmod(0o755)
+    env = {**os.environ, "SERVE_ROOT": str(root), "SERVE_PYTHON": "/nonexistent"}
+
+    def run(script, answers, tag):
+        return _sp.run(["bash", str(script), "--arm", "locksplit"], input=answers,
+                       capture_output=True, text=True, timeout=120,
+                       env={**env, "OUT": str(root / tag)})
+
+    # Two answers are consumed before cleanup runs at all: the restore prompt and
+    # the "delete the spill files?" prompt. Both must be right or the arm measures
+    # nothing -- `n` to the second one skips clean_spill entirely, so RED read as
+    # "the old guard also refused" when it had never been called. The remaining four
+    # are the per-file prompts; feeding fewer leaves the last file at EOF and it is
+    # "kept" for that reason rather than by the guard.
+    answers = "n\ny\n" + "y\n" * len(files)
+
+    # ---- RED / GREEN with the supervisor alive and no serve python under it.
+    sup = _sp.Popen(["bash", str(decoy)])
+    try:
+        deadline = time.monotonic() + 20
+        while _sp.run(["pgrep", "-f", "serve_hybrid_v100.sh"], capture_output=True).returncode != 0:
+            assert time.monotonic() < deadline, "the decoy supervisor never became visible"
+            assert sup.poll() is None, "the decoy supervisor exited"
+            time.sleep(0.05)
+        assert _sp.run(["pgrep", "-f", "tilerl.cli serve"], capture_output=True).returncode != 0, \
+            "precondition failed: a serve python is running, so this is not the gap"
+
+        # RED: the guard narrowed to ONE pattern, which is the old guard's semantics
+        # exactly -- `pgrep -f "tilerl.cli serve" >/dev/null 2>&1 && { ...; return 1; }`
+        # and a one-element `for pat in` loop are the same program.
+        #
+        # Derived by narrowing rather than by reading the old file out of git. CI runs
+        # `actions/checkout@v4` with no fetch-depth, i.e. `--depth 1`, where NEITHER
+        # `origin/main` NOR the PR's base sha resolves -- both measured on a depth-1 clone
+        # (`fatal: invalid object name 'origin/main'`, `fatal: bad object <base>`), so every
+        # git-based route exits 128 in CI. An earlier version used `git show origin/main:`
+        # and would have raised CalledProcessError on both CI rows while passing locally.
+        #
+        # The narrowing is the old guard's semantics exactly, and that was checked rather
+        # than assumed: with pgrep stubbed on a synthetic process set, the real old guard
+        # (read from the base object locally) and the narrowed guard agree in all three
+        # discriminating states -- nothing: NOT-REFUSED / serve python: REFUSED /
+        # supervisor only: NOT-REFUSED. That table is in the PR because it cannot live
+        # here: the base object does not exist in a CI checkout.
+        _full = SRC.read_text()
+        # Slice inside clean_spill, not across the whole file: `pgrep -f "tilerl.cli
+        # serve"` also appears in stop_serve, which is earlier, and slicing from there
+        # silently produced a 255-line "guard" that matched nothing.
+        fn = _full[_full.index("clean_spill() {"):]
+        new_guard = fn[fn.index("  local pat"):fn.index("  # The list arrives on fd 3")]
+        pats = 'for pat in "tilerl.cli serve" "serve_hybrid_v100.sh" "serve_liveness.py"; do'
+        assert pats in new_guard, "the guard's pattern list moved; RED would not narrow"
+        red_guard = new_guard.replace(pats, 'for pat in "tilerl.cli serve"; do')
+        red = root / "red.sh"
+        red.write_text(_full.replace(new_guard, red_guard))
+        assert red_guard in red.read_text(), "the narrowing did not apply"
+        assert new_guard not in red.read_text(), "new and old guard are the same text"
+
+        seed()
+        r = run(red, answers, "red")
+        assert "deleted " in r.stdout, (
+            f"RED is vacuous -- the old python-only guard also refused, so this gate "
+            f"proves nothing about the gap: {r.stdout[-400:]}")
+        assert survivors() != sorted(files), "RED did not actually delete; the arm proves nothing"
+
+        seed()
+        g = run(SRC, answers, "green")
+        assert "REFUSING" in g.stdout, g.stdout[-400:]
+        assert "deleted " not in g.stdout, "the guard refused and then deleted anyway"
+        assert survivors() == sorted(files), f"a file was deleted despite the refusal: {survivors()}"
+    finally:
+        sup.kill()
+        sup.wait(timeout=30)
+
+    # ---- GREEN2: no pattern matches, so the same run must delete.
+    seed()
+    g2 = run(SRC, answers, "green2")
+    assert "REFUSING" not in g2.stdout, f"nothing is running; the guard must not refuse: {g2.stdout[-400:]}"
+    assert g2.stdout.count("deleted ") == len(files), g2.stdout[-400:]
+    assert survivors() == [], survivors()
