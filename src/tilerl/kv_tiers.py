@@ -354,17 +354,6 @@ class ColdSsdFile:
         self._borrowed = max(0, self._borrowed - 1)
         self._prune_maps_locked()
 
-    def release_borrow(self) -> None:
-        """End one source-read mapping borrow (distinct from a destination
-        reserve token). Non-reentrant-lock safe wrapper."""
-        with self._mlock:
-            self._borrowed = max(0, self._borrowed - 1)
-            self._prune_maps_locked()
-
-    def _drop_read_borrow_locked(self) -> None:
-        self._borrowed = max(0, self._borrowed - 1)
-        self._prune_maps_locked()
-
     def _check_blob_spec(self, blob: dict) -> None:
         """Reject a blob whose field-set / per-field shape / dtype does not match
         the layout this file froze at first open. The field-NAME signature alone
@@ -973,9 +962,10 @@ class HostKvPages:
                 self.bg_failed += 1
                 return self._fold_and_event(shared_key)
         self._ssd.release_mapping_borrow()
+        n = src_n
         if extra:
             blob.update(extra)
-        n = src_n + sum(t.numel() * t.element_size() for t in extra.values() if torch.is_tensor(t))
+            n += sum(t.numel() * t.element_size() for t in extra.values() if torch.is_tensor(t))
         sig = _blob_sig(blob)
         # Authoritative admission UNDER _tlock, after the read: inline commits
         # that landed during the lock-free read are now in _shared_ssd_bytes, and
