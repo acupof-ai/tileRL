@@ -84,7 +84,36 @@ The worker stays CUDA-free (the prior diagnosis stands): private reads are
   slots recycled, extent live back to 0, and `_ssd_bytes` decremented exactly
   once. Mutation-red on not releasing the private mapping borrow, and on routing
   the dup consume through the pinned-only `consume_pinned`.
-- Full CPU suite **1032 passed / 22 skipped / 1 xfailed** (rebased over #745).
+- **Hardening (structural rework, same PR):**
+  - The destination reserve is a one-shot `_SlotToken` settled in a finally on
+    EVERY exception, not just OSError: a non-OSError (RuntimeError/copy) in the
+    write, or an arbitrary exception from bucket open/reserve after the read
+    succeeded, releases the token and consumes the already-owned private source
+    exactly once (free, extent down, bytes decremented once) → prompt miss.
+    Mutation-red on catching only OSError around the write.
+  - Phase 3 re-checks the content key under `_tlock`: an inline publisher that
+    committed the same key during the lock-free IO wins; the worker releases its
+    own destination token and folds a ref instead of overwriting the record,
+    double-charging bytes, or orphaning the inline slot.
+  - Pending ref deltas still fold on a failed/missed job whose key an inline
+    commit won (refs = inline 1 + folded delta).
+  - A failed trailing-extent reclaim on the private consume reports back
+    (`consume_pinned -> (freed, reclaim_ok)`); the job then releases its
+    destination token and resolves as a miss rather than committing against
+    unsettled accounting.
+  - `take()` refuses (`None`) a private key an in-flight job owns
+    (`_pub_private`, or the spill file's per-key pin): taking it would race the
+    worker's own consume and double-decrement `_ssd_bytes` / recycle a pinned
+    slot. Deterministic gate verifies no decrement while queued and exactly one
+    after commit.
+  - Shared spill is bucketed by the blob's field-set signature
+    (`{k,v,bounds}` cold; `{k,v,bounds,dk,dv}` warm), dtype NOT part of it.
+    Buckets are sibling files with their own frozen stride; `_shared_ssd_bytes`
+    is the SUM across buckets under one global cap; an unrecognized field set
+    fails loud into RAM (never opens its own file, ≤4 sibling files). A cold and
+    a warm page round-trip in both creation orders and a non-owned field reads
+    as a clean miss, never KeyError.
+- Full CPU suite **1044 passed / 22 skipped / 1 xfailed** (rebased over #745).
 
 ## Rule
 
@@ -107,7 +136,7 @@ Steady decode (~166 ms/tick, ~9.4 tok/s) must hold.
 
 | date | machine | target | result |
 |---|---|---|---|
-| 2026-09-20 | CPU (hermetic) | SSD lift disk IO off `_tlock` | IO-off-lock + source-pin + rollback gates green (all mutation-red); 1032 passed |
+| 2026-09-20 | CPU (hermetic) | SSD lift disk IO off `_tlock` | IO-off-lock + source-pin + rollback + hardening gates green (all mutation-red); 1044 passed |
 | next V100 window | V100 sm70, pending-remote | close ssd_mmap ~3.3 s | target: real lock-wait removed; lock-vs-drain split to be measured |
 
 Raw artifacts: `tests/test_sparse_kv_tier.py`; changes `src/tilerl/kv_tiers.py`.
