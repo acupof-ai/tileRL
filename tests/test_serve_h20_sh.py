@@ -38,10 +38,29 @@ def test_dry_run_resolves_the_sparse_d1_decode_graph_argv():
     for flag in ("--sparse-k", "128", "--sparse-min-tokens", "8192",
                  "--depth", "1", "--decode-graph", "--cold-ssd-path"):
         assert flag in argv, f"missing {flag}: {argv}"
+    # the boot self-certification line names the default arm
+    assert "arm: depth=1 sparse_k=128 decode_graph=on ctx=131072 slots=8" in out
     # Never the V100 hard-coded venv, and never launched through `uv run` (the
     # cu130 torch it resolves cannot load on the pod's 12.9 driver).
     assert "venv70" not in out
     assert argv[0] != "uv" and not argv[0].endswith("/uv"), f"launched through uv: {argv[0]}"
+
+
+def test_decode_graph_off_arm_drops_the_flag_and_self_reports_off():
+    rc, out, err = _dry_run({"SERVE_DECODE_GRAPH": "0", "SERVE_DEPTH": "3"})
+    assert rc == 0, err
+    argv = out.split()
+    assert "--decode-graph" not in argv
+    assert "arm: depth=3 sparse_k=128 decode_graph=off ctx=131072 slots=8" in out
+
+
+def test_dense_arm_keeps_decode_graph_off():
+    rc, out, err = _dry_run({"SERVE_SPARSE_K": "0", "SERVE_DECODE_GRAPH": "0"})
+    assert rc == 0, err
+    argv = out.split()
+    assert "--sparse-k" in argv and "0" in argv
+    assert "--decode-graph" not in argv
+    assert "decode_graph=off" in out and "sparse_k=0" in out
 
 
 def test_an_empty_cold_path_drops_the_spill_tier_flags():
