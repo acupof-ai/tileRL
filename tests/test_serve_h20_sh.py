@@ -46,6 +46,22 @@ def test_dry_run_resolves_the_sparse_d1_decode_graph_argv():
     assert argv[0] != "uv" and not argv[0].endswith("/uv"), f"launched through uv: {argv[0]}"
 
 
+def test_the_arm_name_leads_the_banner_and_is_omitted_when_unset():
+    # An inspector reads which arm a boot is from the boot line, so the name must
+    # be IN it -- and first, since a truncated line loses its tail, not its head.
+    rc, out, err = _dry_run({"SERVE_ARM_NAME": "A4"})
+    assert rc == 0, err
+    assert "arm: arm=A4 depth=1 sparse_k=128 decode_graph=on ctx=131072 slots=8 w=0" in out
+    # Unset and empty are both "no name": appending a bare `arm=` would read as a
+    # field with a missing value, and would also change the banner every existing
+    # consumer of this line already parses.
+    default = "arm: depth=1 sparse_k=128 decode_graph=on ctx=131072 slots=8 w=0"
+    assert default in _dry_run({})[1]
+    assert default in _dry_run({"SERVE_ARM_NAME": ""})[1]
+    # The name is a log label, never an argv token: it must not reach the serve.
+    assert "A4" not in _dry_run({"SERVE_ARM_NAME": "A4"})[1].split()
+
+
 def test_decode_graph_off_arm_passes_the_explicit_force_off_flag():
     rc, out, err = _dry_run({"SERVE_DECODE_GRAPH": "0", "SERVE_DEPTH": "3"})
     assert rc == 0, err
