@@ -58,7 +58,10 @@ WARM_REPS=${WARM_REPS:-3}
 RECLAIM_SAMPLES=${RECLAIM_SAMPLES:-90}
 RECLAIM_INTERVAL_S=${RECLAIM_INTERVAL_S:-15}
 
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+# The header comment block, by RULE not by line number: a fixed `sed -n '2,26p'`
+# silently printed the wrong lines (and lost the examples) the first time a header
+# line was added. Every leading comment line until the first line of code.
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0; }
 
 # ---------------------------------------------------------------- arm table
 # Each arm is the env delta over the shared serve command. Order is deliberate:
