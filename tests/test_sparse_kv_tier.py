@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 
+import pytest
 import torch
 
 from tilerl.kv_cache import BLOCK_TOKENS, PagedKvPool
@@ -795,7 +796,7 @@ def test_ssd_spill_with_prefix_sharing_keeps_host_bytes_under_budget(tmp_path):
         # the running shared-RAM counter must equal the real RAM-resident sum
         # through every hold/spill/read-through transition
         assert cold._shared_ram == sum(
-            rec[0] for rec in cold._shared.values() if rec[2] is not None
+            rec[0] for k, rec in cold._shared.items() if k in cold._shared_blobs
         )
         assert host_bytes() <= budget + per, (i, host_bytes(), budget)
 
@@ -924,8 +925,8 @@ def test_a_shared_spill_failure_stays_in_ram_and_disables_spill(tmp_path):
     orig = ColdSsdFile.write
     ColdSsdFile.write = boom  # fire on BOTH files; private failure must still raise
     try:
-        blob = {"k": torch.zeros(1), "v": torch.zeros(1)}
-        n = 2
+        blob = {"k": torch.zeros(1), "v": torch.zeros(1), "bounds": torch.zeros(1)}
+        n = 3
         cold.share_hold(11, blob, n)
         # Force a shared eviction: it must not raise and the page is retained.
         ok = cold._shared_evict_ram(11)
@@ -967,6 +968,7 @@ def test_bounded_shared_spill_refuses_pages_past_the_cap_and_keeps_them_in_ram(
             return {
                 "k": torch.full((per,), i, dtype=torch.uint8),
                 "v": torch.full((per,), i, dtype=torch.uint8),
+                "bounds": torch.zeros(1, dtype=torch.uint8),
             }
 
         # three holds against a 1-page RAM budget: LRU spills the first two to the
@@ -996,6 +998,7 @@ def test_host_tier_wires_reclaim_to_the_shared_spill_only_by_env(tmp_path, monke
         return {
             "k": torch.full((per,), i, dtype=torch.uint8),
             "v": torch.full((per,), i, dtype=torch.uint8),
+            "bounds": torch.zeros(1, dtype=torch.uint8),
         }
 
     # env ON: a shared spill exists after LRU eviction and is reclaiming; release
@@ -1043,7 +1046,11 @@ def test_host_tier_wires_reclaim_to_the_shared_spill_only_by_env(tmp_path, monke
     cold2 = HostKvPages(budget_bytes=per, ssd_path=ssd, ssd_capacity_bytes=per)
     try:
         assert cold2.prefix_spill_bounded is False
-        b = {"k": torch.zeros(per, dtype=torch.uint8), "v": torch.zeros(per, dtype=torch.uint8)}
+        b = {
+            "k": torch.zeros(per, dtype=torch.uint8),
+            "v": torch.zeros(per, dtype=torch.uint8),
+            "bounds": torch.zeros(1, dtype=torch.uint8),
+        }
         cold2.share_hold(9, {k: t.clone() for k, t in b.items()}, per)
         assert cold2._shared_evict_ram(9) is True
         assert cold2._shared_ssd_bytes == per
@@ -1186,6 +1193,628 @@ def test_bg_publish_lifts_an_ssd_private_page(tmp_path):
         cold.close()
 
 
+def test_bg_publish_ssd_lift_balances_private_mapping_borrow(tmp_path):
+    """borrow_read increments the PRIVATE file's mapping borrow; it must be
+    released exactly once after the bytes are read (a leaked borrow keeps every
+    later mmap generation alive forever). After a normal lift, a write-failure
+    lift (blob falls back to RAM), and a dup-content lift, both spill files show
+    _borrowed == 0 and no pinned keys."""
+    ssd = str(tmp_path / "bal.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+
+    def spill(key, fill):
+        b = pool.alloc_block()
+        pool.k_pool[:, b].fill_(fill)
+        pool.v_pool[:, b].fill_(-fill)
+        pool.demote_page(b, key=key)  # -> private SSD
+        return b
+
+    try:
+        spill(1, 1)
+        assert cold.offer_publish(1, 100, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([100])
+        # normal lift: private mapping borrow back to zero, no lingering pin
+        assert cold._ssd._borrowed == 0
+        assert not cold._ssd._pinned_keys
+
+        # second page: force the shared write to fail once -> RAM fallback
+        spill(2, 2)
+        assert cold._shared_ssd is not None
+        shared_ssd = cold._shared_ssd
+        real_write = shared_ssd.write_reserved
+        shared_ssd.write_reserved = lambda slot, blob, mapping: (_ for _ in ()).throw(
+            OSError("boom")
+        )
+        cold.offer_publish(2, 200, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([200])
+        shared_ssd.write_reserved = real_write
+        assert cold._ssd._borrowed == 0 and not cold._ssd._pinned_keys
+        assert shared_ssd._borrowed == 0 and not shared_ssd._reserved
+    finally:
+        cold.close()
+
+
+def test_bg_publish_ssd_write_non_oserror_releases_reserved_slot(tmp_path):
+    """The phase-2 write only catches OSError: a non-OSError (bad copy /
+    RuntimeError) bypasses release_slot, and the worker top-level except only
+    unpins the source. The destination shared slot then stays _reserved forever
+    and its _borrowed mapping borrow stays >0 (stale mmap generations never
+    prune); the pending record is dropped as a miss. Hardening must release the
+    slot exactly once on ANY exception."""
+    ssd = str(tmp_path / "nonos.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+
+    def spill(key, fill):
+        b = pool.alloc_block()
+        pool.k_pool[:, b].fill_(fill)
+        pool.v_pool[:, b].fill_(-fill)
+        pool.demote_page(b, key=key)
+        return b
+
+    try:
+        spill(10, 10)
+        assert cold.offer_publish(10, 1010, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([1010])  # good page creates the shared file
+
+        spill(9, 9)
+        shared_ssd = cold._shared_ssd
+        assert shared_ssd is not None
+        real_write = shared_ssd.write_reserved
+
+        def raise_non_oserror(slot, blob, mapping):
+            raise RuntimeError("non-os copy failure")
+
+        shared_ssd.write_reserved = raise_non_oserror
+        assert cold.offer_publish(9, 990, {"bounds": torch.zeros(2)})
+        # must NOT hang: the failed job fires its future as a miss promptly
+        assert cold.wait_committed([990], 5) is False
+        shared_ssd.write_reserved = real_write
+
+        assert not shared_ssd._reserved
+        assert shared_ssd._borrowed == 0
+        assert cold._ssd._borrowed == 0
+        assert not cold._ssd._pinned_keys
+    finally:
+        cold.close()
+
+
+def test_bg_publish_ssd_shrink_failure_is_atomic_retriable_not_wedged(tmp_path, monkeypatch):
+    """A trailing-extent ftruncate failure is all-or-nothing: it must commit NO
+    metadata (extents/free-list/cursor stay at the live high-water size), so the
+    file stays writable and a later forget retries the reclaim. The background
+    lift still commits (the un-reclaimed tail is harmless), with no reserved
+    slot or borrow left. Repeated failures across release+publish cycles must not
+    wedge anything; once ftruncate succeeds the next release really truncates.
+    Mutation-red on committing metadata before the truncate."""
+    import tilerl.kv_tiers as kv_tiers
+
+    monkeypatch.setenv("TILERL_COLD_PREFIX_SSD_CAP", "1")  # shared spill reclaim
+    ssd = str(tmp_path / "shrink.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    real_ftruncate = kv_tiers.os.ftruncate
+
+    def spill(key, fill):
+        b = pool.alloc_block()
+        pool.k_pool[:, b].fill_(fill)
+        pool.v_pool[:, b].fill_(-fill)
+        pool.demote_page(b, key=key)
+        return b
+
+    try:
+        spill(10, 10)
+        assert cold.offer_publish(10, 1010, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([1010])  # creates the reclaim shared file
+        shared_ssd = cold._shared_ssd
+        assert shared_ssd is not None
+        # private file reclaims its tail when each lift consumes the source
+        cold._ssd._reclaim = True
+        priv = cold._ssd
+
+        def fail_shrink(fd, length):
+            raise OSError("simulated trailing-extent shrink failure")
+
+        # Two worker lifts while EVERY ftruncate fails. Each consume tries to
+        # collapse the now-empty private tail; the failure must be atomic (the
+        # file keeps its size/free slots) and the lift still commits.
+        monkeypatch.setattr(kv_tiers.os, "ftruncate", fail_shrink)
+        for k, sk in ((9, 990), (12, 1290)):
+            spill(k, k)
+            assert cold.offer_publish(k, sk, {"bounds": torch.zeros(2)})
+            assert cold.wait_committed([sk], 5)  # commit succeeds, no hang/miss
+            blob = cold.share_take(sk)
+            assert blob is not None and torch.all(blob["k"] == k)
+            assert not shared_ssd._reserved and shared_ssd._borrowed == 0
+            assert priv._borrowed == 0 and not priv._pinned_keys
+        # atomic failure: the private file kept its extent list (the old code
+        # popped it to [] and wedged every later write with IndexError), cap and
+        # free slots — the failures are counted, not silently swallowed.
+        assert priv._cap == priv.GROWTH_SLOTS
+        assert len(priv._extent_live) == 1
+        assert priv._free_slots
+        assert priv.reclaim_failures >= 1
+        # a further private write + lift goes through (the old code raised
+        # IndexError here because the extent list had been popped away).
+        spill(13, 13)
+        assert cold.offer_publish(13, 1390, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([1390], 5)
+        assert cold.share_take(1390) is not None
+
+        # ftruncate recovers: release every shared slot; the tail collapse now
+        # succeeds and the physical shared file actually shrinks.
+        monkeypatch.setattr(kv_tiers.os, "ftruncate", real_ftruncate)
+        size_before = os.path.getsize(shared_ssd._path)
+        cold.share_release(1010)
+        cold.share_release(990)
+        cold.share_release(1290)
+        cold.share_release(1390)
+        assert len(shared_ssd) == 0
+        assert os.path.getsize(shared_ssd._path) < size_before
+        assert not shared_ssd._reserved and shared_ssd._borrowed == 0
+    finally:
+        monkeypatch.setattr(kv_tiers.os, "ftruncate", real_ftruncate)
+        cold.close()
+
+
+def _bg_spill_page(pool, key, fill):
+    b = pool.alloc_block()
+    pool.k_pool[:, b].fill_(fill)
+    pool.v_pool[:, b].fill_(-fill)
+    pool.demote_page(b, key=key)
+    return b
+
+
+def test_bg_publish_read_failure_consumes_private_slot_once(tmp_path, monkeypatch):
+    """After the worker borrows the source, a read failure (incl. a non-OSError)
+    makes the queued publish the source's sole owner: the private slot must be
+    consumed exactly once (freed, extent 0, bytes decremented once), unpinned,
+    and resolve as a prompt miss without hanging. The old rollback-only-unpin
+    left the source reachable forever."""
+    ssd = str(tmp_path / "readfail.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    try:
+        _bg_spill_page(pool, 10, 10)
+        cold.offer_publish(10, 1010, {"bounds": torch.zeros(2)})
+        cold.wait_committed([1010])  # good page creates the shared file
+
+        _bg_spill_page(pool, 9, 9)
+        slot = cold._ssd._slot_of[9]
+        nbytes = cold._ssd_page_bytes[9]
+        before = cold._ssd_bytes
+        assert before == nbytes
+
+        def read_boom(borrowed):
+            raise RuntimeError("simulated read failure")
+
+        cold._ssd.read_borrowed = read_boom
+        cold.offer_publish(9, 990, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([990], 5) is False  # miss, promptly, no hang
+        del cold._ssd.read_borrowed
+
+        # source consumed exactly once by its owner (the failed worker)
+        assert 9 not in cold._ssd
+        assert slot in cold._ssd._free_slots
+        assert sum(cold._ssd._extent_live) == 0
+        assert cold._ssd_bytes == before - nbytes
+        assert cold._ssd._borrowed == 0 and not cold._ssd._pinned_keys
+    finally:
+        cold.close()
+
+
+def test_bg_publish_write_failure_consumes_private_slot_once(tmp_path):
+    """A non-OSError phase-2 destination write still owns and consumes the
+    borrowed private source once: slot freed, extent 0, bytes decremented, both
+    files' borrows balanced. The current code only unpins the source."""
+    ssd = str(tmp_path / "str.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    try:
+        _bg_spill_page(pool, 10, 10)
+        cold.offer_publish(10, 1010, {"bounds": torch.zeros(2)})
+        cold.wait_committed([1010])
+
+        _bg_spill_page(pool, 9, 9)
+        slot = cold._ssd._slot_of[9]
+        nbytes = cold._ssd_page_bytes[9]
+        before = cold._ssd_bytes
+        shared_ssd = cold._shared_ssd
+
+        def write_boom(slot_, blob, mapping):
+            raise RuntimeError("non-os copy failure")
+
+        shared_ssd.write_reserved = write_boom
+        cold.offer_publish(9, 990, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([990], 5) is False
+        del shared_ssd.write_reserved
+
+        assert 9 not in cold._ssd and slot in cold._ssd._free_slots
+        assert sum(cold._ssd._extent_live) == 0
+        assert cold._ssd_bytes == before - nbytes
+        assert cold._ssd._borrowed == 0 and not cold._ssd._pinned_keys
+        assert not shared_ssd._reserved and shared_ssd._borrowed == 0
+    finally:
+        cold.close()
+
+
+def test_bg_publish_missing_source_does_not_double_free_private_slot(tmp_path):
+    """committer-None path: the worker never borrowed the source (it was
+    externally evicted/forgot before the job ran). It must not free the slot nor
+    decrement bytes a second time; it resolves as a prompt miss."""
+    import threading
+
+    ssd = str(tmp_path / "none.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    gate = threading.Event()
+    _gate_worker(cold, gate)
+    try:
+        _bg_spill_page(pool, 9, 9)
+        slot = cold._ssd._slot_of[9]
+        nbytes = cold._ssd_page_bytes[9]
+        assert cold.offer_publish(9, 990, {"bounds": torch.zeros(2)})
+        # external owner evicts the source while the job is parked pre-commit
+        cold._ssd.forget(9)
+        cold._ssd_bytes -= nbytes
+        assert slot in cold._ssd._free_slots and 9 not in cold._ssd
+        gate.set()
+        assert cold.wait_committed([990], 5) is False  # miss, promptly
+        # no double free / double decrement
+        assert cold._ssd_bytes == 0
+        assert slot in cold._ssd._free_slots
+        assert cold._ssd._borrowed == 0 and not cold._ssd._pinned_keys
+    finally:
+        gate.set()
+        cold.close()
+
+
+def test_bg_publish_failure_folds_pending_ref_delta_into_inline_record(tmp_path):
+    """A share_ref landing while the publish is queued banks a +1 pending delta.
+    If an inline publisher then commits the same content key and the queued
+    worker fails, that delta must still fold into the existing record: refs must
+    be 2, so one share_release leaves the record live (refs 1), not delete it."""
+    ssd = str(tmp_path / "delta.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    try:
+        _bg_spill_page(pool, 10, 10)
+        cold.offer_publish(10, 1010, {"bounds": torch.zeros(2)})
+        cold.wait_committed([1010])  # creates the shared file
+
+        _bg_spill_page(pool, 9, 9)
+        assert cold.offer_publish(9, 700, {"bounds": torch.zeros(2)})
+        cold.share_ref(700)  # banks pending delta +1
+        assert cold._pub_pending_refs[700] == 1
+
+        real_ensure = cold._ensure_shared_ssd
+
+        def race_inline_then_fail(blob):
+            f = real_ensure(blob)
+            # step thread publishes the same content inline while worker is in
+            # its lock-free phase-2 window
+            cold.share_hold(700, {"bounds": torch.zeros(2)}, 16)
+            f.write_reserved = lambda s, b, m: (_ for _ in ()).throw(
+                RuntimeError("non-os copy failure")
+            )
+            return f
+
+        cold._ensure_shared_ssd = race_inline_then_fail
+        cold.wait_committed([700], 5)
+        cold._ensure_shared_ssd = real_ensure
+
+        rec = cold._shared.get(700)
+        assert rec is not None and rec[1] == 2  # inline 1 + folded pending 1
+        cold.share_release(700)
+        assert 700 in cold._shared and cold._shared[700][1] == 1
+    finally:
+        cold.close()
+
+
+def test_bg_publish_mixed_success_and_failure_leaves_no_borrow_or_reservation(tmp_path):
+    """After an arbitrary mix of successful and failed lifts, both spill files
+    are balanced: no orphan reserved destination slot, no outstanding mapping
+    borrow, no lingering source pin."""
+    ssd = str(tmp_path / "mix.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    try:
+        # key 1 -> shared 101 succeeds and creates the shared spill file
+        _bg_spill_page(pool, 1, 1)
+        cold.offer_publish(1, 101, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([101])
+
+        shared_ssd = cold._shared_ssd
+        keys = [
+            (2, 102, False),
+            (3, 103, True),
+            (4, 104, False),
+            (5, 105, True),
+        ]  # (private key, shared key, fail write?)
+        for pk, sk, fail in keys:
+            _bg_spill_page(pool, pk, pk)
+            if fail:
+                shared_ssd.write_reserved = lambda s, b, m: (_ for _ in ()).throw(
+                    RuntimeError("non-os")
+                )
+            cold.offer_publish(pk, sk, {"bounds": torch.zeros(2)})
+            cold.wait_committed([sk], 5)
+            if fail:
+                del shared_ssd.write_reserved
+
+        assert not shared_ssd._reserved and shared_ssd._borrowed == 0
+        assert cold._ssd._borrowed == 0 and not cold._ssd._pinned_keys
+    finally:
+        cold.close()
+
+
+def _cold_blob(fill=1.0):
+    return {
+        "k": torch.full((2, 4), fill, dtype=torch.float16),
+        "v": torch.full((2, 4), -fill, dtype=torch.float16),
+        "bounds": torch.zeros(2),
+    }
+
+
+def _warm_blob(fill=2.0):
+    b = _cold_blob(fill)
+    b["dk"] = torch.full((2, 4), fill, dtype=torch.float16)
+    b["dv"] = torch.full((2, 4), -fill, dtype=torch.float16)
+    return b
+
+
+def test_bg_publish_ssd_phase2_race_does_not_reset_inline_record(tmp_path):
+    """While the queued worker is in its lock-free phase-2 write, the step thread
+    publishes a SECOND private page of the SAME content key inline (ref=1, own
+    shared slot S0). The worker's phase-3 commit must re-check _shared and fold
+    (release its own destination slot, ref++), not overwrite the record. Current
+    SSD _commit_ssd_publish blindly reassigns: refs reset to 1, its own bytes are
+    charged AGAIN (_shared_ssd_bytes ~3 pages for 2 pages), and the inline slot
+    S0 becomes an orphan (live extent with no key mapping)."""
+    ssd = str(tmp_path / "duprace.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    try:
+        _bg_spill_page(pool, 1, 1)
+        cold.offer_publish(1, 101, {"bounds": torch.zeros(2)})
+        cold.wait_committed([101])  # creates the shared spill file
+        shared_n = cold._shared_ssd.stride  # bucket stride incl. bounds; private differs
+
+        _bg_spill_page(pool, 9, 9)
+        assert cold.offer_publish(9, 700, {"bounds": torch.zeros(2)})
+        inline_slot = []
+        real_write = cold._shared_ssd.write_reserved
+
+        def inline_during_lockfree_write(slot, blob, mapping):
+            real_write(slot, blob, mapping)  # worker destination bytes are in
+            # step thread concurrently publishes a 2nd private page of key 700
+            _bg_spill_page(pool, 11, 11)
+            cold.share_hold_kv(11, 700, {"bounds": torch.zeros(2)})
+            inline_slot.append(cold._shared_ssd._slot_of[("s", 700)])
+
+        cold._shared_ssd.write_reserved = inline_during_lockfree_write
+        assert cold.wait_committed([700], 5)
+        del cold._shared_ssd.write_reserved
+
+        rec = cold._shared.get(700)
+        assert rec is not None and rec[1] == 2  # inline 1 + queued 1, never reset
+        # two content pages now live (101 and the deduped 700), charged once each;
+        # the dedup freed the worker's own reserved slot instead of a third page
+        assert cold._shared_ssd_bytes == 2 * shared_n
+        # the inline slot S0 is still mapped and live; no orphan reserved slot
+        assert ("s", 700) in cold._shared_ssd._slot_of
+        assert not cold._shared_ssd._reserved
+        # every live slot is reachable through a key (no orphan extent slot)
+        live_slots = set(cold._shared_ssd._slot_of.values())
+        assert live_slots
+        assert sum(cold._shared_ssd._extent_live) == len(live_slots)
+    finally:
+        cold.close()
+
+
+def test_bg_publish_ram_phase2_race_folds_inline_ref_without_double_ram(tmp_path):
+    """The RAM variant of the phase-2 race already commits through share_hold
+    (ref++ on an existing key): refs fold to 2 and _shared_ram is charged once.
+    Regression guard so the SSD rework does not regress the RAM path."""
+    import threading
+
+    cold = HostKvPages(budget_bytes=1 << 30, bg_publish=True, bg_wait_s=5)
+    gate = threading.Event()
+    cold._pub_before_job = lambda job: gate.wait(5)
+    try:
+        blob1 = {"k": torch.full((2, 4), 1.0, dtype=torch.float16)}
+        cold.hold(1, blob1, 8)
+        assert cold.offer_publish(1, 700, None)
+        blob2 = {"k": torch.full((2, 4), 2.0, dtype=torch.float16)}
+        cold.hold(2, blob2, 8)
+        cold.share_hold_kv(2, 700, None)  # inline record ref=1 while job queued
+        gate.set()
+        assert cold.wait_committed([700], 5)
+        assert cold._shared[700][1] == 2
+        assert cold._shared_ram == 8  # one page, never charged twice
+    finally:
+        gate.set()
+        cold.close()
+
+
+def test_shared_spill_holds_heterogeneous_warm_and_cold_blobs(tmp_path):
+    """A 3-field cold blob (k/v/bounds) and a 5-field warm blob (plus dk/dv)
+    share the SAME prefix spill file. The file layout is frozen from whichever
+    blob first created it, so today:
+      cold-first -> the warm blob's dk/dv are silently dropped, share_take_field
+                    returns a wrong-value/absent field instead of a clean miss;
+      warm-first -> spilling the cold blob raises KeyError('dk').
+    A bucketed/signature-tagged layout must store both: a missing field on a
+    record that does not own it reads as None (cache miss), never KeyError, and
+    owned fields round-trip their own bytes in both creation orders."""
+
+    def nbytes(b):
+        return sum(t.numel() * t.element_size() for t in b.values())
+
+    # --- cold-first ---
+    d = tmp_path / "coldfirst"
+    d.mkdir()
+    cold = HostKvPages(budget_bytes=64, ssd_path=str(d / "x.bin"))
+    try:
+        cold.share_hold(100, _cold_blob(1.0), nbytes(_cold_blob()))
+        cold.share_hold(200, _warm_blob(2.0), nbytes(_warm_blob()))
+        # budget 64: the 40-byte cold page and the 72-byte warm page both spill,
+        # each into its own signature bucket
+        assert 100 not in cold._shared_blobs and 200 not in cold._shared_blobs
+        # a field the cold record does not own is a clean miss, not a KeyError
+        assert cold.share_take_field(100, "dk") is None
+        # the warm record owns dk/dv and must read them back (fill 2.0)
+        dk = cold.share_take_field(200, "dk")
+        assert dk is not None and torch.all(dk == 2.0)
+        warm = cold.share_take(200)
+        assert torch.all(warm["k"] == 2.0) and torch.all(warm["dk"] == 2.0)
+    finally:
+        cold.close()
+
+    # --- warm-first ---
+    d2 = tmp_path / "warmfirst"
+    d2.mkdir()
+    warmfirst = HostKvPages(budget_bytes=64, ssd_path=str(d2 / "y.bin"))
+    try:
+        warmfirst.share_hold(300, _warm_blob(2.0), nbytes(_warm_blob()))
+        warmfirst.share_hold(400, _cold_blob(3.0), nbytes(_cold_blob()))
+        assert 300 not in warmfirst._shared_blobs  # 72-byte warm page spilled
+        c400 = warmfirst.share_take(400)  # must not KeyError on the 3->5 layout
+        assert c400 is not None and torch.all(c400["k"] == 3.0)
+        # the cold record owns no dk/dv -> miss, not a KeyError
+        assert warmfirst.share_take_field(400, "dk") is None
+        assert torch.all(warmfirst.share_take(300)["dk"] == 2.0)
+    finally:
+        warmfirst.close()
+
+
+def test_bg_publish_dup_content_ssd_consumes_private_slot(tmp_path):
+    """Two publishers with the SAME content key both spilled privately: the
+    second inline commit creates the shared record while the first sits queued,
+    so the worker takes the dup path (no borrow). It must still consume the
+    queued private slot — slot recycled, extent live back to 0, private
+    _ssd_bytes decremented exactly once — not leak it via consume_pinned's
+    not-pinned early return."""
+    ssd = str(tmp_path / "dup.bin")
+    import threading
+
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    gate = threading.Event()
+    _gate_worker(cold, gate)
+    try:
+        # two identical-content private pages; capture their private SSD slots
+        slots = []
+        for key in (10, 11):
+            b = pool.alloc_block()
+            pool.k_pool[:, b].fill_(3)
+            pool.v_pool[:, b].fill_(-3)
+            pool.demote_page(b, key=key)
+            slots.append(cold._ssd._slot_of[key])
+        before = cold.ssd_bytes
+        assert before > 0
+        # enqueue the first; it parks BEFORE commit (no inline record yet)
+        assert cold.offer_publish(10, 700, {"bounds": torch.zeros(2)})
+        # inline-commit the second publisher with the same content key so the
+        # worker, when released, finds the shared record already present (dup)
+        gate.set()
+        n = cold.share_hold_kv(11, 700, {"bounds": torch.zeros(2)})
+        assert n
+        assert cold.drain_publishes(5)
+        # shared record refcount 2 (one per publisher), both private slots gone
+        assert cold._shared[700][1] == 2
+        assert 10 not in cold._ssd and 11 not in cold._ssd
+        assert cold.ssd_bytes == 0
+        assert sum(cold._ssd._extent_live) == 0
+        assert all(s in cold._ssd._free_slots for s in slots)
+        assert not cold._ssd._pinned_keys and cold._ssd._borrowed == 0
+        # the shared page still serves the content
+        blob = cold.share_take(700)
+        assert blob is not None and torch.all(blob["k"] == 3)
+    finally:
+        gate.set()
+        cold.close()
+
+
+def test_bg_publish_take_inflight_does_not_double_decrement_private_bytes(tmp_path):
+    """take() on a private key a queued publish owns returns None instead of
+    racing the worker's consume (which would double-decrement _ssd_bytes and
+    recycle the pinned slot). After the job commits the page is served shared."""
+    import threading
+
+    ssd = str(tmp_path / "take.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    gate = threading.Event()
+    _gate_worker(cold, gate)
+    try:
+        _bg_spill_page(pool, 7, 7)
+        nbytes = cold._ssd_page_bytes[7]
+        before = cold._ssd_bytes
+        assert cold.offer_publish(7, 770, {"bounds": torch.zeros(2)})
+        # job is queued/pre-commit: take refuses, no byte decrement, slot intact
+        assert cold.take(7) is None
+        assert cold._ssd_bytes == before
+        assert 7 in cold._ssd
+        gate.set()
+        assert cold.wait_committed([770], 5)
+        # worker consumed the source once; bytes decremented exactly once
+        assert cold._ssd_bytes == before - nbytes
+        assert cold.take(7) is None
+        blob = cold.share_take(770)
+        assert blob is not None and torch.all(blob["k"] == 7)
+        assert cold._ssd._borrowed == 0 and not cold._ssd._pinned_keys
+    finally:
+        gate.set()
+        cold.close()
+
+
+def test_bg_publish_arbitrary_exception_after_read_consumes_source_once(tmp_path):
+    """The read succeeds, then bucket open/reserve raises a NON-OSError. The job
+    already owns the borrowed source, so it must consume the private slot once
+    and resolve as a miss on ANY exception, not only the write window."""
+    ssd = str(tmp_path / "anyexc.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    try:
+        _bg_spill_page(pool, 10, 10)
+        cold.offer_publish(10, 1010, {"bounds": torch.zeros(2)})
+        cold.wait_committed([1010])  # creates the shared file
+
+        _bg_spill_page(pool, 9, 9)
+        slot = cold._ssd._slot_of[9]
+        nbytes = cold._ssd_page_bytes[9]
+        before = cold._ssd_bytes
+
+        def boom(blob):
+            raise RuntimeError("arbitrary pre-reserve failure")
+
+        cold._ensure_shared_ssd = boom
+        cold.offer_publish(9, 990, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([990], 5) is False
+        del cold._ensure_shared_ssd
+
+        assert 9 not in cold._ssd and slot in cold._ssd._free_slots
+        assert cold._ssd_bytes == before - nbytes
+        assert cold._ssd._borrowed == 0 and not cold._ssd._pinned_keys
+        assert cold._shared_ssd._borrowed == 0 and not cold._shared_ssd._reserved
+    finally:
+        cold.close()
+
+
 def test_bg_publish_queue_full_degrades_to_false_inline_path():
     """A full bounded queue makes offer return False so the caller transfers
     inline; nothing is reserved, no publish is lost or silently stranded."""
@@ -1225,10 +1854,10 @@ def test_bg_publish_failed_transfer_fires_miss_not_hang():
     gate = threading.Event()
     _gate_worker(cold, gate)
 
-    def boom(private_key, shared_key, extra=None):
-        raise OSError("simulated spill failure")
+    def boom(key, blob, nbytes):
+        raise OSError("simulated commit failure")
 
-    cold.share_hold_kv = boom
+    cold.share_hold = boom  # RAM-source commit phase (share_hold under _tlock)
     try:
         _hold_private(cold, 2, 2.0)
         assert cold.offer_publish(2, 200, None)
@@ -1290,6 +1919,166 @@ def test_bg_publish_forget_while_queued_keeps_the_source():
         assert blob is not None and torch.all(blob["k"] == 4.0)
         assert cold.take(21) is None
     finally:
+        cold.close()
+
+
+def test_bg_publish_ssd_lift_disk_io_runs_off_the_tier_lock(tmp_path):
+    """3PR core property: a private-SSD lift's slow disk read+write do NOT hold
+    HostKvPages._tlock. While the worker is parked inside the lock-outside IO a
+    peer _tlock operation (stats takes it) must return immediately; and the
+    reserved shared slot is invisible to readers until commit."""
+    import threading
+    import time
+
+    ssd = str(tmp_path / "lk.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    b = pool.alloc_block()
+    pool.k_pool[:, b].fill_(6)
+    pool.v_pool[:, b].fill_(-6)
+    pool.demote_page(b, key=8)  # -> private SSD
+    inside = threading.Event()
+    release = threading.Event()
+
+    real_read = type(cold._ssd).read_borrowed
+
+    def slow_read(self2, borrowed):
+        if self2 is cold._ssd:
+            inside.set()
+            release.wait(5)
+        return real_read(self2, borrowed)
+
+    type(cold._ssd).read_borrowed = slow_read
+    try:
+        assert cold.offer_publish(8, 880, {"bounds": torch.zeros(2)})
+        assert inside.wait(5)
+        # the shared slot, if already reserved, must not be readable mid-copy
+        if cold._shared_ssd is not None:
+            assert ("s", 880) not in cold._shared_ssd
+        # a peer tier-lock op is not blocked by the worker's disk IO
+        t0 = time.perf_counter()
+        cold.stats()
+        assert time.perf_counter() - t0 < 0.2
+        release.set()
+        assert cold.wait_committed([880], 5)
+        blob = cold.share_take(880)
+        assert blob is not None and torch.all(blob["k"] == 6)
+        assert torch.all(blob["v"] == -6) and "bounds" in blob
+    finally:
+        release.set()
+        type(cold._ssd).read_borrowed = real_read
+        cold.close()
+
+
+def test_bg_publish_ssd_lift_rolls_back_reserved_slot_on_write_failure(tmp_path):
+    """A failure while copying into the reserved shared slot releases it: the
+    slot returns to the free list, its extent live count is not incremented, no
+    borrowed mapping stays open (_borrowed back to 0), and the key reads as a
+    miss with the blob kept in RAM (the shared-spill-disabled fallback)."""
+    ssd = str(tmp_path / "rb.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    b = pool.alloc_block()
+    pool.k_pool[:, b].fill_(7)
+    pool.v_pool[:, b].fill_(-7)
+    pool.demote_page(b, key=9)
+    # Materialize the shared spill file once with a good write so the file exists,
+    # then make ONLY this instance's write_reserved raise; the reserved slot must
+    # roll back and the blob fall back to RAM.
+    b2 = pool.alloc_block()
+    pool.k_pool[:, b2].fill_(2)
+    pool.v_pool[:, b2].fill_(-2)
+    pool.demote_page(b2, key=10)
+    try:
+        assert cold.offer_publish(10, 1010, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([1010], 5)
+        shared_ssd = cold._shared_ssd
+        assert shared_ssd is not None
+        real_write = shared_ssd.write_reserved
+
+        def fail_write(slot, blob, mapping):
+            raise OSError("simulated shared write failure")
+
+        shared_ssd.write_reserved = fail_write  # instance attr
+        assert cold.offer_publish(9, 990, {"bounds": torch.zeros(2)})
+        # write failed -> spill disabled, blob falls back to RAM, key still serves
+        assert cold.wait_committed([990], 5)
+        blob = cold.share_take(990)
+        assert blob is not None and torch.all(blob["k"] == 7)
+        assert cold.shared_spill_disabled
+        assert shared_ssd._borrowed == 0
+        assert not shared_ssd._reserved
+        # no extent gained a live count for the rolled-back slot (the earlier good
+        # write owns exactly one live slot)
+        assert sum(shared_ssd._extent_live) == 1
+    finally:
+        if "real_write" in dir():
+            shared_ssd.write_reserved = real_write
+        cold.close()
+
+
+def test_bg_publish_ssd_source_slot_pinned_across_lock_outside_io(tmp_path):
+    """Deterministic race gate: while the worker is parked inside the
+    lock-outside private read (between borrow_read and phase-3 consume), the
+    step thread's cold.forget on that SAME private key must not recycle its SSD
+    slot — the slot stays allocated, its extent live count holds, and the slot is
+    not returned to the free list (a later write cannot overwrite the bytes the
+    worker is copying). After release the worker consumes the pin and the slot
+    frees exactly once. Mutation-red on dropping the SSD key pin (pin discarded
+    in phase 1a / forget not checking _pinned_keys)."""
+    import threading
+
+    ssd = str(tmp_path / "pin.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    b = pool.alloc_block()
+    pool.k_pool[:, b].fill_(5)
+    pool.v_pool[:, b].fill_(-5)
+    pool.demote_page(b, key=4)  # -> private SSD, slot 0
+    priv = cold._ssd
+    slot0 = priv._slot_of[4]
+    assert slot0 == 0
+
+    inside = threading.Event()
+    release = threading.Event()
+    real_read = type(priv).read_borrowed
+
+    def slow_read(self2, borrowed):
+        if self2 is priv:
+            inside.set()
+            release.wait(5)
+        return real_read(self2, borrowed)
+
+    type(priv).read_borrowed = slow_read
+    try:
+        assert cold.offer_publish(4, 440, {"bounds": torch.zeros(2)})
+        assert inside.wait(5)
+        # Simulate the old bug directly: the tier-level _pub_private marker was
+        # discarded in phase 1a, so the publisher's cold.forget is NOT stopped by
+        # the tier guard and reaches the SPILL FILE. The per-key file pin must be
+        # the second (and now decisive) line of defence.
+        cold._pub_private.discard(4)
+        cold.forget(4)
+        assert 4 in priv._pinned_keys
+        assert priv._slot_of.get(4) == slot0  # still mapped
+        assert slot0 not in priv._free_slots  # not recycled
+        assert priv._extent_live[slot0 // priv.GROWTH_SLOTS] == 1
+        assert all(s != slot0 for s in priv._free_slots)
+        release.set()
+        assert cold.wait_committed([440], 5)
+        blob = cold.share_take(440)
+        assert blob is not None and torch.all(blob["k"] == 5)
+        # phase 3 consumed the pin: the private slot is now freed exactly once
+        assert 4 not in priv._pinned_keys
+        assert 4 not in priv._slot_of
+        assert slot0 in priv._free_slots
+        assert priv._extent_live[slot0 // priv.GROWTH_SLOTS] == 0
+    finally:
+        release.set()
+        type(priv).read_borrowed = real_read
         cold.close()
 
 
@@ -1439,3 +2228,274 @@ def test_spill_io_on_publish_thread_is_billed_separately(tmp_path):
         assert f.ssd_ms_worker == 0.0 and wms > 0.0
     finally:
         f.close()
+
+
+def test_bg_publish_inflight_reservation_counts_toward_shared_cap(tmp_path):
+    """Defect A (cap overrun): while the single worker sits in the lock-free
+    write_reserved its page is RESERVED but uncommitted. The shared-cap admission
+    must count that reservation, so committed + in-flight can never exceed the
+    cap. This gate bypasses the host RAM LRU (which under budget=1 only ever
+    evicts one old page and would limit on the host budget, masking the bug) and
+    drives _write_shared_ssd — the exact cap gate — directly while the worker is
+    parked holding one page: cap = 2 pages, ok1 admits (1 in-flight + 1
+    committed == cap), ok2 must be refused. After the worker commits the shared
+    total is exactly the cap. Mutation-red on removing the pending reservation:
+    ok2 then returns True and the final total is 1.5x the cap (12288 > 8192)."""
+    import threading
+
+    from tilerl.kv_tiers import ColdSsdFile
+
+    per = 4096
+    ssd = str(tmp_path / "cap.bin")
+    cap = 2 * per
+    cold = HostKvPages(
+        budget_bytes=per, ssd_path=ssd, ssd_capacity_bytes=cap, bg_publish=True, bg_wait_s=5
+    )
+    cold.prefix_spill_bounded = True
+
+    def page(i):
+        return {
+            "k": torch.full((per,), i, dtype=torch.uint8),
+            "v": torch.full((per,), i, dtype=torch.uint8),
+            "bounds": torch.zeros(1, dtype=torch.uint8),
+        }
+
+    try:
+        cold.hold(1, page(1), per)
+        cold.hold(2, page(2), per)  # page 1 -> private SSD
+        assert 1 in cold._ssd
+        cold.forget(2)
+
+        parked = threading.Event()
+        gate = threading.Event()
+        real_write = ColdSsdFile.write_reserved
+
+        def hooked(self, slot, blob, mapping):
+            if threading.current_thread().name == ColdSsdFile.PUBLISH_THREAD:
+                parked.set()
+                gate.wait(15)
+            return real_write(self, slot, blob, mapping)
+
+        ColdSsdFile.write_reserved = hooked
+        try:
+            assert cold.offer_publish(1, 1001, {})  # worker holds one in-flight
+            assert parked.wait(15)
+            with cold._tlock:
+                assert cold._shared_ssd_pending == per
+                sig = tuple(sorted(page(0).keys()))
+                # direct cap gate, bypassing the host LRU:
+                # 1 in-flight + first committed == cap -> admitted ...
+                ok1 = cold._write_shared_ssd(501, page(2), per, sig)
+                # ... 1 in-flight + 2 committed would exceed cap -> refused
+                ok2 = cold._write_shared_ssd(502, page(3), per, sig)
+                assert ok1 is True and ok2 is False
+                assert cold._shared_ssd_bytes == per  # only the one committed
+            gate.set()
+            assert cold.drain_publishes(15)
+        finally:
+            ColdSsdFile.write_reserved = real_write
+
+        # the worker's reservation flipped to committed: total exactly the cap,
+        # never 1.5x; nothing reserved/borrowed left.
+        assert cold._shared_ssd_bytes == cap
+        assert cold._shared_ssd_pending == 0
+        bucket = cold._shared_ssd
+        assert sum(bucket._extent_live) == 2
+        assert not bucket._reserved and bucket._borrowed == 0
+    finally:
+        cold.close()
+
+
+def test_shared_bucket_rejects_dtype_and_shape_mismatch_to_ram(tmp_path):
+    """Defect B (frozen-spec mismatch): a bucket is keyed by field-name signature
+    but freezes ONE concrete dtype+shape. An equal-byte-width dtype swap must not
+    be silently reinterpreted as the frozen dtype on readback, and a shape
+    mismatch must not raise out of share_hold (which would wedge the tick and
+    leak a slot). Both fall back to RAM and are counted. Mutation-red on removing
+    the spec comparison (the dtype swap reads back as wrong values)."""
+    ssd = str(tmp_path / "spec.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, ssd_capacity_bytes=1 << 30)
+    cold.prefix_spill_bounded = True
+    try:
+        # establish the cold bucket frozen to fp16: a second 40-byte page pushes
+        # the first past the 64-byte budget and LRU-spills it into the bucket.
+        cold.share_hold(
+            100, _cold_blob(1.0), sum(t.numel() * t.element_size() for t in _cold_blob().values())
+        )
+        cold.share_hold(
+            101, _cold_blob(2.0), sum(t.numel() * t.element_size() for t in _cold_blob().values())
+        )
+        bucket = cold._shared_ssd
+        assert bucket is not None
+
+        # same field names+shapes, EQUAL WIDTH (bf16 is 2 bytes) but different
+        # dtype: rejected to RAM, never reinterpreted through the fp16 spec
+        bf = {
+            "k": torch.full((2, 4), 7.0, dtype=torch.bfloat16),
+            "v": torch.full((2, 4), -7.0, dtype=torch.bfloat16),
+            "bounds": torch.zeros(2),
+        }
+        nbf = sum(t.numel() * t.element_size() for t in bf.values())
+        cold.share_hold(200, bf, nbf)
+        # the 40-byte bf page fits the 64-byte budget, so force it through the
+        # LRU spill path by admitting a second page: the bf page is oldest, its
+        # bucket write is spec-rejected (stays RAM), then the matching page spills.
+        cold.share_hold(
+            201, _cold_blob(5.0), sum(t.numel() * t.element_size() for t in _cold_blob().values())
+        )
+        assert cold.shared_spec_failures >= 1
+        assert 200 in cold._shared_blobs  # kept in RAM ...
+        blob = cold.share_take(200)
+        assert blob is not None and blob["k"].dtype == torch.bfloat16
+        assert torch.all(blob["k"] == 7.0)  # ... with its TRUE dtype, not garbage
+        assert ("s", 200) not in bucket
+
+        # different SHAPE under the same signature: share_hold must NOT raise; the
+        # page stays in RAM and no slot/reservation is leaked.
+        odd = {
+            "k": torch.zeros(2, 8, dtype=torch.float16),
+            "v": torch.zeros(2, 8, dtype=torch.float16),
+            "bounds": torch.zeros(2),
+        }
+        nodd = sum(t.numel() * t.element_size() for t in odd.values())
+        cold.share_hold(300, odd, nodd)  # must not raise
+        assert ("s", 300) not in bucket
+        assert not bucket._reserved and bucket._borrowed == 0
+        assert 300 in cold._shared_blobs
+    finally:
+        cold.close()
+
+
+def test_cold_spill_file_check_blob_spec_raises_at_the_source(tmp_path):
+    """Defect B assertion anchored at the ColdSsdFile raise point itself (rev
+    nit): the two end-to-end gates above prove the RAM-fallback behaviour, but
+    this pins the exact validator — a frozen spec rejects an equal-width dtype
+    swap and a shape mismatch with SpillSpecError, and accepts an exact match —
+    so a refactor that only relaxed the host-level catch could not silently drop
+    the real check."""
+    import pytest
+
+    from tilerl.kv_tiers import ColdSsdFile, SpillSpecError, _blob_spec
+
+    base = {
+        "k": torch.zeros(2, 4, dtype=torch.float16),
+        "v": torch.zeros(2, 4, dtype=torch.float16),
+        "bounds": torch.zeros(2),
+    }
+    f = ColdSsdFile(str(tmp_path / "b.bin"), _blob_spec(base))
+    try:
+        f._check_blob_spec(base)  # exact match: no raise
+        same_shape_other_dtype = {
+            "k": torch.zeros(2, 4, dtype=torch.bfloat16),
+            "v": torch.zeros(2, 4, dtype=torch.bfloat16),
+            "bounds": torch.zeros(2),
+        }
+        other_shape = {
+            "k": torch.zeros(2, 8, dtype=torch.float16),
+            "v": torch.zeros(2, 8, dtype=torch.float16),
+            "bounds": torch.zeros(2),
+        }
+        missing_field = {
+            "k": torch.zeros(2, 4, dtype=torch.float16),
+            "v": torch.zeros(2, 4, dtype=torch.float16),
+        }
+        with pytest.raises(SpillSpecError):
+            f._check_blob_spec(same_shape_other_dtype)
+        with pytest.raises(SpillSpecError):
+            f._check_blob_spec(other_shape)
+        with pytest.raises(SpillSpecError):
+            f._check_blob_spec(missing_field)
+    finally:
+        f.close()
+
+
+def test_bg_publish_phase3_commit_error_rolls_token_back_not_leak(tmp_path):
+    """Defect D (phase-3 finally), independent of the shrink trigger: if the
+    destination token.commit raises AFTER the private source is consumed (a
+    desynced bucket, an arbitrary RuntimeError), the finalize must roll the
+    reservation back (dispose balances _borrowed, frees the slot), release the
+    admission, count a miss and resolve the future — never strand an orphan
+    reserved slot with a live borrow. The bucket then stays writable. Deterministic
+    by injecting into _commit_slot_locked on the worker thread. Mutation-red on
+    deleting the finalize except (token.commit settled before it ran and dispose
+    became a no-op -> borrow accumulates)."""
+    ssd = str(tmp_path / "dcommit.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True, bg_wait_s=5)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    try:
+        _bg_spill_page(pool, 10, 10)
+        cold.offer_publish(10, 1010, {"bounds": torch.zeros(2)})
+        cold.wait_committed([1010])
+        bucket = cold._shared_ssd
+        assert bucket is not None
+
+        # make ONLY the failing job's commit raise inside the file lock
+        real_commit = bucket._commit_slot_locked
+
+        def boom_commit(key, slot):
+            if key == ("s", 990):
+                raise RuntimeError("simulated phase-3 commit failure")
+            return real_commit(key, slot)
+
+        bucket._commit_slot_locked = boom_commit
+        _bg_spill_page(pool, 9, 9)
+        assert cold.offer_publish(9, 990, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([990], 5) is False  # resolved a miss, no hang
+        bucket._commit_slot_locked = real_commit
+
+        # the failed commit left NOTHING behind: source consumed once, destination
+        # reservation fully rolled back, admission released.
+        assert not bucket._reserved and bucket._borrowed == 0
+        assert ("s", 990) not in bucket._slot_of
+        assert cold._shared_ssd_pending == 0
+        assert 9 not in cold._ssd
+        # the bucket still serves a subsequent good lift
+        _bg_spill_page(pool, 11, 11)
+        assert cold.offer_publish(11, 1190, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([1190], 5)
+        blob = cold.share_take(1190)
+        assert blob is not None and torch.all(blob["k"] == 11)
+        assert not bucket._reserved and bucket._borrowed == 0
+    finally:
+        cold.close()
+
+
+def test_step_thread_shared_write_failure_keeps_page_in_ram_no_leak(tmp_path):
+    """Defect D on the inline (step-thread) path: a non-OSError failure writing
+    the shared bucket must not propagate out of share_hold (which would wedge the
+    close tick holding _tlock), must not strand an allocated slot, and must keep
+    the page in RAM. Deterministic by forcing the inline bucket write to raise.
+    Mutation-red on the inline write not catching BaseException (it escapes
+    share_hold) or on _write not returning its post-alloc slot to the free list."""
+    ssd = str(tmp_path / "dinline.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, ssd_capacity_bytes=1 << 30)
+    cold.prefix_spill_bounded = True
+    # establish a frozen cold bucket
+    cold.share_hold(
+        100, _cold_blob(1.0), sum(t.numel() * t.element_size() for t in _cold_blob().values())
+    )
+    cold.share_hold(
+        101, _cold_blob(2.0), sum(t.numel() * t.element_size() for t in _cold_blob().values())
+    )
+    bucket = cold._shared_ssd
+    assert bucket is not None
+    before = len(bucket._free_slots)
+    real_write = bucket._write
+
+    def boom_write(key, blob):
+        raise RuntimeError("simulated inline copy failure")
+
+    bucket._write = boom_write
+    # force a fresh spill attempt of a RAM-resident page
+    nb = sum(t.numel() * t.element_size() for t in _cold_blob().values())
+    cold.share_hold(200, _cold_blob(3.0), nb)
+    try:
+        cold._shared_evict_ram(200)  # must NOT raise
+    finally:
+        bucket._write = real_write
+    # page retained in RAM, no slot stranded, no reservation/borrow
+    assert cold.share_take(200) is not None
+    assert not bucket._reserved and bucket._borrowed == 0
+    assert len(bucket._free_slots) == before
+    cold.close()
