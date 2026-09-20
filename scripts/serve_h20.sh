@@ -23,8 +23,20 @@
 #   SERVE_COLD_FORMAT (f16) SERVE_KV_COLD_BYTES / SERVE_COLD_SSD_BYTES (8 GiB)
 #   SERVE_SPARSE_K (128) SERVE_SPARSE_MIN (8192)
 #   SERVE_SLOTS (8) SERVE_BATCH (8) SERVE_CTX (131072) SERVE_DEPTH (1)
+#   SERVE_DRAFT_WINDOW (0; the draft trailing-READ window in tokens. 0 = full
+#     prefix = the CLI default, so 0 adds no flag. 2048 is the V100 W-sweep
+#     candidate, opt-in)
 #   SERVE_DECODE_GRAPH (1; set 0 for the graph-off measurement arm)
 #   MAX_RESTARTS (10) RESTART_FUSE_MAX (5) RESTART_FUSE_WINDOW_S (600)
+#   LIVENESS_POLL_S (60) -- the guard's poll period; set 999999 for a zero-traffic
+#     baseline, since at this arm's slots=8 the guard injects a real 4-token chat
+#     per poll and that lands inside the decode window being measured. Set it as an
+#     argv PREFIX on the pod_run command, not as a caller `export`:
+#       pod_run.sh h20serve <card> -- LIVENESS_POLL_S=999999 bash scripts/serve_h20.sh
+#     pod_run bakes the CMD into a runner executed inside the container and does not
+#     forward the caller's environment (measured: POD_RUN_EMIT_RUNNER=1 output
+#     carries no LIVENESS_POLL_S while CUDA_VISIBLE_DEVICES is present). An empty
+#     value falls back to 60.
 #
 # `--dry-run` prints the resolved serve argv and exits 0 without touching a GPU:
 # the hermetic gate. The fuse: the FUSE_MAX-th restart inside FUSE_WINDOW_S trips
@@ -61,6 +73,9 @@ SLOTS=${SERVE_SLOTS:-8}
 BATCH=${SERVE_BATCH:-8}
 CTX=${SERVE_CTX:-131072}
 DEPTH=${SERVE_DEPTH:-1}
+# Draft trailing-READ window in tokens; 0 = full prefix, which is also the CLI
+# default, so 0 passes no flag at all (see WINDOW_ARGS below).
+DRAFT_WINDOW=${SERVE_DRAFT_WINDOW:-0}
 # sm90 decode graph on by default. SERVE_DECODE_GRAPH=0 passes the explicit
 # --no-decode-graph force-off: merely omitting --decode-graph leaves the CLI arg
 # at its default None, which engine _graph_on resolves to AUTO = ON on sm90/cuda
@@ -87,11 +102,16 @@ fi
 # default (None) AUTO-enables capture, so omitting the flag would stay graph-on.
 GRAPH_ARGS=(--no-decode-graph)
 [ "$DECODE_GRAPH" != 0 ] && GRAPH_ARGS=(--decode-graph)
+# SERVE_DRAFT_WINDOW=0 is the CLI default (full prefix), so 0 passes no flag --
+# an explicit --draft-attn-window-tokens 0 would be the same arm, one more token
+# in argv to read past in a log full of arms.
+WINDOW_ARGS=()
+[ "$DRAFT_WINDOW" != 0 ] && WINDOW_ARGS=(--draft-attn-window-tokens "$DRAFT_WINDOW")
 # One arm descriptor, logged on every boot line and printed by --dry-run so the
 # reader of /work/serve_h20.log can self-certify which arm served without relying
 # on a relayed command line.
 GRAPH_WORD=off; [ "$DECODE_GRAPH" != 0 ] && GRAPH_WORD=on
-ARM_DESC="depth=$DEPTH sparse_k=$SPARSE_K decode_graph=$GRAPH_WORD ctx=$CTX slots=$SLOTS"
+ARM_DESC="depth=$DEPTH sparse_k=$SPARSE_K decode_graph=$GRAPH_WORD ctx=$CTX slots=$SLOTS w=$DRAFT_WINDOW"
 
 SERVE_ARGV=("$PYTHON" -u -m tilerl.cli serve --model qwen38-27b
   --host 0.0.0.0 --port "$PORT"
@@ -99,6 +119,7 @@ SERVE_ARGV=("$PYTHON" -u -m tilerl.cli serve --model qwen38-27b
   --sparse-k "$SPARSE_K" --sparse-min-tokens "$SPARSE_MIN"
   ${COLD_ARGS[@]+"${COLD_ARGS[@]}"}
   --draft "$DRAFT" --depth "$DEPTH"
+  ${WINDOW_ARGS[@]+"${WINDOW_ARGS[@]}"}
   ${GRAPH_ARGS[@]+"${GRAPH_ARGS[@]}"})
 
 if [ "$DRY_RUN" = 1 ]; then
@@ -116,6 +137,10 @@ mkdir -p "$TMP" 2>/dev/null && export TMPDIR=$TMP TMP=$TMP TEMP=$TMP
 export PYTHONPATH=$REPO/src:$REPO/packages/tilerl-kernels/src${PYTHONPATH:+:$PYTHONPATH}
 export TILERL_QWEN38_SOURCE=$CKPT
 export LIVENESS_BASE="http://127.0.0.1:$PORT"
+# Only a guard against an empty value (`float('')` would raise in the guard). A set
+# value is passed through untouched and the unset case is already 60 in
+# serve_liveness.py, so this line changes no production behavior.
+export LIVENESS_POLL_S=${LIVENESS_POLL_S:-60}
 
 child=; guard=; stopping=
 trap 'stopping=1; [ -n "$guard" ] && { pkill -TERM -P "$guard" 2>/dev/null; kill -TERM "$guard" 2>/dev/null; }; pkill -TERM -f "serve_liveness.py $LOG" 2>/dev/null; pkill -TERM -f "serve_warmup_hybrid.py" 2>/dev/null; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait "$child"; fi; exit 143' TERM INT

@@ -36,8 +36,27 @@ EXPECT_BLOCKS=${EXPECT_BLOCKS:-2213}
 EXPECT_MODEL=${EXPECT_MODEL:-qwen38-27b}
 PROMPT_TOKENS=${PROMPT_TOKENS:-32000}
 WARM_REPS=${WARM_REPS:-3}
-RECLAIM_SAMPLES=${RECLAIM_SAMPLES:-120}
-RECLAIM_INTERVAL_S=${RECLAIM_INTERVAL_S:-20}
+# The reclaim sampler runs only on the arms that can actually shrink (below), and
+# run_arm waits on it. Two constraints set its span, both arithmetic on measured
+# numbers:
+#
+#   1. It must still be RUNNING when the release it watches happens. One 32k cold
+#      fill prompt costs ~156 s measured, the probe's --fill-n default is 5 (the
+#      harness does not pass it) and the warm request is itself a 32k prompt, so
+#      rep0's first release is ~(5+1)*156 = 936 s in. A 60x10 span (590 s) would
+#      have ENDED ~350 s before the event it exists to sample.
+#   2. It must not run far PAST the probe. The probe is the longer of the two at
+#      this shape -- 3 reps x 936 s = ~47 min against a 1335 s sampler -- so an
+#      overlong sampler costs nothing extra, but a span longer than the probe would
+#      make every gated arm pay the difference for tail rows on a settled plateau.
+#
+# 90 x 15 = 1335 s (~22 min) sits comfortably inside the ~47 min probe and covers
+# the 936 s release with ~400 s of post-release tail. It replaces a 120x20 default
+# that cost 39.7 min on EVERY arm, including the five where the shrink is
+# physically impossible. RECLAIM_SAMPLES is COUPLED to --fill-n: a larger --fill-n
+# pushes the first release out and the span has to grow with it.
+RECLAIM_SAMPLES=${RECLAIM_SAMPLES:-90}
+RECLAIM_INTERVAL_S=${RECLAIM_INTERVAL_S:-15}
 
 usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
@@ -51,7 +70,14 @@ usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 # alone leaves build.py to derive (num_slots+1)*ceil(max_ctx/16) from the shape,
 # while bg1 pins the queue at its own default so the two are separable. bg3 pins
 # the 8192 the 2026-09-20 window measured clean.
-ARM_NAMES=(baseline batch bg1 bg2 bg3 locksplit)
+#
+# bgcap adds TILERL_COLD_PREFIX_SSD_CAP=1, which is what makes the #740 trailing
+# truncation visible at all: the shared prefix spill is otherwise unbounded and
+# keeps growing. It is an ARM rather than part of the shared instrumentation
+# because it changes what the engine does (the file is bounded and disk returned)
+# -- turning it on for every arm would make the arms incomparable on the very
+# thing they are being compared on. bg2 is its control: same bg config, no cap.
+ARM_NAMES=(baseline batch bg1 bg2 bg3 bgcap locksplit)
 arm_env() {
   case "$1" in
     baseline)  echo "" ;;
@@ -59,6 +85,7 @@ arm_env() {
     bg1)       echo "TILERL_CLOSE_BATCH_D2H=1 TILERL_CLOSE_BG_PUBLISH=1 TILERL_CLOSE_BG_DEPTH=512" ;;
     bg2)       echo "TILERL_CLOSE_BATCH_D2H=1 TILERL_CLOSE_BG_PUBLISH=1" ;;
     bg3)       echo "TILERL_CLOSE_BATCH_D2H=1 TILERL_CLOSE_BG_PUBLISH=1 TILERL_CLOSE_BG_DEPTH=8192" ;;
+    bgcap)     echo "TILERL_CLOSE_BATCH_D2H=1 TILERL_CLOSE_BG_PUBLISH=1 TILERL_COLD_PREFIX_SSD_CAP=1" ;;
     locksplit) echo "PENDING_746" ;;
     *) return 2 ;;
   esac
@@ -68,7 +95,16 @@ arm_env() {
 # LIVENESS_POLL_S=999999 is the load-bearing one: the supervisor's liveness probe
 # sends a REAL chat every 60 s, which lands in the decode window being measured.
 instrument_env() {
-  echo "LIVENESS_POLL_S=999999 TILERL_STEP_TIMING=1 TILERL_STEP_TIMING_SLOW_MS=0 TILERL_CLOSE_BUSYIDLE=1"
+  # TILERL_DRAFT_ATTN_WINDOW_TOKENS is here, not in an arm, because it is a
+  # MEASUREMENT setting, not a treatment: every arm is compared at the same read
+  # window, and the probe asserts it (--expect-window). Omitting it left the
+  # loader default W=0 against the probe's 2048 and every arm exited rc13 before
+  # producing a number -- a whole window lost to a missing env var.
+  #
+  # This injects the window for the WINDOW only: it is set in the arm's serve
+  # environment here, and DRAFT_ATTN_WINDOW_TOKENS_DEFAULT stays 0, so the
+  # shipped serve is untouched by this harness.
+  echo "LIVENESS_POLL_S=999999 TILERL_STEP_TIMING=1 TILERL_STEP_TIMING_SLOW_MS=0 TILERL_CLOSE_BUSYIDLE=1 TILERL_DRAFT_ATTN_WINDOW_TOKENS=$WINDOW_TOKENS"
 }
 
 ARMS=()
@@ -160,27 +196,55 @@ run_arm() {
   log "=== arm $name: $env_delta"
   stop_serve || return 1
 
+  # One log per arm. The supervisor only truncates a log that is ALREADY over
+  # 32 MiB at boot (serve_hybrid_v100.sh LOG_CAP), and the probe/steady filter
+  # read from offset 0, so a shared fixed path made every arm's steady.json a
+  # statistic over all previous arms' ticks as well. SERVE_LOG is the
+  # supervisor's own override.
+  local arm_log=$dir/serve.log
+  : > "$arm_log"
+
   # Every artifact from this arm lands in $dir; nothing writes outside it.
   local reclaim_pid=
   local env_line; env_line="$(instrument_env) ${env_delta}"
   # shellcheck disable=SC2086  # deliberate: the helpers emit VAR=val words to split
-  ( export SERVE_REPO=$REPO SERVE_ROOT=$ROOT SERVE_PORT=$PORT
+  ( export SERVE_REPO=$REPO SERVE_ROOT=$ROOT SERVE_PORT=$PORT SERVE_LOG=$arm_log
     setsid nohup env $env_line scripts/serve_hybrid_v100.sh >/dev/null 2>&1 & )
   wait_ready || { log "arm $name: serve never became ready"; return 1; }
   health_gate || { log "arm $name: health gate failed"; stop_serve; return 1; }
 
   # reclaim-sample is passive and must span the publish refs' release, so it
   # starts before the fill and outlives it; the spill is retained until it ends.
-  if [ -f "$COLD_SSD" ]; then
+  #
+  # It watches the SHARED prefix spill, `<cold-ssd-path>.prefix.bin`
+  # (kv_tiers._shared_ssd_path), NOT the private `$COLD_SSD`: the #740 trailing
+  # truncation reclaims the shared file. Sampling the private one measured a file
+  # the effect does not touch, so the sample could only ever read a plateau.
+  #
+  # Started whether or not the file exists yet: it is created by the window's own
+  # first publish, and the sampler reads a missing path as size 0, so gating on
+  # existence would skip sampling on exactly the arm that creates it.
+  #
+  # BUT only on the arm pair where the reclaim is a MEASUREMENT. Without
+  # TILERL_COLD_PREFIX_SSD_CAP the shared spill is unbounded and never truncates,
+  # so a sample of it can only read a plateau -- and because the arm `wait`s on the
+  # sampler, every other arm paid its full duration for a non-result. The two arms
+  # that carry the question are bgcap (the cap: truncation observable) and bg2 (the
+  # same bg config WITHOUT the cap: the plateau is the control for it). Sampling
+  # only bgcap would state a shrink with nothing to compare it against.
+  local reclaim_pid= reclaim_on=0
+  case "$name" in bgcap|bg2) reclaim_on=1 ;; esac
+  if [ "$reclaim_on" = 1 ]; then
+    local shared_spill="${COLD_SSD%.bin}.prefix.bin"
     "$PYTHON" scripts/probe_headroom_coldtail.py reclaim-sample \
-      --spill-path "$COLD_SSD" --out "$dir/reclaim.json" \
+      --spill-path "$shared_spill" --out "$dir/reclaim.json" \
       --samples "$RECLAIM_SAMPLES" --interval-s "$RECLAIM_INTERVAL_S" \
       >"$dir/reclaim.log" 2>&1 &
     reclaim_pid=$!
   fi
 
   "$PYTHON" scripts/probe_headroom_coldtail.py arm \
-    --url "$HEALTH_URL" --headroom 0 --log "$LOG" --out "$dir/arm.json" \
+    --url "$HEALTH_URL" --headroom 0 --log "$arm_log" --out "$dir/arm.json" \
     --prompt-tokens "$PROMPT_TOKENS" --warm-reps "$WARM_REPS" \
     --expect-window "$WINDOW_TOKENS" >"$dir/arm.log" 2>&1
   local rc=$?
@@ -191,9 +255,67 @@ run_arm() {
   # dec==1 & sparse==1 & model>0 & sample>0 & path!=graph with the tail listed
   # apart. Re-filter the same log so the two can be tabled together -- or not
   # tabled at all, when this log cannot support the standard set.
-  "$PYTHON" scripts/steady_filter.py --log "$LOG" --out "$dir/steady.json" \
-    >"$dir/steady.log" 2>&1
-  log "arm $name: steady-filter rc=$? (see $dir/steady.json)"
+  # Window the standard-set re-filter to this arm's WARM spans. Three things must be
+  # excluded and a start offset excludes none of them:
+  #   - the supervisor's warmup (dense 7000 + sparse 9000 prompts, 8-token decodes)
+  #     which runs before any arm measurement;
+  #   - EVERY rep's cold FILL, which sits between that rep's warm window and the
+  #     previous one in the same log and emits short-context decode ticks that pass
+  #     the standard set.
+  # The probe's log_byte_offset is a warm START (taken after the fill, before the
+  # warm POST), so [off_i, off_{i+1}) would contain warm_i AND fill_{i+1} -- the very
+  # ticks this is meant to drop. Each rep therefore carries its own log_byte_end, and
+  # every span is an explicit start:end, the last one included (relying on the last
+  # rep being clean only because nothing writes after it is step-ordering, not
+  # geometry, and a later step added after the filter would silently break it).
+  # One --window per rep and ONE call, so the median is taken over the union of the
+  # rows rather than averaged across per-rep medians (which would weight a
+  # 2-tick rep the same as an 8-tick one).
+  local win_args=() spans
+  spans=$("$PYTHON" -c '
+import json, sys
+try:
+    arm = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    raise SystemExit          # no arm.json -> no spans -> the branch below says so
+bad = []
+for r in arm.get("reps", []):
+    t = r.get("ticks")
+    if not t:
+        continue
+    start = t.get("log_byte_offset")
+    end = t.get("log_byte_end")
+    if end is None:
+        # No fallback to EOF: only the LAST rep would be clean that way, and only
+        # because nothing happens to write after it (step ordering, not geometry).
+        # A stale arm.json is refused like a missing one rather than yielding a
+        # number that quietly includes the next rep fill.
+        bad.append(str(start))
+    else:
+        print("%d:%d" % (start, end))
+if bad:
+    print("reps %s lack log_byte_end (arm.json predates the probe fix); the "
+          "warm window cannot be bounded, so no steady figure is produced"
+          % ", ".join(bad), file=sys.stderr)
+    raise SystemExit(3)
+' "$dir/arm.json" 2>"$dir/spans.note") || spans=
+  if [ -z "$spans" ]; then
+    # No spans means no bounded warm windows, so there is NO standard-set figure
+    # for this arm. Falling through to an unwindowed (or open-ended) read would
+    # write a steady.json whose median contains the supervisor's warmup and a later
+    # rep's fill -- a number that looks like the others and is not. Refuse instead
+    # of degrading, and surface the extractor's own reason when it gave one.
+    log "arm $name: no bounded warm spans in arm.json"
+    [ -s "$dir/spans.note" ] && log "  -- $(cat "$dir/spans.note")"
+    log "  -- steady.json NOT written: there is no warm span to filter to"
+  else
+    # Each line is already a start:end span, so the shell only forwards them.
+    for s in $spans; do win_args+=(--window "$s"); done
+    # ${a[@]+...} so an empty win_args does not trip `set -u` on bash 3.2.
+    "$PYTHON" scripts/steady_filter.py --log "$arm_log" --out "$dir/steady.json" \
+      ${win_args[@]+"${win_args[@]}"} >"$dir/steady.log" 2>&1
+    log "arm $name: steady-filter rc=$? (see $dir/steady.json)"
+  fi
 
   # Each smoke is recorded, and a failed one fails the arm: a window that reports
   # "arm done" over a broken follower or a wedged cancel is worse than one that
