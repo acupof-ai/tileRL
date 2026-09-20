@@ -196,45 +196,97 @@ def test_the_sandboxes_do_not_land_in_the_cwd():
     assert not list(pathlib.Path.cwd().glob("serve_v100_check.*"))
 
 
+def _date_flavour(binary: str) -> str:
+    """'bsd' or 'gnu' -- asked of the BINARY, never inferred from its name or host.
+
+    The first version labelled `date` as "bsd/macOS" and `gdate` as "gnu" and then
+    branched on the label, so on Linux (where plain `date` IS GNU) it ran the BSD
+    parse command `date -j -f` against GNU date: `date: invalid option -- 'j'`.
+    Same defect class as the bug this PR fixes -- a platform-specific branch running
+    on the wrong platform -- so it is keyed on a probe, not on an assumption.
+    """
+    # `-j -f <fmt> <date>` is BSD-only; GNU refuses `-j`.
+    probe = subprocess.run([binary, "-j", "-f", "%Y-%m-%d", "2026-01-01", "+%s"],
+                           capture_output=True, text=True, timeout=30)
+    return "bsd" if probe.returncode == 0 else "gnu"
+
+
 def test_the_boot_timestamp_is_portable_and_parseable():
     """The boot/exit lines are the only record of when a restart happened, and they
     used `date -Is`, which BSD `date` rejects (`date: invalid argument 's' for -I`)
     -- so on macOS every one of those lines carried an empty timestamp.
 
-    The gate is the timestamp FORMAT, not a grep for the new spelling: run both
-    `date` implementations the scripts can meet and require each to emit a value the
-    platform's own parser accepts. A grep would pass on a string no `date` produces.
+    The gate is the timestamp FORMAT, not a grep for the new spelling: run every
+    `date` implementation the scripts can meet and require each to emit a value its
+    own platform parser accepts. A grep would pass on a string no `date` produces.
     """
     from datetime import datetime
 
     fmt = "%Y-%m-%dT%H:%M:%S%z"
-    for name, binary in (("bsd/macOS", "date"), ("gnu", "gdate")):
+    # `date` is POSIX-required; `gdate` is the GNU build Homebrew installs beside
+    # BSD date on macOS, so that host exercises both flavours.
+    seen = set()
+    for binary in ("date", "gdate"):
         if shutil.which(binary) is None:
-            continue  # gdate is a macOS extra; CI's Ubuntu has GNU as plain `date`
+            continue
+        flavour = _date_flavour(binary)
+        seen.add(flavour)
         out = subprocess.run([binary, "+" + fmt], capture_output=True, text=True, timeout=30)
-        assert out.returncode == 0, (name, out.stderr[:200])
+        assert out.returncode == 0, (binary, flavour, out.stderr[:200])
         stamp = out.stdout.strip()
-        # Python is the reader that matters: the vendored artifacts are parsed by
-        # hand-written code, and `fromisoformat` accepts %z with and without the
-        # colon (verified: +0800 and +08:00 both parse).
+        # Python is the reader that matters: the artifacts are consumed by code, and
+        # `fromisoformat` accepts %z with and without the colon (both verified).
         parsed = datetime.fromisoformat(stamp)
-        assert parsed.tzinfo is not None, (name, stamp)
-        # ... and the platform's own parser must accept it too, since an operator
-        # reading the log will reach for `date -j -f` (BSD) or `date -d` (GNU).
-        if name.startswith("bsd"):
-            p = subprocess.run(["date", "-j", "-f", fmt, stamp, "+%s"],
-                               capture_output=True, text=True, timeout=30)
+        assert parsed.tzinfo is not None, (binary, stamp)
+        # ... and the flavour's OWN parser must accept it, since an operator reading
+        # the log reaches for `date -j -f` (bsd) or `date -d` (gnu). Each branch runs
+        # only against a binary PROBED to be that flavour.
+        if flavour == "bsd":
+            cmd = [binary, "-j", "-f", fmt, stamp, "+%s"]
         else:
-            p = subprocess.run(["gdate", "-d", stamp, "+%s"],
-                               capture_output=True, text=True, timeout=30)
-        assert p.returncode == 0, (name, stamp, p.stderr[:200])
+            cmd = [binary, "-d", stamp, "+%s"]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, (binary, flavour, stamp, p.stderr[:200])
+    assert seen, "no date implementation was exercised"
 
     # No launcher may go back to the non-portable form. `%:z` is NOT the fix either:
-    # BSD date prints it literally (`...20:37:37:z`), measured.
+    # BSD date prints it literally (`...20:37:37:z`, measured).
     here = SRC.parent
     offenders = [p.name for p in sorted(here.glob("serve_*.sh"))
                  if "date -Is" in p.read_text() or "date +%Y-%m-%dT%H:%M:%S%:z" in p.read_text()]
     assert not offenders, f"non-portable timestamp in {offenders}"
+
+
+def test_the_flavour_probe_separates_the_two_parse_forms():
+    """Pin the discriminator itself, so a label-based branch cannot come back.
+
+    The ubuntu row went red because a BSD parse command ran against GNU date. Where
+    both flavours exist this asserts each binary answers its own flavour and that the
+    two parse forms really are distinct -- the fact the probe relies on.
+    """
+    fmt = "%Y-%m-%dT%H:%M:%S%z"
+    flavours = {}
+    for binary in ("date", "gdate"):
+        if shutil.which(binary) is None:
+            continue
+        flavours[_date_flavour(binary)] = binary
+    assert flavours, "no date implementation available"
+    for flavour, binary in flavours.items():
+        stamp = subprocess.run([binary, "+" + fmt], capture_output=True, text=True,
+                               timeout=30).stdout.strip()
+        own = (["-j", "-f", fmt, stamp, "+%s"] if flavour == "bsd"
+               else ["-d", stamp, "+%s"])
+        assert subprocess.run([binary, *own], capture_output=True,
+                              timeout=30).returncode == 0, (flavour, own)
+    # The two forms are not interchangeable: whatever else is on this host must
+    # reject the form that is not its own.
+    gnu_bin = flavours.get("gnu")
+    if gnu_bin is not None:
+        r = subprocess.run([gnu_bin, "-j", "-f", fmt, "2026-01-01", "+%s"],
+                           capture_output=True, text=True, timeout=30)
+        # The message names the invoked binary (`gdate: invalid option -- 'j'`), so
+        # match the quoted flag, not the program name.
+        assert r.returncode != 0 and "'j'" in r.stderr, r.stderr[:200]
 
 
 def test_the_old_form_really_was_broken_on_this_platform():
