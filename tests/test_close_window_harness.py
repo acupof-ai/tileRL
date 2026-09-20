@@ -22,6 +22,7 @@ import os
 import pathlib
 import re
 import subprocess
+import time
 
 import pytest
 
@@ -630,12 +631,114 @@ def test_clean_spill_deletes_every_sibling_of_this_arms_stem(tmp_path):
     assert r.stdout.count("deleted ") == 3, r.stdout[-600:]
 
 
-def test_clean_spill_refuses_while_anything_of_the_serve_is_up():
-    """The supervisor RESTARTS a killed python, so a guard that only looks for
-    `tilerl.cli serve` finds nothing in the gap between the kill and the reboot and
-    deletes a spill the incoming boot is about to read. It checks what `stop_serve`
-    signals, so the guard and the stop cannot disagree."""
-    body = SRC.read_text().split("clean_spill() {", 1)[1].split("\n}", 1)[0]
-    for pat in ("tilerl.cli serve", "serve_hybrid_v100.sh", "serve_liveness.py"):
-        assert f'"{pat}"' in body, f"clean_spill does not check {pat}"
-    assert "REFUSING" in body
+def test_clean_spill_refuses_while_the_supervisor_is_between_restarts(tmp_path):
+    """The guard's failure mode is a DELETION, so it is driven, not grepped.
+
+    `serve_hybrid_v100.sh` RESTARTS a serve python that exits, so there is a window
+    where the supervisor is alive and `tilerl.cli serve` is not. A guard that checks
+    only the python finds nothing there, logs "serve is down", and deletes a spill the
+    incoming boot is about to read. The guard has to check what `stop_serve` signals.
+
+    Both arms run the REAL script with `--arm locksplit`, which is refused before any
+    serve work, so the end-of-run prompts are reached without a card:
+
+      RED   -- the OLD single-pattern guard, same tree, same gap: it deletes.
+      GREEN -- the shipped guard: it REFUSES and leaves every file on disk.
+      GREEN2-- decoy stopped, so no pattern matches: it reaches the prompts and the
+               deletion is real, which is what makes the refusal above mean
+               something rather than "this code path never deletes".
+
+    The RED arm substitutes the guard TEXT from the pre-fix revision (taken with
+    `git show <base>:scripts/...`, not retyped here), so it cannot drift from what
+    actually shipped. The substitution is asserted, so a stale base turns the arm
+    red instead of silently making GREEN and RED the same program.
+    """
+    import subprocess as _sp
+
+    root = tmp_path
+    files = ["sparse_cold_128k.bin", "sparse_cold_128k.prefix.bin",
+             "sparse_cold_128k.prefix.w5.bin", "qwen38-27b.prefix.bin"]
+
+    def seed():
+        for name in files:
+            (root / name).write_text("x")
+
+    def survivors():
+        return sorted(p.name for p in root.iterdir() if p.name in files)
+
+    decoy = root / "serve_hybrid_v100.sh"
+    decoy.write_text("#!/usr/bin/env bash\nsleep 120\n")
+    decoy.chmod(0o755)
+    env = {**os.environ, "SERVE_ROOT": str(root), "SERVE_PYTHON": "/nonexistent"}
+
+    def run(script, answers, tag):
+        return _sp.run(["bash", str(script), "--arm", "locksplit"], input=answers,
+                       capture_output=True, text=True, timeout=120,
+                       env={**env, "OUT": str(root / tag)})
+
+    # Two answers are consumed before cleanup runs at all: the restore prompt and
+    # the "delete the spill files?" prompt. Both must be right or the arm measures
+    # nothing -- `n` to the second one skips clean_spill entirely, so RED read as
+    # "the old guard also refused" when it had never been called. The remaining four
+    # are the per-file prompts; feeding fewer leaves the last file at EOF and it is
+    # "kept" for that reason rather than by the guard.
+    answers = "n\ny\n" + "y\n" * len(files)
+
+    # ---- RED / GREEN with the supervisor alive and no serve python under it.
+    sup = _sp.Popen(["bash", str(decoy)])
+    try:
+        deadline = time.monotonic() + 20
+        while _sp.run(["pgrep", "-f", "serve_hybrid_v100.sh"], capture_output=True).returncode != 0:
+            assert time.monotonic() < deadline, "the decoy supervisor never became visible"
+            assert sup.poll() is None, "the decoy supervisor exited"
+            time.sleep(0.05)
+        assert _sp.run(["pgrep", "-f", "tilerl.cli serve"], capture_output=True).returncode != 0, \
+            "precondition failed: a serve python is running, so this is not the gap"
+
+        # RED: the guard text as it was before this PR, read from the base commit.
+        base = _sp.run(["git", "-C", str(REPO), "rev-parse", "origin/main"],
+                       capture_output=True, text=True, check=True).stdout.strip()
+        old_src = _sp.run(["git", "-C", str(REPO), "show",
+                           f"{base}:scripts/run_close_window_v100.sh"],
+                          capture_output=True, text=True, check=True).stdout
+        # Slice inside clean_spill, not across the whole file: `pgrep -f
+        # "tilerl.cli serve"` also appears in stop_serve, which is earlier, and
+        # slicing from there silently produced a 255-line "guard" that matched
+        # nothing.
+        def guard_of(text):
+            fn = text[text.index("clean_spill() {"):]
+            start = fn.index("  local pat") if "  local pat" in fn else \
+                fn.index('  pgrep -f "tilerl.cli serve"')
+            end = fn.index("  # The list arrives on fd 3") if "  # The list arrives" in fn \
+                else fn.index('  for f in "$COLD_SSD"')
+            return fn[start:end]
+
+        new_guard, old_guard = guard_of(SRC.read_text()), guard_of(old_src)
+        assert "serve_hybrid_v100.sh" not in old_guard, "the RED arm is not the old guard"
+        red = root / "red.sh"
+        red.write_text(SRC.read_text().replace(new_guard, old_guard))
+        assert old_guard in red.read_text(), "the substitution did not apply"
+        assert new_guard not in red.read_text(), "new and old guard are the same text"
+
+        seed()
+        r = run(red, answers, "red")
+        assert "deleted " in r.stdout, (
+            f"RED is vacuous -- the old python-only guard also refused, so this gate "
+            f"proves nothing about the gap: {r.stdout[-400:]}")
+        assert survivors() != sorted(files), "RED did not actually delete; the arm proves nothing"
+
+        seed()
+        g = run(SRC, answers, "green")
+        assert "REFUSING" in g.stdout, g.stdout[-400:]
+        assert "deleted " not in g.stdout, "the guard refused and then deleted anyway"
+        assert survivors() == sorted(files), f"a file was deleted despite the refusal: {survivors()}"
+    finally:
+        sup.kill()
+        sup.wait(timeout=30)
+
+    # ---- GREEN2: no pattern matches, so the same run must delete.
+    seed()
+    g2 = run(SRC, answers, "green2")
+    assert "REFUSING" not in g2.stdout, f"nothing is running; the guard must not refuse: {g2.stdout[-400:]}"
+    assert g2.stdout.count("deleted ") == len(files), g2.stdout[-400:]
+    assert survivors() == [], survivors()
