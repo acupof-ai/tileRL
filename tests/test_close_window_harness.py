@@ -18,9 +18,12 @@ no locking of its own.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import re
 import subprocess
+
+import pytest
 
 SRC = pathlib.Path(__file__).parent.parent / "scripts" / "run_close_window_v100.sh"
 REPO = SRC.parent.parent
@@ -563,3 +566,76 @@ def test_restore_uses_the_production_fuse_read_only():
         assert bad not in code, f"restore mutates the prod fuse: {bad}"
     assert "$ROOT/.servehybridsse.fuse" in code, "restore does not name the prod fuse"
     assert "WARNING" in code, "restore does not warn when the prod fuse is tripped"
+
+
+# ------------------------------------------------------------------ *.py collection
+# Every gate here that reads SOURCE starts by enumerating `*.py`, and an AppleDouble
+# sidecar (`._evil.py`) matches that glob on every platform and Python tested. Its
+# bytes are a binary header, so reading it raises UnicodeDecodeError -- which is how
+# every one of these gates would fail: as a collection error about a file that is not
+# source, burying whatever the gate was really asserting. `scripts/pod_sync_check.py`
+# already shipped the predicate; this is the same one, with a gate, so the next
+# enumeration site inherits it instead of rediscovering it.
+def test_apple_double_sidecars_are_skipped_and_named(tmp_path):
+    """Excluded from the collection AND reported -- a silent skip is how a real source
+    file with a genuine encoding defect would vanish from every gate at once."""
+    (tmp_path / "._evil.py").write_bytes(b"\x00\x01\xff\xfe com.apple.provenance \x80\n")
+    (tmp_path / "evil.py").write_text("real = 1\n")
+    src, skipped = py_sources(tmp_path)
+    assert [p.name for p in src] == ["evil.py"], [p.name for p in src]
+    assert skipped == ["._evil.py"], skipped
+
+
+def test_the_apple_double_guard_is_what_keeps_the_collection_readable(tmp_path):
+    """Negative control: without the guard the same tree raises. Removing the
+    `startswith` from `py_sources` must turn this gate red."""
+    (tmp_path / "._evil.py").write_bytes(b"\x00\x01\xff\xfe com.apple.provenance \x80\n")
+    (tmp_path / "evil.py").write_text("real = 1\n")
+    raw = sorted(tmp_path.rglob("*.py"))
+    assert [p.name for p in raw] == ["._evil.py", "evil.py"], [p.name for p in raw]
+    with pytest.raises(UnicodeDecodeError):
+        "".join(p.read_text() for p in raw)   # the unguarded collection
+    # ... and the guarded one has to be what this test would catch: strip the
+    # predicate from `py_sources` and `read_sources` raises here.
+    assert read_sources(tmp_path) == "real = 1\n"
+
+
+def test_clean_spill_deletes_every_sibling_of_this_arms_stem(tmp_path):
+    """The shared-prefix spill is a SET, not one file: the cold bucket is plain
+    `.prefix.bin`, and a warm bucket is `<base>.prefix.w<field-count>.bin` (today
+    `.prefix.w5.bin`, the (bounds,dk,dv,k,v) warm spec page). Cleaning only the two
+    the old list named left the warm sibling on disk -- the biggest of the three --
+    so the next window started against a partially-filled spill and its cold-tier
+    gate read a state nobody intended.
+
+    Driven through the REAL script, and that matters here: an earlier version of this
+    loop was `while read ... done < <(spill_files)`, which redirects the loop's stdin
+    so `read -r ans` ate the next FILENAME instead of the operator's answer. Every
+    file was silently "kept", y or not, and a grep-based gate would have passed it.
+    """
+    root = tmp_path
+    for name in ("sparse_cold_128k.bin", "sparse_cold_128k.prefix.bin",
+                 "sparse_cold_128k.prefix.w5.bin", "otherstem.prefix.w5.bin",
+                 "qwen38-27b.prefix.bin"):
+        (root / name).write_text("x")
+    # `--arm locksplit` is refused (PENDING_746) before any serve work, so the end-of-run
+    # prompts are reached without a card: n to the restore, y to each of three deletes.
+    r = subprocess.run(["bash", str(SRC), "--arm", "locksplit"],
+                       input="n\ny\ny\ny\ny\n", capture_output=True, text=True, timeout=120,
+                       env={**os.environ, "SERVE_ROOT": str(root),
+                            "SERVE_PYTHON": "/nonexistent"})
+    left = sorted(p.name for p in root.iterdir() if p.name != "closewin")
+    assert left == ["otherstem.prefix.w5.bin", "qwen38-27b.prefix.bin"], (
+        f"this arm's stem must lose all three of its files and no other stem any: {left}")
+    assert r.stdout.count("deleted ") == 3, r.stdout[-600:]
+
+
+def test_clean_spill_refuses_while_anything_of_the_serve_is_up():
+    """The supervisor RESTARTS a killed python, so a guard that only looks for
+    `tilerl.cli serve` finds nothing in the gap between the kill and the reboot and
+    deletes a spill the incoming boot is about to read. It checks what `stop_serve`
+    signals, so the guard and the stop cannot disagree."""
+    body = SRC.read_text().split("clean_spill() {", 1)[1].split("\n}", 1)[0]
+    for pat in ("tilerl.cli serve", "serve_hybrid_v100.sh", "serve_liveness.py"):
+        assert f'"{pat}"' in body, f"clean_spill does not check {pat}"
+    assert "REFUSING" in body
