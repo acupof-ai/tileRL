@@ -38,8 +38,8 @@ def test_dry_run_resolves_the_sparse_d1_decode_graph_argv():
     for flag in ("--sparse-k", "128", "--sparse-min-tokens", "8192",
                  "--depth", "1", "--decode-graph", "--cold-ssd-path"):
         assert flag in argv, f"missing {flag}: {argv}"
-    # the boot self-certification line names the default arm
-    assert "arm: depth=1 sparse_k=128 decode_graph=on ctx=131072 slots=8" in out
+    # the boot self-certification line names the default arm, window included
+    assert "arm: depth=1 sparse_k=128 decode_graph=on ctx=131072 slots=8 w=0" in out
     # Never the V100 hard-coded venv, and never launched through `uv run` (the
     # cu130 torch it resolves cannot load on the pod's 12.9 driver).
     assert "venv70" not in out
@@ -54,7 +54,23 @@ def test_decode_graph_off_arm_passes_the_explicit_force_off_flag():
     # AUTO-enables capture on sm90, so a missing flag would silently stay graph-on.
     assert "--no-decode-graph" in argv
     assert "--decode-graph" not in argv
-    assert "arm: depth=3 sparse_k=128 decode_graph=off ctx=131072 slots=8" in out
+    assert "arm: depth=3 sparse_k=128 decode_graph=off ctx=131072 slots=8 w=0" in out
+
+
+def test_the_draft_window_reaches_argv_only_when_nonzero_and_self_reports():
+    # A6's arm: the launched window must be in the resolved argv, or the arm is
+    # silently the full-prefix one -- and the descriptor must name it, because
+    # A6's evidence is that banner rather than an environ read.
+    rc, out, err = _dry_run({"SERVE_DRAFT_WINDOW": "2048"})
+    assert rc == 0, err
+    argv = out.split()
+    i = argv.index("--draft-attn-window-tokens")
+    assert argv[i + 1] == "2048", argv
+    assert "w=2048" in out
+    # 0 IS the CLI default (full prefix), so the default arm adds no flag: an
+    # explicit `--draft-attn-window-tokens 0` would be one more token to read
+    # past in a log holding every arm.
+    assert "--draft-attn-window-tokens" not in _dry_run({})[1].split()
 
 
 def test_dense_arm_keeps_decode_graph_off():
