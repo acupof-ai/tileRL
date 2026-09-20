@@ -61,7 +61,11 @@ SLOTS=${SERVE_SLOTS:-8}
 BATCH=${SERVE_BATCH:-8}
 CTX=${SERVE_CTX:-131072}
 DEPTH=${SERVE_DEPTH:-1}
-# sm90 decode graph on by default; set SERVE_DECODE_GRAPH=0 for the graph-off arm.
+# sm90 decode graph on by default. SERVE_DECODE_GRAPH=0 passes the explicit
+# --no-decode-graph force-off: merely omitting --decode-graph leaves the CLI arg
+# at its default None, which engine _graph_on resolves to AUTO = ON on sm90/cuda
+# (cli.py --decode-graph is store_const default None; the only off switch is
+# --no-decode-graph, const=False).
 DECODE_GRAPH=${SERVE_DECODE_GRAPH:-1}
 MAX_RESTARTS=${MAX_RESTARTS:-10}
 RESTART_FUSE_MAX=${RESTART_FUSE_MAX:-5}
@@ -79,8 +83,9 @@ if [ -n "$COLD_SSD" ]; then
             --cold-ssd-path "$COLD_SSD" --cold-ssd-bytes "$COLD_SSD_BYTES")
 fi
 
-# SERVE_DECODE_GRAPH=0 drops --decode-graph (the graph-off measurement arm).
-GRAPH_ARGS=()
+# SERVE_DECODE_GRAPH=0 must pass --no-decode-graph explicitly: on sm90 the CLI's
+# default (None) AUTO-enables capture, so omitting the flag would stay graph-on.
+GRAPH_ARGS=(--no-decode-graph)
 [ "$DECODE_GRAPH" != 0 ] && GRAPH_ARGS=(--decode-graph)
 # One arm descriptor, logged on every boot line and printed by --dry-run so the
 # reader of /work/serve_h20.log can self-certify which arm served without relying
