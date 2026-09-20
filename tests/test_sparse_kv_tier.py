@@ -1109,6 +1109,97 @@ def test_bg_publish_lifts_an_ssd_private_page(tmp_path):
         cold.close()
 
 
+def test_bg_publish_ssd_lift_balances_private_mapping_borrow(tmp_path):
+    """borrow_read increments the PRIVATE file's mapping borrow; it must be
+    released exactly once after the bytes are read (a leaked borrow keeps every
+    later mmap generation alive forever). After a normal lift, a write-failure
+    lift (blob falls back to RAM), and a dup-content lift, both spill files show
+    _borrowed == 0 and no pinned keys."""
+    ssd = str(tmp_path / "bal.bin")
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+
+    def spill(key, fill):
+        b = pool.alloc_block()
+        pool.k_pool[:, b].fill_(fill)
+        pool.v_pool[:, b].fill_(-fill)
+        pool.demote_page(b, key=key)  # -> private SSD
+        return b
+
+    try:
+        spill(1, 1)
+        assert cold.offer_publish(1, 100, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([100])
+        # normal lift: private mapping borrow back to zero, no lingering pin
+        assert cold._ssd._borrowed == 0
+        assert not cold._ssd._pinned_keys
+
+        # second page: force the shared write to fail once -> RAM fallback
+        spill(2, 2)
+        assert cold._shared_ssd is not None
+        shared_ssd = cold._shared_ssd
+        real_write = shared_ssd.write_reserved
+        shared_ssd.write_reserved = lambda slot, blob, mapping: (_ for _ in ()).throw(
+            OSError("boom"))
+        cold.offer_publish(2, 200, {"bounds": torch.zeros(2)})
+        assert cold.wait_committed([200])
+        shared_ssd.write_reserved = real_write
+        assert cold._ssd._borrowed == 0 and not cold._ssd._pinned_keys
+        assert shared_ssd._borrowed == 0 and not shared_ssd._reserved
+    finally:
+        cold.close()
+
+
+def test_bg_publish_dup_content_ssd_consumes_private_slot(tmp_path):
+    """Two publishers with the SAME content key both spilled privately: the
+    second inline commit creates the shared record while the first sits queued,
+    so the worker takes the dup path (no borrow). It must still consume the
+    queued private slot — slot recycled, extent live back to 0, private
+    _ssd_bytes decremented exactly once — not leak it via consume_pinned's
+    not-pinned early return."""
+    ssd = str(tmp_path / "dup.bin")
+    import threading
+
+    cold = HostKvPages(budget_bytes=64, ssd_path=ssd, bg_publish=True)
+    pool = PagedKvPool(8, 2, 8, num_layers=2, device=torch.device("cpu"))
+    pool.attach_cold(cold)
+    gate = threading.Event()
+    _gate_worker(cold, gate)
+    try:
+        # two identical-content private pages; capture their private SSD slots
+        slots = []
+        for key in (10, 11):
+            b = pool.alloc_block()
+            pool.k_pool[:, b].fill_(3)
+            pool.v_pool[:, b].fill_(-3)
+            pool.demote_page(b, key=key)
+            slots.append(cold._ssd._slot_of[key])
+        before = cold.ssd_bytes
+        assert before > 0
+        # enqueue the first; it parks BEFORE commit (no inline record yet)
+        assert cold.offer_publish(10, 700, {"bounds": torch.zeros(2)})
+        # inline-commit the second publisher with the same content key so the
+        # worker, when released, finds the shared record already present (dup)
+        gate.set()
+        n = cold.share_hold_kv(11, 700, {"bounds": torch.zeros(2)})
+        assert n
+        assert cold.drain_publishes(5)
+        # shared record refcount 2 (one per publisher), both private slots gone
+        assert cold._shared[700][1] == 2
+        assert 10 not in cold._ssd and 11 not in cold._ssd
+        assert cold.ssd_bytes == 0
+        assert sum(cold._ssd._extent_live) == 0
+        assert all(s in cold._ssd._free_slots for s in slots)
+        assert not cold._ssd._pinned_keys and cold._ssd._borrowed == 0
+        # the shared page still serves the content
+        blob = cold.share_take(700)
+        assert blob is not None and torch.all(blob["k"] == 3)
+    finally:
+        gate.set()
+        cold.close()
+
+
 def test_bg_publish_queue_full_degrades_to_false_inline_path():
     """A full bounded queue makes offer return False so the caller transfers
     inline; nothing is reserved, no publish is lost or silently stranded."""

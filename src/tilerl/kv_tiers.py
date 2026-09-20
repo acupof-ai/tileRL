@@ -665,8 +665,13 @@ class HostKvPages:
         through that file's own lock, reads its bytes, reserves a shared slot and
         copies the bytes in — the two slow disk passes never hold _tlock. Returns
         a zero-arg phase-3 committer (takes _tlock), or None when the source is
-        gone. Reserved slots and borrows roll back on failure (no extent/slot
-        leak). Lock order is _tlock -> ColdSsdFile._mlock everywhere; the IO
+        gone. The mapping borrow from borrow_read is released exactly once, in a
+        finally right after read_borrowed (success or failure); the source KEY pin
+        outlives the copy to phase 3 on the non-dup SSD path. A duplicate-content
+        SSD source never borrows (no bytes are read) and is consumed in phase 3 by
+        the ordinary forget. Reserved shared slots and key pins roll back on
+        failure (no extent/slot/borrow leak). Lock order is _tlock ->
+        ColdSsdFile._mlock everywhere; the IO
         itself holds neither."""
         # ---- phase 1a: short _tlock section: resolve RAM vs SSD ----
         with self._tlock:
@@ -706,10 +711,12 @@ class HostKvPages:
         try:
             blob = self._ssd.read_borrowed(src)
         except Exception:
-            self._ssd.rollback_pinned(private_key)  # unpin source on read failure
+            # read failed: unpin the source KEY; the mapping borrow is released
+            # once by the finally below on both success and failure.
+            self._ssd.rollback_pinned(private_key)
             raise
-        # bytes are now in the local blob; the mapping borrow ended inside the
-        # read's finally, and the source KEY stays pinned until phase 3.
+        finally:
+            self._ssd.release_mapping_borrow()
         if extra:
             blob.update(extra)
         pn = self._ssd_page_bytes.get(private_key, self._ssd.stride)
@@ -743,13 +750,15 @@ class HostKvPages:
             return self._fold_and_event(shared_key)
 
     def _commit_dup_ssd_publish(self, private_key, shared_key):
-        """Phase 3 for a duplicate content key whose PRIVATE copy is on SSD:
-        consume that pinned copy (consume_pinned frees+unpins under the file
-        lock) and ref++ the existing record, under _tlock for the byte total."""
+        """Phase 3 for a duplicate content key whose PRIVATE copy is on SSD. The
+        dup path never borrowed the source (no read), so the key is NOT pinned:
+        consume it through the ordinary spill-file forget under the file's lock
+        and ref++ the existing record, under _tlock for the byte total."""
         with self._tlock:
             existing = self._shared.get(shared_key)
             pn = self._ssd_page_bytes.pop(private_key, self._ssd.stride)
-            if self._ssd.consume_pinned(private_key):
+            if private_key in self._ssd:
+                self._ssd.forget(private_key)
                 self._ssd_bytes -= pn
             self._pub_private.discard(private_key)
             if existing is not None:

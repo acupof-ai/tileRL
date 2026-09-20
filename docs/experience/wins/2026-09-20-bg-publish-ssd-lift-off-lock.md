@@ -77,7 +77,14 @@ The worker stays CUDA-free (the prior diagnosis stands): private reads are
   `borrow_read` not pinning the key.
 - Byte equality of a lifted page and every prior background-publish gate
   (RAM/hold/dup/failure/follower-hit) still pass.
-- Full CPU suite **1030 passed / 22 skipped / 1 xfailed** (rebased over #745).
+- **Borrow balance / dup cleanup:** after a normal lift, a write-failure lift
+  (RAM fallback), and a dup-content lift, both spill files show `_borrowed == 0`
+  and no pinned keys; two same-content private publishers (one queued, one
+  inline, so the worker takes the never-borrowed dup path) both have private
+  slots recycled, extent live back to 0, and `_ssd_bytes` decremented exactly
+  once. Mutation-red on not releasing the private mapping borrow, and on routing
+  the dup consume through the pinned-only `consume_pinned`.
+- Full CPU suite **1032 passed / 22 skipped / 1 xfailed** (rebased over #745).
 
 ## Rule
 
@@ -100,7 +107,7 @@ Steady decode (~166 ms/tick, ~9.4 tok/s) must hold.
 
 | date | machine | target | result |
 |---|---|---|---|
-| 2026-09-20 | CPU (hermetic) | SSD lift disk IO off `_tlock` | IO-off-lock + source-pin + rollback gates green (all mutation-red); 1030 passed |
+| 2026-09-20 | CPU (hermetic) | SSD lift disk IO off `_tlock` | IO-off-lock + source-pin + rollback gates green (all mutation-red); 1032 passed |
 | next V100 window | V100 sm70, pending-remote | close ssd_mmap ~3.3 s | target: real lock-wait removed; lock-vs-drain split to be measured |
 
 Raw artifacts: `tests/test_sparse_kv_tier.py`; changes `src/tilerl/kv_tiers.py`.
