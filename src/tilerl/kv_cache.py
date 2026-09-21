@@ -9,7 +9,6 @@ device, after agent-infer's ``host_paged_kv_pool.rs`` / ``prefix_store.rs``.
 from __future__ import annotations
 
 import contextlib
-import os
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -49,28 +48,6 @@ def _kv_fp8_ref():
     from tilerl_kernels.reference import dequant_kv_fp8, quant_kv_fp8
 
     return quant_kv_fp8, dequant_kv_fp8
-
-
-class _CloseBatchDisabled:
-    """Sentinel yielded by close_publishes off-card / off-env: every snapshot is
-    an ordinary blocking clone, so no prepare/commit split is needed."""
-    active = False
-    synced = True
-
-
-class _CloseBatchActive:
-    """Holds the state of one close-time batched-D2H window. ``launched`` means at
-    least one non-blocking copy is in flight; ``synced`` is set by the single
-    batch-tail synchronization, after which the prepared pinned blobs are valid
-    and may be committed (share_hold / SSD write)."""
-    active = True
-
-    def __init__(self) -> None:
-        self.launched = False
-        self.synced = False
-        #: Prepared close pages awaiting the post-sync cold-tier commit, in
-        #: publish order. Tuples are consumed by SparseRuntime.transfer_deferred.
-        self.deferred: list = []
 
 
 class PagedKvPool:
@@ -230,11 +207,6 @@ class PagedKvPool:
                        ("vs", self.v_scale[:, block], None)]
         blob = {}
         n = 0
-        # An active close_publishes batch forces non-blocking D2H exactly like an
-        # explicit demotions batch; its single tail sync makes these valid.
-        batch = getattr(self, "_close_batch", None)
-        if isinstance(batch, _CloseBatchActive):
-            non_blocking = True
         for key, t, cast_dtype in planes:
             # A pinned cross-dtype copy_ narrows on the D2H path directly; no extra
             # device cast tensor is allocated.
@@ -243,8 +215,6 @@ class PagedKvPool:
             host.copy_(t, non_blocking=(non_blocking and cuda))
             blob[key] = host
             n += host.numel() * host.element_size()
-        if non_blocking and cuda and isinstance(batch, _CloseBatchActive):
-            batch.launched = True
         return blob, n
 
     def _sync_cold(self) -> None:
@@ -252,65 +222,6 @@ class PagedKvPool:
         the spy point the batched-demote gate counts (mock torch.cuda.synchronize)."""
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
-
-    @contextlib.contextmanager
-    def close_publishes(self, force: bool = False):
-        """Batch the device->host snapshots a request-close prefix publish takes
-        (bounds + draft K/V + still-resident trunk frames) into ONE device sync,
-        all of it BEFORE the publisher's blocks are returned to the pool.
-
-        Inside, ``host_snapshot`` and ``_page_blob(non_blocking=True)`` launch
-        non-blocking copies into per-page pinned buffers and return IMMEDIATELY;
-        the host data is not valid until the context exit runs the single sync.
-        The caller must therefore DEFER every read of those buffers (the cold
-        tier's share_hold / SSD write) until after ``__exit__`` — commit phase.
-        Sync-before-free is the whole contract: reusing a frame before this sync
-        would overwrite bytes a non-blocking D2H is still reading. Off cuda the
-        copies are synchronous clones and the sync is a no-op, but ``force=True``
-        still drives the prepare/commit split so the CPU e2e gate exercises the
-        exact batched code path (a plain cuda-flagged cell never reaches it).
-
-        Env-gated (TILERL_CLOSE_BATCH_D2H=1); without it the close path keeps
-        its per-page blocking copy behavior exactly. TILERL_CLOSE_BG_PUBLISH=1
-        also enables the batch: its background handoff needs the same
-        prepare/defer split. The gate is backend-agnostic so the CPU cell drives
-        the identical prepare/commit split (its copies are synchronous clones
-        and the tail sync is a no-op); only on cuda does the single batched
-        sync change wall time."""
-        enabled = force or os.environ.get(
-            "TILERL_CLOSE_BATCH_D2H", "").strip() not in (
-            "", "0", "false", "False") or os.environ.get(
-            "TILERL_CLOSE_BG_PUBLISH", "").strip() not in (
-            "", "0", "false", "False")
-        if not enabled:
-            yield _CloseBatchDisabled()
-            return
-        batch = _CloseBatchActive()
-        prev = getattr(self, "_close_batch", None)
-        self._close_batch = batch
-        try:
-            yield batch
-        finally:
-            self._close_batch = prev
-            # One sync makes every non-blocking D2H above valid BEFORE any
-            # publisher frame is freed (the caller frees only after this exits).
-            if batch.launched:
-                self._sync_cold()
-            batch.synced = True
-
-    def host_snapshot(self, t):
-        """A pinned host copy of one device tensor, non-blocking while a
-        ``close_publishes`` batch is active (valid after that batch's single
-        sync); a plain blocking clone otherwise. Used for the close-time bounds
-        and draft K/V planes."""
-        cuda = t.is_cuda
-        batch = getattr(self, "_close_batch", None)
-        nb = cuda and isinstance(batch, _CloseBatchActive)
-        host = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=cuda)
-        host.copy_(t, non_blocking=nb)
-        if nb:
-            batch.launched = True
-        return host
 
     def demote_page(self, block: int, key=None) -> int:
         """Move one page (all planes of one block id, fp8 scales included) to the
