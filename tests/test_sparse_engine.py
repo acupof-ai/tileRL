@@ -3232,3 +3232,62 @@ def test_sparse_nodraft_full_prefix_resend_re_forwards_the_last_page():
     ts = _drain(sparse, r2, 8)
     sparse.shutdown()
     assert ts == ts_miss, f"re-forwared follower {ts} != prefix-miss {ts_miss}"
+
+
+def test_health_namespaces_sparse_prefix_counters_separately_from_dense():
+    """#797: a sparse build runs NoPrefixStore, so the dense prefix_* fields read
+    the empty store and must NOT carry the sparse index's publishes/entries (the
+    +9/+8 misread during #796). The sparse SparsePrefixCache counters surface
+    under sparse_prefix_*, move on a sparse run, and are absent on a dense build.
+    """
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    from tilerl.engine import SamplingParams
+
+    def sparse_engine():
+        from tilerl_kernels.backend import get_backend
+        return build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+
+    eng = sparse_engine()
+    try:
+        # sparse publisher forms prefix entries via natural page drops
+        pid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+        _drain(eng, pid, 200)
+        st = eng.stats()
+        # sparse namespace moved: published counts frontier-closure events
+        # (one grow entry for this single publisher), live_entries >=1, and the
+        # shared cold pages carry the 24 published content pages.
+        assert st["sparse_prefix_published"] >= 1, st["sparse_prefix_published"]
+        assert st["sparse_prefix_entries"] >= 1, st["sparse_prefix_entries"]
+        assert st["sparse_prefix_entries_capacity"] > 0
+        assert st["kv_cold_shared_pages"] >= 24, st["kv_cold_shared_pages"]
+        # a warm follower takes a hit and a warm adoption
+        rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
+        eng.step()
+        _drain(eng, rid, 8)
+        st = eng.stats()
+        assert st["sparse_prefix_hits"] >= 1, st["sparse_prefix_hits"]
+        assert st["sparse_prefix_warm_adoptions"] >= 1, st["sparse_prefix_warm_adoptions"]
+        # the DENSE fields still read NoPrefixStore: empty, never the sparse counts
+        assert st["prefix_published"] == 0, st["prefix_published"]
+        assert st["prefix_entries"] == 0, st["prefix_entries"]
+    finally:
+        eng.shutdown()
+
+    # dense build: no sparse namespace at all, dense counters are the live ones.
+    from tilerl_kernels.backend import get_backend
+    dense = build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=0, scorer="bounds")
+    try:
+        dst = dense.stats()
+        assert "sparse_prefix_published" not in dst, dst.keys() & {
+            "sparse_prefix_published", "sparse_prefix_entries"}
+    finally:
+        dense.shutdown()
