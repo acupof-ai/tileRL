@@ -27,6 +27,16 @@ follower that adopts and decodes past its hot window.
 - `transfer_to_shared` on an existing content key skips bounds/draft/frame D2H
   and the private lift, taking one `share_ref`.
 
+The check, frame release and frontier closure are separate steps (the closure
+can land a later tick), so a prefix-index capacity LRU could evict the key in
+that gap and leave the closure naming a dead blob. The pin is now taken
+atomically (`share_ref_if_present`: live-check and ref bump in one critical
+section) before the frame is freed, on both release paths (finalize and
+evict_victim); the ref is parked in `preheld`, consumed by the closing
+frontier (handed to the grow entry, no second bump) or released at request
+drop when the frontier never closes. A missing shared blob at resolve falls
+back to a fresh block instead of raising.
+
 CPU gate: an adopted prefix re-leaving the union triggers zero `demote_page`
 calls on adopted pages and zero private→shared lifts, with follower tokens
 equal to a prefix-miss oracle; a forced post-adopt eviction exercises the
