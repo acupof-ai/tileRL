@@ -48,14 +48,15 @@ _SHORT_DECODE = 8
 _LONG_DECODE = 32
 
 
-def _publisher(decode_tokens: int, prefix_store=None):
+def _publisher(decode_tokens: int, prefix_store=None, prompt_tokens: int | None = None):
     kw = {} if prefix_store is None else {"prefix_store": prefix_store}
     e = build_engine(
         cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
         num_blocks=4096, num_slots=4, max_batch=1, max_total_tokens=65536,
         max_num_batched_tokens=_CHUNK, sparse_k=_K, scorer="bounds",
         kv_cold_bytes=1 << 30, decode_graph=True, **kw)
-    prompt = (np.arange(_PAGES * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    n_tok = _PAGES * BLOCK_TOKENS if prompt_tokens is None else prompt_tokens
+    prompt = (np.arange(n_tok, dtype=np.int64) % 300) + 7
     rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=decode_tokens, seed=0))
     saw_resident = False
     for _ in range(40000):
@@ -161,3 +162,30 @@ def test_the_close_path_still_carries_no_forced_publish():
         "closure this issue is re-scoping around")
     src = inspect.getsource(Engine._release)
     assert "close_request" not in src, "the request-release path calls close_request again"
+
+
+def test_an_unaligned_prompt_closes_to_its_actual_end_with_zero_tail_recompute():
+    """b'2 + perf2 F1: the real M6 prompt is 32028 tokens = 2001 pages + 12
+    tokens, so no note_boundary snapshot exists at the prompt end. Without a
+    synthesized end snapshot the closure stops at m=1920 and the follower
+    recomputes the 81-page / 1308-token (4.1%) tail. finish must add the
+    prompt-end snapshot from live recurrent state and close through it.
+
+    Asserts the EXACT adopted length (not >0) and that shared BYTES land
+    (a partial/skipped dead entry would also satisfy a >0 entry check)."""
+    n_tok = _PAGES * BLOCK_TOKENS + 12  # 32044 here; same shape class as 32028
+    prompt_pages = n_tok // BLOCK_TOKENS
+    e, prompt, _res = _publisher(_SHORT_DECODE, prompt_tokens=n_tok)
+    try:
+        pfx = e._sparse.prefix
+        entry = pfx.lookup(prompt)
+        assert entry is not None, "unaligned prompt end did not close (#796 F1)"
+        assert len(entry["keys"]) == prompt_pages, (
+            f"closed to {len(entry['keys'])} pages, expected the full "
+            f"{prompt_pages} (tail would be recomputed)")
+        assert _shared_bytes(e._kv.cold) > 0, "unaligned closure landed no blob bytes"
+        adopted = _adopt_after(e, prompt)
+        assert adopted == prompt_pages * BLOCK_TOKENS, (
+            f"follower adopted {adopted} tokens, expected {prompt_pages * BLOCK_TOKENS}")
+    finally:
+        e.shutdown()

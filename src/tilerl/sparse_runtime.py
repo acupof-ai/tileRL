@@ -468,27 +468,37 @@ class SparseRuntime:
 
     def publish_at_finish(self, r) -> None:
         """One synchronous prompt-prefix publish at successful request finish
-        (#796 b'), while this request's frames/private blobs/snapshots are still
+        (#796), while this request's frames/private blobs/snapshots are still
         live. Reuses the exact transfer an offer uses (resident frames are D2H'd
-        here); no batch/bg machinery. A cancel never calls this."""
+        here); no batch/bg machinery. A cancel never calls this.
+
+        b'2: for an unaligned prompt, synthesize the prompt-end boundary
+        snapshot from the request's live recurrent state first, so the entry can
+        close through the prompt end with zero tail recompute. An aligned prompt
+        already has that snapshot; pass hidden=None to publish trunk-only."""
         ctx = self.ctx
         tr = self.tracker
         if tr.prefix is None:
             return
-        keys = tr.prefix.close_prompt(r.req_id, r.tokens, tr.bounds_view(r.req_id))
+        tr.prefix.ensure_prompt_end_snapshot(
+            r.req_id,
+            (ctx.states.states[r.state_slot], ctx.states.window_snapshot(r.state_slot)),
+            None,
+        )
+        def publishable(p: int) -> bool:
+            # A source exists to materialize the blob: a held private blob (RAM
+            # or private SSD) or a live resident device frame. The closure stops
+            # before the first page that has neither, so the index never names a
+            # key the transfer cannot land.
+            return (r.req_id, p) in ctx.kv.cold \
+                or tr.resident.get(r.req_id, {}).get(p) is not None
+
+        keys = tr.prefix.close_prompt(
+            r.req_id, r.tokens, tr.bounds_view(r.req_id), publishable=publishable)
         written_page = (
             (r.draft_pos + 1) // BLOCK_TOKENS if ctx.draft is not None and r.draft_blocks else -1
         )
         for p, content_key in keys.items():
-            # Best-effort: a finish closure can name a page whose entry was
-            # capacity-evicted and whose frame has since left both the union and
-            # the private tier. It is genuinely unpublishable now; skip it rather
-            # than raise inside request teardown. Normal geometry (capacity 4096,
-            # frames live until _release) never hits this.
-            if content_key not in ctx.kv.cold.share_keys() and \
-                    (r.req_id, p) not in ctx.kv.cold and \
-                    tr.resident.get(r.req_id, {}).get(p) is None:
-                continue
             draft_block = r.draft_blocks[p] if p <= written_page else None
             self.transfer_to_shared(r, p, content_key, draft_block)
         for content_key in tr.prefix.take_freeze_refs():

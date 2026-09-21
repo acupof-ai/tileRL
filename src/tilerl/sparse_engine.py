@@ -1049,36 +1049,51 @@ class SparsePrefixCache:
                     self._cold.share_ref(k)
         return out
 
-    def close_prompt(self, req_id: int, tokens, bounds) -> dict[int, int]:
-        """Synchronously close the prompt prefix to the deepest aligned boundary
-        still reachable, while the request's frames, private blobs and snapshots
-        are all live — called once at successful request finish (#796 b').
+    def ensure_prompt_end_snapshot(self, req_id: int, state, hidden=None) -> bool:
+        """b'2: synthesize the prompt-end boundary snapshot for an UNALIGNED
+        prompt (len % BLOCK_TOKENS != 0), which note_boundary never records.
+        Called at successful finish while the recurrent state is still the
+        request's own. Returns True if it added a snapshot, False if one already
+        exists at the prompt end (aligned prompt, or already closed there)."""
+        pp = self._prompt_pages.get(req_id)
+        if pp is None or pp <= 0 or pp in self._snap.get(req_id, {}):
+            return False
+        states, window = state
+        self._snap.setdefault(req_id, {})[pp] = (
+            states.cpu(), None if window is None else window.cpu())
+        if hidden is not None:
+            self._snap_hidden.setdefault(req_id, {})[pp] = (
+                hidden.detach().cpu().clone().reshape(-1))
+        return True
 
-        Natural drops never span the low pages of a short-turn prompt (page 0
-        stays in the k+window union with no pool pressure), so without this the
-        same-prefix follower arriving after a blocking chat cannot adopt. This is
-        the inline publish the pre-refactor close path did, WITHOUT the deleted
-        batch/bg/worker machinery: it fills offers for the still-resident pages
-        and closes in one step, after which the caller resolves each key from the
-        live frame / held blob via transfer_to_shared.
-
-        Returns {} for a prefix that already closed (grow length already at the
-        reachable boundary). The reachable length is capped by snapshot
-        availability: an UNALIGNED prompt end (len % BLOCK_TOKENS != 0) has no
-        end snapshot, so the entry closes at the deepest aligned boundary below
-        it and the follower re-forwards the short tail — the pre-refactor
-        behaviour too."""
+    def close_prompt(self, req_id: int, tokens, bounds, publishable=None) -> dict[int, int]:
+        """Synchronously close the prompt prefix to its deepest reachable
+        boundary while the request's frames, private blobs and snapshots are
+        still live — called once at successful finish (#796). See
+        ensure_prompt_end_snapshot for the aligned (b'2) vs deepest-aligned
+        (b'1) tail distinction. ``publishable(p)`` optionally limits the closure
+        to pages the caller can land a blob for; the closure stops at the first
+        gap and only fires if the truncation still lands on a snapshot."""
         pp = self._prompt_pages.get(req_id)
         if pp is None:
             return {}
         e = self._grow.get(req_id)
         old_len = 0 if e is None else len(e["keys"])
         # The longest length that has a snapshot (snaps are aligned prefill
-        # boundaries, capped to {lowest,newest}); never above the prompt end.
+        # boundaries, capped to {lowest,newest}, plus a synthesized prompt-end
+        # one under b'2); never above the prompt end.
         reachable = sorted(m for m in self._snap.get(req_id, {}) if old_len < m <= pp)
         if not reachable:
             return {}
         m = reachable[-1]
+        # Only close over a page the caller can actually land a blob for. The
+        # frontier grows from old_len, so a single source-less page truncates the
+        # closure at it instead of letting publish_dropped name a dead key.
+        if publishable is not None:
+            while m > old_len and not all(publishable(p) for p in range(old_len, m)):
+                m -= 1
+            if m == old_len or m not in self._snap.get(req_id, {}):
+                return {}
         pend = self._pending.setdefault(req_id, {})
         for p in range(old_len, m):
             pend.setdefault(p, (req_id, p))
