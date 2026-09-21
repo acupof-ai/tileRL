@@ -54,6 +54,17 @@ def test_close_positive_control_separates_moved_from_all_zero():
     assert not M.close_transfer_present([zero, M.parse_close_tick("not a tick")])
 
 
+def test_cancel_window_must_be_zero_and_observed():
+    moved, zero = M.parse_close_tick(_MOVED), M.parse_close_tick(_ZERO)
+    # A clean cancel window: every observed tick carries no publish bytes.
+    assert M.close_window_moved_zero([zero, zero])
+    # One byte-moving tick in the cancel window violates the #785 red line.
+    assert not M.close_window_moved_zero([zero, moved])
+    # Empty/None is NOT a pass: an unobserved cancellation must not read clean.
+    assert not M.close_window_moved_zero([])
+    assert not M.close_window_moved_zero([M.parse_close_tick("nope")])
+
+
 def test_geometry_matches_the_796_32k_head():
     g = M.Geometry(words=16000, tokens_per_word=2.002,
                    suffix_words=64, follower_tokens=48)

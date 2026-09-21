@@ -38,9 +38,11 @@ Device:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
+import socket
 import subprocess
 import time
 import urllib.request
@@ -117,6 +119,46 @@ def close_transfer_present(parsed_ticks: list[dict]) -> bool:
                (*CLOSE_TRANSFER_KEYS, "ssd_mmap"))
 
 
+def close_window_moved_zero(parsed_ticks: list[dict]) -> bool:
+    """#785 red line for a CANCELLED/FAILED row: its request-end ticks move NO
+    publish bytes -- every five-key segment and ssd_mmap are 0. Returns True
+    only when every supplied tick is clean (an empty window is not accepted:
+    no ticks means the cancellation was never observed, not that it was clean)."""
+    ticks = [t for t in parsed_ticks if t]
+    if not ticks:
+        return False
+    return all(t.get(k, 0) == 0 for t in ticks for k in
+               (*CLOSE_TRANSFER_KEYS, "ssd_mmap"))
+
+
+def cancel_during_stream(base_url: str, head: str, settle_s: float = 3.0):
+    """Open a STREAMING chat on the long head and sever the socket while it is
+    generating, which is the reader-disconnect / abort geometry the serve maps
+    to engine.cancel. Returns once the connection is torn down; the caller then
+    gives the serve a short settle window and reads the cancel tick from the log.
+    Non-streaming chat cannot be interrupted (it returns only on completion), so
+    the stream is what exercises the cancel release path."""
+    import http.client
+    hostport = base_url.replace("http://", "").replace("https://", "")
+    host, _, port = hostport.partition(":")
+    conn = http.client.HTTPConnection(host, int(port or 8000), timeout=30)
+    body = json.dumps({
+        "model": "qwen38-27b",
+        "messages": [{"role": "user", "content": head}],
+        "max_tokens": 4096, "temperature": 0.0, "stream": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }).encode()
+    conn.request("POST", "/v1/chat/completions", body=body,
+                 headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    # Drain enough to prove the request is admitted and generating, then sever.
+    resp.read(64)
+    time.sleep(settle_s)
+    with contextlib.suppress(OSError):
+        conn.sock.shutdown(socket.SHUT_RDWR)
+    conn.close()
+
+
 def cold_fill_state(stats: dict) -> dict:
     """The four cold-tier keys (GiB) + residency, the state a tok/s number must
     be read with; identical shape to the H20/A6 collector."""
@@ -183,7 +225,8 @@ class Acceptance:
                 and self.follower_hits_delta >= 1
                 and self.follower_adoptions_delta >= 1
                 and self.follower_sparse_matched > 0
-                and self.tokens_equal_oracle is True)
+                and self.tokens_equal_oracle is True
+                and self.close_zero_on_cancel is True)
 
 
 GATES_DOC = [
@@ -310,6 +353,34 @@ def run_device(args, geo) -> int:  # pragma: no cover - device path
     otxt = (oracle.get("choices") or [{}])[0].get("message", {}).get("content", "")
     acc.tokens_equal_oracle = ftxt.strip() == otxt.strip()
 
+    # ---- CANCEL red line (#785): a reader-aborted row moves no publish bytes.
+    # Record the log offset, sever a streaming head mid-generation, then read
+    # only the ticks the serve wrote during the cancel window and demand every
+    # close key + ssd_mmap be 0. A normal request-end closure elsewhere is
+    # allowed to move bytes; THIS window must not.
+    cancel_ticks: list[dict] = []
+    log_off = 0
+    if args.serve_log:
+        log_off = os.path.getsize(args.serve_log)
+    try:
+        cancel_during_stream(args.url, head)
+    except Exception as exc:  # noqa: BLE001 - reported as a failed gate, not a crash
+        acc.detail["cancel_error"] = f"{type(exc).__name__}: {exc}"
+    # give the serve the disconnect-detection + cancel release tick
+    deadline = time.time() + 15
+    if args.serve_log:
+        while time.time() < deadline:
+            time.sleep(0.5)
+            with open(args.serve_log, "rb") as fh:
+                fh.seek(log_off)
+                window = fh.read().decode(errors="replace")
+            cancel_ticks = [p for p in
+                           (parse_close_tick(line) for line in window.splitlines()) if p]
+            if cancel_ticks and "cancel" in window.lower():
+                break
+    acc.close_zero_on_cancel = close_window_moved_zero(cancel_ticks)
+    acc.detail["cancel_tick_count"] = len(cancel_ticks)
+
     # ---- log evidence: close-tick positive control + sparse_matched
     polling["on"] = False
     worker.join(timeout=2)
@@ -333,9 +404,10 @@ def run_device(args, geo) -> int:  # pragma: no cover - device path
         "sparse_after": {k: f1.get(k) for k in SPARSE_KEYS},
         "follower_text_head": ftxt[:80],
     }
+    identity = serve_identity()
     record = {
         "metric": "d796_adoption", "verdict": "PASS" if acc.ok() else "FAIL",
-        "geometry": geo.describe(), "serve": serve_identity(),
+        "geometry": geo.describe(), "serve": identity,
         "gates": {
             "close_transfer_seen": acc.close_transfer_seen,
             "shared_pages_after_publisher": acc.shared_pages_after_publisher,
@@ -344,6 +416,7 @@ def run_device(args, geo) -> int:  # pragma: no cover - device path
             "follower_adoptions_delta": acc.follower_adoptions_delta,
             "follower_sparse_matched": acc.follower_sparse_matched,
             "tokens_equal_oracle": acc.tokens_equal_oracle,
+            "close_zero_on_cancel": acc.close_zero_on_cancel,
         },
         **acc.detail,
     }
@@ -352,6 +425,11 @@ def run_device(args, geo) -> int:  # pragma: no cover - device path
         json.dump(record, fh, indent=2)
     if poll_rows:
         import csv
+        # sha/pgrep ride on every poll row, not just the result JSON, so a CSV
+        # row read on its own still names the binary that produced it.
+        for row in poll_rows:
+            row["serve_sha"] = identity["sha"]
+            row["serve_pgrep"] = identity["pgrep"]
         csv_path = os.path.join(args.out, "d796_health_poll.csv")
         with open(csv_path, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(poll_rows[0]))
