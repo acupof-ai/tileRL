@@ -2215,6 +2215,109 @@ def test_sparse_warm_follower_with_an_exact_page_aligned_prompt_matches_cold():
     got = _drain(warm, rid, 8)
     warm.shutdown()
     assert got == cold_got, f"zero-tail warm {got} != cold {cold_got}"
+
+
+def test_an_adopted_prefix_redemotes_with_zero_device_bytes():
+    """#783: a follower promotes an adopted prefix into PRIVATE device blocks, and
+    those blocks leave its hot union as decode advances. The identical bytes are
+    already held under the same content keys, so the re-leave must do zero device
+    work: no demote_page (which D2Hs a whole page) for an adopted page, and the
+    re-publish is a share_ref only.
+
+    Two arms:
+    * dedup live: zero demote_page calls naming an adopted logical page, at least
+      one dup share_ref, follower tokens equal a prefix-miss oracle;
+    * fallback: with share_keys() emptied after adoption (the shared LRU evicted
+      the keys) adopted pages demote normally and still decode to the same tokens.
+    Mutation-red: pre-#783 code demoted every re-leaving adopted page, so the
+    first arm's zero-demote assertion fails on the old shape."""
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    n_prompt_pages = 24
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    def spec_engine():
+        from tilerl_kernels.backend import get_backend
+
+        return build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+
+    miss = spec_engine()
+    want = _drain(miss, miss.submit(prompt, params), 8)
+    miss.shutdown()
+
+    def run_follower(hide_shared_after_adopt: bool):
+        warm = spec_engine()
+        pub = warm.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+        _drain(warm, pub, 200)
+        entry = warm._sparse.prefix.lookup(prompt)
+        assert entry is not None and len(entry["keys"]) == n_prompt_pages
+        content_keys = set(entry["keys"])
+        pool = warm._kv
+        cold = pool.cold
+
+        adopted_demoted: list[int] = []
+        real_demote = pool.demote_page
+
+        def spy_demote(block, key=None):
+            if isinstance(key, tuple) and len(key) == 2 and key[1] < n_prompt_pages:
+                adopted_demoted.append(key[1])
+            return real_demote(block, key=key)
+
+        pool.demote_page = spy_demote
+        dup_refs: list[int] = []
+        real_share_ref = cold.share_ref
+
+        def spy_share_ref(key):
+            if key in content_keys:
+                dup_refs.append(key)
+            return real_share_ref(key)
+
+        cold.share_ref = spy_share_ref
+        # share_hold_kv is the private->shared transfer: the dup path must never
+        # reach it (freeze-ref bumps go through share_ref on both old and new
+        # shapes, so demote_page zero is what pins change B; this pins change C).
+        lifted: list[int] = []
+        real_lift = cold.share_hold_kv
+
+        def spy_lift(private_key, shared_key, extra=None):
+            if shared_key in content_keys:
+                lifted.append(shared_key)
+            return real_lift(private_key, shared_key, extra=extra)
+
+        cold.share_hold_kv = spy_lift
+        try:
+            rid = warm.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+            warm.step()  # adopts the 24-page prefix
+            assert next(x for x in warm._running if x.req_id == rid).sparse_matched \
+                == n_prompt_pages * BLOCK_TOKENS
+            if hide_shared_after_adopt:
+                # Simulate shared-LRU eviction between adopt and re-leave.
+                cold.share_keys = lambda: frozenset()
+            got = _drain(warm, rid, 200)
+        finally:
+            pool.demote_page = real_demote
+            cold.share_ref = real_share_ref
+            cold.share_hold_kv = real_lift
+            warm.shutdown()
+        return got, adopted_demoted, dup_refs, lifted
+
+    got, adopted_demoted, dup_refs, lifted = run_follower(hide_shared_after_adopt=False)
+    assert got[:8] == want, f"dedup follower {got[:8]} != miss {want}"
+    assert not adopted_demoted, f"adopted pages paid a D2H demote: {adopted_demoted}"
+    assert not lifted, "dup republish reached the private->shared lift instead of ref-only"
+    assert dup_refs, "the re-publish never took the zero-byte share_ref path"
+
+    fb_got, fb_demoted, _, fb_lifted = run_follower(hide_shared_after_adopt=True)
+    assert fb_got[:8] == want, f"fallback follower {fb_got[:8]} != miss {want}"
+    assert fb_demoted, "evicted shared keys must fall back to a real demote"
+    assert fb_lifted, "fallback must republish through the normal lift path"
+
+
 def test_sparse_mixed_length_rows_prefilling_one_tick_match_their_solo_g0():
     """H20 MMLU surface (cc bisect): the standalone FIFO probe was bit-exact but
     the harness drains several prompts whose PREFILL CHUNKS SHARE A TICK, mixed

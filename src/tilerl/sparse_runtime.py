@@ -331,8 +331,10 @@ class SparseRuntime:
         """Physical block for a resident, private-cold, or shared-prefix logical
         page, allocating a fresh block for a never-written own page or promoting
         the host blob. A shared prefix page promotes its read-only host blob into
-        a fresh PRIVATE block (the store entry keeps the blob); promoting makes
-        the page private, so it is unlinked from the shared key. Under the
+        a fresh PRIVATE block (the store entry keeps the blob). The promote makes
+        the block private, but the page's shared content-key label is KEPT: when
+        that block later leaves the hot union again the bytes already exist under
+        the same key, so the redemote skips device bytes (#783). Under the
         cross-tick pin the pool is full of last tick's pages, so evict one
         unreserved frame first when no block is free."""
         ctx = self.ctx
@@ -349,13 +351,11 @@ class SparseRuntime:
         if page in r.cold_pages and (r.req_id, page) in ctx.kv.cold:
             new = ctx.kv.promote_keyed((r.req_id, page))
             r.cold_pages.remove(page)
-            shared_keys.pop(page, None)
         elif page in shared_keys:
             blob = ctx.kv.cold.share_take(shared_keys[page])
             if blob is None:
                 raise RuntimeError(f"sparse prefix page {page} missing its shared blob")
             new = ctx.kv.shared_promote(blob)
-            shared_keys.pop(page)  # the store keeps its ref; this page is now private
             if page in r.cold_pages:
                 r.cold_pages.remove(page)  # transfer moved the blob to the content key
         else:
@@ -433,7 +433,9 @@ class SparseRuntime:
         """Publish one page under its content key: attach bounds (+ draft K/V for
         a warm spec entry) to the page's trunk K/V.
 
-        Three states the page can be in when its frontier closes:
+        Four states the page can be in when its frontier closes:
+        - its content key already exists in the shared tier (an adopted page
+          re-leaving the union): zero device bytes, just one more share ref;
         - held on the host as the PRIVATE (rid,page) blob: transfer it (no copy);
         - on the private SSD: share_hold_kv lifts it into the prefix spill file;
         - still DEVICE-resident (in the own window, never dropped): build the host
@@ -451,6 +453,13 @@ class SparseRuntime:
         ctx = self.ctx
         tr = self.tracker
         tm = ctx.step_timing
+        tr.shared.setdefault(r.req_id, {})[page] = content_key
+        # Dup content key (typically an adopted prefix whose frame left the union
+        # again): the identical trunk/bounds/draft bytes are already shared, so no
+        # D2H and no private transfer — one ref keeps the grow/frozen entry whole.
+        if content_key in ctx.kv.cold.share_keys():
+            ctx.kv.cold.share_ref(content_key)
+            return
         t = time.perf_counter() if tm is not None else 0.0
         # bounds: one blocking page D2H.
         bv = tr.bounds_view(r.req_id)[page]
@@ -468,7 +477,6 @@ class SparseRuntime:
         if tm is not None:
             tm.mark("pub_draft_clone", t)
             t = time.perf_counter()
-        tr.shared.setdefault(r.req_id, {})[page] = content_key
         if (r.req_id, page) in ctx.kv.cold:
             # Host-resident or already on the private SSD: no device bytes.
             n = ctx.kv.cold.share_hold_kv((r.req_id, page), content_key, extra=extra_host)
@@ -596,12 +604,24 @@ class SparseRuntime:
                     continue
                 kept = sf.selected_pages(bi)
                 dropped = [p for p in live if p not in kept]
+                labels = tr.shared.get(rid, {})
                 for p in dropped:
                     phys = live[p]
-                    pool.demote_page(phys, key=(rid, p))
+                    # An adopted (or self-republished) page whose identical bytes
+                    # are already held under a shared content key needs no D2H:
+                    # return the frame straight to the pool. The label must be
+                    # checked against the live set — the key can be gone since
+                    # resolve (shared LRU eviction), in which case the page is
+                    # demoted normally and republished (#783). The page is still
+                    # offered below so publish_dropped keeps a hole-free frontier.
+                    label = labels.get(p)
+                    if label is not None and label in ctx.kv.cold.share_keys():
+                        ctx.kv.free_block(phys)
+                    else:
+                        pool.demote_page(phys, key=(rid, p))
+                        r.cold_pages.append(p)
                     tr.map_evict(rid, p)
                     r.blocks.remove(phys)
-                    r.cold_pages.append(p)
                 kept_live = {p: live[p] for p in kept if p in live}
                 # r.blocks mirrors the live frames in LOGICAL page order (paged_attention
                 # derives causal positions from the order), so sort the pinned set.
