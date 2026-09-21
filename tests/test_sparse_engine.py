@@ -2152,33 +2152,6 @@ def test_sparse_draft_follower_adopts_a_published_prefix_and_matches_cold():
     assert got == cold_got, f"warm draft follower {got} != cold spec {cold_got}"
 
 
-def test_a_prompt_that_never_leaves_the_hot_pool_publishes_nothing():
-    """Publish-once semantics (#782): a page is published only when it LEAVES the
-    resident union. A hot pool (k=64 >= the 8-page prompt plus its window) keeps
-    every prompt frame for the whole run, so request end moves zero bytes: no
-    lookup entry, no shared blobs, no draft K/V copied. The old forced
-    prompt-end closure at _release is gone; a same-prompt follower misses."""
-    cfg = tiny()
-    model = build_random(cfg, seed=11)
-    prompt = (np.arange(8 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
-
-    from tilerl_kernels.backend import get_backend
-
-    eng = build_engine(
-        cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
-        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-        max_num_batched_tokens=512, sparse_k=64, scorer="bounds",
-        kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
-    try:
-        rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
-        _drain(eng, rid, 8)
-        assert eng._sparse.prefix.published == 0, eng._sparse.prefix.published
-        assert eng._sparse.prefix.lookup(prompt) is None
-        assert not eng._kv.cold.share_keys(), eng._kv.cold.share_keys()
-    finally:
-        eng.shutdown()
-
-
 def test_sparse_warm_follower_with_an_exact_page_aligned_prompt_matches_cold():
     """A warm follower whose prompt equals the published prefix in WHOLE (zero
     residual tokens) used to stick in PREFILL forever: nothing schedules a chunk

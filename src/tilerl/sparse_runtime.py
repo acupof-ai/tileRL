@@ -466,6 +466,34 @@ class SparseRuntime:
         for content_key in tr.prefix.take_freeze_refs():
             ctx.kv.cold.share_ref(content_key)
 
+    def publish_at_finish(self, r) -> None:
+        """One synchronous prompt-prefix publish at successful request finish
+        (#796 b'), while this request's frames/private blobs/snapshots are still
+        live. Reuses the exact transfer an offer uses (resident frames are D2H'd
+        here); no batch/bg machinery. A cancel never calls this."""
+        ctx = self.ctx
+        tr = self.tracker
+        if tr.prefix is None:
+            return
+        keys = tr.prefix.close_prompt(r.req_id, r.tokens, tr.bounds_view(r.req_id))
+        written_page = (
+            (r.draft_pos + 1) // BLOCK_TOKENS if ctx.draft is not None and r.draft_blocks else -1
+        )
+        for p, content_key in keys.items():
+            # Best-effort: a finish closure can name a page whose entry was
+            # capacity-evicted and whose frame has since left both the union and
+            # the private tier. It is genuinely unpublishable now; skip it rather
+            # than raise inside request teardown. Normal geometry (capacity 4096,
+            # frames live until _release) never hits this.
+            if content_key not in ctx.kv.cold.share_keys() and \
+                    (r.req_id, p) not in ctx.kv.cold and \
+                    tr.resident.get(r.req_id, {}).get(p) is None:
+                continue
+            draft_block = r.draft_blocks[p] if p <= written_page else None
+            self.transfer_to_shared(r, p, content_key, draft_block)
+        for content_key in tr.prefix.take_freeze_refs():
+            ctx.kv.cold.share_ref(content_key)
+
     def transfer_to_shared(
         self, r, page: int, content_key: int, draft_block: int | None = None
     ) -> None:

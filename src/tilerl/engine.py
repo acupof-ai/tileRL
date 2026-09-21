@@ -2700,10 +2700,15 @@ class Engine:
         if req.state_slot is None:
             return  # never admitted; blocks and slot are taken together in `_admit`
         if req.sparse_on and self._sparse is not None:
-            # Publishing happens only while pages leave the resident union
-            # (offer_drop); request end moves no bytes, so there is no close cost
-            # to bracket. The busy/idle instrumentation went with it (#784).
-            # Sparse: drop this request's host-held cold blobs, keyed (req, logical
+            # A SUCCESSFUL finish synchronously publishes the prompt prefix while
+            # its frames / private blobs / snapshots are still live, so a
+            # same-prefix follower arriving after this blocking request can
+            # adopt (#796 b'). Natural drops alone never span a short-turn
+            # prompt's low pages with no pool pressure. A cancelled/failed row
+            # publishes nothing (failed is set before _release).
+            if not req.failed and self._sparse.prefix is not None:
+                self._sparse.publish_at_finish(req)
+            # Drop this request's host-held cold blobs, keyed (req, logical
             # page) and never present in req.blocks, plus its bounds store.
             cold = self._kv.cold
             if cold is not None:

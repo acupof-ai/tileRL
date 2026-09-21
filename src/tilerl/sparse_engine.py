@@ -1049,6 +1049,41 @@ class SparsePrefixCache:
                     self._cold.share_ref(k)
         return out
 
+    def close_prompt(self, req_id: int, tokens, bounds) -> dict[int, int]:
+        """Synchronously close the prompt prefix to the deepest aligned boundary
+        still reachable, while the request's frames, private blobs and snapshots
+        are all live — called once at successful request finish (#796 b').
+
+        Natural drops never span the low pages of a short-turn prompt (page 0
+        stays in the k+window union with no pool pressure), so without this the
+        same-prefix follower arriving after a blocking chat cannot adopt. This is
+        the inline publish the pre-refactor close path did, WITHOUT the deleted
+        batch/bg/worker machinery: it fills offers for the still-resident pages
+        and closes in one step, after which the caller resolves each key from the
+        live frame / held blob via transfer_to_shared.
+
+        Returns {} for a prefix that already closed (grow length already at the
+        reachable boundary). The reachable length is capped by snapshot
+        availability: an UNALIGNED prompt end (len % BLOCK_TOKENS != 0) has no
+        end snapshot, so the entry closes at the deepest aligned boundary below
+        it and the follower re-forwards the short tail — the pre-refactor
+        behaviour too."""
+        pp = self._prompt_pages.get(req_id)
+        if pp is None:
+            return {}
+        e = self._grow.get(req_id)
+        old_len = 0 if e is None else len(e["keys"])
+        # The longest length that has a snapshot (snaps are aligned prefill
+        # boundaries, capped to {lowest,newest}); never above the prompt end.
+        reachable = sorted(m for m in self._snap.get(req_id, {}) if old_len < m <= pp)
+        if not reachable:
+            return {}
+        m = reachable[-1]
+        pend = self._pending.setdefault(req_id, {})
+        for p in range(old_len, m):
+            pend.setdefault(p, (req_id, p))
+        return self.publish_dropped(req_id, tokens, bounds, m - 1, pend.get(m - 1))
+
     def bound_of_key(self, content_key: int):
         """A page's stored Quest bound from its (possibly spilled) shared blob,
         or None. Adopt reads bounds by field so the bounds plane is not pinned
