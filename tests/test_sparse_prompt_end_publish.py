@@ -48,15 +48,18 @@ _SHORT_DECODE = 8
 _LONG_DECODE = 32
 
 
-def _publisher(decode_tokens: int, prefix_store=None, prompt_tokens: int | None = None):
-    kw = {} if prefix_store is None else {"prefix_store": prefix_store}
-    e = build_engine(
+def _build_engine():
+    return build_engine(
         cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
         num_blocks=4096, num_slots=4, max_batch=1, max_total_tokens=65536,
         max_num_batched_tokens=_CHUNK, sparse_k=_K, scorer="bounds",
-        kv_cold_bytes=1 << 30, decode_graph=True, **kw)
-    n_tok = _PAGES * BLOCK_TOKENS if prompt_tokens is None else prompt_tokens
-    prompt = (np.arange(n_tok, dtype=np.int64) % 300) + 7
+        kv_cold_bytes=1 << 30, decode_graph=True)
+
+
+def _run(e, decode_tokens, prompt=None, n_tok=None):
+    if prompt is None:
+        n_tok = _PAGES * BLOCK_TOKENS if n_tok is None else n_tok
+        prompt = (np.arange(n_tok, dtype=np.int64) % 300) + 7
     rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=decode_tokens, seed=0))
     saw_resident = False
     for _ in range(40000):
@@ -66,6 +69,13 @@ def _publisher(decode_tokens: int, prefix_store=None, prompt_tokens: int | None 
         e.step()
         if e._sparse.tracker.resident.get(rid):
             saw_resident = True
+    return prompt, saw_resident
+
+
+def _publisher(decode_tokens: int, prefix_store=None, prompt_tokens: int | None = None):
+    kw = {} if prefix_store is None else {"prefix_store": prefix_store}
+    e = _build_engine(**kw)
+    prompt, saw_resident = _run(e, decode_tokens, n_tok=prompt_tokens)
     return e, prompt, saw_resident
 
 
@@ -79,6 +89,59 @@ def _adopt_after(e, prompt) -> int:
     e.step()
     r = next((x for x in e._running if x.req_id == rid), None)
     return 0 if r is None else int(r.sparse_matched)
+
+
+def _publisher_with_failing_finish_transfer(mode: str):
+    """A short-decode publisher whose finish publish dies on its 3rd page:
+    'raise' = a SpillWriteError out of the transfer; 'soft' = the transfer
+    places no shared record (a key absent from share_keys). Armed on the
+    finish close_prompt so natural decode offers are untouched."""
+    from tilerl.kv_tiers import SpillWriteError
+
+    e = _build_engine()
+    sp = e._sparse
+    real_xfer = sp.transfer_to_shared
+    real_close = sp.prefix.close_prompt
+    state = {"calls": 0}
+
+    def arm_close(*a, **k):
+        state["armed"] = True  # finish is this publisher's last publish
+        return real_close(*a, **k)
+
+    def fault_xfer(r, page, content_key, draft_block=None):
+        if getattr(state, "armed", False) or state.get("armed"):
+            state["calls"] += 1
+            if state["calls"] == 3:
+                if mode == "raise":
+                    raise SpillWriteError("injected spill failure")
+                return  # soft: no record placed
+        return real_xfer(r, page, content_key, draft_block)
+
+    sp.transfer_to_shared = fault_xfer
+    sp.prefix.close_prompt = arm_close
+    prompt, _saw = _run(e, _SHORT_DECODE)
+    return e, prompt, state
+
+
+def test_a_failed_finish_publish_leaves_no_dead_entry_and_no_dirty_follower():
+    """P2-1 (#796): close_prompt attaches the index entry BEFORE the per-page
+    transfers. A spill failure on page 3 must roll the whole close back:
+    no lookup entry, no content key without a blob, and a same-head follower
+    misses instead of adopting dead keys. The publisher itself succeeded, so it
+    still completes normally — the abandoned publish is not a client error."""
+    for mode in ("raise", "soft"):
+        e, prompt, st = _publisher_with_failing_finish_transfer(mode)
+        try:
+            assert st["calls"] >= 3, f"{mode}: the injected fault never fired (vacuous gate)"
+            pfx = e._sparse.prefix
+            assert pfx.lookup(prompt) is None, f"{mode}: dead entry survived the failed publish"
+            orphans = [k for en in pfx._by_id.values() for k in en["keys"]
+                       if k not in e._kv.cold.share_keys()]
+            assert not orphans, f"{mode}: entries name {len(orphans)} keys with no blob"
+            assert _adopt_after(e, prompt) == 0, (
+                f"{mode}: follower dirty-adopted from a half-published prefix")
+        finally:
+            e.shutdown()
 
 
 def test_a_short_decode_prompt_is_adoptable_by_a_same_head_follower():

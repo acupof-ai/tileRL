@@ -891,6 +891,9 @@ class SparsePrefixCache:
         self._frozen: dict[int, set[int]] = {}  # req -> boundaries frozen
         #: (rid, frozen-entry eid) waiting for the engine to add their share refs
         self._freeze_pending: list[tuple[int, int]] = []
+        #: rollback state for the last close_prompt per request, consumed by
+        #: abort_close when a finish transfer fails partway (#796)
+        self._close_rb: dict[int, dict] = {}
         self.published = 0
         self.hits = 0
         self.evictions = 0
@@ -1085,7 +1088,19 @@ class SparsePrefixCache:
         pend = self._pending.setdefault(req_id, {})
         for p in range(old_len, m):
             pend.setdefault(p, (req_id, p))
-        return self.publish_dropped(req_id, tokens, bounds, m - 1, pend.get(m - 1))
+        old = self._grow.get(req_id)
+        rb = {
+            "eids_before": set(self._by_id),
+            "grow": None if old is None else {
+                "tokens": old["tokens"], "keys": list(old["keys"]),
+                "hash": old["hash"], "state": old["state"],
+                "hidden": old.get("hidden")},
+            "old_len": old_len, "m": m,
+        }
+        out = self.publish_dropped(req_id, tokens, bounds, m - 1, pend.get(m - 1))
+        if out:
+            self._close_rb[req_id] = rb
+        return out
 
     def bound_of_key(self, content_key: int):
         """A page's stored Quest bound from its (possibly spilled) shared blob,
@@ -1152,6 +1167,60 @@ class SparsePrefixCache:
         for key in entry["keys"]:
             self._cold.share_release(key)
 
+    def abort_close(self, req_id: int, landed: list[int]) -> None:
+        """Roll back the last close_prompt after a per-page transfer failed
+        partway (#796): the entries were attached to the lookup chains BEFORE
+        any transfer, so without this the index keeps an entry naming keys with
+        no blob, which a follower then dirty-reads. ``landed`` is the content
+        keys that transferred before the failure, in order WITH duplicates (a
+        dup content key takes its own ref per page). Releases exactly one ref
+        per landed key; the frozen-copy bump never landed (take_freeze_refs was
+        not called). The consumed boundary snapshot is not restored — this
+        publish is abandoned, not retried."""
+        rb = self._close_rb.pop(req_id, None)
+        if rb is None:
+            return
+        new_eids = set(self._by_id) - rb["eids_before"]
+        for eid in new_eids:
+            self._unlink(self._by_id[eid])
+        for _rid, eid in list(self._freeze_pending):
+            if _rid == req_id and eid in new_eids:
+                self._freeze_pending.remove((_rid, eid))
+        old = rb["grow"]
+        cur = self._grow.get(req_id)
+        if old is None:
+            if cur is not None:
+                self._unlink(cur)
+                self._grow.pop(req_id, None)
+        elif cur is not None:
+            # detach from the NEW chain bucket publish_dropped attached it to
+            chain = self._entries.get(cur["hash"])
+            if chain is not None and cur in chain:
+                chain.remove(cur)
+            cur["tokens"] = old["tokens"]
+            cur["keys"] = old["keys"]
+            cur["hash"] = old["hash"]
+            cur["state"] = old["state"]
+            cur["hidden"] = old["hidden"]
+            old_chain = self._entries.setdefault(old["hash"], [])
+            if cur not in old_chain:
+                old_chain.append(cur)
+        for key in landed:
+            self._cold.share_release(key)
+        self._frozen.get(req_id, set()).discard(rb["m"])
+        pend = self._pending.setdefault(req_id, {})
+        for p in range(rb["old_len"], rb["m"]):
+            pend.setdefault(p, (req_id, p))
+        self.published -= 1
+
+    def _unlink(self, entry: dict) -> None:
+        """Structural removal only; releases no blob refs (abort_close owns the
+        accounting; _drop is the unlink-plus-release pair)."""
+        self._by_id.pop(entry["eid"], None)
+        chain = self._entries.get(self._chain_hash(entry))
+        if chain is not None and entry in chain:
+            chain.remove(entry)
+
     def lookup(self, tokens):
         """Longest block-aligned published prefix of ``tokens`` -> entry dict or None."""
         tokens = tuple(int(t) for t in tokens)
@@ -1180,6 +1249,7 @@ class SparsePrefixCache:
         self._content_keys.pop(req_id, None)
         self._prompt_pages.pop(req_id, None)
         self._frozen.pop(req_id, None)
+        self._close_rb.pop(req_id, None)
 
     def clear(self) -> None:
         for entry in list(self._by_id.values()):
@@ -1192,6 +1262,7 @@ class SparsePrefixCache:
         self._content_keys.clear()
         self._prompt_pages.clear()
         self._frozen.clear()
+        self._close_rb.clear()
         self.evictions = 0
 
     def stats(self) -> dict[str, int]:

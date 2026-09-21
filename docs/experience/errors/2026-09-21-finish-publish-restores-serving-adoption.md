@@ -57,6 +57,14 @@ A scoped revert of one piece of M3, with none of the machinery M3 deleted:
   name a dead content key. A source-less page in the middle does not kill the
   aligned suffix: the closure falls back to the highest snapshot boundary
   below the first gap instead of dropping the whole suffix.
+- The index entry attaches BEFORE the per-page transfers, so a spill failure
+  partway (a raised SpillWriteError, or a lift that placed no record) would
+  otherwise leave a dead entry on the lookup chain. `abort_close` rolls the
+  close back on any such failure: the pre-close grow entry is restored, the
+  entries the close added are unlinked, one ref per actually-landed key is
+  released, and the follower misses instead of dirty-reading; the request
+  itself still finishes successfully (the abandoned publish is not a client
+  error).
 - The prompt-end synthesized snapshot was deleted; the deepest closure is the
   natural chunk-aligned boundary the production chunker already records, and
   the follower re-forwards only the <16-token tail.
@@ -67,8 +75,10 @@ at the exact full closure length (2002 pages, 0-token tail for the aligned
 fixture); unaligned 32044-token prompt closes to 2002 pages and the follower
 adopts 32032 tokens (12-token recompute); decoding past one chunk still
 publishes via the natural chain (the discriminator control); an adopted row
-publishes nothing at its own finish; a forced post-adopt eviction still takes
-the real-demote path. Full suite 1094 passed.
+publishes nothing at its own finish; an injected failure on the 3rd finish
+transfer (both raise and silent-no-record shapes) leaves no dead entry and a
+miss instead of a dirty adopt; plus the hole-fallback unit gate in
+test_sparse_engine.py. Full suite 1096 passed.
 
 Device finish-tick cost and the follower-adoption delta at M6 geometry are
 pending remote; the earlier 189–246 s recompute is the before arm.
