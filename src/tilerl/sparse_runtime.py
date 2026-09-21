@@ -179,12 +179,12 @@ class SparseRuntime:
         self.tracker.attach(req_id)
 
     def drop(self, req_id: int) -> None:
-        # Release early share refs whose labelled pages left the union but whose
-        # frontier never closed (a hole / request end): they never became a grow
-        # entry's holding, so they must not outlive the request.
+        # Release this request's pins. Each was taken once per adopted content
+        # key, independent of index-entry refs; unpin deletes a blob whose
+        # entries were already evicted, otherwise it just drops the hold.
         if self.ctx is not None:
-            for key in self.tracker.preheld.pop(req_id, ()):
-                self.ctx.kv.cold.share_release(key)
+            for key in self.tracker.request_pins.pop(req_id, ()):
+                self.ctx.kv.cold.unpin(key)
         self.tracker.drop(req_id)
 
     def set_index_keys(self, *args, **kwargs):
@@ -312,11 +312,17 @@ class SparseRuntime:
     def _release_private_frame(self, ctx, tr, r, rid: int, p: int, phys: int) -> bool:
         """Release a departing page's device frame. A page whose identical bytes
         are already shared (a labelled adopted page) returns the frame with no
-        D2H and preholds one ref to pin the key; returns True in that case.
-        Otherwise demotes the page to the private host tier and returns False."""
+        D2H and preholds one request-scoped ref to pin the key until the
+        request ends; returns True in that case. Otherwise demotes the page to
+        the private host tier and returns False. The pin is per key, so a page
+        re-resolved and re-leaving the pool bumps it at most once."""
         label = tr.shared.get(rid, {}).get(p)
-        if label is not None and ctx.kv.cold.share_ref_if_present(label):
-            tr.preheld.setdefault(rid, set()).add(label)
+        request_pins = tr.request_pins.setdefault(rid, set())
+        if label is not None and (label in request_pins or ctx.kv.cold.pin_if_present(label)):
+            # The key is already request-pinned, or we just pinned it: one pin
+            # per key for the whole request, so a re-leaving page bumps nothing
+            # and moves no device bytes.
+            request_pins.add(label)
             ctx.kv.free_block(phys)
             return True
         ctx.kv.demote_page(phys, key=(rid, p))
@@ -384,6 +390,13 @@ class SparseRuntime:
                 new = ctx.kv.shared_promote(blob)
                 if page in r.cold_pages:
                     r.cold_pages.remove(page)
+                # Adopt = this request now holds the page until it ends: pin the
+                # content key once so a capacity LRU deleting the index entries
+                # cannot remove the blob this row may re-resolve or re-publish.
+                key = shared_keys[page]
+                request_pins = tr.request_pins.setdefault(r.req_id, set())
+                if key not in request_pins and ctx.kv.cold.pin_if_present(key):
+                    request_pins.add(key)
         else:
             new = ctx.kv.alloc_block()
         live[page] = new
@@ -482,19 +495,16 @@ class SparseRuntime:
         tr.shared.setdefault(r.req_id, {})[page] = content_key
         # Dup content key (typically an adopted page re-leaving the union): the
         # identical trunk/bounds/draft bytes are already shared, so no D2H and no
-        # private lift. The grow entry's ref was either taken early in finalize
-        # (preheld: consume it now) or is bumped here for a dup offer that did
-        # not pass through the labelled-drop path.
+        # private lift — but the new grow entry still takes its OWN ref here
+        # (share_hold's idempotent bump on the old path). The early request-scoped
+        # prehold pin is separate and stays until request drop, so a capacity LRU
+        # evicting this entry cannot delete the blob before the row finishes.
         if content_key in ctx.kv.cold.share_keys():
-            preheld = tr.preheld.get(r.req_id)
-            if preheld is not None and content_key in preheld:
-                preheld.discard(content_key)
-            else:
-                ctx.kv.cold.share_ref(content_key)
-            # The identical bytes are already shared, so a private (rid,page)
-            # copy this request demoted before another row published the same
-            # content is redundant: drop it now rather than hold it to request
-            # end. The preheld path never demoted, so the key is absent there.
+            ctx.kv.cold.share_ref(content_key)
+            # A private (rid,page) copy demoted before another row published the
+            # same content is redundant: drop it now rather than hold it to
+            # request end. A request-pinned page never demoted, so it has no
+            # such copy.
             priv = (r.req_id, page)
             if priv in ctx.kv.cold:
                 ctx.kv.cold.forget(priv)
@@ -648,9 +658,9 @@ class SparseRuntime:
                 for p in dropped:
                     phys = live[p]
                     # A labelled page whose bytes are already shared is freed
-                    # with no D2H (its key is preheld so the LRU cannot evict
-                    # it before the frontier closes) and is still offered below;
-                    # any other page demotes to the private host tier.
+                    # with no D2H (its request pin stops the LRU deleting the
+                    # blob before the frontier closes) and is still offered
+                    # below; any other page demotes to the private host tier.
                     self._release_private_frame(ctx, tr, r, rid, p, phys)
                     tr.map_evict(rid, p)
                     r.blocks.remove(phys)

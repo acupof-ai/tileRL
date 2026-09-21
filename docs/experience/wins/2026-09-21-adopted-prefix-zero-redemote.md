@@ -32,7 +32,7 @@ can land a later tick), so a prefix-index capacity LRU could evict the key in
 that gap and leave the closure naming a dead blob. The pin is now taken
 atomically (`share_ref_if_present`: live-check and ref bump in one critical
 section) before the frame is freed, on both release paths (finalize and
-evict_victim); the ref is parked in `preheld`, consumed by the closing
+evict_victim); the ref is parked in `request_pins`, consumed by the closing
 frontier (handed to the grow entry, no second bump) or released at request
 drop when the frontier never closes. A missing shared blob at resolve falls
 back to a fresh block instead of raising.
