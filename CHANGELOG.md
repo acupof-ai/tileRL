@@ -15,16 +15,31 @@
   chunker (`engine.py:1549-1561`) already records the floor-page aligned
   snapshot, so the unaligned M6 prompt (32028) closes at page 2001 / 32016
   tokens and only the 12-token tail is recomputed. Adopted followers do not
-  republish. Four CPU gates green, full suite 1094 passed; device finish-tick
-  cost pending remote —
-  [errors/2026-09-21-finish-publish-restores-serving-adoption.md](docs/experience/errors/2026-09-21-finish-publish-restores-serving-adoption.md).
+  republish. Four CPU gates green, full suite 1094 passed. **Device-verdicted
+  2026-09-22 on V100 sm70 (serve a38c3bc4, M6 #785):** a short-advance same-head
+  follower adopts (`sparse_prefix_hits`/`sparse_prefix_warm_adoptions` +1) and
+  finishes in **8.6 s vs 190–246 s** pre-fix recompute (different rounds, not
+  one A/B arm), tokens equal to the temperature-0 oracle; publisher finish
+  lands **1286 shared pages / 1.49 GiB RAM, 0 SSD**, finish tick
+  bounds/draft/frame/hold/transfer = 149/208/770/7/22 ms, ssd_mmap 0; the
+  unaligned 32028 tail recomputes 12 tokens; repeat adoptions add 0 bytes (M4);
+  a cancelled row publishes zero; steady sparse decode model p50 158 ms vs 170
+  ms before, no regression —
+  [errors/2026-09-21-finish-publish-restores-serving-adoption.md](docs/experience/errors/2026-09-21-finish-publish-restores-serving-adoption.md),
+  [wins/2026-09-21-adopted-prefix-zero-redemote.md](docs/experience/wins/2026-09-21-adopted-prefix-zero-redemote.md),
+  [wins/2026-09-21-close-zero-bytes.md](docs/experience/wins/2026-09-21-close-zero-bytes.md).
 - **default flip (kv, publish-once M3 #782)** — request close moves zero KV
   bytes: `_release` no longer force-closes the prompt-end frontier,
   `SparsePrefixCache.close_request` is deleted. A page reaches the shared prefix
   only when it leaves the resident union; prompts that stay VRAM-resident for
   the whole run are no longer shared (no follower under disjoint spans).
-  Natural-leave freeze and cancel semantics unchanged. CPU gates green;
-  device delta pending remote — [2026-09-21-close-zero-bytes.md](docs/experience/wins/2026-09-21-close-zero-bytes.md).
+  Natural-leave freeze and cancel semantics unchanged. CPU gates green.
+  Device-verdicted 2026-09-22 (V100, M3-only serve 4dd944b4): n=17
+  request-end ticks all carry `ssd_mmap=0` and the five `pub_*` keys absent.
+  Scope narrowed the same day — a successful origin finish regained a bounded
+  one-shot publish in #800/#796 (cancelled/failed rows stay zero); see the
+  accept entry above and
+  [2026-09-21-close-zero-bytes.md](docs/experience/wins/2026-09-21-close-zero-bytes.md).
   Why the layer existed and why scheduling it was the wrong call, with both before
   geometries (09-21 close-bracket median over all 20 ticks per arm 1829.5→1098.5 ms, read from the vendored
   TSV column; 09-19 CLOSETAIL ~1.8 s + ~1.8 s): [errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md](docs/experience/errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md).
