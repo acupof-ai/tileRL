@@ -45,7 +45,7 @@ window genuinely runs a different shape.
 ### Instrumentation every arm gets
 
 `LIVENESS_POLL_S=999999 TILERL_STEP_TIMING=1 TILERL_STEP_TIMING_SLOW_MS=0
-TILERL_CLOSE_BUSYIDLE=1 TILERL_DRAFT_ATTN_WINDOW_TOKENS=2048`.
+TILERL_DRAFT_ATTN_WINDOW_TOKENS=2048`.
 
 `LIVENESS_POLL_S` is the load-bearing one: the supervisor's liveness probe sends
 a **real chat every 60 s**, which lands inside the decode window being measured.
@@ -150,10 +150,6 @@ means two full windows.
 
 - does `pub_cold_transfer` / `ssd_mmap` leave the close segment with steady
   decode held;
-- `close_dev` vs `close_host` on the release ticks — device-busy or host-blocked
-  (the #749 bracket);
-- `ssd_mmap_worker` subtracted from `ssd_mmap` — how much of the step charge was
-  cross-thread disk accounting;
 - `reclaim.json` — the #740 trailing truncation, from apparent bytes only (only
   if the sampler was run by hand; this harness no longer starts it).
 
