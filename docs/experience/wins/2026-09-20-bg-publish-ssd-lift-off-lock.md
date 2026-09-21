@@ -1,5 +1,6 @@
 # Background SSD lift moves disk IO off the tier lock — 2026-09-20
 
+> **Superseded 2026-09-21 by #787 (Epic #779 M2)**: #746 exists to let a background worker do its disk IO with the tier lock released; that worker is gone, so what this entry measures — the background worker's lock-outside lift — no longer has a call site. **The lock-split primitives survive and are reused**: `ColdSsdFile._mlock` and `HostKvPages.share_hold_kv` are called inline on the natural-leave path (`offer_drop` → `transfer_to_shared` → `share_hold_kv`), on the step thread, once per page. Do not delete `_mlock`/`share_hold_kv` reading this banner. (#746 merged, but the background form never ran on the production path.) The mechanism this entry measures is deleted; the page now publishes once, when it leaves the pool. See [errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md](../errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md).
 > Status: landed behind the existing `TILERL_CLOSE_BG_PUBLISH=1` gate (still
 > default OFF). CPU gates green; device benefit pending-remote and, per
 > perf1/b1, must be reported honestly if the #732 event-query arm shows most of

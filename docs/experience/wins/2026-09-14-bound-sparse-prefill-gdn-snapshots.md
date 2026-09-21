@@ -46,6 +46,8 @@ unconsumed boundary and the NEWEST.
   unconsumed snapshot is the one the next closure (`publish_dropped`) adopts.
 - The newest is the prompt-end boundary, which freezes the entry a same-prompt
   follower adopts (`close_request` / the `at_prompt_end` freeze).
+
+> **Note 2026-09-21:** `close_request` is deleted (Epic #779 M3, #787/#789) — the entry freezes when the page naturally leaves the resident union, not at a forced prompt-end closure. The `at_prompt_end` freeze and the natural-leave freeze describe the same lowest-boundary rule; read "prompt-end boundary" as "the boundary the walk reached", not as a close-time action. See [errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md](../errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md).
 - Any snapshot strictly between can only land an intermediate grow-entry
   length. The back-scan in `publish_dropped` already skips a boundary whose
   pages have not all dropped, so dropping the middle snapshot makes the entry

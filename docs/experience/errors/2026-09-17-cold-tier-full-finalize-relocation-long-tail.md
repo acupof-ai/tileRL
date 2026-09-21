@@ -11,6 +11,8 @@
 > finalize tail is gone (1–2 ms) and the long tail moved to a once-per-request
 > cold SSD close (~3.1 s); see
 > [2026-09-19-sm70-32k-decode-physical-wall-and-ssd-close-tail.md](2026-09-19-sm70-32k-decode-physical-wall-and-ssd-close-tail.md).
+>
+> **Note 2026-09-21:** the “cold SSD close ~3.1 s” path cited here is deleted — the refactor publishes a page once when it leaves the pool and close moves no KV bytes (Epic #779 M3, #787/#789; see [errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md](2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md)). The measurements above are unaffected; only the pointer to a now-removed mechanism is stale.
 
 ## Context
 
