@@ -1,5 +1,6 @@
 # Batched one-sync D2H for request-close prefix publish — 2026-09-19
 
+> **Superseded 2026-09-21 by #787 (Epic #779 M1)**: #741's close-batch D2H context is the first item of the deletion list. The mechanism this entry measures is deleted; the page now publishes once, when it leaves the pool. See [errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md](../errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md).
 > Status: landed behind an env gate (`TILERL_CLOSE_BATCH_D2H=1`), default OFF,
 > device delta measured on V100 2026-09-19 (659c2fbb): request-close median
 > 2940 → 2321 ms (−21%), steady decode unchanged. First of two PRs attacking

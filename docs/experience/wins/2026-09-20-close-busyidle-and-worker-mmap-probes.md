@@ -1,5 +1,6 @@
 # Close busy/idle attribution, worker-mmap split, cap reclaim sampler — 2026-09-20
 
+> **Superseded 2026-09-21 by #791 (Epic #779 M5)**: the busy/idle `close_bracket` instrument belongs to the deleted close path and #791 removes it; the worker-vs-step spill split (`ssd_ms_worker`) went with the #787 tier rewrite. Both instrumented a mechanism that no longer exists. The mechanism this entry measures is deleted; the page now publishes once, when it leaves the pool. See [errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md](../errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md).
 > Status: landed env-gated, default OFF. Device-only instrumentation for the
 > final #743 follow-up window; full CPU suite 1030 green. No behavior change
 > unless `TILERL_CLOSE_BUSYIDLE=1` (which requires `TILERL_STEP_TIMING=1`);

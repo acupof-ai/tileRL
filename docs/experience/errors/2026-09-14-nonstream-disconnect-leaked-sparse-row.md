@@ -18,6 +18,8 @@ its prefix published and, on a spill-capable build, could trigger an SSD write
 for nobody. The #587 cold-spill failure rows set `failed` specifically to skip
 that closure; cancel did not.
 
+> **Note 2026-09-21:** the routing bug this entry fixed is unaffected, but the *motive* for the second half no longer exists: the refactor deleted the forced prompt-end closure entirely (Epic #779 M3, #787/#789), so a cancelled row can no longer publish a prefix for a reader that does not exist. Setting `failed` remains correct; it is no longer load-bearing for this reason. See [errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md](2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md).
+
 `/health` understated the damage: `stats()` serves a snapshot refreshed only
 after a `step()`. A cancel leaves zero rows, so the loop idles and never
 refreshes, and `/health` kept reporting the dead row and occupied slot.

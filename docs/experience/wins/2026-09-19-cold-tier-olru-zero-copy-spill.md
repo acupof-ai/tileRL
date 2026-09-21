@@ -79,6 +79,8 @@ Keep a circuit counter so a pass over only unspillable entries still returns.
 - A close-time published-page count (pp-grow keys) is not in the step log; the
   release-path investigation needs that counter to size the close transfer.
 
+> **Note 2026-09-21:** this follow-up is moot — there is no close transfer left to size. The refactor deletes close-side publishing (Epic #779 M3, #787/#789); a page publishes once, when it leaves the pool. See [errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md](../errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md).
+
 ## Results
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |

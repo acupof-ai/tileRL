@@ -1,5 +1,6 @@
 # Background publisher for request-close host/SSD bytes — 2026-09-20
 
+> **Superseded 2026-09-21 by #787 (Epic #779 M2)**: #743's background publisher thread and its future/adoption protocol are deleted. The mechanism this entry measures is deleted; the page now publishes once, when it leaves the pool. See [errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md](../errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md).
 > Status: landed behind an env gate (`TILERL_CLOSE_BATCH_D2H=1`/`TILERL_CLOSE_BG_PUBLISH=1`),
 > default OFF; device partial confirmation on V100 2026-09-20 (0041fb14): the
 > shared-SSD write leaves the step thread when the bounded queue fits

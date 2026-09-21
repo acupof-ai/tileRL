@@ -1,5 +1,6 @@
 # Background-publish queue depth derives from context — 2026-09-20
 
+> **Superseded 2026-09-21 by #787 (Epic #779 M2)**: #745's derived queue depth and payload byte cap go with #743. The mechanism this entry measures is deleted; the page now publishes once, when it leaves the pool. See [errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md](../errors/2026-09-21-optimizing-at-the-wrong-layer-close-scheduling.md).
 > Status: landed behind the existing `TILERL_CLOSE_BG_PUBLISH=1` gate (still
 > default OFF). CPU gates green; device numbers are the #743 review arms
 > (perf1, V100, 2026-09-20). A follow-up to
