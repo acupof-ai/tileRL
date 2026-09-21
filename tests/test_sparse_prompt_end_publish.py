@@ -189,3 +189,29 @@ def test_an_unaligned_prompt_closes_to_its_actual_end_with_zero_tail_recompute()
             f"follower adopted {adopted} tokens, expected {prompt_pages * BLOCK_TOKENS}")
     finally:
         e.shutdown()
+
+
+def test_a_row_that_adopted_does_not_republish_at_finish():
+    """A follower that adopted a prefix must not re-close it at its own finish:
+    re-publishing adds a redundant frozen entry (extra refs on the #793 capacity
+    path) for zero new bytes. Only an origin publisher (sparse_matched==0)
+    publishes at finish. The adopted blobs it already pins survive its drop via
+    the request-pin release; the original publisher's entry stays the source."""
+    e, prompt, _res = _publisher(_SHORT_DECODE)
+    try:
+        rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
+        e.step()
+        r = next(x for x in e._running if x.req_id == rid)
+        assert r.sparse_matched > 0, "geometry failed to adopt"
+        pfx = e._sparse.prefix
+        n_entries_before = len(pfx._by_id)
+        n_shared_bytes_before = _shared_bytes(e._kv.cold)
+        for _ in range(40000):
+            d = e.poll()
+            if rid in d and len(d[rid]) >= 8:
+                break
+            e.step()
+        assert len(pfx._by_id) == n_entries_before, "adopted row added a re-published entry"
+        assert _shared_bytes(e._kv.cold) == n_shared_bytes_before, "adopted finish moved bytes"
+    finally:
+        e.shutdown()

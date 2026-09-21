@@ -2700,13 +2700,15 @@ class Engine:
         if req.state_slot is None:
             return  # never admitted; blocks and slot are taken together in `_admit`
         if req.sparse_on and self._sparse is not None:
-            # A SUCCESSFUL finish synchronously publishes the prompt prefix while
-            # its frames / private blobs / snapshots are still live, so a
-            # same-prefix follower arriving after this blocking request can
-            # adopt (#796 b'). Natural drops alone never span a short-turn
-            # prompt's low pages with no pool pressure. A cancelled/failed row
+            # A SUCCESSFUL finish of a row that did NOT itself adopt a prefix
+            # synchronously publishes its prompt prefix while frames/blobs/
+            # snapshots are live, so the next same-prefix follower can adopt
+            # (#796). A row that already adopted (sparse_matched > 0) does not
+            # re-publish: it would only add a redundant frozen entry onto the
+            # #793 capacity path for zero new bytes. A cancelled/failed row
             # publishes nothing (failed is set before _release).
-            if not req.failed and self._sparse.prefix is not None:
+            if not req.failed and req.sparse_matched == 0 \
+                    and self._sparse.prefix is not None:
                 self._sparse.publish_at_finish(req)
             # Drop this request's host-held cold blobs, keyed (req, logical
             # page) and never present in req.blocks, plus its bounds store.
