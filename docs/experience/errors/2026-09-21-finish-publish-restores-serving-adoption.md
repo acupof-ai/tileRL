@@ -97,7 +97,7 @@ test_sparse_engine.py. Full suite 1096 passed.
 ## Device verdict (2026-09-22, V100, serve a38c3bc4)
 
 `scripts/repro_adopt_796.py` (#799), geometry 16000-word head = 32028 tokens /
-2002 pages publisher → request-end finish → 128-token-suffix / 48-gen follower
+2001 full pages + 12-token tail publisher → request-end finish → 128-token-suffix / 48-gen follower
 → streaming cancel. Artifacts on V100 `~/closewin-m6/r800/d796/`
 (`d796_adopt.json`, `d796_health_poll.csv` 200 ms rows, `serve.log`,
 finish/follower tick extracts). Serve identity: sha a38c3bc4, python pgrep
