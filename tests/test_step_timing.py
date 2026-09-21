@@ -31,8 +31,8 @@ from tilerl.kv_cache import BLOCK_TOKENS
 #: The three release sub-segments every request end must charge.
 _RELEASE_SEGMENTS = ("release_close_request", "release_cold_forget", "release_blocks")
 
-#: The per-page publish costs, split by fix (see transfer_to_shared). Each has
-#: a different remedy, which is why one close_request bucket is not enough.
+#: The per-page publish costs, split by fix (see transfer_to_shared). They
+#: charge on natural-drop ticks since publish-once (#782), not at request end.
 _PUBLISH_SEGMENTS = (
     "pub_bounds_d2h",
     "pub_draft_clone",
