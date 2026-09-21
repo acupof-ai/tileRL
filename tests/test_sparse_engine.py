@@ -360,10 +360,12 @@ def test_serve_build_path_wires_the_sparse_engine(tmp_path, capsys):
 def test_sparse_prefix_publishes_only_when_pages_leave_the_hot_union():
     """Drop-only publishing under the cross-tick hot pin (#534): a page is shared
     only when it LEAVES the resident union, and only once pages 0..m-1 have all
-    dropped at least once and an exact boundary-m state snapshot exists. A short
-    prompt wholly inside the hot set publishes NOTHING; a long prompt whose early
-    pages drop publishes an entry, and a follower sharing it HITS (adopts the
-    block-aligned prefix, prefills only the tail) and matches a dense engine."""
+    dropped at least once and an exact boundary-m state snapshot exists. A long
+    prompt whose early pages drop publishes an entry, and a follower sharing it
+    HITS (adopts the block-aligned prefix, prefills only the tail) and matches a
+    dense engine. A short prompt wholly inside the hot set publishes nothing
+    (#782), which test_a_prompt_that_never_leaves_the_hot_pool_publishes_nothing
+    pins separately."""
     # tiny has one source group; k=2 + the forced 8-page window keep ~10 pages
     # hot, so decoding the 24-page prompt demotes its early pages and the
     # contiguous dropped frontier closes over the whole page-aligned prompt.
@@ -393,22 +395,6 @@ def test_sparse_prefix_publishes_only_when_pages_leave_the_hot_union():
     miss.shutdown()
 
     sparse = _sparse()
-    # A 5-page prompt fits entirely inside k+window: nothing leaves the union,
-    # so no DROP publishes while it runs. Finishing it closes the prompt-end
-    # frontier from the live device frames instead.
-    short = sparse.submit(np.arange(7, 7 + 5 * BLOCK_TOKENS, dtype=np.int64),
-                          SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
-    for _ in range(30):
-        sparse.step()
-        sr = next((x for x in sparse._running if x.req_id == short), None)
-        if sr is not None and sr.decoding:
-            break
-    assert sparse._sparse.prefix.published == 0, sparse._sparse.prefix.published
-    _drain(sparse, short, 4)
-    short_entry = sparse._sparse.prefix.lookup(
-        np.arange(7, 7 + 5 * BLOCK_TOKENS, dtype=np.int64))
-    assert short_entry is not None and len(short_entry["keys"]) == 5
-
     r1 = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
     _drain(sparse, r1, 200)
     entry = sparse._sparse.prefix.lookup(follow)
@@ -542,11 +528,15 @@ def test_sparse_long_prefill_snapshot_cap_keeps_a_follower_hit_exact():
     miss.shutdown()
 
     pub = _eng()
-    rp = pub.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
-    _drain(pub, rp, 2)
+    # Decode long enough that ALL 32 prompt pages leave the k+window union: with
+    # an 8-page own window, page 31 drops after roughly 8 decode pages (~128
+    # tokens). Publish-once (#782) forms the prompt-end entry from those natural
+    # drops, not from a forced closure at finish.
+    rp = pub.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    _drain(pub, rp, 200)
     cache = pub._sparse.prefix
-    # 32 boundaries were noted across the prefill; at most two snapshots remain,
-    # and the prompt-end prefix was still published.
+    # 32 boundaries were noted across the prefill; the prompt-end prefix was
+    # published as the last prompt pages dropped during decode.
     assert len(cache._snap) <= 1  # publisher's request finished and dropped its state
     entry = cache.lookup(follow)
     assert entry is not None and len(entry["keys"]) == 32
@@ -2162,11 +2152,12 @@ def test_sparse_draft_follower_adopts_a_published_prefix_and_matches_cold():
     assert got == cold_got, f"warm draft follower {got} != cold spec {cold_got}"
 
 
-def test_sparse_publisher_publishes_full_prompt_at_finish_without_any_drop():
-    """A hot pool (k >= prompt pages) never drops a prompt page during the run;
-    the prompt-end entry must still form when the publisher finishes, from live
-    device frames with draft K/V attached (the card gate's publisher shape:
-    k=128, a 24-page prompt — drop-only publishing alone never closes)."""
+def test_a_prompt_that_never_leaves_the_hot_pool_publishes_nothing():
+    """Publish-once semantics (#782): a page is published only when it LEAVES the
+    resident union. A hot pool (k=64 >= the 8-page prompt plus its window) keeps
+    every prompt frame for the whole run, so request end moves zero bytes: no
+    lookup entry, no shared blobs, no draft K/V copied. The old forced
+    prompt-end closure at _release is gone; a same-prompt follower misses."""
     cfg = tiny()
     model = build_random(cfg, seed=11)
     prompt = (np.arange(8 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
@@ -2181,11 +2172,9 @@ def test_sparse_publisher_publishes_full_prompt_at_finish_without_any_drop():
     try:
         rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
         _drain(eng, rid, 8)
-        entry = eng._sparse.prefix.lookup(prompt)
-        assert entry is not None and len(entry["keys"]) == 8, \
-            "publisher finished without closing the prompt-end frontier"
-        assert all("dk" in eng._kv.cold.share_take(k) for k in entry["keys"]), \
-            "finish-published blobs carry no draft KV"
+        assert eng._sparse.prefix.published == 0, eng._sparse.prefix.published
+        assert eng._sparse.prefix.lookup(prompt) is None
+        assert not eng._kv.cold.share_keys(), eng._kv.cold.share_keys()
     finally:
         eng.shutdown()
 
@@ -2197,7 +2186,9 @@ def test_sparse_warm_follower_with_an_exact_page_aligned_prompt_matches_cold():
     cold follower."""
     cfg = tiny()
     model = build_random(cfg, seed=11)
-    prompt = (np.arange(8 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    # Long enough that k+window cannot hold the whole prompt: under publish-once
+    # (#782) the prefix forms from natural drops, never from a forced closure.
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
     params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
 
     def eng():
@@ -2206,19 +2197,21 @@ def test_sparse_warm_follower_with_an_exact_page_aligned_prompt_matches_cold():
         return build_engine(
             cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
             num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-            max_num_batched_tokens=512, sparse_k=64, scorer="bounds",
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
             kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
 
     cold = eng()
     cold_got = _drain(cold, cold.submit(prompt, params), 8)
     cold.shutdown()
     warm = eng()
-    pid = warm.submit(prompt, params)
-    _drain(warm, pid, 8)
+    # Decode the publisher until every prompt page left the union and the
+    # exact-aligned prefix formed via natural drops (#782).
+    pid = warm.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    _drain(warm, pid, 200)
     rid = warm.submit(prompt, params)
     warm.step()
     assert next(x for x in warm._running if x.req_id == rid).sparse_matched \
-        == 8 * BLOCK_TOKENS
+        == 24 * BLOCK_TOKENS
     got = _drain(warm, rid, 8)
     warm.shutdown()
     assert got == cold_got, f"zero-tail warm {got} != cold {cold_got}"
@@ -2492,6 +2485,11 @@ def test_a_shared_spill_failure_lets_requests_finish_token_exact(tmp_path):
 
     kvmod.ColdSsdFile.write = shared_only_fail
     try:
+        # A long publisher: its early pages leave the union and the shared spill
+        # write fails on the first natural publish (publish-once, #782 — request
+        # end itself writes no shared bytes).
+        pub = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+        _drain(e, pub, 200)
         rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
         out = _drain(e, rid, 4)
         # a second request still completes on the same engine
@@ -2917,19 +2915,19 @@ def test_hybrid_dense_spec_row_finishes_with_exactly_n_during_sparse_fill():
 
 
 def test_a_cancelled_sparse_row_publishes_no_prefix_and_returns_every_page():
-    """A disconnected sparse reader releases like a #587 cold-spill failure row.
+    """A disconnected sparse row releases its pages like a normal finish.
 
-    cancel() used to leave failed=False, so _release ran close_request: it closed
-    the prompt-end frontier and transferred the row's own pages into shared cold
-    blobs for a reader already gone, and on a spill-capable build even wrote SSD.
-    A cancelled row must publish nothing and give back blocks, cold blobs and slot.
-    """
+    Publish-once (#782) removed the forced prompt-end closure at _release, so
+    cancel and finish move no bytes at request end: either way a page is
+    published only if it already left the union (offer_drop). Cancelled while
+    still prefill-decoding here, the row's pages never leave, so it publishes
+    nothing and gives back blocks, cold blobs and slot."""
     engine = build_engine(
         cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
         num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
         max_num_batched_tokens=512, sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
-    # Same 24-page prompt the publishing test uses: early pages demote in decode,
-    # so a prompt-end close WOULD publish 24 keys if cancel skipped the failed flag.
+    # Same 24-page prompt the publishing tests use; the cancel lands while the row
+    # is still prefill-decoding, before any contiguous frontier can close.
     prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
     rid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
     for _ in range(30):

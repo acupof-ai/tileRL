@@ -2747,25 +2747,9 @@ class Engine:
         if req.sparse_on and self._sparse is not None:
             if _tm is not None:
                 _tm.close_bracket_start()
-            if self._sparse.prefix is not None and req.sparse_matched == 0 and not req.failed:
-                # This segment is a SUPERSET of the five pub_* marks its callees
-                # charge: close_request's own index accounting and the
-                # take_freeze_refs/share_ref loop below carry no mark, so roughly
-                # a third of this bucket is unmarked. A profile that reads a
-                # leftover here as a per-page cost is reading the index work.
-                keys = self._sparse.prefix.close_request(
-                    req.req_id, req.tokens, self._sparse.bounds_view(req.req_id)
-                )
-                written_page = (
-                    (req.draft_pos + 1) // BLOCK_TOKENS
-                    if self._draft is not None and req.draft_blocks
-                    else -1
-                )
-                for p, content_key in keys.items():
-                    draft_block = req.draft_blocks[p] if p <= written_page else None
-                    self._sparse.transfer_to_shared(req, p, content_key, draft_block)
-                for content_key in self._sparse.prefix.take_freeze_refs():
-                    self._kv.cold.share_ref(content_key)
+            # Publishing happens only while pages leave the resident union
+            # (offer_drop); request end moves no bytes. The timing bracket is
+            # removed with the rest of the close-window instrumentation (#784).
             if _tm is not None:
                 _tm.close_bracket_end()
                 _tm.mark("release_close_request", _t)
@@ -2827,9 +2811,8 @@ class Engine:
             for queue in (self._running, self._waiting):
                 req = next((r for r in queue if r.req_id == request_id), None)
                 if req is not None:
-                    # Same flag a cold-spill failure row carries: _release then skips
-                    # close_request, which would publish and maybe spill a prefix for a
-                    # reader that is already gone.
+                    # Marker for a row that did not finish; request end publishes
+                    # nothing regardless (publish-once, #782).
                     req.failed = True
                     self._release(req)
                     self._failed[request_id] = (None, "cancelled: the reader disconnected")

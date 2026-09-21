@@ -31,8 +31,8 @@ from tilerl.kv_cache import BLOCK_TOKENS
 #: The three release sub-segments every request end must charge.
 _RELEASE_SEGMENTS = ("release_close_request", "release_cold_forget", "release_blocks")
 
-#: The per-page publish costs, split by fix (see transfer_to_shared). Each has
-#: a different remedy, which is why one close_request bucket is not enough.
+#: The per-page publish costs, split by fix (see transfer_to_shared). They
+#: charge on natural-drop ticks since publish-once (#782), not at request end.
 _PUBLISH_SEGMENTS = (
     "pub_bounds_d2h",
     "pub_draft_clone",
@@ -183,11 +183,11 @@ def test_release_subsegments_are_inside_sample(monkeypatch):
 
 
 def test_release_subsegments_charge_on_a_sparse_request_end(monkeypatch):
-    """Every release and publish sub-segment must charge on a real sparse end.
+    """Publish and release sub-segments must charge on a real sparse run.
 
-    The dense test above only ever exercises `release_blocks`: with no sparse
-    row the `close_request`/`cold_forget` marks are never reached, so deleting
-    either one left the gate green. Two shapes are needed beyond that:
+    Publish-once (#782) moved the five pub_* segments from request end to the
+    ticks pages leave the resident union (offer_drop), while the release itself
+    charges cold_forget and blocks. Two shapes are needed beyond the dense test:
 
     * a DRAFT row: without one `pub_draft_clone` charges only timer noise on the
       skipped `if draft_block is not None` branch, so the assertion passes
@@ -203,7 +203,10 @@ def test_release_subsegments_charge_on_a_sparse_request_end(monkeypatch):
     try:
         tm = eng._step_timing
         prompt = (np.arange(16 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
-        rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+        # Publish-once (#782): the prompt pages publish on the ticks they leave
+        # the union, so decode long enough to demote them; the release itself
+        # only charges cold_forget + blocks.
+        rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
         peak: dict[str, float] = {}
         for _ in range(512):
             done = eng.poll()
@@ -212,13 +215,17 @@ def test_release_subsegments_charge_on_a_sparse_request_end(monkeypatch):
             # release work of exactly the requests that ended in this tick.
             for k, v in tm.cur.items():
                 peak[k] = peak.get(k, 0.0) + v
-            if rid in done and len(done[rid]) >= 2:
+            if rid in done and len(done[rid]) >= 200:
                 break
         else:
             raise AssertionError("sparse request did not finish")
-        missing = [k for k in _RELEASE_SEGMENTS if peak.get(k, 0.0) <= 0.0]
+        assert eng._sparse.prefix.published >= 1, eng._sparse.prefix.published
+        # release_close_request is an empty bracket after #782 (the #784
+        # instrumentation cleanup removes the mark); the segments that must
+        # charge at a sparse end are the two below it.
+        charged_at_release = ("release_cold_forget", "release_blocks")
+        missing = [k for k in charged_at_release if peak.get(k, 0.0) <= 0.0]
         assert not missing, f"never charged on a sparse request end: {missing}"
-        assert eng._sparse.prefix.published == 1, eng._sparse.prefix.published
         # Asserted >0, never against a magnitude: these are wall-clock samples on
         # a shared CPU box and vary run to run. Illustrative only, one 2026-09-18
         # run at k=2 / 16 pages / draft=True: bounds 39.5us, draft_clone 64.1,
