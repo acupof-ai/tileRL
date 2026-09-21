@@ -470,21 +470,13 @@ class SparseRuntime:
         """One synchronous prompt-prefix publish at successful request finish
         (#796), while this request's frames/private blobs/snapshots are still
         live. Reuses the exact transfer an offer uses (resident frames are D2H'd
-        here); no batch/bg machinery. A cancel never calls this.
-
-        b'2: for an unaligned prompt, synthesize the prompt-end boundary
-        snapshot from the request's live recurrent state first, so the entry can
-        close through the prompt end with zero tail recompute. An aligned prompt
-        already has that snapshot; pass hidden=None to publish trunk-only."""
+        here); no batch/bg machinery. A cancel, a failed row, or an adopted
+        follower never calls this (the engine gates sparse_matched/failed)."""
         ctx = self.ctx
         tr = self.tracker
         if tr.prefix is None:
             return
-        tr.prefix.ensure_prompt_end_snapshot(
-            r.req_id,
-            (ctx.states.states[r.state_slot], ctx.states.window_snapshot(r.state_slot)),
-            None,
-        )
+
         def publishable(p: int) -> bool:
             # A source exists to materialize the blob: a held private blob (RAM
             # or private SSD) or a live resident device frame. The closure stops

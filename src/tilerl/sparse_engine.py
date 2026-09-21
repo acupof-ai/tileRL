@@ -1049,51 +1049,39 @@ class SparsePrefixCache:
                     self._cold.share_ref(k)
         return out
 
-    def ensure_prompt_end_snapshot(self, req_id: int, state, hidden=None) -> bool:
-        """b'2: synthesize the prompt-end boundary snapshot for an UNALIGNED
-        prompt (len % BLOCK_TOKENS != 0), which note_boundary never records.
-        Called at successful finish while the recurrent state is still the
-        request's own. Returns True if it added a snapshot, False if one already
-        exists at the prompt end (aligned prompt, or already closed there)."""
-        pp = self._prompt_pages.get(req_id)
-        if pp is None or pp <= 0 or pp in self._snap.get(req_id, {}):
-            return False
-        states, window = state
-        self._snap.setdefault(req_id, {})[pp] = (
-            states.cpu(), None if window is None else window.cpu())
-        if hidden is not None:
-            self._snap_hidden.setdefault(req_id, {})[pp] = (
-                hidden.detach().cpu().clone().reshape(-1))
-        return True
-
     def close_prompt(self, req_id: int, tokens, bounds, publishable=None) -> dict[int, int]:
-        """Synchronously close the prompt prefix to its deepest reachable
-        boundary while the request's frames, private blobs and snapshots are
-        still live — called once at successful finish (#796). See
-        ensure_prompt_end_snapshot for the aligned (b'2) vs deepest-aligned
-        (b'1) tail distinction. ``publishable(p)`` optionally limits the closure
-        to pages the caller can land a blob for; the closure stops at the first
-        gap and only fires if the truncation still lands on a snapshot."""
+        """Synchronously close the prompt prefix while the request's frames,
+        private blobs and snapshots are still live — called once at successful
+        finish (#796). Closes to the highest snapshot boundary m (≤ prompt end)
+        for which EVERY page in [grow_len, m) can land a blob.
+
+        The production prefill chunker cuts an unaligned tail (len % 16) into
+        its own forward, so the deepest aligned chunk end is a full page boundary
+        at floor(prompt_pages); the follower re-forwards only the <16-token
+        remainder. ``publishable(p)`` guards the closure: a mid-range source-less
+        page does not kill the whole aligned suffix — the closure falls back to
+        the highest snapshot below the first gap. Returns {} if no boundary from
+        the current grow length is fully serviceable."""
         pp = self._prompt_pages.get(req_id)
         if pp is None:
             return {}
         e = self._grow.get(req_id)
         old_len = 0 if e is None else len(e["keys"])
-        # The longest length that has a snapshot (snaps are aligned prefill
-        # boundaries, capped to {lowest,newest}, plus a synthesized prompt-end
-        # one under b'2); never above the prompt end.
-        reachable = sorted(m for m in self._snap.get(req_id, {}) if old_len < m <= pp)
-        if not reachable:
+        # Snapshot boundaries at/after the grow length, at or before the prompt
+        # end; try the longest first so a hole in the middle keeps the suffix.
+        reachable = sorted(
+            (m for m in self._snap.get(req_id, {}) if old_len < m <= pp),
+            reverse=True)
+        m = 0
+        if publishable is None:
+            m = reachable[0] if reachable else 0
+        else:
+            for cand in reachable:
+                if all(publishable(p) for p in range(old_len, cand)):
+                    m = cand
+                    break
+        if m == 0:
             return {}
-        m = reachable[-1]
-        # Only close over a page the caller can actually land a blob for. The
-        # frontier grows from old_len, so a single source-less page truncates the
-        # closure at it instead of letting publish_dropped name a dead key.
-        if publishable is not None:
-            while m > old_len and not all(publishable(p) for p in range(old_len, m)):
-                m -= 1
-            if m == old_len or m not in self._snap.get(req_id, {}):
-                return {}
         pend = self._pending.setdefault(req_id, {})
         for p in range(old_len, m):
             pend.setdefault(p, (req_id, p))

@@ -460,6 +460,35 @@ def test_sparse_prefix_out_of_order_drops_never_publish_a_hole():
     assert hit4 is not None and len(hit4["keys"]) == P
 
 
+def test_close_prompt_falls_back_below_a_source_hole_instead_of_dropping_the_suffix():
+    """#796: at finish the closure candidate pages are only those with a live
+    blob/frame source. A source-less page in the middle must not truncate the
+    closure to NOTHING (the old while-walk landed below the lowest remaining
+    snapshot): the closure falls back to the highest snapshot boundary below
+    the first gap, so the aligned prefix below it still adopts."""
+    import torch
+
+    from tilerl.kv_tiers import HostKvPages
+    from tilerl.sparse_engine import SparsePrefixCache
+
+    cold = HostKvPages(budget_bytes=1 << 30)
+    cache = SparsePrefixCache(cold, states=None)
+    rid, P = 0, 5
+    tokens = tuple(range(P * BLOCK_TOKENS))
+    cache.set_request(rid, P)
+    for m in (2, 4):
+        cache.note_boundary(rid, m, (torch.zeros(2), None))
+    bounds = {p: torch.zeros(1) for p in range(P)}
+
+    # The hole is page 3 only. The old per-page walk-back stopped at m=3
+    # (pages 0..2 serviceable), saw 3 is not a snapshot, and returned {} --
+    # dropping the suffix even though snapshot 2 below the gap is serviceable.
+    keys = cache.close_prompt(rid, tokens, bounds, publishable=lambda p: p != 3)
+    assert len(keys) == 2, f"hole fallback closed {len(keys)} pages, expected 2"
+    entry = cache.lookup(tokens)
+    assert entry is not None and len(entry["keys"]) == 2
+
+
 def test_sparse_prefill_retains_at_most_two_boundary_snapshots_per_request():
     """The 256k V100 SIGKILL: a long single-request prefill stalls the dropped
     frontier at page 0 (k+window keep every early page resident), while every

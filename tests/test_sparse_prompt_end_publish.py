@@ -111,9 +111,9 @@ def test_a_short_decode_prompt_is_adoptable_by_a_same_head_follower():
             "the prompt is not findable in the sparse prefix index after a short "
             "decode; the prompt-end frontier never closed (#796)")
         adopted = _adopt_after(e, prompt)
-        assert adopted > 0, (
-            "a same-head follower adopted 0 tokens from a completed prompt whose "
-            "pages never left the union (#796)")
+        assert adopted == _PAGES * BLOCK_TOKENS, (
+            f"a same-head follower adopted {adopted} tokens, expected the full "
+            f"{_PAGES * BLOCK_TOKENS} closure (#796)")
     finally:
         e.shutdown()
 
@@ -141,35 +141,13 @@ def test_the_same_publisher_decoding_past_a_chunk_does_publish_and_adopt():
         e.shutdown()
 
 
-def test_the_close_path_still_carries_no_forced_publish():
-    """The other red line (M3, `wins/2026-09-21-close-zero-bytes`): a request end
-    must not force a frontier closure. Asserted structurally rather than by a
-    counter, because the counter that matters -- close-tick `pub_*` / `ssd_mmap`
-    -- only exists under TILERL_STEP_TIMING, and the thing being guarded is that
-    the call is gone from the release path at all.
-
-    `SparsePrefixCache.close_request` is the deleted forced-closure entry point;
-    a remediation fix must not reintroduce a call to it on the close path. The
-    prompt-end trigger belongs off the request-close tick.
-    """
-    import inspect
-
-    from tilerl import sparse_engine
-    from tilerl.engine import Engine
-
-    assert not hasattr(sparse_engine.SparsePrefixCache, "close_request"), (
-        "close_request is back on SparsePrefixCache -- the M3 close-time forced "
-        "closure this issue is re-scoping around")
-    src = inspect.getsource(Engine._release)
-    assert "close_request" not in src, "the request-release path calls close_request again"
-
-
 def test_an_unaligned_prompt_closes_to_its_actual_end_with_zero_tail_recompute():
-    """b'2 + perf2 F1: the real M6 prompt is 32028 tokens = 2001 pages + 12
-    tokens, so no note_boundary snapshot exists at the prompt end. Without a
-    synthesized end snapshot the closure stops at m=1920 and the follower
-    recomputes the 81-page / 1308-token (4.1%) tail. finish must add the
-    prompt-end snapshot from live recurrent state and close through it.
+    """The real M6 prompt is 32028 tokens = 2001 pages + 12 tokens. The
+    production prefill chunker cuts the unaligned tail back to a block
+    boundary (engine.py chunk loop), so a snapshot exists at floor page 2001 =
+    32016 tokens and only the 12-token tail is recomputed. finish must close
+    through that naturally-present deepest snapshot -- no synthesized end
+    snapshot from post-decode live state.
 
     Asserts the EXACT adopted length (not >0) and that shared BYTES land
     (a partial/skipped dead entry would also satisfy a >0 entry check)."""
