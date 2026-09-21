@@ -2250,7 +2250,9 @@ def test_an_adopted_prefix_redemotes_with_zero_device_bytes():
     want = _drain(miss, miss.submit(prompt, params), 8)
     miss.shutdown()
 
-    def run_follower(hide_shared_after_adopt: bool):
+    def run_follower(
+        hide_shared_after_adopt=False, prefix_capacity=None, drop_blob_at_resolve=False,
+    ):
         warm = spec_engine()
         pub = warm.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
         _drain(warm, pub, 200)
@@ -2259,6 +2261,11 @@ def test_an_adopted_prefix_redemotes_with_zero_device_bytes():
         content_keys = set(entry["keys"])
         pool = warm._kv
         cold = pool.cold
+        if prefix_capacity is not None:
+            # Shrink the index after the publisher's entry exists so the
+            # follower's own closures evict entries between the labelled frame
+            # release and the frontier close — the F1 race (#783).
+            warm._sparse.prefix.capacity = prefix_capacity
 
         adopted_demoted: list[int] = []
         real_demote = pool.demote_page
@@ -2271,6 +2278,7 @@ def test_an_adopted_prefix_redemotes_with_zero_device_bytes():
         pool.demote_page = spy_demote
         dup_refs: list[int] = []
         real_share_ref = cold.share_ref
+        real_share_ref_if_present = cold.share_ref_if_present
 
         def spy_share_ref(key):
             if key in content_keys:
@@ -2290,32 +2298,72 @@ def test_an_adopted_prefix_redemotes_with_zero_device_bytes():
             return real_lift(private_key, shared_key, extra=extra)
 
         cold.share_hold_kv = spy_lift
+        real_share_take = cold.share_take
+
+        if drop_blob_at_resolve:
+            # The entry's label survives but its shared record was evicted:
+            # a later select that promotes the page gets None and must fall
+            # back to a fresh block instead of raising (the daemon would log
+            # and the row would sit there as a zombie).
+            def share_take_none(key):
+                if key in content_keys:
+                    return None
+                return real_share_take(key)
+
+            cold.share_take = share_take_none
+
         try:
             rid = warm.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
             warm.step()  # adopts the 24-page prefix
             assert next(x for x in warm._running if x.req_id == rid).sparse_matched \
                 == n_prompt_pages * BLOCK_TOKENS
             if hide_shared_after_adopt:
-                # Simulate shared-LRU eviction between adopt and re-leave.
+                # Simulate shared-LRU eviction between adopt and re-leave: both
+                # the membership probe and the atomic take must miss.
                 cold.share_keys = lambda: frozenset()
+                cold.share_ref_if_present = lambda key: False
             got = _drain(warm, rid, 200)
+            leftover = set(warm._sparse.tracker.preheld.get(rid, ()))
         finally:
             pool.demote_page = real_demote
             cold.share_ref = real_share_ref
             cold.share_hold_kv = real_lift
+            cold.share_ref_if_present = real_share_ref_if_present
+            cold.share_take = real_share_take
             warm.shutdown()
-        return got, adopted_demoted, dup_refs, lifted
+        return got, adopted_demoted, dup_refs, lifted, leftover
 
-    got, adopted_demoted, dup_refs, lifted = run_follower(hide_shared_after_adopt=False)
+    got, adopted_demoted, dup_refs, lifted, leftover = run_follower(hide_shared_after_adopt=False)
     assert got[:8] == want, f"dedup follower {got[:8]} != miss {want}"
     assert not adopted_demoted, f"adopted pages paid a D2H demote: {adopted_demoted}"
     assert not lifted, "dup republish reached the private->shared lift instead of ref-only"
     assert dup_refs, "the re-publish never took the zero-byte share_ref path"
+    assert not leftover, f"early refs never handed to a closed frontier: {leftover}"
 
-    fb_got, fb_demoted, _, fb_lifted = run_follower(hide_shared_after_adopt=True)
+    fb_got, fb_demoted, _, fb_lifted, fb_leftover = run_follower(hide_shared_after_adopt=True)
     assert fb_got[:8] == want, f"fallback follower {fb_got[:8]} != miss {want}"
     assert fb_demoted, "evicted shared keys must fall back to a real demote"
     assert fb_lifted, "fallback must republish through the normal lift path"
+    assert not fb_leftover
+
+    # F1 race: a prefix-index LRU that evicts entries between the labelled frame
+    # release and the (possibly later-tick) frontier closure. Pre-#783 the closure
+    # hit a dead key and raised "neither a private host blob nor a resident frame";
+    # the early ref pins the key across the gap. Capacity 2 forces evictions while
+    # 24 pages re-leave. Every early ref must be consumed by a closed frontier.
+    cap_got, _, _, _, cap_leftover = run_follower(
+        hide_shared_after_adopt=False, prefix_capacity=2)
+    assert cap_got[:8] == want, f"capacity-2 follower {cap_got[:8]} != miss {want}"
+    assert not cap_leftover, f"preheld refs leaked under LRU pressure: {cap_leftover}"
+
+    # resolve-None arm: the label outlives the shared record and a page is
+    # re-selected. Pre-fix resolve raised "missing its shared blob" and the
+    # daemon logged-and-continued into a zombie row; now it allocates a fresh
+    # block and the row FINISHES (tokens need not equal the oracle — the blob
+    # is genuinely gone, this is the non-crashing recovery contract, not a
+    # silent correct adopt).
+    none_got, *_ = run_follower(drop_blob_at_resolve=True)
+    assert len(none_got) == 200, "row stalled/zombied instead of finishing its decode"
 
 
 def test_sparse_mixed_length_rows_prefilling_one_tick_match_their_solo_g0():

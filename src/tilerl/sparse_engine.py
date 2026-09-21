@@ -234,6 +234,11 @@ class SparseTracker:
         self.resident: dict[int, dict[int, int]] = {}
         #: logical pages adopted from a shared prefix entry: req_id -> {page: content key}
         self.shared: dict[int, dict[int, int]] = {}
+        #: content keys whose share ref was taken early when a labelled page
+        #: left the union (the frame was returned with no D2H), waiting for the
+        #: frontier closure to hand the ref to the grow entry: req_id -> {keys}.
+        #: An unclosed request releases them on drop.
+        self.preheld: dict[int, set[int]] = {}
         #: host-blob-backed prefix index (None = the NoPrefixStore stopgap)
         self.prefix: SparsePrefixCache | None = None
         #: False when the caller explicitly chose NoPrefixStore (sharing disabled)

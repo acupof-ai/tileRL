@@ -1000,6 +1000,18 @@ class HostKvPages:
             if rec is not None:
                 rec[1] += 1
 
+    def share_ref_if_present(self, key: int) -> bool:
+        """Atomically check-and-add one store reference: True when the key is
+        currently shared and one ref was taken, False when it is gone. The check
+        and the bump run in one critical section so a caller can act on False
+        without a check-then-act race."""
+        with self._tlock:
+            rec = self._shared.get(key)
+            if rec is None:
+                return False
+            rec[1] += 1
+            return True
+
     def share_keys(self) -> frozenset[int]:
         with self._tlock:
             return frozenset(self._shared)
