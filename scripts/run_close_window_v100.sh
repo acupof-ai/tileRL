@@ -9,14 +9,14 @@
 # and writes every artifact to a vendored directory so a number is attributable.
 #
 # It orchestrates; it does not measure. The probes it calls own their reporting:
-#   scripts/probe_headroom_coldtail.py  arm / compare / reclaim-sample  (#620/#749)
+#   scripts/probe_headroom_coldtail.py  arm / compare  (#620/#749)
 #   scripts/probe_sse_overload.py       --timing        (cancel immediacy)
 # and the serve itself is the shipped supervisor:
 #   scripts/serve_hybrid_v100.sh
 #
 #   scripts/run_close_window_v100.sh --repo ~/tilerl-v100-sse --out ~/closewin
 #   scripts/run_close_window_v100.sh --list
-#   scripts/run_close_window_v100.sh --arm bg1        # one arm
+#   scripts/run_close_window_v100.sh --arm baseline   # one arm
 #   scripts/run_close_window_v100.sh --all            # every arm, then restore
 #   scripts/run_close_window_v100.sh --restore-only   # official serve back, no flags
 #
@@ -36,27 +36,6 @@ EXPECT_BLOCKS=${EXPECT_BLOCKS:-2213}
 EXPECT_MODEL=${EXPECT_MODEL:-qwen38-27b}
 PROMPT_TOKENS=${PROMPT_TOKENS:-32000}
 WARM_REPS=${WARM_REPS:-3}
-# The reclaim sampler runs only on the arms that can actually shrink (below), and
-# run_arm waits on it. Two constraints set its span, both arithmetic on measured
-# numbers:
-#
-#   1. It must still be RUNNING when the release it watches happens. One 32k cold
-#      fill prompt costs ~156 s measured, the probe's --fill-n default is 5 (the
-#      harness does not pass it) and the warm request is itself a 32k prompt, so
-#      rep0's first release is ~(5+1)*156 = 936 s in. A 60x10 span (590 s) would
-#      have ENDED ~350 s before the event it exists to sample.
-#   2. It must not run far PAST the probe. The probe is the longer of the two at
-#      this shape -- 3 reps x 936 s = ~47 min against a 1335 s sampler -- so an
-#      overlong sampler costs nothing extra, but a span longer than the probe would
-#      make every gated arm pay the difference for tail rows on a settled plateau.
-#
-# 90 x 15 = 1335 s (~22 min) sits comfortably inside the ~47 min probe and covers
-# the 936 s release with ~400 s of post-release tail. It replaces a 120x20 default
-# that cost 39.7 min on EVERY arm, including the five where the shrink is
-# physically impossible. RECLAIM_SAMPLES is COUPLED to --fill-n: a larger --fill-n
-# pushes the first release out and the span has to grow with it.
-RECLAIM_SAMPLES=${RECLAIM_SAMPLES:-90}
-RECLAIM_INTERVAL_S=${RECLAIM_INTERVAL_S:-15}
 
 # The header comment block, by RULE not by line number: a fixed `sed -n '2,26p'`
 # silently printed the wrong lines (and lost the examples) the first time a header
@@ -69,26 +48,17 @@ usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' 
 # The lock-split arm (#746) is a placeholder until that PR merges -- an unmerged
 # flag would boot a serve that silently ignores it and report a no-op as a result.
 #
-# bg1 vs bg2 is the depth question, not a second flag: TILERL_CLOSE_BG_PUBLISH
-# alone leaves build.py to derive (num_slots+1)*ceil(max_ctx/16) from the shape,
-# while bg1 pins the queue at its own default so the two are separable. bg3 pins
-# the 8192 the 2026-09-20 window measured clean.
-#
-# bgcap adds TILERL_COLD_PREFIX_SSD_CAP=1, which is what makes the #740 trailing
-# truncation visible at all: the shared prefix spill is otherwise unbounded and
-# keeps growing. It is an ARM rather than part of the shared instrumentation
-# because it changes what the engine does (the file is bounded and disk returned)
-# -- turning it on for every arm would make the arms incomparable on the very
-# thing they are being compared on. bg2 is its control: same bg config, no cap.
-ARM_NAMES=(baseline batch bg1 bg2 bg3 bgcap locksplit)
+# The batch/bg1/bg2/bg3/bgcap arms were deleted with the close/batch/bg machinery
+# they measured (#784): `TILERL_CLOSE_BATCH_D2H`, `TILERL_CLOSE_BG_PUBLISH` and
+# `TILERL_CLOSE_BG_DEPTH` are no longer read anywhere in src/, so an arm setting
+# them would have silently measured the baseline and reported it as a treatment.
+# `TILERL_COLD_PREFIX_SSD_CAP` (a cold-tier capacity knob, not a close-transport
+# one) survives in src/ but has no arm here; it is verified per-M6 rather than by
+# a measurement arm in this window.
+ARM_NAMES=(baseline locksplit)
 arm_env() {
   case "$1" in
     baseline)  echo "" ;;
-    batch)     echo "TILERL_CLOSE_BATCH_D2H=1" ;;
-    bg1)       echo "TILERL_CLOSE_BATCH_D2H=1 TILERL_CLOSE_BG_PUBLISH=1 TILERL_CLOSE_BG_DEPTH=512" ;;
-    bg2)       echo "TILERL_CLOSE_BATCH_D2H=1 TILERL_CLOSE_BG_PUBLISH=1" ;;
-    bg3)       echo "TILERL_CLOSE_BATCH_D2H=1 TILERL_CLOSE_BG_PUBLISH=1 TILERL_CLOSE_BG_DEPTH=8192" ;;
-    bgcap)     echo "TILERL_CLOSE_BATCH_D2H=1 TILERL_CLOSE_BG_PUBLISH=1 TILERL_COLD_PREFIX_SSD_CAP=1" ;;
     locksplit) echo "PENDING_746" ;;
     *) return 2 ;;
   esac
@@ -243,7 +213,6 @@ run_arm() {
   rm -f "$arm_fuse"
 
   # Every artifact from this arm lands in $dir; nothing writes outside it.
-  local reclaim_pid=
   local env_line; env_line="$(instrument_env) ${env_delta}"
   # shellcheck disable=SC2086  # deliberate: the helpers emit VAR=val words to split
   ( export SERVE_REPO=$REPO SERVE_ROOT=$ROOT SERVE_PORT=$PORT SERVE_LOG=$arm_log
@@ -252,35 +221,6 @@ run_arm() {
   wait_ready || { log "arm $name: serve never became ready"; return 1; }
   health_gate || { log "arm $name: health gate failed"; stop_serve; return 1; }
 
-  # reclaim-sample is passive and must span the publish refs' release, so it
-  # starts before the fill and outlives it; the spill is retained until it ends.
-  #
-  # It watches the SHARED prefix spill, `<cold-ssd-path>.prefix.bin`
-  # (kv_tiers._shared_ssd_path), NOT the private `$COLD_SSD`: the #740 trailing
-  # truncation reclaims the shared file. Sampling the private one measured a file
-  # the effect does not touch, so the sample could only ever read a plateau.
-  #
-  # Started whether or not the file exists yet: it is created by the window's own
-  # first publish, and the sampler reads a missing path as size 0, so gating on
-  # existence would skip sampling on exactly the arm that creates it.
-  #
-  # BUT only on the arm pair where the reclaim is a MEASUREMENT. Without
-  # TILERL_COLD_PREFIX_SSD_CAP the shared spill is unbounded and never truncates,
-  # so a sample of it can only read a plateau -- and because the arm `wait`s on the
-  # sampler, every other arm paid its full duration for a non-result. The two arms
-  # that carry the question are bgcap (the cap: truncation observable) and bg2 (the
-  # same bg config WITHOUT the cap: the plateau is the control for it). Sampling
-  # only bgcap would state a shrink with nothing to compare it against.
-  local reclaim_pid= reclaim_on=0
-  case "$name" in bgcap|bg2) reclaim_on=1 ;; esac
-  if [ "$reclaim_on" = 1 ]; then
-    local shared_spill="${COLD_SSD%.bin}.prefix.bin"
-    "$PYTHON" scripts/probe_headroom_coldtail.py reclaim-sample \
-      --spill-path "$shared_spill" --out "$dir/reclaim.json" \
-      --samples "$RECLAIM_SAMPLES" --interval-s "$RECLAIM_INTERVAL_S" \
-      >"$dir/reclaim.log" 2>&1 &
-    reclaim_pid=$!
-  fi
 
   "$PYTHON" scripts/probe_headroom_coldtail.py arm \
     --url "$HEALTH_URL" --headroom 0 --log "$arm_log" --out "$dir/arm.json" \
@@ -417,10 +357,6 @@ PY
   rc_c=$?
   log "arm $name: cancel rc=$rc_c"
 
-  if [ -n "$reclaim_pid" ]; then
-    wait "$reclaim_pid" 2>/dev/null
-    log "arm $name: reclaim rc=$?"
-  fi
   stop_serve || true
   # Exit codes, one meaning each, so a wrapper can branch without parsing logs:
   #   probe's own rc (13 = fail-closed on reps, ...)   as-is

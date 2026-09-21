@@ -105,98 +105,12 @@ def test_the_instrumentation_preset_disables_liveness_polling():
 def test_arm_list_is_stable_and_the_unmerged_arm_is_refused():
     r = _run("--list")
     names = r.stdout.split()
-    assert names == ["baseline", "batch", "bg1", "bg2", "bg3", "bgcap", "locksplit"], names
+    assert names == ["baseline", "locksplit"], names
     # #746 is not merged: the arm must refuse rather than boot a serve that
     # ignores an unknown flag and report a no-op as a result.
     assert _arm_envs()["locksplit"] == "PENDING_746"
     src = SRC.read_text()
     assert "PENDING_746" in src and "SKIPPED" in src
-
-
-def test_bgcap_is_the_only_arm_with_the_spill_cap():
-    """The cap changes what the engine does, so it is an arm and not shared
-    instrumentation: on every arm it would make them incomparable on the thing
-    they are compared on. bg2 is its control (same bg config, no cap)."""
-    arms = _arm_envs()
-    assert "TILERL_COLD_PREFIX_SSD_CAP=1" in arms["bgcap"], arms["bgcap"]
-    for a, env in arms.items():
-        if a != "bgcap":
-            assert "TILERL_COLD_PREFIX_SSD_CAP" not in env, (a, env)
-    # bgcap differs from bg2 by exactly the cap.
-    a, b = arms["bgcap"].split(), arms["bg2"].split()
-    assert set(a) - set(b) == {"TILERL_COLD_PREFIX_SSD_CAP=1"}, (a, b)
-    assert set(b) - set(a) == set(), (a, b)
-
-
-def test_reclaim_sampling_runs_only_on_the_arms_that_carry_the_question():
-    """Without the cap the shared spill is unbounded and never truncates, so a
-    sample of it can only read a plateau -- and because the arm WAITS on the
-    sampler, every other arm paid its full duration for a non-result. The two arms
-    that carry the question are bgcap (cap: truncation observable) and bg2 (same bg
-    config without the cap: the plateau is its control). Sampling bgcap alone would
-    state a shrink with nothing to compare it against."""
-    src = SRC.read_text()
-    assert 'case "$name" in bgcap|bg2) reclaim_on=1 ;; esac' in src, "the gate is not the pair"
-    assert "if [ \"$reclaim_on\" = 1 ]" in src, "the gate result is not used"
-    # The pair really is cap-vs-no-cap, which is what makes bg2 the control.
-    arms = _arm_envs()
-    assert "TILERL_COLD_PREFIX_SSD_CAP=1" in arms["bgcap"]
-    assert "TILERL_COLD_PREFIX_SSD_CAP" not in arms["bg2"]
-    assert set(arms["bgcap"].split()) - set(arms["bg2"].split()) == {
-        "TILERL_COLD_PREFIX_SSD_CAP=1"}
-    # ... and no OTHER arm samples, so the remaining five do not pay the wait.
-    assert sum("TILERL_COLD_PREFIX_SSD_CAP=1" in e for e in arms.values()) == 1
-
-
-def test_reclaim_span_outlives_the_first_release_it_watches():
-    """The sampler is the arm's clock: run_arm waits on it before stopping the
-    serve. If its span ends before rep0's first release, it samples the plateau and
-    the release it exists to catch is never in its rows -- and the arm still pays
-    the full span.
-
-    Arithmetic, from measured numbers: one 32k cold fill prompt ~156 s, the probe's
-    --fill-n default 5 (the harness does not pass it), and the warm request is
-    itself a 32k prompt. A 60x10 span (590 s) is short of that; the shipped default
-    must clear it."""
-    import re
-
-    src = SRC.read_text()
-    samples = int(re.search(r"RECLAIM_SAMPLES=\$\{RECLAIM_SAMPLES:-(\d+)\}", src).group(1))
-    interval = int(re.search(r"RECLAIM_INTERVAL_S=\$\{RECLAIM_INTERVAL_S:-(\d+)\}", src).group(1))
-    span = (samples - 1) * interval
-    fill_s, fill_n = 156, 5          # measured fill; the probe's default --fill-n
-    first_release = fill_n * fill_s + fill_s
-    assert span >= first_release, (
-        f"sampler span {span}s ends before rep0's first release ~{first_release}s")
-    # The old default cost every arm ~40 min, including the five that cannot shrink.
-    assert span <= 40 * 60, f"{span}s is the old unbounded wait back again"
-
-
-def test_reclaim_span_matches_the_documented_arithmetic():
-    """The header states the constraint and the numbers it was derived from. Keep
-    the two in step: a default changed without the comment is how the coupling
-    gets silently broken. Matched case-insensitively -- the assertion is about the
-    fact being stated, not about the capitalisation."""
-    src = SRC.read_text().lower()
-    assert "936 s" in src, "the header no longer states rep0's first release"
-    assert "90 x 15" in src, "the header no longer states the shipped span"
-    assert "coupled" in src, "the --fill-n coupling is not stated"
-
-
-def test_reclaim_samples_the_shared_spill_not_the_private_one():
-    """The #740 trailing truncation reclaims `<cold-ssd-path>.prefix.bin`
-    (kv_tiers._shared_ssd_path). Sampling the private `$COLD_SSD` measured a file
-    the effect does not touch, so the reading could only ever be a plateau."""
-    src = SRC.read_text()
-    assert "${COLD_SSD%.bin}.prefix.bin" in src, src[:200]
-    assert '--spill-path "$shared_spill"' in src
-    # ... and the sampler is NOT gated on that file existing. The shared spill is
-    # created by this window's own first publish, so an existence gate would skip
-    # sampling on exactly the arm that creates it; the sampler reads a missing
-    # path as size 0, which is what the first rows of a real run look like.
-    assert '[ -f "$shared_spill" ]' not in src, "the sampler is gated on existence"
-
-
 def test_each_arm_gets_its_own_log():
     """steady_filter and the probe read from offset 0, and the supervisor only
     truncates a log already over LOG_CAP at boot -- so a shared fixed path made
@@ -333,19 +247,6 @@ def test_the_steady_filter_is_windowed_to_each_reps_warm_span():
     bad_rec = json.loads(r.stdout)
     assert bad_rec["tail_n"] == 1 and bad_rec["tail_max_ms"] == 400, bad_rec
     assert bad_rec["ticks_total"] > rec["ticks_total"], (bad_rec, rec)
-
-
-def test_bg_arms_differ_only_in_the_depth_knob():
-    """bg1/bg2/bg3 are the depth sweep. If two of them emit the same env the
-    sweep measures one configuration three times."""
-    arms = _arm_envs()
-    assert arms["bg1"] != arms["bg2"] != arms["bg3"]
-    for a in ("bg1", "bg2", "bg3"):
-        assert "TILERL_CLOSE_BG_PUBLISH=1" in arms[a], (a, arms[a])
-    # bg2 leaves the depth unset on purpose: build.py derives it from the shape.
-    assert "TILERL_CLOSE_BG_DEPTH" not in arms["bg2"], arms["bg2"]
-
-
 def test_baseline_arm_sets_no_experimental_flag():
     assert _arm_envs()["baseline"] == ""
 

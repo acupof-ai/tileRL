@@ -133,8 +133,9 @@ class ColdSsdFile:
     #: tail space.
     GROWTH_SLOTS = 64
 
-    #: Thread name of the background close-publish daemon (HostKvPages._start_publisher).
-    #: Used only to attribute spill-file IO to the worker instead of the step tick.
+    #: Thread name a background publisher would run under; used to attribute
+    #: spill-file IO to a worker instead of the step tick. The close-publish daemon
+    #: that set it was deleted with the close/batch/bg machinery (#784).
     PUBLISH_THREAD = "tilerl-cold-publish"
 
     def __init__(
