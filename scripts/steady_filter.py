@@ -62,7 +62,6 @@ def parse_line(line: str) -> dict | None:
         "pre": int(m.group(4)) if m.group(4) is not None else 0,
         "model": segs.get("model", 0),
         "sample": segs.get("sample", 0),
-        "close_host": segs.get("close_host", 0),
         "path": p.group(1) if p else None,
         "sparse": int(sp.group(1)) if sp else None,
     }
@@ -183,7 +182,6 @@ def summarise(rows: list[dict], tail_ms: int = TAIL_MS,
         "tail_n": len(tail),
         "tail_p50_ms": median([r["total"] for r in tail]),
         "tail_max_ms": max((r["total"] for r in tail), default=None),
-        "tail_close_host_max_ms": max((r["close_host"] for r in tail), default=None),
         "excluded_n": len(rows) - len(steady),
         "excluded_path_graph_n": len([r for r in rows if r["path"] == "graph"]),
         "excluded_undecidable_n": len(unclassifiable),
@@ -251,8 +249,7 @@ def _self_check() -> int:
     graph/idle rows leave the median, and the tail is reported apart."""
     def line(n, total, dec, pre, model, sample, path, sparse):
         return (f"[step-timing] tick {n} total={total}ms dec={dec} pre={pre} "
-                f"model={model}ms sample={sample}ms path={path} sparse={sparse} "
-                f"close_host=0ms")
+                f"model={model}ms sample={sample}ms path={path} sparse={sparse}")
     rows = [parse_line(line(1, 5000, 1, 0, 100, 5, "graph", 1)),
             parse_line(line(2, 30, 0, 0, 0, 0, "graph", 0)),
             parse_line(line(3, 400, 0, 512, 380, 0, "eager", 1)),

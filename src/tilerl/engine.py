@@ -260,27 +260,10 @@ class _StepTiming:
         "alloc_conf",
         "phase_dec",
         "phase_pre",
-        "close_busyidle",
-        "_cl_ev_s",
-        "_cl_ev_e",
-        "_cl_wall_ms",
-        "_cl_open",
-        "_cl_t0",
     )
 
     def __init__(self, engine=None) -> None:
         self.slow_s = float(os.environ.get("TILERL_STEP_TIMING_SLOW_MS", "500")) / 1000.0
-        #: TILERL_CLOSE_BUSYIDLE=1: bracket release_close_request with a pair of
-        #: async CUDA events so a slow close splits into device-busy (the stream
-        #: ran work) vs host-blocked (the step thread waited off-stream — on a
-        #: lock or a host mmap). Only resolves non-blocking at tick_end; never
-        #: synchronizes. Requires TILERL_STEP_TIMING=1.
-        self.close_busyidle = os.environ.get("TILERL_CLOSE_BUSYIDLE", "").strip() not in (
-            "",
-            "0",
-            "false",
-            "False",
-        )
         self.tot: dict[str, float] = {}
         self.count: dict[str, int] = {}
         self.cur: dict[str, float] = {}
@@ -294,12 +277,6 @@ class _StepTiming:
         self.cuda: bool | None = None
         self.ev_s = None
         self.ev_e = None
-        # close busy/idle bracket (TILERL_CLOSE_BUSYIDLE): events reused across
-        # ticks, populated in close_start, resolved non-blocking in tick_end.
-        self._cl_ev_s = None
-        self._cl_ev_e = None
-        self._cl_wall_ms = 0.0
-        self._cl_open = False
         self.mem0: dict[str, int] = {}
         self.fwd_t0 = 0.0
         self.fwd_host_ms = 0.0
@@ -327,50 +304,6 @@ class _StepTiming:
         self.fwd_path = "eager"
         self.fwd_sparse = False
         self.mem0 = {}
-        self._cl_open = False
-        self._cl_wall_ms = 0.0
-
-    def close_bracket_start(self) -> None:
-        """Open the release_close_request busy/idle bracket. Host anchor plus a
-        non-blocking start event; no sync."""
-        if not self.close_busyidle:
-            return
-        self._cl_t0 = time.perf_counter()
-        self._cl_open = True
-        if self.cuda is None:
-            self.cuda = torch.cuda.is_available()
-        if self.cuda:
-            if self._cl_ev_s is None:
-                self._cl_ev_s = torch.cuda.Event(enable_timing=True)
-                self._cl_ev_e = torch.cuda.Event(enable_timing=True)
-            self._cl_ev_s.record()
-
-    def close_bracket_end(self) -> None:
-        """Close the bracket: host wall and a non-blocking end event. The device
-        span is read at tick_end; query() only, never a blocking wait."""
-        if not self.close_busyidle or not self._cl_open:
-            return
-        self._cl_wall_ms = (time.perf_counter() - self._cl_t0) * 1000.0
-        if self.cuda:
-            self._cl_ev_e.record()
-
-    def _close_busyidle_fields(self) -> str:
-        """Resolve the close bracket non-blocking. device_ms is stream work that
-        completed within the bracket; host_ms = wall - device is the off-stream
-        wait. device=pending means the end event had not drained (still running
-        on-stream at tick_end) — honest, not a forced sync."""
-        if not self.close_busyidle or not self._cl_open:
-            return ""
-        wall = max(0.0, self._cl_wall_ms)
-        device = None
-        if self.cuda and self._cl_ev_e is not None and self._cl_ev_e.query():
-            device = self._cl_ev_s.elapsed_time(self._cl_ev_e)
-        self._cl_open = False
-        if device is None:
-            return f" close_wall={wall:.0f}ms close_dev=pending"
-        device = max(0.0, min(device, wall))
-        return f" close_wall={wall:.0f}ms close_dev={device:.0f}ms close_host={wall - device:.0f}ms"
-
     def mark(self, seg: str, t: float) -> None:
         self.cur[seg] = self.cur.get(seg, 0.0) + time.perf_counter() - t
 
@@ -448,10 +381,9 @@ class _StepTiming:
             # phase tag for the whole-tick distribution.
             phase = f" dec={self.phase_dec} pre={self.phase_pre}"
             tail = self._slow_tail(dt * 1000)
-            close_bi = self._close_busyidle_fields()
             print(
                 f"[step-timing] tick {self.n} total={dt * 1000:.0f}ms{phase} {parts}"
-                f"{extra} {tail}{close_bi}",
+                f"{extra} {tail}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -2745,15 +2677,9 @@ class Engine:
         if req.state_slot is None:
             return  # never admitted; blocks and slot are taken together in `_admit`
         if req.sparse_on and self._sparse is not None:
-            if _tm is not None:
-                _tm.close_bracket_start()
             # Publishing happens only while pages leave the resident union
-            # (offer_drop); request end moves no bytes. The timing bracket is
-            # removed with the rest of the close-window instrumentation (#784).
-            if _tm is not None:
-                _tm.close_bracket_end()
-                _tm.mark("release_close_request", _t)
-                _t = time.perf_counter()
+            # (offer_drop); request end moves no bytes, so there is no close cost
+            # to bracket. The busy/idle instrumentation went with it (#784).
             # Sparse: drop this request's host-held cold blobs, keyed (req, logical
             # page) and never present in req.blocks, plus its bounds store.
             cold = self._kv.cold

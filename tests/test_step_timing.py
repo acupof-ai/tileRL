@@ -29,7 +29,7 @@ from tilerl.engine import SamplingParams
 from tilerl.kv_cache import BLOCK_TOKENS
 
 #: The three release sub-segments every request end must charge.
-_RELEASE_SEGMENTS = ("release_close_request", "release_cold_forget", "release_blocks")
+_RELEASE_SEGMENTS = ("release_cold_forget", "release_blocks")
 
 #: The per-page publish costs, split by fix (see transfer_to_shared). They
 #: charge on natural-drop ticks since publish-once (#782), not at request end.
@@ -57,7 +57,6 @@ _SEGMENTS = {
     "draft_blocks",
     "draft_step",
     "offers_pub",
-    "release_close_request",
     "release_cold_forget",
     "release_blocks",
     "pub_bounds_d2h",
@@ -220,9 +219,9 @@ def test_release_subsegments_charge_on_a_sparse_request_end(monkeypatch):
         else:
             raise AssertionError("sparse request did not finish")
         assert eng._sparse.prefix.published >= 1, eng._sparse.prefix.published
-        # release_close_request is an empty bracket after #782 (the #784
-        # instrumentation cleanup removes the mark); the segments that must
-        # charge at a sparse end are the two below it.
+        # The request end moves no KV bytes after #782, so there is no close
+        # segment left to charge; the busy/idle mark and its bracket are gone
+        # (#784). The two segments below are what a sparse end still charges.
         charged_at_release = ("release_cold_forget", "release_blocks")
         missing = [k for k in charged_at_release if peak.get(k, 0.0) <= 0.0]
         assert not missing, f"never charged on a sparse request end: {missing}"
@@ -412,72 +411,3 @@ def test_hollow_tick_classifier_decisions():
     assert t._classify(1000.0, 900, zero) == "cpu"
 
 
-def test_close_busyidle_bracket_is_off_by_default_and_pending_on_cpu():
-    """TILERL_CLOSE_BUSYIDLE is opt-in. Off: bracket methods no-op and the field
-    string is empty. On (CPU wheel, no cuda): the bracket opens/closes with a real
-    wall and resolves to close_dev=pending (the end event can never be queried)
-    rather than fabricating a device-busy number."""
-    from tilerl.engine import _StepTiming
-
-    off = _StepTiming(None)
-    assert off.close_busyidle is False
-    off.close_bracket_start()
-    off.close_bracket_end()
-    assert off._close_busyidle_fields() == ""
-
-    import os
-
-    os.environ["TILERL_CLOSE_BUSYIDLE"] = "1"
-    try:
-        on = _StepTiming(None)
-        assert on.close_busyidle is True
-        on.cuda = False
-        on.close_bracket_start()
-        on.close_bracket_end()
-        assert on._cl_wall_ms >= 0.0
-        f = on._close_busyidle_fields()
-        assert "close_wall=" in f and "close_dev=pending" in f and "close_dev=0" not in f
-    finally:
-        del os.environ["TILERL_CLOSE_BUSYIDLE"]
-
-
-def test_close_busyidle_splits_host_and_device_with_a_fake_event_pair():
-    """With fake non-blocking events, device=min(event_span, wall) and
-    host=wall-device. elapsed_time must be read via the events (the busy share),
-    never a blocking call."""
-    from tilerl.engine import _StepTiming
-
-    class _Ev:
-        def __init__(self, ms):
-            self._ms = ms
-            self.recorded = False
-
-        def record(self):
-            self.recorded = True
-
-        def query(self):
-            return True
-
-        def elapsed_time(self, other):
-            # CUDA semantics: self=start, other=end -> other.ms - self.ms.
-            return other._ms - self._ms
-
-    import os
-
-    os.environ["TILERL_CLOSE_BUSYIDLE"] = "1"
-    try:
-        t = _StepTiming(None)
-        t.cuda = True
-        t._cl_ev_s, t._cl_ev_e = _Ev(0.0), _Ev(200.0)  # 200 ms of stream work
-        t.close_bracket_start()
-        # force a known wall independent of scheduling:
-        t._cl_t0 = 0.0
-        import time as _t
-
-        t._cl_t0 = _t.perf_counter() - 0.5  # 500 ms host-anchored bracket
-        t.close_bracket_end()
-        f = t._close_busyidle_fields()
-        assert "close_dev=200ms" in f, f
-        assert "close_host=300ms" in f, f
-    finally:
-        del os.environ["TILERL_CLOSE_BUSYIDLE"]

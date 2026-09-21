@@ -102,7 +102,6 @@ decode ticks are scored.
 | per-prompt tok/s spread (IQR / p10–p90) | `probe_draft_window_sweep.py` | in-process, one engine; W mutated live |
 | d1 vs d3 | **not in the sweep probe** | `probe_draft_window_sweep.py` hardcodes `spec_depth=1` and has no `--depth`; the launcher hardcodes `--depth 1`. A depth arm is a **separate launcher env change** (or `scripts/ab_draft_depth.py`, which exists for the depth question specifically) |
 | true-Q on/off | boot env `TILERL_DRAFT_TRUE_Q_WIDTH` | import-time, so two boots |
-| close busy/idle split, worker vs step spill | boot env `TILERL_CLOSE_BUSYIDLE=1` (needs `STEP_TIMING=1`) | prints `close_wall/close_dev/close_host` and `ssd_mmap_worker` |
 | cap reclaim over time | `probe_headroom_coldtail.py reclaim-sample` | passive sampler; drives no requests |
 
 The W×acceptance sweep is paired: the same prompts run in every W arm within a

@@ -68,7 +68,7 @@ instrument_env() {
   # This injects the window for the WINDOW only: it is set in the arm's serve
   # environment here, and DRAFT_ATTN_WINDOW_TOKENS_DEFAULT stays 0, so the
   # shipped serve is untouched by this harness.
-  echo "LIVENESS_POLL_S=999999 TILERL_STEP_TIMING=1 TILERL_STEP_TIMING_SLOW_MS=0 TILERL_CLOSE_BUSYIDLE=1 TILERL_DRAFT_ATTN_WINDOW_TOKENS=$WINDOW_TOKENS"
+  echo "LIVENESS_POLL_S=999999 TILERL_STEP_TIMING=1 TILERL_STEP_TIMING_SLOW_MS=0 TILERL_DRAFT_ATTN_WINDOW_TOKENS=$WINDOW_TOKENS"
 }
 
 # The shared-prefix spill is a SET of siblings, not one file. kv_tiers
