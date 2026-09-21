@@ -102,15 +102,23 @@ def test_the_instrumentation_preset_disables_liveness_polling():
     assert "TILERL_DRAFT_ATTN_WINDOW_TOKENS=2048" in env, env
 
 
-def test_arm_list_is_stable_and_the_unmerged_arm_is_refused():
+def test_arm_list_is_baseline_only_and_an_unknown_arm_is_refused():
+    """`baseline` is the only arm left: the close/batch/bg machinery and its arms
+    were deleted with it (#784), and a name still listed would boot a serve that
+    ignores the env and report the baseline as a treatment."""
     r = _run("--list")
-    names = r.stdout.split()
-    assert names == ["baseline", "locksplit"], names
-    # #746 is not merged: the arm must refuse rather than boot a serve that
-    # ignores an unknown flag and report a no-op as a result.
-    assert _arm_envs()["locksplit"] == "PENDING_746"
+    assert r.stdout.split() == ["baseline"], r.stdout.split()
+    assert _arm_envs() == {"baseline": ""}, _arm_envs()
+    # An unknown name still refuses rather than running as a silent baseline. It
+    # exits 1, not 2: `run_arm` returns 2 but main records `fail=1` and carries on
+    # to the end-of-run prompts. Exit 2 is the unknown-FLAG path (its own gate).
+    bad = _run("--arm", "bg1")
+    assert bad.returncode != 0, bad.returncode
+    assert "unknown arm" in bad.stdout + bad.stderr
     src = SRC.read_text()
-    assert "PENDING_746" in src and "SKIPPED" in src
+    assert "PENDING_746" not in src, "the #746 placeholder is still in the script"
+    assert "SKIPPED" not in src, "the #746 skip branch is still in the script"
+
 def test_each_arm_gets_its_own_log():
     """steady_filter and the probe read from offset 0, and the supervisor only
     truncates a log already over LOG_CAP at boot -- so a shared fixed path made
@@ -527,16 +535,22 @@ def test_clean_spill_deletes_every_sibling_of_this_arms_stem(tmp_path):
                  "sparse_cold_128k.prefix.w5.bin", "otherstem.prefix.w5.bin",
                  "qwen38-27b.prefix.bin"):
         (root / name).write_text("x")
-    # `--arm locksplit` is refused (PENDING_746) before any serve work, so the end-of-run
-    # prompts are reached without a card: n to the restore, y to each of three deletes.
-    r = subprocess.run(["bash", str(SRC), "--arm", "locksplit"],
-                       input="n\ny\ny\ny\ny\n", capture_output=True, text=True, timeout=120,
+    # `--clean-spill-only` calls clean_spill directly: no arm, no serve, and none of
+    # the end-of-run prompts that used to consume answers ahead of it.
+    r = subprocess.run(["bash", str(SRC), "--clean-spill-only"],
+                       input="y\n" * 5, capture_output=True, text=True, timeout=120,
                        env={**os.environ, "SERVE_ROOT": str(root),
                             "SERVE_PYTHON": "/nonexistent"})
     left = sorted(p.name for p in root.iterdir() if p.name != "closewin")
-    assert left == ["otherstem.prefix.w5.bin", "qwen38-27b.prefix.bin"], (
-        f"this arm's stem must lose all three of its files and no other stem any: {left}")
-    assert r.stdout.count("deleted ") == 3, r.stdout[-600:]
+    # `otherstem.prefix.w5.bin` is the negative control: a sibling under a DIFFERENT
+    # stem must never match. Everything else in the fixture is this arm's -- the
+    # stem's three files plus the model-named one that `spill_files` also offers.
+    # (The pre-#784 version of this gate expected the model-named file to survive,
+    # but that was an artifact of feeding one answer too few: it reached EOF and was
+    # "kept" for that reason, not because the glob excluded it.)
+    assert left == ["otherstem.prefix.w5.bin"], (
+        f"only the different-stem sibling may survive: {left}")
+    assert r.stdout.count("deleted ") == 4, r.stdout[-600:]   # 3 stem + the model-named one
 
 
 def test_clean_spill_refuses_while_the_supervisor_is_between_restarts(tmp_path):
@@ -547,8 +561,8 @@ def test_clean_spill_refuses_while_the_supervisor_is_between_restarts(tmp_path):
     only the python finds nothing there, logs "serve is down", and deletes a spill the
     incoming boot is about to read. The guard has to check what `stop_serve` signals.
 
-    Both arms run the REAL script with `--arm locksplit`, which is refused before any
-    serve work, so the end-of-run prompts are reached without a card:
+    Both arms run the REAL script with `--clean-spill-only`, which calls clean_spill
+    directly -- no arm, no serve, no prompts ahead of the deletion:
 
       RED   -- the OLD single-pattern guard, same tree, same gap: it deletes.
       GREEN -- the shipped guard: it REFUSES and leaves every file on disk.
@@ -580,17 +594,17 @@ def test_clean_spill_refuses_while_the_supervisor_is_between_restarts(tmp_path):
     env = {**os.environ, "SERVE_ROOT": str(root), "SERVE_PYTHON": "/nonexistent"}
 
     def run(script, answers, tag):
-        return _sp.run(["bash", str(script), "--arm", "locksplit"], input=answers,
+        # `--clean-spill-only` calls clean_spill directly, so there is no arm and no
+        # restore / "delete the spill files?" prompt ahead of it. Those two used to
+        # eat the first two answers, and getting the second one wrong skipped
+        # cleanup entirely while still reading as "the guard refused" -- the failure
+        # this entry is here to make impossible.
+        return _sp.run(["bash", str(script), "--clean-spill-only"], input=answers,
                        capture_output=True, text=True, timeout=120,
                        env={**env, "OUT": str(root / tag)})
 
-    # Two answers are consumed before cleanup runs at all: the restore prompt and
-    # the "delete the spill files?" prompt. Both must be right or the arm measures
-    # nothing -- `n` to the second one skips clean_spill entirely, so RED read as
-    # "the old guard also refused" when it had never been called. The remaining four
-    # are the per-file prompts; feeding fewer leaves the last file at EOF and it is
-    # "kept" for that reason rather than by the guard.
-    answers = "n\ny\n" + "y\n" * len(files)
+    # One answer per file, and no more: `y` to each deletes, `n` keeps.
+    answers = "y\n" * len(files)
 
     # ---- RED / GREEN with the supervisor alive and no serve python under it.
     sup = _sp.Popen(["bash", str(decoy)])

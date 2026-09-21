@@ -60,18 +60,20 @@ flag, so this env is injected per arm by the harness and never by the launcher.
 
 | arm | env delta | question |
 |---|---|---|
-| `baseline` | none | the reference every other arm is a delta against |
-| `locksplit` | — | **refused**: #746 is not merged, and a flag nothing reads would report a no-op as a measured result |
+| `baseline` | none | the reference a measured arm would be a delta against |
 
-The `batch`/`bg1`/`bg2`/`bg3`/`bgcap` arms were deleted with the close/batch/bg
-machinery they measured (#784): `TILERL_CLOSE_BATCH_D2H`, `TILERL_CLOSE_BG_PUBLISH`
-and `TILERL_CLOSE_BG_DEPTH` are no longer read in `src/`, so an arm setting them
-would have silently measured `baseline` and reported it as a treatment.
-`TILERL_COLD_PREFIX_SSD_CAP` survives in `src/` as a cold-tier capacity knob with no
-arm here; it is verified per-M6 rather than through a measurement arm.
+`baseline` is the only arm left. The `batch`/`bg1`/`bg2`/`bg3`/`bgcap` arms and the
+`locksplit` placeholder were deleted with the machinery they measured (#784, #787):
+`TILERL_CLOSE_BATCH_D2H`, `TILERL_CLOSE_BG_PUBLISH` and `TILERL_CLOSE_BG_DEPTH` are
+no longer read in `src/`, so an arm setting them would have silently measured
+`baseline` and reported it as a treatment, and `locksplit` refused to run at all
+(#746 never merged). `TILERL_COLD_PREFIX_SSD_CAP` survives in `src/` as a cold-tier
+capacity knob with no arm here; it is verified per-M6 rather than through a
+measurement arm.
 
-`locksplit` is never sampled: it refuses to run (below), so there is no serve to
-sample against.
+The harness still runs the full per-arm pipeline (boot, health gate, probe, steady
+re-filter, follower and cancel smokes) against `baseline`, and
+`--clean-spill-only` deletes the regenerable spill with no serve at all.
 
 ## Reading the result
 
