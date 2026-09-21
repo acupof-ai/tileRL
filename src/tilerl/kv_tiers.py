@@ -488,6 +488,10 @@ class HostKvPages:
         #: uncapped clone was the 256k host OOM: a second full KV copy). None blob
         #: = spilled; share_take reads it back.
         self._shared: OrderedDict[int, list] = OrderedDict()
+        #: Request-scoped pins per content key, separate from entry refs. A
+        #: pinned blob cannot be deleted by entry-ref release (capacity LRU); it
+        #: is deleted only when both the entry refs and the pins are gone.
+        self._shared_pins: dict[int, int] = {}
         #: running sum of RAM-resident shared bytes; updated at each RAM/spill
         #: transition so the budget loop never sums all shared records per eviction
         #: (the 256k profile: the O(n) sum was ~9% of post-budget prefill).
@@ -971,25 +975,54 @@ class HostKvPages:
                     return bucket.read_field(("s", key), field)
             return None
 
+    def _delete_shared_locked(self, key: int) -> None:
+        n, _refs, tag = self._shared.pop(key)
+        self._ram_order.pop(("s", key), None)
+        if self._shared_blobs.pop(key, None) is not None:
+            self._shared_ram -= n
+        if tag is not None:
+            bucket = self._shared_ssds.get(tag)
+            if bucket is not None and ("s", key) in bucket:
+                bucket.forget(("s", key))
+                self._shared_ssd_bytes -= n
+
     def share_release(self, key: int) -> None:
-        """Drop one store reference; the blob is deleted/spilled-slot freed at
-        the last reference."""
+        """Drop one ENTRY reference. The blob is deleted at the last entry ref
+        only if no request-scoped pin holds it; a pinned blob survives every
+        index entry and is deleted when the pin releases."""
         with self._tlock:
             rec = self._shared.get(key)
             if rec is None:
                 return
             rec[1] -= 1
-            if rec[1] > 0:
+            if rec[1] <= 0 and self._shared_pins.get(key, 0) == 0:
+                self._delete_shared_locked(key)
+
+    def pin_if_present(self, key: int) -> bool:
+        """Take one REQUEST-SCOPED pin on a shared key, independent of entry
+        refs: atomic check-and-pin. Returns False if the key is not shared.
+        Capacity/byte-budget eviction removes entries but cannot delete a
+        pinned blob; the pinning request unpin()s at its end."""
+        with self._tlock:
+            if key not in self._shared:
+                return False
+            self._shared_pins[key] = self._shared_pins.get(key, 0) + 1
+            return True
+
+    def unpin(self, key: int) -> None:
+        """Release one request-scoped pin; delete the blob if its entry refs are
+        already gone. No-op for an already-deleted key (its pin was the last
+        holder and the record went with a prior unpin)."""
+        with self._tlock:
+            n = self._shared_pins.get(key, 0) - 1
+            if n <= 0:
+                self._shared_pins.pop(key, None)
+            else:
+                self._shared_pins[key] = n
                 return
-            n, _refs, tag = self._shared.pop(key)
-            self._ram_order.pop(("s", key), None)
-            if self._shared_blobs.pop(key, None) is not None:
-                self._shared_ram -= n
-            if tag is not None:
-                bucket = self._shared_ssds.get(tag)
-                if bucket is not None and ("s", key) in bucket:
-                    bucket.forget(("s", key))
-                    self._shared_ssd_bytes -= n
+            rec = self._shared.get(key)
+            if rec is not None and rec[1] <= 0:
+                self._delete_shared_locked(key)
 
     def share_ref(self, key: int) -> None:
         """Add one store reference to an already-shared key (a frozen prefix
@@ -999,18 +1032,6 @@ class HostKvPages:
             rec = self._shared.get(key)
             if rec is not None:
                 rec[1] += 1
-
-    def share_ref_if_present(self, key: int) -> bool:
-        """Atomically check-and-add one store reference: True when the key is
-        currently shared and one ref was taken, False when it is gone. The check
-        and the bump run in one critical section so a caller can act on False
-        without a check-then-act race."""
-        with self._tlock:
-            rec = self._shared.get(key)
-            if rec is None:
-                return False
-            rec[1] += 1
-            return True
 
     def share_keys(self) -> frozenset[int]:
         with self._tlock:

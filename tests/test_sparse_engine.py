@@ -2278,7 +2278,7 @@ def test_an_adopted_prefix_redemotes_with_zero_device_bytes():
         pool.demote_page = spy_demote
         dup_refs: list[int] = []
         real_share_ref = cold.share_ref
-        real_share_ref_if_present = cold.share_ref_if_present
+        real_pin_if_present = cold.pin_if_present
 
         def spy_share_ref(key):
             if key in content_keys:
@@ -2318,17 +2318,19 @@ def test_an_adopted_prefix_redemotes_with_zero_device_bytes():
             assert next(x for x in warm._running if x.req_id == rid).sparse_matched \
                 == n_prompt_pages * BLOCK_TOKENS
             if hide_shared_after_adopt:
-                # Simulate shared-LRU eviction between adopt and re-leave: both
-                # the membership probe and the atomic take must miss.
+                # Simulate the shared blob being gone by the time pages leave:
+                # the adopt pin and the re-leave pin both miss. The request must
+                # demote to the private tier and republish normally.
                 cold.share_keys = lambda: frozenset()
-                cold.share_ref_if_present = lambda key: False
+                cold.pin_if_present = lambda key: False
+                warm._sparse.tracker.request_pins.pop(rid, None)
             got = _drain(warm, rid, 200)
-            leftover = set(warm._sparse.tracker.preheld.get(rid, ()))
+            leftover = set(warm._sparse.tracker.request_pins.get(rid, ()))
         finally:
             pool.demote_page = real_demote
             cold.share_ref = real_share_ref
             cold.share_hold_kv = real_lift
-            cold.share_ref_if_present = real_share_ref_if_present
+            cold.pin_if_present = real_pin_if_present
             cold.share_take = real_share_take
             warm.shutdown()
         return got, adopted_demoted, dup_refs, lifted, leftover
@@ -2354,7 +2356,7 @@ def test_an_adopted_prefix_redemotes_with_zero_device_bytes():
     cap_got, _, _, _, cap_leftover = run_follower(
         hide_shared_after_adopt=False, prefix_capacity=2)
     assert cap_got[:8] == want, f"capacity-2 follower {cap_got[:8]} != miss {want}"
-    assert not cap_leftover, f"preheld refs leaked under LRU pressure: {cap_leftover}"
+    assert not cap_leftover, f"request_pins refs leaked under LRU pressure: {cap_leftover}"
 
     # resolve-None arm: the label outlives the shared record and a page is
     # re-selected. Pre-fix resolve raised "missing its shared blob" and the
@@ -2364,6 +2366,105 @@ def test_an_adopted_prefix_redemotes_with_zero_device_bytes():
     # silent correct adopt).
     none_got, *_ = run_follower(drop_blob_at_resolve=True)
     assert len(none_got) == 200, "row stalled/zombied instead of finishing its decode"
+
+
+def test_a_request_pinned_adopted_page_survives_capacity_eviction():
+    """The prehold pin must hold against the prefix-index CAPACITY LRU, not only
+    the host byte-budget LRU. At capacity=1 the publisher's grow+frozen entries
+    and the follower's own grow entry are evicted while the follower still has the
+    adopted pages resident; _drop releases each entry's ref unconditionally. The
+    request-scoped prehold is an independent holding, so those releases cannot
+    delete the blob the follower may still re-resolve. No-draft geometry: with a
+    draft head each closure adds extra idempotent bumps and the race never fires.
+
+    Pre-fix the closing transfer found neither a shared record nor a resident
+    frame and raised (publish page 2 ... resident frame)."""
+    from tilerl_kernels.backend import get_backend
+
+    cfg = tiny()
+    n_prompt_pages = 24
+    prompt = (np.arange(n_prompt_pages * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    def nodraft_engine():
+        return build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30)
+
+    miss = nodraft_engine()
+    want = _drain(miss, miss.submit(prompt, params), 8)
+    miss.shutdown()
+
+    warm = nodraft_engine()
+    pub = warm.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    _drain(warm, pub, 200)
+    cold = warm._kv.cold
+    entry = warm._sparse.prefix.lookup(prompt)
+    keys = list(entry["keys"])
+    assert cold.share_keys() >= set(keys)
+    warm._sparse.prefix.capacity = 1
+    try:
+        rid = warm.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+        warm.step()
+        assert next(x for x in warm._running if x.req_id == rid).sparse_matched \
+            == n_prompt_pages * BLOCK_TOKENS
+        # Pins were taken for the pages actually promoted back (the k+window own
+        # set), before any decode re-leave can delete their records.
+        assert warm._sparse.tracker.request_pins.get(rid)
+        got = _drain(warm, rid, 200)
+    finally:
+        warm.shutdown()
+    assert got[:8] == want, f"capacity-1 follower {got[:8]} != miss {want}"
+    # Balanced release: after the request drops, every pin it took is returned.
+    # The publisher's entries were evicted with no survivor, so nothing holds
+    # these content keys any more.
+    assert not (set(keys) & cold.share_keys()), "request-scoped pins leaked past drop"
+
+
+def test_request_pins_release_fully_after_repeated_adopt_cycles():
+    """Acquire-side balance (#793): adopted pages are promoted back and released
+    many times during a long decode. The request pin is taken once per content
+    key at adopt, never re-bumped on a re-leave, and released exactly once at
+    request drop. After the request drops AND every prefix entry is force-dropped,
+    the shared store must be EMPTY — a pin folded through a set used to leave
+    one orphan ref per key even though every entry was released, permanently
+    pinning the blobs past the byte-budget LRU (measured 24 keys / 418 refs)."""
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+
+    def spec_engine():
+        from tilerl_kernels.backend import get_backend
+
+        return build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+
+    warm = spec_engine()
+    pub = warm.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    _drain(warm, pub, 200)
+    cold, pref = warm._kv.cold, warm._sparse.prefix
+    rid = warm.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    warm.step()  # adopt: the live follower pins the pages it promoted
+    assert next(x for x in warm._running if x.req_id == rid).sparse_matched > 0
+    # Force-drop EVERY prefix entry while the follower is still live (the old
+    # bug: orphaned pins / dead blobs under capacity LRU had no live-request
+    # protection). The follower's request pins must keep its adopted blobs.
+    for e in list(pref._by_id.values()):
+        pref._drop(e)
+    pinned_survivors = len(cold._shared)
+    assert pinned_survivors > 0, "request pins must hold adopted blobs past all entry drops"
+    assert not any(r for _k, r in ((k, cold._shared[k][1]) for k in cold._shared) if r > 0), \
+        "survivors are pin-held with zero entry refs"
+    got = _drain(warm, rid, 200)  # finish -> the request drops its pins
+    assert len(got) == 200
+    warm.shutdown()
+    assert not cold._shared, f"orphan pins after request drop: {len(cold._shared)} blobs"
+    assert not cold._shared_pins, cold._shared_pins
 
 
 def test_sparse_mixed_length_rows_prefilling_one_tick_match_their_solo_g0():
