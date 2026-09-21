@@ -15,8 +15,9 @@ serve and asserts, in ONE run:
     leave 0 and sparse_prefix_entries >= 1 (sparse_prefix_* is the real sparse
     index, #798 -- dense prefix_* is NoPrefixStore noise under a sparse build);
   * a follower with the SAME head plus a short suffix then adopts:
-    sparse_prefix_hits >= 1, sparse_prefix_warm_adoptions >= 1, and the serve
-    reports a non-zero adopted prefix (sparse_matched in the log);
+    sparse_prefix_hits >= 1 and sparse_prefix_warm_adoptions >= 1 (the #798
+    sparse_prefix_* counters are the authoritative adoption signal; there is no
+    per-tick sparse_matched log field, so the gate reads the counter deltas);
   * POSITIVE CONTROL for the five close keys: request-end ticks show the
     remedial transfer (pub_cold_transfer / pub_share_hold / pub_frame_d2h /
     pub_bounds_d2h / pub_draft_clone) and/or ssd_mmap -- the old symptom was all
@@ -213,7 +214,6 @@ class Acceptance:
     sparse_entries_after_publisher: int = 0
     follower_hits_delta: int = 0
     follower_adoptions_delta: int = 0
-    follower_sparse_matched: int = 0
     tokens_equal_oracle: bool | None = None
     close_zero_on_cancel: bool | None = None
     detail: dict = field(default_factory=dict)
@@ -224,7 +224,6 @@ class Acceptance:
                 and self.sparse_entries_after_publisher >= 1
                 and self.follower_hits_delta >= 1
                 and self.follower_adoptions_delta >= 1
-                and self.follower_sparse_matched > 0
                 and self.tokens_equal_oracle is True
                 and self.close_zero_on_cancel is True)
 
@@ -235,7 +234,7 @@ GATES_DOC = [
     "after publisher request-end: kv_cold_shared_pages >= 1 and "
     "sparse_prefix_entries >= 1",
     "short-advance follower: sparse_prefix_hits >= 1 and "
-    "sparse_prefix_warm_adoptions >= 1, log sparse_matched > 0",
+    "sparse_prefix_warm_adoptions >= 1 (#798 counter deltas — the adoption signal)",
     "follower tokens == temperature-0 single-request oracle",
     "cancel/failed row: request-end ticks move no publish bytes",
 ]
@@ -381,7 +380,8 @@ def run_device(args, geo) -> int:  # pragma: no cover - device path
     acc.close_zero_on_cancel = close_window_moved_zero(cancel_ticks)
     acc.detail["cancel_tick_count"] = len(cancel_ticks)
 
-    # ---- log evidence: close-tick positive control + sparse_matched
+    # ---- log evidence: close-tick positive control (adoption gates come from the
+    # #798 sparse_prefix_* counter deltas, already recorded above)
     polling["on"] = False
     worker.join(timeout=2)
     if args.serve_log and os.path.exists(args.serve_log):
@@ -389,8 +389,6 @@ def run_device(args, geo) -> int:  # pragma: no cover - device path
             log_text = fh.read()
         ticks = [p for p in (parse_close_tick(line) for line in log_text.splitlines()) if p]
         acc.close_transfer_seen = close_transfer_present(ticks)
-        m = re.findall(r"sparse_matched[=: ]+(\d+)", log_text)
-        acc.follower_sparse_matched = max((int(x) for x in m), default=0)
     else:
         acc.close_transfer_seen = post.get("kv_cold_shared_pages", 0) >= 1
 
@@ -414,7 +412,6 @@ def run_device(args, geo) -> int:  # pragma: no cover - device path
             "sparse_entries_after_publisher": acc.sparse_entries_after_publisher,
             "follower_hits_delta": acc.follower_hits_delta,
             "follower_adoptions_delta": acc.follower_adoptions_delta,
-            "follower_sparse_matched": acc.follower_sparse_matched,
             "tokens_equal_oracle": acc.tokens_equal_oracle,
             "close_zero_on_cancel": acc.close_zero_on_cancel,
         },
