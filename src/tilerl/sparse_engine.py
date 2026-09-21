@@ -1145,26 +1145,6 @@ class SparsePrefixCache:
                     return e
         return None
 
-    def peek_hit(self, tokens):
-        """Read-only longest-prefix match: the entry's keys or None, WITHOUT the
-        lookup() side effects (no hits++, no LRU move). The engine calls this off
-        its tick lock solely to discover which content keys a waiting sparse
-        follower would adopt, so it can block on their background publishes
-        before taking the lock. Safe off-lock: only the step thread mutates this
-        index, and this runs on that thread before it locks; the publish worker
-        never touches it."""
-        tokens = tuple(int(t) for t in tokens)
-        h = 0
-        hashes = []
-        for t in tokens:
-            h = kv_cache._rolling_hash(h, int(t))
-            hashes.append(h)
-        for i in range(len(tokens) // BLOCK_TOKENS, 0, -1):
-            for e in self._entries.get(hashes[i * BLOCK_TOKENS - 1], ()):
-                if e["tokens"] == tokens[: i * BLOCK_TOKENS]:
-                    return e
-        return None
-
     def drop_request(self, req_id: int) -> None:
         """A finished publisher stops growing; its frozen prompt entries stay on
         the lookup chains and age out under the normal LRU. Gapped buffers,

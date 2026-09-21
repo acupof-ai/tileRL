@@ -404,8 +404,8 @@ class SparseRuntime:
         yet: the index buffers out-of-order drops behind the contiguous frontier
         and skips a page with no bound, so an entry never names a page it cannot
         serve. When the frontier closes, :meth:`SparsePrefixCache.publish_dropped`
-        hands back the content keys and :meth:`_sparse_transfer_to_shared`
-        REHOMES each private blob to its content key (one copy, not two). A
+        hands back the content keys and the engine rehomes each private blob to
+        its content key (one copy, not two). A
         newly published page's draft K/V is copied from the request's draft pool
         (warm spec adoption)."""
         ctx = self.ctx

@@ -437,12 +437,6 @@ class _StepTiming:
         cold = getattr(getattr(eng, "_kv", None), "cold", None) if eng is not None else None
         if cold is not None:
             self.charge_ms("ssd_mmap", cold.drain_ssd_ms())
-            # Drain the worker bucket on every tick so it cannot accumulate; it
-            # only shows on the line under the busy/idle gate (default path
-            # unchanged, and the worker exists solely behind its own opt-in flag).
-            wms = cold.drain_worker_ssd_ms() / 1000.0
-            if self.close_busyidle and wms:
-                self.cur["ssd_mmap_worker"] = wms
         for k, v in self.cur.items():
             self.tot[k] = self.tot.get(k, 0.0) + v
             self.count[k] = self.count.get(k, 0) + 1
@@ -2753,10 +2747,6 @@ class Engine:
         if req.sparse_on and self._sparse is not None:
             if _tm is not None:
                 _tm.close_bracket_start()
-            # pages belong to another publisher's blobs) forces its prompt-end
-            # frontier closure while device frames and draft blocks are still
-            # live: pages a hot pool never dropped get snapshotted from the live
-            # frame here, so a same-prompt follower can still adopt the prefix.
             if self._sparse.prefix is not None and req.sparse_matched == 0 and not req.failed:
                 # This segment is a SUPERSET of the five pub_* marks its callees
                 # charge: close_request's own index accounting and the

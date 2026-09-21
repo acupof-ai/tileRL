@@ -133,11 +133,6 @@ class ColdSsdFile:
     #: tail space.
     GROWTH_SLOTS = 64
 
-    #: Thread name a background publisher would run under; used to attribute
-    #: spill-file IO to a worker instead of the step tick. The close-publish daemon
-    #: that set it was deleted with the close/batch/bg machinery (#784).
-    PUBLISH_THREAD = "tilerl-cold-publish"
-
     def __init__(
         self,
         path: str,
@@ -169,11 +164,6 @@ class ColdSsdFile:
         #: reader cannot silently go uncounted.
         self.step_timing = step_timing
         self.ssd_ms = 0.0
-        #: Spill IO performed on the background publish thread. drain_ssd_ms
-        #: returns only step-thread IO; the worker's share is read separately via
-        #: drain_worker_ssd_ms so its disk time cannot masquerade as a step-tick
-        #: stall (it runs with no engine/tick lock held by the step).
-        self.ssd_ms_worker = 0.0
         #: Count of best-effort trailing-extent truncates that failed (a shrink is
         #: retried on a later forget; this makes a repeated failure observable
         #: instead of swallowed). Test/stats diagnostic.
@@ -197,9 +187,7 @@ class ColdSsdFile:
         self._cap = (os.path.getsize(path) - self.HEADER) // self.stride
         #: Metadata lock, SEPARATE from the owning tier's _tlock. Slot allocation,
         #: the key->slot map, free list, extent live counts and the mmap rotation
-        #: all run under it. Lock order is tier _tlock -> this lock, always; the
-        #: background publish worker takes it for a short reserve/commit only and
-        #: does the slow disk bytes with NEITHER lock held.
+        #: all run under it. Lock order is tier _tlock -> this lock, always.
         self._mlock = threading.Lock()
         self._maps: list = []
         # A reopened file's slots are all FREE (the slot map is in-memory; a
@@ -319,13 +307,7 @@ class ColdSsdFile:
         return True
 
     def _charge(self, t: float) -> None:
-        ms = (time.perf_counter() - t) * 1000.0
-        # Attribute worker-thread IO to its own bucket: draining it into the step
-        # tick would report cross-thread disk time as if the step thread blocked.
-        if threading.current_thread().name == self.PUBLISH_THREAD:
-            self.ssd_ms_worker += ms
-        else:
-            self.ssd_ms += ms
+        self.ssd_ms += (time.perf_counter() - t) * 1000.0
 
     def write(self, key, blob: dict) -> None:
         if self.step_timing is None:
@@ -473,9 +455,8 @@ class HostKvPages:
         if ssd_path:  # "" means no spill; the derived sibling would be ".prefix.bin"
             assert_spill_writable(_shared_ssd_path(ssd_path))
         #: One re-entrant lock over every RAM/SSD/shared structure. The step
-        #: thread and the optional background publish thread take it for short
-        #: sections; RLock so a locked public method may call another. The one
-        #: place that must NOT hold it is a follower waiting on a publish event.
+        #: thread takes it for short sections; RLock so a locked public method
+        #: may call another.
         self._tlock = threading.RLock()
         self.budget_bytes = budget_bytes
         #: opaque cold key -> held bytes / blob (int block on #500, (req,page) tuple on sparse)
@@ -588,11 +569,11 @@ class HostKvPages:
             if self.shared_spill_disabled:
                 return
             self.shared_spill_disabled = True
-            self.shared_spill_error = "background lift write failure"
+            self.shared_spill_error = "shared spill write failure"
             print(
                 f"[cold] shared-prefix spill to {_shared_ssd_path(self._ssd_path)!r} "
-                "failed once in a background lift; shared SSD spill disabled "
-                "for this process, shared pages stay in RAM",
+                "failed once; shared SSD spill disabled for this process, "
+                "shared pages stay in RAM",
                 flush=True,
             )
 
@@ -975,8 +956,7 @@ class HostKvPages:
         """One named tensor of a shared page blob (``bounds``/``dk``),
         read-through from the record's signature bucket when the blob is
         spilled, without loading its K/V. A field this record's layout does not
-        own is a clean None (cache miss), never a KeyError. Non-blocking: None
-        while a background publish is still queued."""
+        own is a clean None (cache miss), never a KeyError."""
         with self._tlock:
             rec = self._shared.get(key)
             if rec is None:
@@ -1027,8 +1007,7 @@ class HostKvPages:
     def drain_ssd_ms(self) -> float:
         """Milliseconds the STEP thread spent touching the mmap'd spill files
         since the last drain, across the private and shared files. The engine
-        drains this into the step timer at the end of the tick that paid it.
-        Background-publish-worker IO is excluded (see drain_worker_ssd_ms)."""
+        drains this into the step timer at the end of the tick that paid it."""
         with self._tlock:
             ms = 0.0
             files = [self._ssd, *self._shared_ssds.values()]
@@ -1036,18 +1015,6 @@ class HostKvPages:
                 if f is not None:
                     ms += f.ssd_ms
                     f.ssd_ms = 0.0
-            return ms
-
-    def drain_worker_ssd_ms(self) -> float:
-        """Spill-file IO performed by the background publish thread since the
-        last drain. Read (not attached to any step tick) to tell a real
-        step-thread block from disk time that merely ran concurrently."""
-        with self._tlock:
-            ms = 0.0
-            for f in [self._ssd, *self._shared_ssds.values()]:
-                if f is not None:
-                    ms += f.ssd_ms_worker
-                    f.ssd_ms_worker = 0.0
             return ms
 
     def shared_bytes(self) -> int:
