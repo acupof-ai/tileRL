@@ -466,6 +466,55 @@ class SparseRuntime:
         for content_key in tr.prefix.take_freeze_refs():
             ctx.kv.cold.share_ref(content_key)
 
+    def publish_at_finish(self, r) -> None:
+        """One synchronous prompt-prefix publish at successful request finish
+        (#796), while this request's frames/private blobs/snapshots are still
+        live. Reuses the exact transfer an offer uses (resident frames are D2H'd
+        here); no batch/bg machinery. A cancel, a failed row, or an adopted
+        follower never calls this (the engine gates sparse_matched/failed)."""
+        ctx = self.ctx
+        tr = self.tracker
+        if tr.prefix is None:
+            return
+
+        def publishable(p: int) -> bool:
+            # A source exists to materialize the blob: a held private blob (RAM
+            # or private SSD) or a live resident device frame. The closure stops
+            # before the first page that has neither, so the index never names a
+            # key the transfer cannot land.
+            return (r.req_id, p) in ctx.kv.cold \
+                or tr.resident.get(r.req_id, {}).get(p) is not None
+
+        keys = tr.prefix.close_prompt(
+            r.req_id, r.tokens, tr.bounds_view(r.req_id), publishable=publishable)
+        if not keys:
+            return
+        written_page = (
+            (r.draft_pos + 1) // BLOCK_TOKENS if ctx.draft is not None and r.draft_blocks else -1
+        )
+        try:
+            landed: list[int] = []
+            for p, content_key in keys.items():
+                draft_block = r.draft_blocks[p] if p <= written_page else None
+                self.transfer_to_shared(r, p, content_key, draft_block)
+                landed.append(content_key)
+            # A spill write can also fail SOFTLY (share_hold_kv returns 0 and
+            # places no record) rather than raising: verify, do not trust.
+            if any(k not in ctx.kv.cold.share_keys() for k in landed):
+                raise RuntimeError("a published page landed no shared blob")
+        except Exception as exc:
+            # The entry attached before the first transfer; roll it back so no
+            # follower dirty-reads keys without blobs. The request itself
+            # succeeded — publish abandonment is not a client error (#796).
+            tr.prefix.abort_close(r.req_id, landed)
+            print(
+                f"[sparse] finish-publish for req {r.req_id} abandoned after a "
+                f"transfer failure ({exc}); the prompt is not shared this turn",
+                flush=True)
+            return
+        for content_key in tr.prefix.take_freeze_refs():
+            ctx.kv.cold.share_ref(content_key)
+
     def transfer_to_shared(
         self, r, page: int, content_key: int, draft_block: int | None = None
     ) -> None:
