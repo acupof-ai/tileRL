@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-09-22
+- **accept (kv, #796 / PR #800)** — scoped revert of one piece of M3 for the
+  serving geometry: after the M3 close-time forced publish was removed, an
+  origin publisher finishing with a 32k prompt after 8 decode tokens left
+  same-head followers nothing to adopt (low pages never leave the k+window
+  union under no pool pressure; device: 45328 offers, `keys_total=0`,
+  followers recomputed 189–246 s). A successful origin finish
+  (`sparse_matched==0`, not failed) now closes and publishes its prompt
+  prefix synchronously while frames/blobs/snapshots are live, reusing the
+  offer-time per-page transfer — no batch D2H context, no background worker.
+  The closure is per-page source-gated and falls back to the highest snapshot
+  below a source gap rather than naming dead keys; the production prefill
+  chunker (`engine.py:1549-1561`) already records the floor-page aligned
+  snapshot, so the unaligned M6 prompt (32028) closes at page 2001 / 32016
+  tokens and only the 12-token tail is recomputed. Adopted followers do not
+  republish. Four CPU gates green, full suite 1094 passed; device finish-tick
+  cost pending remote —
+  [errors/2026-09-22-finish-publish-restores-serving-adoption.md](docs/experience/errors/2026-09-22-finish-publish-restores-serving-adoption.md).
+
 ## 2026-09-21
 - **default flip (kv, publish-once M3 #782)** — request close moves zero KV
   bytes: `_release` no longer force-closes the prompt-end frontier,
