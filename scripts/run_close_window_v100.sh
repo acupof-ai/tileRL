@@ -43,18 +43,7 @@ WARM_REPS=${WARM_REPS:-3}
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0; }
 
 # ---------------------------------------------------------------- arm table
-# Each arm is the env delta over the shared serve command. Order is deliberate:
-# cheapest change first, each arm adding one flag so a delta is attributable.
-# The lock-split arm (#746) is a placeholder until that PR merges -- an unmerged
-# flag would boot a serve that silently ignores it and report a no-op as a result.
-#
-# The batch/bg1/bg2/bg3/bgcap arms were deleted with the close/batch/bg machinery
-# they measured (#784): `TILERL_CLOSE_BATCH_D2H`, `TILERL_CLOSE_BG_PUBLISH` and
-# `TILERL_CLOSE_BG_DEPTH` are no longer read anywhere in src/, so an arm setting
-# them would have silently measured the baseline and reported it as a treatment.
-# `TILERL_COLD_PREFIX_SSD_CAP` (a cold-tier capacity knob, not a close-transport
-# one) survives in src/ but has no arm here; it is verified per-M6 rather than by
-# a measurement arm in this window.
+# Env delta each arm applies over the shared serve command.
 ARM_NAMES=(baseline locksplit)
 arm_env() {
   case "$1" in
