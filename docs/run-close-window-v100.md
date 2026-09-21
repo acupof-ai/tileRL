@@ -14,8 +14,7 @@ scripts/run_close_window_v100.sh --all                  # every arm, then prompt
 
 Per arm, in order: stop any serve → boot `serve_hybrid_v100.sh` under that arm's
 env **with its own `SERVE_LOG`** → wait for `/health` → **assert the health body**
-→ start the passive reclaim sampler (only on the `bgcap`/`bg2` pair — see
-[below](#the-reclaim-sampler)) → run `probe_headroom_coldtail.py arm` → re-window
+→ run `probe_headroom_coldtail.py arm` → re-window
 the steady filter → follower correctness smoke → cancel-immediacy smoke → stop the
 serve. Artifacts land in `$OUT/<arm>/` (`serve.log`, `arm.json`, `steady.json`,
 `reclaim.json`, `follower.json`, `cancel.log`, and a log per step).
@@ -62,22 +61,17 @@ flag, so this env is injected per arm by the harness and never by the launcher.
 | arm | env delta | question |
 |---|---|---|
 | `baseline` | none | the reference every other arm is a delta against |
-| `batch` | `TILERL_CLOSE_BATCH_D2H=1` | #741's one-sync close batch |
-| `bg1` | `+ TILERL_CLOSE_BG_PUBLISH=1 TILERL_CLOSE_BG_DEPTH=512` | #743's background publisher at its own default depth |
-| `bg2` | `+ TILERL_CLOSE_BG_PUBLISH=1` | the publisher with #745's **derived** depth (`(num_slots+1)·ceil(max_ctx/16)`) |
-| `bg3` | `+ TILERL_CLOSE_BG_PUBLISH=1 TILERL_CLOSE_BG_DEPTH=8192` | the depth the 2026-09-20 window measured clean |
-| `bgcap` | `+ TILERL_CLOSE_BG_PUBLISH=1 TILERL_COLD_PREFIX_SSD_CAP=1` | #740's trailing truncation, sampled from the shared prefix spill. `bg2` is its control (the sampler runs on this pair) |
 | `locksplit` | — | **refused**: #746 is not merged, and a flag nothing reads would report a no-op as a measured result |
 
-`bg1` vs `bg2` is the depth question, not a second flag: `bg2` leaves the depth
-unset so `build.py` derives it from the shape.
+The `batch`/`bg1`/`bg2`/`bg3`/`bgcap` arms were deleted with the close/batch/bg
+machinery they measured (#784): `TILERL_CLOSE_BATCH_D2H`, `TILERL_CLOSE_BG_PUBLISH`
+and `TILERL_CLOSE_BG_DEPTH` are no longer read in `src/`, so an arm setting them
+would have silently measured `baseline` and reported it as a treatment.
+`TILERL_COLD_PREFIX_SSD_CAP` survives in `src/` as a cold-tier capacity knob with no
+arm here; it is verified per-M6 rather than through a measurement arm.
 
-`bgcap` carries the cap because the cap **changes what the engine does** — put on
-every arm it would make them incomparable on the thing they are compared on. The
-reclaim sampler runs on the `bgcap`/`bg2` pair only; the cap is arm-specific.
-
-`locksplit` is not sampled either: it refuses to run (below), so there is no serve
-to sample against.
+`locksplit` is never sampled: it refuses to run (below), so there is no serve to
+sample against.
 
 ## Reading the result
 
@@ -86,7 +80,7 @@ decide):
 
 ```sh
 $PY scripts/probe_headroom_coldtail.py compare \
-    --arms baseline=$OUT/baseline/arm.json bg2=$OUT/bg2/arm.json
+    --arms baseline=$OUT/baseline/arm.json
 ```
 
 ### Two steady-tick filters — do not put them in one table
@@ -158,17 +152,17 @@ means two full windows.
   (the #749 bracket);
 - `ssd_mmap_worker` subtracted from `ssd_mmap` — how much of the step charge was
   cross-thread disk accounting;
-- `reclaim.json` — the #740 trailing truncation, from apparent bytes only.
+- `reclaim.json` — the #740 trailing truncation, from apparent bytes only (only
+  if the sampler was run by hand; this harness no longer starts it).
 
 ### The reclaim sampler
 
-The sampler is started on the two arms that carry the question — `bgcap` (the cap:
-truncation observable) and `bg2` (the same bg config **without** the cap, so the
-plateau is its control) — and those arms **wait on it**. Every other arm skips it:
-without the cap the shared spill is unbounded and never truncates, and before this
-was gated all seven arms paid the sampler's full duration for a non-result.
+**Not started by this harness.** It was wired to the `bgcap`/`bg2` pair, and those
+arms are gone with the close/batch/bg machinery (#784). The probe's `reclaim-sample`
+subcommand is untouched: run it by hand against the shared prefix spill
+(`<cold-ssd-path>.prefix.bin`) when a window is about the #740 trailing truncation.
 
-Two things set the span, both arithmetic on measured numbers:
+Two things set its span, both arithmetic on measured numbers, and both still apply:
 
 - **It must still be running when rep0's first release happens.** One 32k cold
   fill prompt costs ~156 s measured; the probe's `--fill-n` default is **5** (the
@@ -179,12 +173,10 @@ Two things set the span, both arithmetic on measured numbers:
   the two (3 reps × 936 s ≈ 47 min), so the sampler's span fits inside the arm
   rather than setting it.
 
-The shipped `90 × 15 = 1335 s` clears 936 s with ~400 s of post-release tail.
-`RECLAIM_SAMPLES` is **coupled to `--fill-n`**: if the harness ever passes a larger
-`--fill-n`, the first release moves out and the span has to grow with it.
-
 ```sh
-RECLAIM_SAMPLES=120 RECLAIM_INTERVAL_S=15 scripts/run_close_window_v100.sh --arm bgcap
+scripts/probe_headroom_coldtail.py reclaim-sample \
+    --spill-path "$ROOT/sparse_cold_128k.prefix.bin" --out "$OUT/reclaim.json" \
+    --samples 90 --interval-s 15
 ```
 
 ## Recovery checklist

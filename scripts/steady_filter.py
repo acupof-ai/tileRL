@@ -13,7 +13,7 @@ same log under the standard set, so a headroom arm and a sweep arm can be placed
 side by side, or not placed at all when the log cannot support it.
 
     python3 scripts/steady_filter.py --log ~/servehybridsse.log --out steady.json
-    python3 scripts/steady_filter.py --log ~/closewin/bgcap/serve.log \
+    python3 scripts/steady_filter.py --log ~/closewin/baseline/serve.log \
         --window 194540:264100 --window 489409:558000   # this arm's warm spans
 
 Each `--window` is one rep, `start:end`, both from `arm.json`'s `reps[].ticks`

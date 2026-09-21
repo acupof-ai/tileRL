@@ -437,12 +437,6 @@ class _StepTiming:
         cold = getattr(getattr(eng, "_kv", None), "cold", None) if eng is not None else None
         if cold is not None:
             self.charge_ms("ssd_mmap", cold.drain_ssd_ms())
-            # Drain the worker bucket on every tick so it cannot accumulate; it
-            # only shows on the line under the busy/idle gate (default path
-            # unchanged, and the worker exists solely behind its own opt-in flag).
-            wms = cold.drain_worker_ssd_ms() / 1000.0
-            if self.close_busyidle and wms:
-                self.cur["ssd_mmap_worker"] = wms
         for k, v in self.cur.items():
             self.tot[k] = self.tot.get(k, 0.0) + v
             self.count[k] = self.count.get(k, 0) + 1
@@ -1244,37 +1238,9 @@ class Engine:
                 raise RequestFailed(request_id, reason, message)
             return self._finished.pop(request_id, None)
 
-    def _await_waiting_publishes(self) -> None:
-        """Block OFF the tick lock until the background close-publishes a waiting
-        sparse follower would adopt have committed. This is the only place the
-        engine waits on the publish worker, and it runs BEFORE taking
-        ``self._lock`` so a slow worker never stalls submit/poll/shutdown or moves
-        the ssd_mmap/cold_transfer bytes back under the tick lock.
-
-        Snapshot the waiting sparse requests under a short lock, release it,
-        resolve each head's would-be entry read-only (peek_hit), and wait. The
-        adopt under the tick lock re-checks commitment; a timeout or a release in
-        between is a miss there, never a raise."""
-        cold = self._kv.cold
-        if cold is None or not getattr(cold, "bg_enabled", False) or not cold.has_pending():
-            return
-        with self._lock:
-            waiting = [
-                (r.req_id, tuple(int(t) for t in r.tokens)) for r in self._waiting if r.sparse_on
-            ][: self.limits.max_batch]
-        if self._sparse is None or self._sparse.prefix is None:
-            return
-        for _rid, tokens in waiting:
-            entry = self._sparse.prefix.peek_hit(tokens)
-            if entry is not None and not cold.wait_committed(entry["keys"]):
-                # Timed out / abandoned: the locked adopt probe below takes the
-                # miss. Stop awaiting further heads this tick (one deadline spent).
-                return
-
     def step(self) -> None:
         """Run one tick: one forward over the planned rows."""
         idle = False
-        self._await_waiting_publishes()
         with self._lock:
             _tm = self._step_timing
             if _tm is not None:
@@ -1501,13 +1467,6 @@ class Engine:
             # trunk hidden at matched-1 (the first tail draft conditions on it);
             # an old/trunk-only entry is a miss (prefill from zero).
             entry = self._sparse.prefix.lookup(req.tokens) if self._sparse.prefix else None
-            if entry is not None and not self._kv.cold.has_all_keys(entry["keys"]):
-                # A background close publish for this entry is still queued (the
-                # off-lock step pre-wait timed out or the job was enqueued after
-                # that snapshot): never block under the tick lock. Adopt nothing
-                # this tick — the entry stays on the chains and a later tick
-                # adopts once committed; right now it is a full prefill miss.
-                entry = None
             if (
                 entry is not None
                 and self._draft is not None
@@ -1677,11 +1636,6 @@ class Engine:
         if t is not None:
             t.join(timeout)
         self._thread = None
-        # Drain the background close-publisher BEFORE clearing the prefix index:
-        # queued page transfers must commit so the index's share_release sees the
-        # records it references. No-op when the gate is off.
-        if self._kv.cold is not None:
-            self._kv.cold.stop_publisher(timeout)
         if self._sparse is not None and self._sparse.prefix is not None:
             self._sparse.prefix.clear()  # release shared prefix blobs to the cold tier
 
@@ -2793,43 +2747,23 @@ class Engine:
         if req.sparse_on and self._sparse is not None:
             if _tm is not None:
                 _tm.close_bracket_start()
-            # pages belong to another publisher's blobs) forces its prompt-end
-            # frontier closure while device frames and draft blocks are still
-            # live: pages a hot pool never dropped get snapshotted from the live
-            # frame here, so a same-prompt follower can still adopt the prefix.
             if self._sparse.prefix is not None and req.sparse_matched == 0 and not req.failed:
                 # This segment is a SUPERSET of the five pub_* marks its callees
                 # charge: close_request's own index accounting and the
                 # take_freeze_refs/share_ref loop below carry no mark, so roughly
                 # a third of this bucket is unmarked. A profile that reads a
                 # leftover here as a per-page cost is reading the index work.
-                #
-                # close_publishes (TILERL_CLOSE_BATCH_D2H=1) collapses the
-                # per-page bounds/draft/frame D2H into non-blocking launches; the
-                # context's single sync at exit runs HERE, still inside this
-                # segment and strictly BEFORE the free_block loop below, so a
-                # recycled publisher frame cannot overwrite bytes still copying.
-                # The deferred cold-tier commits happen after that sync.
-                _deferred: list = []
-                with self._kv.close_publishes() as _cb:
-                    keys = self._sparse.prefix.close_request(
-                        req.req_id, req.tokens, self._sparse.bounds_view(req.req_id)
-                    )
-                    written_page = (
-                        (req.draft_pos + 1) // BLOCK_TOKENS
-                        if self._draft is not None and req.draft_blocks
-                        else -1
-                    )
-                    for p, content_key in keys.items():
-                        draft_block = req.draft_blocks[p] if p <= written_page else None
-                        self._sparse.transfer_to_shared(req, p, content_key, draft_block)
-                    if getattr(_cb, "active", False):
-                        _deferred = _cb.deferred
-                # __exit__ has now run the single sync (still in this segment,
-                # strictly BEFORE the free_block loop below): the prepared pinned
-                # bounds/draft/frame bytes are valid, so commit them to the tier.
-                if _deferred:
-                    self._sparse.transfer_deferred(req, _deferred)
+                keys = self._sparse.prefix.close_request(
+                    req.req_id, req.tokens, self._sparse.bounds_view(req.req_id)
+                )
+                written_page = (
+                    (req.draft_pos + 1) // BLOCK_TOKENS
+                    if self._draft is not None and req.draft_blocks
+                    else -1
+                )
+                for p, content_key in keys.items():
+                    draft_block = req.draft_blocks[p] if p <= written_page else None
+                    self._sparse.transfer_to_shared(req, p, content_key, draft_block)
                 for content_key in self._sparse.prefix.take_freeze_refs():
                     self._kv.cold.share_ref(content_key)
             if _tm is not None:

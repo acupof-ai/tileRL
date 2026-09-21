@@ -12,7 +12,6 @@ from __future__ import annotations
 import contextlib
 import os
 import pickle
-import queue
 import threading
 import time
 from collections import OrderedDict
@@ -95,15 +94,6 @@ def _prefix_spill_bounded() -> bool:
     )
 
 
-def _close_bg_publish() -> bool:
-    """Env gate for moving the request-close private->shared page transfer
-    (host pop + private-SSD lift + .prefix.bin write) off the close critical
-    path onto one bounded single-consumer thread. Default OFF: the transfer
-    stays inline on the step thread, byte-identical. Set
-    TILERL_CLOSE_BG_PUBLISH=1 to enable."""
-    return os.environ.get("TILERL_CLOSE_BG_PUBLISH", "").strip() not in ("", "0", "false", "False")
-
-
 def assert_spill_writable(path: str) -> None:
     """Open/creates ``path`` for writing at build time, so a serve pointed at an
     unwritable spill location refuses to START instead of wedging the first tick
@@ -120,46 +110,6 @@ def assert_spill_writable(path: str) -> None:
             f"cold spill path {path!r} is not writable "
             f"(errno {e.errno}: {e.strerror}); pass a writable --cold-ssd-path"
         ) from e
-
-
-class _SlotToken:
-    """One-shot settlement handle for a ColdSsdFile reserved slot. Exactly one of
-    commit()/release() takes effect; dispose() in a finally releases if neither
-    ran. Every path balances the file's mapping _borrowed exactly once. Methods
-    acquire the file's non-reentrant _mlock, so never call them while already
-    holding it (use the file's *_locked internals there)."""
-
-    __slots__ = ("file", "slot", "mapping", "_settled")
-
-    def __init__(self, file, slot, mapping):
-        self.file = file
-        self.slot = slot
-        self.mapping = mapping
-        self._settled = False
-
-    def commit(self, key) -> bool:
-        """Publish the reserved slot. Settles only on SUCCESS: if the commit body
-        raises, this call settles nothing and drops no borrow, so a caller
-        finally/dispose still rolls the reservation back via release (defect D)."""
-        if self._settled:
-            return False
-        with self.file._mlock:
-            self.file._commit_slot_locked(key, self.slot)
-        self._settled = True
-        return True
-
-    def release(self) -> bool:
-        if self._settled:
-            return False
-        self._settled = True
-        with self.file._mlock:
-            self.file._release_slot_locked(self.slot)
-        return True
-
-    def dispose(self) -> None:
-        """finally hook: release unless already committed/released."""
-        if not self._settled:
-            self.release()
 
 
 class ColdSsdFile:
@@ -182,10 +132,6 @@ class ColdSsdFile:
     #: of times during a cold fill. Unused extent slots are at most one chunk of
     #: tail space.
     GROWTH_SLOTS = 64
-
-    #: Thread name of the background close-publish daemon (HostKvPages._start_publisher).
-    #: Used only to attribute spill-file IO to the worker instead of the step tick.
-    PUBLISH_THREAD = "tilerl-cold-publish"
 
     def __init__(
         self,
@@ -218,11 +164,6 @@ class ColdSsdFile:
         #: reader cannot silently go uncounted.
         self.step_timing = step_timing
         self.ssd_ms = 0.0
-        #: Spill IO performed on the background publish thread. drain_ssd_ms
-        #: returns only step-thread IO; the worker's share is read separately via
-        #: drain_worker_ssd_ms so its disk time cannot masquerade as a step-tick
-        #: stall (it runs with no engine/tick lock held by the step).
-        self.ssd_ms_worker = 0.0
         #: Count of best-effort trailing-extent truncates that failed (a shrink is
         #: retried on a later forget; this makes a repeated failure observable
         #: instead of swallowed). Test/stats diagnostic.
@@ -246,22 +187,8 @@ class ColdSsdFile:
         self._cap = (os.path.getsize(path) - self.HEADER) // self.stride
         #: Metadata lock, SEPARATE from the owning tier's _tlock. Slot allocation,
         #: the key->slot map, free list, extent live counts and the mmap rotation
-        #: all run under it. Lock order is tier _tlock -> this lock, always; the
-        #: background publish worker takes it for a short reserve/commit only and
-        #: does the slow disk bytes with NEITHER lock held.
+        #: all run under it. Lock order is tier _tlock -> this lock, always.
         self._mlock = threading.Lock()
-        #: Keys a background lift is reading / about to consume. While pinned the
-        #: slot is NOT returned to the free list by forget and is invisible to
-        #: allocation, so the step thread cannot recycle (or a reclaim truncate
-        #: the extent of) the source bytes a lock-outside lift still needs. The
-        #: lift unpins in its phase-3 commit or in its failure rollback.
-        self._pinned_keys: set = set()
-        self._reserved: set = set()
-        #: Count of lock-outside readers/writers currently using a mapping that a
-        #: concurrent grow must not munmap. Only the single publish worker borrows
-        #: (once per 3-phase lift); _remap leaves the borrowed mapping alive and a
-        #: later prune closes the stale generations.
-        self._borrowed = 0
         self._maps: list = []
         # A reopened file's slots are all FREE (the slot map is in-memory; a
         # reopened serving spill resolves nothing), so it starts with zero live
@@ -271,9 +198,8 @@ class ColdSsdFile:
 
     def _remap(self, cap: int) -> None:
         """Map exactly ``cap`` fixed-stride slots (the file already holds them).
-        Called under _mlock. Old mappings are kept in _maps rather than closed so
-        a lock-outside IO borrowing one is never munmapped mid-copy;
-        _prune_maps_locked reaps stale generations once no borrow is active."""
+        Called under _mlock; stale mapping generations are pruned at once since
+        no caller reads the mmap off-lock."""
         self._cap = cap
         n_ext = (cap + self.GROWTH_SLOTS - 1) // self.GROWTH_SLOTS
         if n_ext > len(self._extent_live):
@@ -285,10 +211,9 @@ class ColdSsdFile:
             self._prune_maps_locked()
 
     def _prune_maps_locked(self) -> None:
-        """Close every mapping generation except the newest, unless a lock-outside
-        IO is borrowing one (then keep them all; the commit path prunes again once
-        the borrow returns). Held mappings cost address space, not RSS."""
-        if self._borrowed or len(self._maps) <= 1:
+        """Close every mapping generation except the newest. All IO runs under
+        _mlock, so no caller can hold a stale mapping."""
+        if len(self._maps) <= 1:
             return
         for old in self._maps[:-1]:
             with contextlib.suppress(ValueError):
@@ -296,63 +221,16 @@ class ColdSsdFile:
         self._maps = self._maps[-1:]
 
     def _alloc_slot_locked(self) -> int:
-        """Allocate a slot that is neither free-nor-reusable nor reserved."""
-        free = [s for s in self._free_slots if s not in self._reserved]
-        if free:
-            slot = free[-1]
-            del self._free_slots[self._free_slots.index(slot)]
+        if self._free_slots:
+            slot = self._free_slots.pop()
             return slot
         slot = self._next_slot
-        while slot in self._reserved:  # reserved slots past the cursor
-            self._next_slot += 1
-            slot = self._next_slot
         self._next_slot = slot + 1
         if slot >= self._cap:
             cap = self._cap + self.GROWTH_SLOTS
             os.ftruncate(self._f.fileno(), self.HEADER + cap * self.stride)
             self._remap(cap)
         return slot
-
-    def reserve_slot(self):
-        """Allocate + grow under the file lock, mark reserved, and return a
-        one-shot _SlotToken. Nobody else can read/allocate the slot until
-        commit()/release(); its mapping is borrow-protected for a lock-outside
-        write. The token is the ONLY way to settle a reservation, so a caller's
-        try/finally cannot leak it, and commit/release each balance the borrow
-        exactly once regardless of which path ran."""
-        with self._mlock:
-            slot = self._alloc_slot_locked()
-            self._reserved.add(slot)
-            self._borrowed += 1
-            return _SlotToken(self, slot, self._map)
-
-    # ---- locked internals (caller already holds self._mlock) ----
-    def _release_slot_locked(self, slot: int) -> None:
-        """Roll a reserved slot back (free list + drop borrow). Idempotent for a
-        slot already committed/released. Non-reentrant-lock safe: no acquire."""
-        if slot not in self._reserved:
-            return
-        self._reserved.discard(slot)
-        self._free_slots.append(slot)
-        self._borrowed = max(0, self._borrowed - 1)
-        self._prune_maps_locked()
-
-    def _commit_slot_locked(self, key, slot: int) -> None:
-        """Publish a reserved slot (install key, count extent, drop borrow).
-        Ordering: the extent increment — the one step that can raise
-        (IndexError if the extent table was desynced) — runs BEFORE any visible
-        commit. If it raises, the slot stays _reserved with its borrow, so the
-        caller's token.commit propagates the error and its dispose() then rolls
-        the reservation cleanly instead of leaving an orphan slot + live borrow
-        (defect D). Idempotent/no-op if the slot was already settled."""
-        if slot not in self._reserved:
-            return
-        extent = slot // self.GROWTH_SLOTS
-        self._extent_live[extent] += 1  # may raise: nothing committed yet
-        self._reserved.discard(slot)
-        self._slot_of[key] = slot
-        self._borrowed = max(0, self._borrowed - 1)
-        self._prune_maps_locked()
 
     def _check_blob_spec(self, blob: dict) -> None:
         """Reject a blob whose field-set / per-field shape / dtype does not match
@@ -368,9 +246,7 @@ class ColdSsdFile:
             )
 
     def _copy_into(self, mapping, slot: int, blob: dict) -> None:
-        """Byte copy into a reserved slot through its borrow-protected mapping.
-        NO lock: the slot is reserved (no other writer) and the mapping cannot be
-        munmapped while borrowed."""
+        """Byte copy into a slot. Called under _mlock."""
         off = self.HEADER + slot * self.stride
         for k, _shape, _dt, n in self._spec:
             t = blob[k].detach()
@@ -382,40 +258,16 @@ class ColdSsdFile:
             dst.copy_(t.contiguous().view(torch.uint8).reshape(-1))
             off += n
 
-    def write_reserved(self, slot: int, blob: dict, mapping) -> None:
-        """The slow disk bytes of one reserved slot, copied with NO lock held.
-        Raises SpillSpecError before touching the slot if the blob does not match
-        the file's frozen layout (the caller disposes the reserved token)."""
-        self._check_blob_spec(blob)
-        self._copy_into(mapping, slot, blob)
-
-    def commit_slot(self, key, slot: int) -> None:
-        """Lock-acquiring publish of a reserved slot (token.commit is preferred
-        in the worker; this stays for any non-worker/standalone use)."""
-        with self._mlock:
-            self._commit_slot_locked(key, slot)
-
-    def release_slot(self, slot: int) -> None:
-        """Lock-acquiring rollback of a reserved slot (token.release preferred)."""
-        with self._mlock:
-            self._release_slot_locked(slot)
-
     def _shrink_trailing_extents(self) -> bool:
         """All-or-nothing tail reclaim: drop every fully-free extent at the
         high-water end by truncating the file and remapping FIRST, and committing
-        the extent/free-list/cursor metadata only after that succeeds. An extent
-        with a RESERVED slot is treated as occupied so a truncate can never
-        SIGBUS a borrowed mapping's bytes. On OSError NO metadata changes: the
-        file keeps its size, the freed slots stay on the LIFO and the next forget
-        retries the shrink — a failed truncate can never wedge the file (the old
-        order popped the extent list before the truncate and then wedged every
-        later write with an out-of-range extent index)."""
+        the extent/free-list/cursor metadata only after that succeeds. On OSError
+        NO metadata changes: the file keeps its size, the freed slots stay on the
+        LIFO and the next forget retries the shrink — a failed truncate can never
+        wedge the file (the old order popped the extent list before the truncate
+        and then wedged every later write with an out-of-range extent index)."""
         e = len(self._extent_live) - 1
-        while (
-            e >= 0
-            and self._extent_live[e] == 0
-            and not any(s // self.GROWTH_SLOTS == e for s in self._reserved)
-        ):
+        while e >= 0 and self._extent_live[e] == 0:
             e -= 1
         new_cap = 0 if e < 0 else (e + 1) * self.GROWTH_SLOTS
         if new_cap >= self._cap:
@@ -455,13 +307,7 @@ class ColdSsdFile:
         return True
 
     def _charge(self, t: float) -> None:
-        ms = (time.perf_counter() - t) * 1000.0
-        # Attribute worker-thread IO to its own bucket: draining it into the step
-        # tick would report cross-thread disk time as if the step thread blocked.
-        if threading.current_thread().name == self.PUBLISH_THREAD:
-            self.ssd_ms_worker += ms
-        else:
-            self.ssd_ms += ms
+        self.ssd_ms += (time.perf_counter() - t) * 1000.0
 
     def write(self, key, blob: dict) -> None:
         if self.step_timing is None:
@@ -517,76 +363,6 @@ class ColdSsdFile:
                 off += n
             return blob
 
-    def borrow_read(self, key, pin: bool):
-        """Resolve key -> (slot, mapping) under the file lock, borrow the mapping
-        AND pin the source key, so the slow bytes can be read with NO lock held
-        (read_borrowed). The mapping borrow ends with release_mapping_borrow once
-        the bytes are in the caller's blob, but the KEY STAYS PINNED until
-        consume_pinned (phase 3) or rollback_pinned (failure): forget skips a
-        pinned key, so the step thread cannot recycle the source slot mid-lift.
-        None when the key is gone."""
-        with self._mlock:
-            slot = self._slot_of.get(key)
-            if slot is None or key in self._pinned_keys:
-                return None
-            self._borrowed += 1
-            self._pinned_keys.add(key)
-            shapes = [(k, shape, dt, n) for k, shape, dt, n in self._spec]
-            return slot, self._map, pin, shapes
-
-    def release_mapping_borrow(self) -> None:
-        """End the mapping borrow after read_borrowed finished copying; the
-        source key remains pinned until consume/rollback."""
-        with self._mlock:
-            self._borrowed = max(0, self._borrowed - 1)
-            self._prune_maps_locked()
-
-    def consume_pinned(self, key) -> bool:
-        """Forget a pinned key's slot and unpin it. Returns True when it
-        actually popped a live slot (caller decrements bytes once); False when the
-        key was already gone (caller must not double-free). A trailing-extent
-        shrink is all-or-nothing and retried later, so it does NOT change this
-        result or leave the file half-updated."""
-        with self._mlock:
-            return self._consume_pinned_locked(key)
-
-    def _consume_pinned_locked(self, key) -> bool:
-        """Non-reentrant variant: consume under an already-held _mlock. Whether
-        the key was pinned by a lift OR is an ordinary spill slot owned by the
-        caller's in-flight publish, this is the single release: pop, free the
-        slot, count the extent down (tail shrink is atomic/retried), unpin."""
-        slot = self._slot_of.pop(key, None)
-        self._pinned_keys.discard(key)
-        if slot is None:
-            return False
-        self._free_slots.append(slot)
-        self._extent_live[slot // self.GROWTH_SLOTS] -= 1
-        if self._reclaim:
-            self._shrink_trailing_extents()
-        return True
-
-    def rollback_pinned(self, key) -> None:
-        """Unpin a key WITHOUT freeing its slot (the source is NOT consumed):
-        used only when the borrow itself never yielded ownership. The normal
-        failed-lift path consumes the source, so this is rarely needed."""
-        with self._mlock:
-            self._pinned_keys.discard(key)
-
-    def read_borrowed(self, borrowed) -> dict:
-        """Copy one slot's bytes via a borrow from borrow_read; NO file lock."""
-        slot, mapping, pin, spec = borrowed
-        off = self.HEADER + slot * self.stride
-        blob = {}
-        for k, shape, dt, n in spec:
-            t = torch.empty(shape, dtype=getattr(torch, dt), device="cpu", pin_memory=pin)
-            src = torch.from_numpy(
-                self._np.frombuffer(mapping, dtype=self._np.uint8, count=n, offset=off)
-            )
-            t.view(torch.uint8).reshape(-1).copy_(src)
-            blob[k] = t
-            off += n
-        return blob
-
     def read_field(self, key, field: str, pin: bool = False):
         if self.step_timing is None:
             return self._read_field(key, field, pin)
@@ -619,11 +395,6 @@ class ColdSsdFile:
 
     def forget(self, key) -> None:
         with self._mlock:
-            if key in self._pinned_keys:
-                # A background lift is reading/consuming this slot: do not
-                # recycle it or shrink its extent out from under the lock-outside
-                # IO. consume_pinned frees it when the lift finishes.
-                return
             slot = self._slot_of.pop(key, None)
             if slot is not None:
                 self._free_slots.append(slot)
@@ -676,10 +447,6 @@ class HostKvPages:
         ssd_path: str = "",
         ssd_capacity_bytes: int = 0,
         step_timing=None,
-        bg_publish: bool | None = None,
-        bg_depth: int | None = None,
-        bg_wait_s: float | None = None,
-        bg_max_payload_bytes: int | None = None,
     ) -> None:
         # Fail fast: both the private spill and its shared-prefix sibling must be
         # writable now, because the failure used to surface only after the host
@@ -688,9 +455,8 @@ class HostKvPages:
         if ssd_path:  # "" means no spill; the derived sibling would be ".prefix.bin"
             assert_spill_writable(_shared_ssd_path(ssd_path))
         #: One re-entrant lock over every RAM/SSD/shared structure. The step
-        #: thread and the optional background publish thread take it for short
-        #: sections; RLock so a locked public method may call another. The one
-        #: place that must NOT hold it is a follower waiting on a publish event.
+        #: thread takes it for short sections; RLock so a locked public method
+        #: may call another.
         self._tlock = threading.RLock()
         self.budget_bytes = budget_bytes
         #: opaque cold key -> held bytes / blob (int block on #500, (req,page) tuple on sparse)
@@ -732,13 +498,6 @@ class HostKvPages:
         #: the SUM across every bucket (one global cap, never per-bucket).
         self._shared_ssds: dict = {}
         self._shared_ssd_bytes = 0
-        #: Bytes the single publish worker has RESERVED in a bucket slot but not
-        #: yet committed or released (the lock-free write window). Admission for
-        #: BOTH the worker reserve and an inline step-thread spill checks
-        #: _shared_ssd_bytes + this, so in-flight and committed pages together can
-        #: never exceed the cap (the old check omitted in-flight bytes and an
-        #: inline burst over-committed while the worker sat in write_reserved).
-        self._shared_ssd_pending = 0
         #: Count of blobs rejected to RAM for not matching their bucket's frozen
         #: shape/dtype (a field-name signature routed them but the concrete spec
         #: differed). Observable fail-loud, never a silent reinterpreted read.
@@ -759,356 +518,6 @@ class HostKvPages:
         self.prefix_spill_bounded = bool(ssd_path) and _prefix_spill_bounded()
         #: one RAM LRU across private and shared pages: ("p",key)/("s",key) -> n.
         self._ram_order: OrderedDict[tuple[str, Any], int] = OrderedDict()
-        # ----- optional background private->shared publish (TILERL_CLOSE_BG_PUBLISH) -----
-        #: content key -> event fired once the key is committed (or abandoned).
-        #: A follower whose lookup entry names a not-yet-committed key waits on
-        #: the event instead of raising, and treats a timeout as a cache miss.
-        self._pub_pending: dict[int, threading.Event] = {}
-        #: share_ref/share_release calls that land before the worker commits the
-        #: key; folded into the record's refcount at commit.
-        self._pub_pending_refs: dict[int, int] = {}
-        #: private keys an in-flight job is about to transfer; forget() must not
-        #: remove them before the worker consumes the job (bounded by queue depth).
-        self._pub_private: set = set()
-        self.bg_enabled = _close_bg_publish() if bg_publish is None else bool(bg_publish)
-        # Default queue depth when neither the caller nor TILERL_CLOSE_BG_DEPTH
-        # gives one. 512 is enough for a small CPU test; build_engine replaces it
-        # with a context-derived depth for serving. The env var always wins so an
-        # operator can bound object count without a code change.
-        self.bg_depth = (
-            int(os.environ["TILERL_CLOSE_BG_DEPTH"])
-            if "TILERL_CLOSE_BG_DEPTH" in os.environ and bg_depth is None
-            else (512 if bg_depth is None else bg_depth)
-        )
-        self.bg_wait_s = (
-            float(os.environ.get("TILERL_CLOSE_BG_WAIT_S", "30"))
-            if bg_wait_s is None
-            else bg_wait_s
-        )
-        #: Hard cap on host bytes held by queued job payloads ABOVE the pinned
-        #: cold budget (0 = off). Two payloads are allocated before commit but
-        #: enter the shared budget (and its LRU spill) only then: the "hold"
-        #: frame blob the 1PR batch made, and a warm-spec "kv" job's attached
-        #: draft dk/dv host snapshots (a cold page and its draft block overlap, so
-        #: a close burst can attach them to nearly every page). The kv base blob
-        #: is already budgeted/on-disk and is not charged. The cap keeps
-        #: budget + queued <= 2x budget; an over-cap offer commits inline, which
-        #: spills immediately, so a worker lag cannot pin unbounded bytes.
-        self.bg_max_bytes = (
-            int(os.environ["TILERL_CLOSE_BG_MAX_BYTES"])
-            if "TILERL_CLOSE_BG_MAX_BYTES" in os.environ and bg_max_payload_bytes is None
-            else (0 if bg_max_payload_bytes is None else bg_max_payload_bytes)
-        )
-        self._pub_payload_bytes = 0
-        self.bg_queued = 0
-        self.bg_degraded = 0  # queue full -> caller transferred inline
-        self.bg_timeouts = 0
-        self.bg_failed = 0
-        self._pub_q: queue.Queue | None = None
-        self._pub_thread: threading.Thread | None = None
-        #: Test seam: invoked by the worker with the dequeued job and NO tier lock
-        #: held; production is a no-op. Lets a gate park the worker before commit
-        #: while the test drives ref/forget races on the step-thread side.
-        self._pub_before_job = lambda job: None
-        if self.bg_enabled:
-            self._start_publisher()
-
-    def _start_publisher(self) -> None:
-        self._pub_q = queue.Queue(maxsize=self.bg_depth)
-        self._pub_thread = threading.Thread(
-            target=self._publish_worker, name="tilerl-cold-publish", daemon=True
-        )
-        self._pub_thread.start()
-
-    def _publish_worker(self) -> None:
-        """Single consumer: run each page's private->shared transfer off the
-        step thread. It is the ONLY other thread touching this tier. Never
-        touches CUDA: every source byte is already host-resident or on disk.
-
-        A kv job's private source is OWNED by the job from enqueue
-        (_pub_private): once the worker borrows the private slot every terminal
-        path consumes it exactly once — a read failure or a non-OSError write
-        failure is a prompt miss, not a rollback that leaves the source
-        reachable. Only the never-borrowed paths (source already gone, or a
-        duplicate content key committed inline) do its zero/ordinary cleanup.
-        The destination reservation is a _SlotToken settled exactly once on
-        EVERY exception. Lock order is _tlock -> ColdSsdFile._mlock, one
-        direction; the slow disk bytes hold neither."""
-        while True:
-            job = self._pub_q.get()
-            try:
-                if job is None:
-                    return
-                self._pub_before_job(job)  # test seam: runs with NO tier lock held
-                kind, private_key, shared_key, payload = job
-                with self._tlock:
-                    self._pub_payload_bytes -= self._job_payload_n(job)
-                try:
-                    if kind == "kv":
-                        event = self._run_kv_publish(private_key, shared_key, payload)
-                    else:  # "hold": a host frame blob already folded with bounds
-                        blob, n = payload
-                        with self._tlock:
-                            self.share_hold(shared_key, blob, n)
-                            event = self._fold_and_event(shared_key)
-                except BaseException:
-                    # Safety net only: the kv paths settle their own source and
-                    # destination on every failure they can name. This clears the
-                    # bookkeeping a totally unexpected exception left behind, so a
-                    # follower still gets a fired event instead of a hang.
-                    if kind == "kv" and self._ssd is not None:
-                        self._ssd.rollback_pinned(private_key)
-                    with self._tlock:
-                        self.bg_failed += 1
-                        self._pub_private.discard(private_key)
-                        self._pub_pending_refs.pop(shared_key, None)
-                        event = self._pub_pending.pop(shared_key, None)
-                if event is not None:
-                    event.set()
-            finally:
-                self._pub_q.task_done()
-
-    def _run_kv_publish(self, private_key, shared_key, extra):
-        """Phase 1 (short _tlock): pop a RAM source, or classify an SSD source
-        and snapshot its byte size. Then run the RAM commit, dup consume, SSD
-        lift, or source-gone miss. Returns the future event."""
-        with self._tlock:
-            n = self._held.pop(private_key, None)
-            blob = self._blobs.pop(private_key, None)
-            self._ram_order.pop(("p", private_key), None)
-            if n is not None:
-                self._used -= n
-            ram = blob is not None
-            existing = self._shared.get(shared_key)
-            if ram:
-                src_n = 0
-            else:
-                ssd_present = self._ssd is not None and private_key in self._ssd
-                src_n = (
-                    self._ssd_page_bytes.get(private_key, self._ssd.stride)
-                    if self._ssd is not None
-                    else 0
-                )
-        if ram:
-            if extra:
-                blob.update(extra)
-                n += sum(t.numel() * t.element_size() for t in extra.values() if torch.is_tensor(t))
-            with self._tlock:
-                # share_hold also folds the phase-2 inline racer (ref++), so the
-                # RAM blob is dropped rather than double-charged in that case.
-                self._pub_private.discard(private_key)
-                self.share_hold(shared_key, blob, n)
-                return self._fold_and_event(shared_key)
-        if not ssd_present:
-            # Source externally evicted before the worker ran; never borrowed,
-            # so ZERO source frees/decrements here.
-            with self._tlock:
-                self.bg_failed += 1
-                self._pub_private.discard(private_key)
-                return self._fold_and_event(shared_key)
-        if existing is not None:
-            return self._commit_dup_ssd_publish(private_key, shared_key, src_n)
-        return self._lift_ssd_publish(private_key, shared_key, extra, src_n)
-
-    def _commit_dup_ssd_publish(self, private_key, shared_key, src_n):
-        """An SSD-source job whose content key was committed inline while the job
-        sat queued. Never borrowed the source (no read), so the key is NOT
-        pinned: free it through the spill file's ORDINARY forget under _tlock,
-        decrement private bytes once, and ref++ the existing record."""
-        with self._tlock:
-            self._ssd_page_bytes.pop(private_key, None)
-            if private_key in self._ssd:
-                self._ssd.forget(private_key)
-                self._ssd_bytes -= src_n
-            self._pub_private.discard(private_key)
-            existing = self._shared.get(shared_key)
-            if existing is not None:
-                existing[1] += 1
-            return self._fold_and_event(shared_key)
-
-    def _lift_ssd_publish(self, private_key, shared_key, extra, src_n):
-        """The private source is on SSD and the content key is unpublished.
-        Borrow the private slot (mapping + KEY pin), read its bytes with NO lock,
-        reserve and write a destination bucket slot with NO lock, then publish
-        under _tlock.
-
-        Terminal accounting:
-        - read raises (ANY exception): release the mapping borrow, then consume
-          the owned private source once (free, extent--, bytes--, unpin) -> miss.
-        - destination write raises OSError: release the token, disable shared
-          spill, keep the blob in RAM, commit succeeds.
-        - destination write raises any OTHER exception: release the token,
-          consume the owned source once -> miss. A copy/RuntimeError is not a
-          disk-capacity signal; silently pinning corrupted bytes as shared is
-          worse than a prompt miss.
-        - unrecognized layout / over cap / bucket open failed: no token, the
-          blob stays in RAM, commit succeeds.
-        """
-        borrowed = self._ssd.borrow_read(private_key, False)
-        if borrowed is None:
-            # take() bypassed the tier marker and consumed the slot between
-            # phase 1 and the borrow: that external owner already did the
-            # decrements, so do nothing to the source here.
-            with self._tlock:
-                self.bg_failed += 1
-                self._pub_private.discard(private_key)
-                return self._fold_and_event(shared_key)
-        try:
-            blob = self._ssd.read_borrowed(borrowed)
-        except BaseException:
-            self._ssd.release_mapping_borrow()
-            with self._tlock:
-                self._consume_owned_source(private_key, src_n)
-                self.bg_failed += 1
-                return self._fold_and_event(shared_key)
-        self._ssd.release_mapping_borrow()
-        n = src_n
-        if extra:
-            blob.update(extra)
-            n += sum(t.numel() * t.element_size() for t in extra.values() if torch.is_tensor(t))
-        sig = _blob_sig(blob)
-        # Authoritative admission UNDER _tlock, after the read: inline commits
-        # that landed during the lock-free read are now in _shared_ssd_bytes, and
-        # the single worker's own in-flight page is in _shared_ssd_pending. This
-        # reserve is what makes committed+in-flight never exceed the cap (A).
-        with self._tlock:
-            reserve_bytes = (
-                bool(self._ssd_path)
-                and not self.shared_spill_disabled
-                and sig is not None
-                and (
-                    not self.prefix_spill_bounded
-                    or self._shared_ssd_bytes + self._shared_ssd_pending + n
-                    <= self.ssd_capacity_bytes
-                )
-            )
-            if reserve_bytes:
-                self._shared_ssd_pending += n
-        token = None
-        if reserve_bytes:
-            try:
-                bucket = (
-                    self._ensure_shared_ssd(blob)
-                    if sig == _SHARED_SIG_COLD
-                    else self._open_shared_bucket(sig, blob)
-                )
-                if bucket is not None:
-                    token = bucket.reserve_slot()
-                    try:
-                        bucket.write_reserved(token.slot, blob, token.mapping)
-                    except SpillSpecError:
-                        # Bucket frozen to a different concrete dtype/shape
-                        # despite the same field-name signature. The source bytes
-                        # are good, so keep this page in RAM and count it; do not
-                        # disable spill for other layouts.
-                        token.dispose()
-                        token = None
-                        self.shared_spec_failures += 1
-                    except OSError:
-                        token.dispose()  # settled release; blob falls back to RAM
-                        token = None
-                        self._disable_shared_spill()
-            except SpillSpecError:
-                # Spec mismatch surfaced while opening/validating (no token yet):
-                # RAM fallback for this page only.
-                if token is not None:
-                    token.dispose()
-                token = None
-                self.shared_spec_failures += 1
-            except OSError:
-                # Bucket open/grow failed: keep the blob in RAM, same as a write
-                # OSError. dispose() is a no-op here (reserve never returned).
-                if token is not None:
-                    token.dispose()
-                token = None
-                self._disable_shared_spill()
-            except BaseException:
-                # Read already SUCCEEDED, so this job owns the private source:
-                # release the admission reservation and the token, consume the
-                # source once, resolve as a miss on ANY non-OSError from
-                # open/reserve/write (incl. a frozen-spec mismatch, SpillSpecError).
-                if token is not None:
-                    token.dispose()
-                with self._tlock:
-                    self._shared_ssd_pending -= n
-                    self._consume_owned_source(private_key, src_n)
-                    self.bg_failed += 1
-                    return self._fold_and_event(shared_key)
-        with self._tlock:
-            return self._finalize_ssd_lift(
-                private_key, shared_key, blob, n, src_n, sig, token, reserve_bytes
-            )
-
-    def _consume_owned_source(self, private_key, src_n) -> None:
-        """Consume the in-flight private source exactly once (caller holds
-        _tlock): pop its byte record, free+unpin the pinned spill slot, decrement
-        the private byte total, clear the in-flight marker. The tail shrink is
-        atomic and retried on a later forget, so it neither rolls this back nor
-        fails the publish."""
-        self._ssd_page_bytes.pop(private_key, None)
-        if self._ssd is not None and self._ssd.consume_pinned(private_key):
-            self._ssd_bytes -= src_n
-        self._pub_private.discard(private_key)
-
-    def _finalize_ssd_lift(self, private_key, shared_key, blob, n, src_n, sig, token, reserved):
-        """Phase 3 under _tlock. Consume the owned private source once. Re-check
-        the content key: an inline publisher that committed during the lock-free
-        IO wins, so this job releases ITS destination token and only folds a ref
-        (never overwrites the record, double-charges bytes, or orphans the inline
-        slot). A failed trailing-extent reclaim on the source is likewise a miss
-        that releases the token rather than publishing against unsettled
-        accounting. Otherwise publish spilled (token commit) or RAM (token None)."""
-        self._consume_owned_source(private_key, src_n)
-        existing = self._shared.get(shared_key)
-        if existing is not None:
-            if reserved:
-                self._shared_ssd_pending -= n
-            if token is not None:
-                token.dispose()  # the inline record already owns a shared slot
-            existing[1] += 1
-            return self._fold_and_event(shared_key)
-        try:
-            if token is not None:
-                token.commit(("s", shared_key))
-                # reservation flips to committed: total admitted bytes unchanged.
-                self._shared_ssd_pending -= n
-                self._shared_ssd_bytes += n
-                self._shared[shared_key] = [n, 1, sig]
-            else:
-                if reserved:
-                    # Reserved then fell back to RAM (write OSError/spec): the
-                    # bucket slot was released; free the reserved admission too.
-                    self._shared_ssd_pending -= n
-                self._shared[shared_key] = [n, 1, None]
-                self._shared_blobs[shared_key] = blob
-                self._shared_ram += n
-                self._ram_order[("s", shared_key)] = n
-                self._enforce_budget()
-        except BaseException:
-            # Destination settle failed AFTER the source was consumed (defect D:
-            # e.g. commit into a desynced bucket). token.commit left the token
-            # unsettled, so dispose rolls the reserved slot/borrow back; release
-            # the admission and resolve a miss — never leak an orphan slot.
-            if token is not None:
-                token.dispose()
-            if reserved:
-                self._shared_ssd_pending -= n
-            self.bg_failed += 1
-        return self._fold_and_event(shared_key)
-
-    def _fold_and_event(self, shared_key):
-        """Fold the pre-commit ref delta into a committed record and return the
-        future event (the worker fires it after releasing _tlock). No committed
-        record means the delta is dropped (the queued publish is the only owner
-        and it missed)."""
-        event = self._pub_pending.pop(shared_key, None)
-        delta = self._pub_pending_refs.pop(shared_key, 0)
-        rec = self._shared.get(shared_key)
-        if rec is not None:
-            rec[1] += delta
-            if rec[1] <= 0:
-                self.share_release(shared_key)
-        return event
 
     def _ensure_shared_ssd(self, blob: dict):
         """Open (once) and return the cold-layout {k,v,bounds} shared bucket.
@@ -1160,11 +569,11 @@ class HostKvPages:
             if self.shared_spill_disabled:
                 return
             self.shared_spill_disabled = True
-            self.shared_spill_error = "background lift write failure"
+            self.shared_spill_error = "shared spill write failure"
             print(
                 f"[cold] shared-prefix spill to {_shared_ssd_path(self._ssd_path)!r} "
-                "failed once in a background lift; shared SSD spill disabled "
-                "for this process, shared pages stay in RAM",
+                "failed once; shared SSD spill disabled for this process, "
+                "shared pages stay in RAM",
                 flush=True,
             )
 
@@ -1246,12 +655,6 @@ class HostKvPages:
                     blob = self._blobs.pop(k, None)
                     if blob is None or self._held.get(k) != n:
                         continue  # promoted/forgotten between enqueue and sweep
-                    if k in self._pub_private:
-                        # A background publish is about to transfer this blob;
-                        # re-park it rather than spill/drop the worker's source.
-                        self._blobs[k] = blob
-                        self._ram_order[("p", k)] = n
-                        continue
                     self._held.pop(k)
                     self._used -= n
                     if self._ssd_path:
@@ -1294,16 +697,9 @@ class HostKvPages:
 
     def take(self, key) -> dict | None:
         """Remove and return the page blob — from host RAM, or read back through
-        the SSD spill path — or None if neither tier has it. A key an in-flight
-        background publish owns is not taken: its private bytes are committed to
-        the shared namespace or freed by that job, so taking them here would race
-        the job's own consume and double-decrement _ssd_bytes / recycle a pinned
-        slot. Caller promotes via the shared record after the job commits."""
+        the SSD spill path — or None if neither tier has it. Caller promotes via
+        the shared record."""
         with self._tlock:
-            if key in self._pub_private or (
-                self._ssd is not None and key in self._ssd._pinned_keys
-            ):
-                return None
             n = self._held.pop(key, None)
             blob = self._blobs.pop(key, None)
             self._ram_order.pop(("p", key), None)
@@ -1328,10 +724,6 @@ class HostKvPages:
 
     def forget(self, key) -> None:
         with self._tlock:
-            if key in self._pub_private:
-                # A background publish job will consume this private blob; its
-                # publisher release is the signed ref delta, not a removal here.
-                return
             n = self._held.pop(key, None)
             self._blobs.pop(key, None)
             self._ram_order.pop(("p", key), None)
@@ -1355,19 +747,14 @@ class HostKvPages:
                 "kv_cold_demotions": self.demotions,
                 "kv_cold_promotions": self.promotions,
                 "kv_cold_drops": self.drops,
-                "kv_cold_bg_queued": self.bg_queued,
-                "kv_cold_bg_degraded": self.bg_degraded,
-                "kv_cold_bg_timeouts": self.bg_timeouts,
-                "kv_cold_bg_failed": self.bg_failed,
                 "kv_cold_shared_spec_failures": self.shared_spec_failures,
                 "kv_cold_reclaim_failures": (0 if self._ssd is None else self._ssd.reclaim_failures)
                 + sum(f.reclaim_failures for f in self._shared_ssds.values()),
             }
 
     def close(self) -> None:
-        """Drain queued publishes, stop the worker, then release the spill files'
-        mmap and handles (host RAM is GC'd with the blobs)."""
-        self.stop_publisher()
+        """Release the spill files' mmap and handles (host RAM is GC'd with the
+        blobs)."""
         with self._tlock:
             if self._ssd is not None:
                 self._ssd.close()
@@ -1397,149 +784,6 @@ class HostKvPages:
             self._ram_order[("s", key)] = nbytes
             self._enforce_budget()
 
-    def offer_publish(self, private_key, shared_key: int, extra: dict | None) -> bool:
-        """Enqueue one private->shared page transfer for the background worker
-        (TILERL_CLOSE_BG_PUBLISH). The private blob stays exactly where it is —
-        RAM or the private spill file — until the worker consumes it; the page is
-        reserved under ``shared_key`` immediately, so a follower blocks on its
-        event instead of taking a miss, and share_ref/share_release calls landing
-        before the commit accumulate as a signed delta folded into refcount 1.
-
-        Returns False when the key is already committed (a duplicate content key)
-        or the bounded queue is full: the caller then transfers inline, which
-        bounds queue memory and never drops a publish. Reservation and enqueue are
-        one locked step, so a key can never be reserved without its job queued."""
-        return self._enqueue(("kv", private_key, shared_key, extra), private_key, shared_key)
-
-    def offer_hold(self, shared_key: int, blob: dict, nbytes: int) -> bool:
-        """Enqueue one already-host frame blob's shared hold (the device-resident
-        close page whose D2H the 1PR batch synced before its frame freed). Same
-        reservation/future contract as :meth:`offer_publish`."""
-        return self._enqueue(("hold", None, shared_key, (blob, nbytes)), None, shared_key)
-
-    def _job_payload_n(self, job) -> int:
-        """Host bytes a queued job pins ABOVE the pinned cold budget until the
-        worker commits it:
-
-        - "hold": the whole frame blob (1PR batch made it; it enters the shared
-          budget and its LRU spill only at commit).
-        - "kv": the base blob is already budgeted (RAM) or on disk (SSD), but a
-          warm-spec job's ``extra`` carries freshly-snapshotted host draft K/V
-          (dk/dv, hundreds of KiB per warm page) plus bounds. Those tensors are
-          NOT in the cold budget until commit, so they ARE charged; a cold page
-          and its draft block overlap almost entirely, so a close burst can
-          attach dk/dv to nearly every page.
-        Over-cap offers degrade inline, which spills at once — the bound is
-        payload, not object count."""
-        if job[0] == "hold":
-            return int(job[3][1])
-        extra = job[3]
-        if not extra:
-            return 0
-        return sum(t.numel() * t.element_size() for t in extra.values() if torch.is_tensor(t))
-
-    def _enqueue(self, job, private_key, shared_key: int) -> bool:
-        with self._tlock:
-            if not self.bg_enabled or self._pub_q is None:
-                return False
-            if shared_key in self._shared or shared_key in self._pub_pending:
-                return False
-            payload_n = self._job_payload_n(job)
-            if self.bg_max_bytes and self._pub_payload_bytes + payload_n > self.bg_max_bytes:
-                self.bg_degraded += 1
-                return False
-            try:
-                self._pub_q.put_nowait(job)
-            except queue.Full:
-                self.bg_degraded += 1
-                return False
-            self._pub_payload_bytes += payload_n
-            self._pub_pending[shared_key] = threading.Event()
-            self._pub_pending_refs[shared_key] = 0
-            if private_key is not None:
-                self._pub_private.add(private_key)
-            self.bg_queued += 1
-            return True
-
-    def drain_publishes(self, timeout: float | None = None) -> bool:
-        """Block until every queued publish has committed (shutdown join). False
-        on timeout. Pending reservations whose jobs never ran are abandoned:
-        their events fire so a waiter takes a miss rather than hanging."""
-        if self._pub_q is None:
-            return True
-        if timeout is None:
-            self._pub_q.join()
-            return True
-        deadline = time.monotonic() + timeout
-        with self._pub_q.all_tasks_done:
-            while self._pub_q.unfinished_tasks and time.monotonic() < deadline:
-                self._pub_q.all_tasks_done.wait(deadline - time.monotonic())
-        ok = self._pub_q.unfinished_tasks == 0
-        if not ok:
-            with self._tlock:
-                for key, ev in list(self._pub_pending.items()):
-                    self._pub_pending.pop(key, None)
-                    self._pub_pending_refs.pop(key, None)
-                    ev.set()
-        return ok
-
-    def stop_publisher(self, timeout: float | None = None) -> None:
-        """Drain every queued publish, then send the sentinel and join. Timeout
-        bounds only the final join (a worker that ignores sentinels); the drain
-        itself waits for all queued jobs because a clean shutdown is not a crash.
-        Idempotent."""
-        q, t = self._pub_q, self._pub_thread
-        if q is None:
-            return
-        self.drain_publishes(None)
-        q.put(None)
-        if t is not None and timeout is not None:
-            t.join(timeout)
-        elif t is not None:
-            t.join()
-        self._pub_thread = None
-        self._pub_q = None  # offers after stop fall back to inline transfers
-
-    def has_pending(self) -> bool:
-        """True while at least one background publish is queued/uncommitted."""
-        with self._tlock:
-            return bool(self._pub_pending)
-
-    def has_all_keys(self, keys) -> bool:
-        """Non-blocking commit check: every key is a live shared record. An
-        adopt runs this under the engine lock after wait_committed returned; a
-        False result adopts nothing (timeout, failed publish, or a release that
-        landed in between) instead of letting a later share_take raise."""
-        with self._tlock:
-            return all(k in self._shared for k in keys)
-
-    def wait_committed(self, keys, timeout_s: float | None = None) -> bool:
-        """OFF-LOCK wait for background publishes of ``keys`` to commit, then
-        confirm every key is a live shared record. False on timeout OR a queued
-        publish that failed/abandoned: the caller adopts nothing (a cache miss).
-
-        The only call that blocks on the publish worker. It must run with the
-        engine lock released: share_take/share_take_field stay non-blocking so no
-        forward/admit path can stall a tick on the worker."""
-        if timeout_s is None:
-            timeout_s = self.bg_wait_s
-        deadline = time.monotonic() + timeout_s
-        ok = True
-        for key in keys:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                ok = False
-                break
-            ev = self._pub_pending.get(key)
-            if ev is not None and not ev.wait(remaining):
-                self.bg_timeouts += 1
-                ok = False
-                break
-        if not ok:
-            return False
-        with self._tlock:
-            return all(k in self._shared for k in keys)
-
     def share_hold_kv(self, private_key, shared_key: int, extra: dict | None = None) -> int:
         """Transfer one private blob to a shared content key (no clone): pop it
         from the private namespace (RAM or private spill file), fold in ``extra``
@@ -1550,7 +794,6 @@ class HostKvPages:
             n = self._held.pop(private_key, None)
             blob = self._blobs.pop(private_key, None)
             self._ram_order.pop(("p", private_key), None)
-            self._pub_private.discard(private_key)
             if n is not None:
                 self._used -= n
             if blob is None:
@@ -1630,13 +873,7 @@ class HostKvPages:
         forget. The gate is off by default."""
         if not self._ssd_path or self.shared_spill_disabled:
             return False
-        # Count the worker's in-flight reservation in admission so a step-thread
-        # spill cannot over-commit while the single worker sits in its lock-free
-        # write (defect A).
-        if (
-            self.prefix_spill_bounded
-            and self._shared_ssd_bytes + self._shared_ssd_pending + nbytes > self.ssd_capacity_bytes
-        ):
+        if self.prefix_spill_bounded and self._shared_ssd_bytes + nbytes > self.ssd_capacity_bytes:
             return False
         bucket = self._shared_ssds.get(sig)
         if bucket is None:
@@ -1695,9 +932,7 @@ class HostKvPages:
         """A read-only REFERENCE to a shared page blob. Read-through: a spilled
         page is loaded from its signature bucket (without removing it — the
         store entry still owns it; promotion copies it into a private fresh
-        block). None when the key is not a shared page OR its background publish
-        has not committed yet — this never blocks on the worker; a follower
-        waits once, off the engine lock, via wait_committed before adopting."""
+        block). None when the key is not a shared page."""
         with self._tlock:
             rec = self._shared.get(key)
             if rec is None:
@@ -1721,8 +956,7 @@ class HostKvPages:
         """One named tensor of a shared page blob (``bounds``/``dk``),
         read-through from the record's signature bucket when the blob is
         spilled, without loading its K/V. A field this record's layout does not
-        own is a clean None (cache miss), never a KeyError. Non-blocking: None
-        while a background publish is still queued."""
+        own is a clean None (cache miss), never a KeyError."""
         with self._tlock:
             rec = self._shared.get(key)
             if rec is None:
@@ -1739,12 +973,8 @@ class HostKvPages:
 
     def share_release(self, key: int) -> None:
         """Drop one store reference; the blob is deleted/spilled-slot freed at
-        the last reference. A release landing while the key's publish is still
-        queued accumulates as a signed delta the worker folds into refcount 1."""
+        the last reference."""
         with self._tlock:
-            if key in self._pub_pending:
-                self._pub_pending_refs[key] -= 1
-                return
             rec = self._shared.get(key)
             if rec is None:
                 return
@@ -1764,25 +994,20 @@ class HostKvPages:
     def share_ref(self, key: int) -> None:
         """Add one store reference to an already-shared key (a frozen prefix
         copy shares the blob of the entry it was snapshotted from). No-op when
-        the key has already been released (evicted between freeze and ref).
-        Pending (background publish queued, not yet committed): accumulate."""
+        the key has already been released (evicted between freeze and ref)."""
         with self._tlock:
-            if key in self._pub_pending:
-                self._pub_pending_refs[key] += 1
-                return
             rec = self._shared.get(key)
             if rec is not None:
                 rec[1] += 1
 
     def share_keys(self) -> frozenset[int]:
         with self._tlock:
-            return frozenset(self._shared) | frozenset(self._pub_pending)
+            return frozenset(self._shared)
 
     def drain_ssd_ms(self) -> float:
         """Milliseconds the STEP thread spent touching the mmap'd spill files
         since the last drain, across the private and shared files. The engine
-        drains this into the step timer at the end of the tick that paid it.
-        Background-publish-worker IO is excluded (see drain_worker_ssd_ms)."""
+        drains this into the step timer at the end of the tick that paid it."""
         with self._tlock:
             ms = 0.0
             files = [self._ssd, *self._shared_ssds.values()]
@@ -1790,18 +1015,6 @@ class HostKvPages:
                 if f is not None:
                     ms += f.ssd_ms
                     f.ssd_ms = 0.0
-            return ms
-
-    def drain_worker_ssd_ms(self) -> float:
-        """Spill-file IO performed by the background publish thread since the
-        last drain. Read (not attached to any step tick) to tell a real
-        step-thread block from disk time that merely ran concurrently."""
-        with self._tlock:
-            ms = 0.0
-            for f in [self._ssd, *self._shared_ssds.values()]:
-                if f is not None:
-                    ms += f.ssd_ms_worker
-                    f.ssd_ms_worker = 0.0
             return ms
 
     def shared_bytes(self) -> int:

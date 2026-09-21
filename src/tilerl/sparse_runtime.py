@@ -299,8 +299,9 @@ class SparseRuntime:
         device_select = self.device_select and pure_decode and not do_refresh
         if do_refresh:
             self.ticks_since_refresh = 0
-        return SparseForward(tr, srows, ctx.backend.device, ctx.backend,
-                             device_select=device_select)
+        return SparseForward(
+            tr, srows, ctx.backend.device, ctx.backend, device_select=device_select
+        )
 
     def evict_victim(self, r, reserved: set[int]) -> None:
         """Free one frame this tick does NOT need, so a promotion can allocate.
@@ -382,8 +383,7 @@ class SparseRuntime:
             dk = ctx.kv.cold.share_take_field(key, "dk")
             dv = ctx.kv.cold.share_take_field(key, "dv")
             if dk is None or dv is None:
-                raise RuntimeError(
-                    f"warm prefix entry lost draft KV for page {p} (key {key})")
+                raise RuntimeError(f"warm prefix entry lost draft KV for page {p} (key {key})")
             blk = r.draft_blocks[p]
             dpool.k_pool[:, blk].copy_(dk.to(dev))
             dpool.v_pool[:, blk].copy_(dv.to(dev))
@@ -404,8 +404,8 @@ class SparseRuntime:
         yet: the index buffers out-of-order drops behind the contiguous frontier
         and skips a page with no bound, so an entry never names a page it cannot
         serve. When the frontier closes, :meth:`SparsePrefixCache.publish_dropped`
-        hands back the content keys and :meth:`_sparse_transfer_to_shared`
-        REHOMES each private blob to its content key (one copy, not two). A
+        hands back the content keys and the engine rehomes each private blob to
+        its content key (one copy, not two). A
         newly published page's draft K/V is copied from the request's draft pool
         (warm spec adoption)."""
         ctx = self.ctx
@@ -413,20 +413,23 @@ class SparseRuntime:
         if tr.prefix is None or not tr.has_bounds(r.req_id, page):
             return
         keys = tr.prefix.publish_dropped(
-            r.req_id, r.tokens, tr.bounds_view(r.req_id), page, (r.req_id, page))
+            r.req_id, r.tokens, tr.bounds_view(r.req_id), page, (r.req_id, page)
+        )
         # The frontier can close over MANY pages though only ``page`` dropped
         # this tick, so resolve each new page's draft block from the reserved
         # draft span, not from the one dropped page.
-        written_page = ((r.draft_pos + 1) // BLOCK_TOKENS
-                        if ctx.draft is not None and r.draft_blocks else -1)
+        written_page = (
+            (r.draft_pos + 1) // BLOCK_TOKENS if ctx.draft is not None and r.draft_blocks else -1
+        )
         for p, content_key in keys.items():
             draft_block = r.draft_blocks[p] if p <= written_page else None
             self.transfer_to_shared(r, p, content_key, draft_block)
         for content_key in tr.prefix.take_freeze_refs():
             ctx.kv.cold.share_ref(content_key)
 
-    def transfer_to_shared(self, r, page: int, content_key: int,
-                           draft_block: int | None = None) -> None:
+    def transfer_to_shared(
+        self, r, page: int, content_key: int, draft_block: int | None = None
+    ) -> None:
         """Publish one page under its content key: attach bounds (+ draft K/V for
         a warm spec entry) to the page's trunk K/V.
 
@@ -443,19 +446,15 @@ class SparseRuntime:
         file measures itself and the engine reports it as ``ssd_mmap``, so a
         profile attributing disk time to any of these five is misreading.
 
-        Under a close_publishes batch the device snapshots (bounds/draft/frame)
-        are launched non-blocking and their cold-tier commit is deferred to the
-        batch's single post-sync commit phase via ``transfer_deferred``; pages
-        whose source is already host/SSD commit inline (no device bytes)."""
+        Every page commits inline here (bounds/draft/frame D2H are synchronous);
+        pages whose source is already host/SSD move no device bytes."""
         ctx = self.ctx
         tr = self.tracker
         tm = ctx.step_timing
-        batch = getattr(ctx.kv, "_close_batch", None)
-        batched = getattr(batch, "active", False)
         t = time.perf_counter() if tm is not None else 0.0
-        # bounds: blocking one-page D2H, or one non-blocking launch in a batch
+        # bounds: one blocking page D2H.
         bv = tr.bounds_view(r.req_id)[page]
-        bounds_host = ctx.kv.host_snapshot(bv) if batched else bv.cpu()
+        bounds_host = bv.cpu()
         if tm is not None:
             tm.mark("pub_bounds_d2h", t)
             t = time.perf_counter()
@@ -463,113 +462,45 @@ class SparseRuntime:
         if draft_block is not None and ctx.draft is not None:
             dpool = ctx.draft.kv
             # clone: .cpu() is a no-op on the CPU cell, so without it the blob
-            # aliases a draft block that gets recycled and overwritten. In a batch
-            # these are non-blocking launches, valid only after the tail sync.
-            if batched:
-                extra_host["dk"] = ctx.kv.host_snapshot(
-                    dpool.k_pool[:, draft_block].detach())
-                extra_host["dv"] = ctx.kv.host_snapshot(
-                    dpool.v_pool[:, draft_block].detach())
-            else:
-                extra_host["dk"] = dpool.k_pool[:, draft_block].detach().cpu().clone()
-                extra_host["dv"] = dpool.v_pool[:, draft_block].detach().cpu().clone()
+            # aliases a draft block that gets recycled and overwritten.
+            extra_host["dk"] = dpool.k_pool[:, draft_block].detach().cpu().clone()
+            extra_host["dv"] = dpool.v_pool[:, draft_block].detach().cpu().clone()
         if tm is not None:
             tm.mark("pub_draft_clone", t)
             t = time.perf_counter()
         tr.shared.setdefault(r.req_id, {})[page] = content_key
         if (r.req_id, page) in ctx.kv.cold:
-            # Host-resident or already on the private SSD: no device bytes, safe
-            # to commit immediately even inside a batch (extra_host attaches once;
-            # its bounds/draft are already valid on the CPU cell, and on cuda in a
-            # batch the private path is the spilled/hot case — but bounds were just
-            # launched non-blocking, so defer it too when batched).
-            if batched:
-                batch.deferred.append(
-                    (r, page, "cold", content_key, extra_host))
-                if tm is not None:
-                    tm.mark("pub_cold_transfer", t)
-                return
-            n = ctx.kv.cold.share_hold_kv(
-                (r.req_id, page), content_key, extra=extra_host)
+            # Host-resident or already on the private SSD: no device bytes.
+            n = ctx.kv.cold.share_hold_kv((r.req_id, page), content_key, extra=extra_host)
             if tm is not None:
                 tm.mark("pub_cold_transfer", t)
             if n:
                 return
             r.cold_pages = [
-                content_key if (isinstance(p, tuple) and p == (r.req_id, page))
-                else p for p in r.cold_pages]
+                content_key if (isinstance(p, tuple) and p == (r.req_id, page)) else p
+                for p in r.cold_pages
+            ]
             return
         phys = tr.resident.get(r.req_id, {}).get(page)
         if phys is None:
             raise RuntimeError(
                 f"publish page {page}: neither a private host blob nor a resident "
-                f"frame exists (req {r.req_id}, content key {content_key})")
-        # Device-resident frame snapshot. In a batch _page_blob launches the
-        # non-blocking D2H (and marks batch.launched); commit after the tail sync.
+                f"frame exists (req {r.req_id}, content key {content_key})"
+            )
+        # Device-resident frame snapshot, committed inline.
         blob, n = ctx.kv._page_blob(phys)
         if tm is not None:
             tm.mark("pub_frame_d2h", t)
             t = time.perf_counter()
-        if batched:
-            batch.deferred.append((r, page, "frame", content_key, extra_host, blob, n))
-            if tm is not None:
-                tm.mark("pub_share_hold", t)
-            return
         self._commit_frame(blob, n, extra_host, content_key, tm, t)
 
     def _commit_frame(self, blob, n, extra_host, content_key, tm, t):
         """Commit one already-valid host frame blob to the shared cold tier."""
         blob.update(extra_host)
-        n += sum(x.numel() * x.element_size() for x in extra_host.values()
-                 if torch.is_tensor(x))
+        n += sum(x.numel() * x.element_size() for x in extra_host.values() if torch.is_tensor(x))
         self.ctx.kv.cold.share_hold(content_key, blob, n)
         if tm is not None:
             tm.mark("pub_share_hold", t)
-
-    def transfer_deferred(self, r, items) -> None:
-        """Commit the close pages whose device D2H a close_publishes batch has now
-        synced. Runs AFTER the single batch-tail sync and BEFORE the publisher's
-        frames are freed. ``items`` is the batch's deferred list of tuples built by
-        transfer_to_shared: ("cold",...) pages rehome from the private host/SSD
-        namespace; ("frame",...) pages carry a ready pinned trunk blob.
-
-        With TILERL_CLOSE_BG_PUBLISH the host/SSD byte move is handed to the cold
-        tier's single background publisher (offer_publish/offer_hold); a full
-        bounded queue makes that call return False and the transfer runs inline
-        here, so a publish is never dropped. The pages were reserved (entries on
-        the lookup chains) before this point, so a follower blocks on their
-        futures rather than seeing a half-published prefix."""
-        ctx = self.ctx
-        tm = ctx.step_timing
-        cold = ctx.kv.cold
-        for item in items:
-            if item[2] == "cold":
-                _r, page, _kind, content_key, extra_host = item
-                if cold.offer_publish((_r.req_id, page), content_key, extra_host):
-                    continue
-                t = time.perf_counter() if tm is not None else 0.0
-                n = cold.share_hold_kv(
-                    (_r.req_id, page), content_key, extra=extra_host)
-                if tm is not None:
-                    tm.mark("pub_cold_transfer", t)
-                if not n:
-                    _r.cold_pages = [
-                        content_key
-                        if (isinstance(p, tuple) and p == (_r.req_id, page))
-                        else p for p in _r.cold_pages]
-                continue
-            _r, page, _kind, content_key, extra_host, blob, n = item
-            extra_n = sum(x.numel() * x.element_size() for x in extra_host.values()
-                          if torch.is_tensor(x))
-            # Fold bounds/draft into the host frame BEFORE handing it over: the
-            # worker stores the blob verbatim and never sees extra_host. The
-            # inline fallback passes the already-folded blob and an empty extra
-            # so _commit_frame does not count extra_n twice.
-            blob.update(extra_host)
-            if cold.offer_hold(content_key, blob, n + extra_n):
-                continue
-            t = time.perf_counter() if tm is not None else 0.0
-            self._commit_frame(blob, n + extra_n, {}, content_key, tm, t)
 
     def finalize(self, sf, rows, hidden=None) -> list:
         """After the forward: store Quest bounds of every now-complete page, then
@@ -647,13 +578,17 @@ class SparseRuntime:
                 if tr.scorer == "bounds" and tr.prefix is not None and q_hi % BLOCK_TOKENS == 0:
                     sp = ctx.states
                     # vector at position q_hi-1; note_boundary moves it to host
-                    boundary_h = (None if hidden is None or ctx.draft is None
-                                 else hidden[bi, sf.rows[bi]["tq"] - 1])
+                    boundary_h = (
+                        None
+                        if hidden is None or ctx.draft is None
+                        else hidden[bi, sf.rows[bi]["tq"] - 1]
+                    )
                     tr.prefix.note_boundary(
-                        rid, complete,
-                        (sp.states[r.state_slot].clone(),
-                         sp.window_snapshot(r.state_slot)),
-                        boundary_h)
+                        rid,
+                        complete,
+                        (sp.states[r.state_slot].clone(), sp.window_snapshot(r.state_slot)),
+                        boundary_h,
+                    )
                 if getattr(sf, "device_select", False) and sf.device.type == "cuda":
                     # Captured tick: skip the device→host pin readback here;
                     # evict_victim prunes on promotion and the eager refresh tick
@@ -767,10 +702,21 @@ class SparseRuntime:
                 own_w_cap=own_w,
             )
             g, ctx.graph_capture.pool, err = make_sparse_graph(
-                ctx.model, ctx.backend, ctx.kv, ctx.states, self.tracker,
-                sf, B, W, ctx.aux_layers, ctx.graph_capture.pool)
+                ctx.model,
+                ctx.backend,
+                ctx.kv,
+                ctx.states,
+                self.tracker,
+                sf,
+                B,
+                W,
+                ctx.aux_layers,
+                ctx.graph_capture.pool,
+            )
             if g is None:
-                warnings.warn(f"sparse decode graph capture failed for {key}: {err}; eager fallback")
+                warnings.warn(
+                    f"sparse decode graph capture failed for {key}: {err}; eager fallback"
+                )
                 self.graph_on = False
                 return False
             self.graphs[key] = g
