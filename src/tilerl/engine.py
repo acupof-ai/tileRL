@@ -921,6 +921,23 @@ class Engine:
     def _prefix_warm_adoptions(self) -> int:
         return self._sparse.warm_adoptions if self._sparse is not None else 0
 
+    def _sparse_prefix_stats(self) -> dict:
+        """Sparse KV's own prefix-index counters, namespaced sparse_prefix_* so
+        they are never confused with the dense PrefixStore prefix_* fields: a
+        sparse build runs NoPrefixStore, whose dense counters stay at their empty
+        values and otherwise read as a misleading +published/+entries."""
+        if self._sparse is None or self._sparse.tracker.prefix is None:
+            return {}
+        s = self._sparse.tracker.prefix.stats()
+        return {
+            "sparse_prefix_published": s["published"],
+            "sparse_prefix_hits": s["hits"],
+            "sparse_prefix_evictions": s["evictions"],
+            "sparse_prefix_entries": s["live_entries"],
+            "sparse_prefix_entries_capacity": s["entries_capacity"],
+            "sparse_prefix_warm_adoptions": self._sparse.warm_adoptions,
+        }
+
     @property
     def _sparse_graphs(self) -> dict:
         return self._sparse.graphs if self._sparse is not None else {}
@@ -1644,6 +1661,10 @@ class Engine:
                 **self._device_free_limit(),
                 "slots_used": self._slots_used,
                 "slots_total": self.usable_slots,
+                # DENSE PrefixStore counters (self._prefix). A sparse-KV build
+                # runs NoPrefixStore, so these read as the empty store (0/0) by
+                # design; the sparse index's counters are the sparse_prefix_*
+                # fields below, not these.
                 "prefix_hits": self._prefix_hits,
                 "prefix_misses": self._prefix_misses,
                 "prefix_warm_adoptions": self._prefix_warm_adoptions,
@@ -1671,6 +1692,8 @@ class Engine:
                 **{k: v for k, v in store.items() if k.startswith(("dram_", "ssd_"))},
                 # sparse-KV cold page tier (absent when kv_cold_bytes=0)
                 **(self._kv.cold.stats() if getattr(self._kv, "cold", None) is not None else {}),
+                # sparse-KV's OWN prefix-index counters (empty set on dense builds)
+                **self._sparse_prefix_stats(),
                 "prefix_demoted": store.get("demoted", 0),
                 # cold-start KV boots from --kv-store (not a prefix-cache hit)
                 "boot_hits": self._boot_hits,

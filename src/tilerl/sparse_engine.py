@@ -1156,3 +1156,16 @@ class SparsePrefixCache:
         self._frozen.clear()
         self.evictions = 0
 
+    def stats(self) -> dict[str, int]:
+        """Sparse prefix-index counters for /health. This is a DIFFERENT store
+        from the dense PrefixStore the engine's ``prefix_*`` fields read, so the
+        health endpoint namespaces these ``sparse_prefix_*`` — a sparse build
+        runs NoPrefixStore and must not be read through the dense counters."""
+        return {
+            "published": self.published,
+            "hits": self.hits,
+            "evictions": self.evictions,
+            "live_entries": len(self._by_id),
+            "entries_capacity": self.capacity,
+        }
+
