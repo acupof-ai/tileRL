@@ -1,4 +1,4 @@
-# M3 删掉 close 发布后，32k+短解码的同头 follower 全量重算 — V100, 2026-09-22
+# M3 删掉 close 发布后，32k+短解码的同头 follower 全量重算 — V100, 2026-09-21
 
 > Status: pending-remote (#796 / PR #800)
 

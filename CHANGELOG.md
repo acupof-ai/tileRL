@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-09-22
+## 2026-09-21
 - **accept (kv, #796 / PR #800)** — scoped revert of one piece of M3 for the
   serving geometry: after the M3 close-time forced publish was removed, an
   origin publisher finishing with a 32k prompt after 8 decode tokens left
@@ -17,9 +17,7 @@
   tokens and only the 12-token tail is recomputed. Adopted followers do not
   republish. Four CPU gates green, full suite 1094 passed; device finish-tick
   cost pending remote —
-  [errors/2026-09-22-finish-publish-restores-serving-adoption.md](docs/experience/errors/2026-09-22-finish-publish-restores-serving-adoption.md).
-
-## 2026-09-21
+  [errors/2026-09-21-finish-publish-restores-serving-adoption.md](docs/experience/errors/2026-09-21-finish-publish-restores-serving-adoption.md).
 - **default flip (kv, publish-once M3 #782)** — request close moves zero KV
   bytes: `_release` no longer force-closes the prompt-end frontier,
   `SparsePrefixCache.close_request` is deleted. A page reaches the shared prefix
