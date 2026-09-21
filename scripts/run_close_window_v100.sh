@@ -19,6 +19,7 @@
 #   scripts/run_close_window_v100.sh --arm baseline   # one arm
 #   scripts/run_close_window_v100.sh --all            # every arm, then restore
 #   scripts/run_close_window_v100.sh --restore-only   # official serve back, no flags
+#   scripts/run_close_window_v100.sh --clean-spill-only  # delete the regenerable spill, no serve
 #
 # NOT run from CI or a GPU-less host: every arm boots a 27B serve.
 set -u
@@ -43,12 +44,13 @@ WARM_REPS=${WARM_REPS:-3}
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0; }
 
 # ---------------------------------------------------------------- arm table
-# Env delta each arm applies over the shared serve command.
-ARM_NAMES=(baseline locksplit)
+# Env delta each arm applies over the shared serve command. `baseline` is the
+# reference the measured arms are delta against; it is the only one left since the
+# close/batch/bg machinery and its arms were deleted (#784, #787).
+ARM_NAMES=(baseline)
 arm_env() {
   case "$1" in
     baseline)  echo "" ;;
-    locksplit) echo "PENDING_746" ;;
     *) return 2 ;;
   esac
 }
@@ -91,6 +93,7 @@ spill_files() {
 ARMS=()
 ALL=0
 RESTORE_ONLY=0
+CLEAN_SPILL_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO=$2; shift 2 ;;
@@ -99,6 +102,7 @@ while [ $# -gt 0 ]; do
     --arm) ARMS+=("$2"); shift 2 ;;
     --all) ALL=1; shift ;;
     --restore-only) RESTORE_ONLY=1; shift ;;
+    --clean-spill-only) CLEAN_SPILL_ONLY=1; shift ;;
     --list) printf '%s\n' "${ARM_NAMES[@]}"; exit 0 ;;
     --arms-env) for _a in "${ARM_NAMES[@]}"; do printf '%s|%s\n' "$_a" "$(arm_env "$_a")"; done; exit 0 ;;
     --instrument-env) printf '%s\n' "$(instrument_env)"; exit 0 ;;
@@ -168,11 +172,6 @@ stop_serve() {
 run_arm() {
   local name=$1
   local env_delta; env_delta=$(arm_env "$name") || { log "unknown arm $name"; return 2; }
-  if [ "$env_delta" = "PENDING_746" ]; then
-    log "arm $name: SKIPPED -- #746 (lock split) is not merged; a flag that does"
-    log "  nothing would report a no-op as a measured result. Re-run after it lands."
-    return 0
-  fi
   local dir=$OUT/$name
   mkdir -p "$dir"
   log "=== arm $name: $env_delta"
@@ -433,6 +432,7 @@ mkdir -p "$OUT"
 log "repo=$REPO out=$OUT port=$PORT blocks=$EXPECT_BLOCKS"
 
 if [ "$RESTORE_ONLY" = 1 ]; then restore; exit $?; fi
+if [ "$CLEAN_SPILL_ONLY" = 1 ]; then clean_spill; exit $?; fi
 if [ "$ALL" = 1 ]; then ARMS=("${ARM_NAMES[@]}"); fi
 if [ ${#ARMS[@]} -eq 0 ]; then usage; fi
 
