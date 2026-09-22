@@ -461,9 +461,6 @@ def _repo_root() -> str:
 
 PARITY_BUCKETS = [512, 1024, 2048]  # 3 cmax buckets x W=1,2 = the 6 v5 cells
 PARITY_GEN = 48  # max_new_tokens cap; natural EOS before it is a valid sequence
-# Minimum produced tokens accepted as a real cell: one full SPARSE_REFRESH_TICKS
-# (=8) cycle, so both captured replay and an eager refresh tick are exercised.
-SPARSE_REFRESH_TICKS_MIN = 8
 
 
 def _sig(x) -> float:
@@ -850,6 +847,18 @@ def prime_counting(engine, tok, bucket, depth, tag, job):
     raise ProbeError(f"{tag}: counting prompt never landed in bucket {bucket}")
 
 
+def _cell_crossed_bucket(ticks, observed_bucket):
+    """True iff SOME recorded tick's cmax bucket exceeded the prime bucket.
+    Crossing means a new earlier page completed (a lazy graph recapture at the
+    doubled bucket) and the steady replay after it ran. Looking at any tick, not
+    just the last, so an early cross followed by a later same-or-smaller cmax
+    (candidate set can change with selection) still counts; the boundary is
+    monotonic in decode length for the growing own-span geometry here."""
+    from tilerl.sparse_engine import cmax_bucket
+
+    return any(cmax_bucket(t["cmax"]) > observed_bucket for t in ticks)
+
+
 def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b"):
     """One arm process, ONE model load for all three buckets at this W. Per
     decode tick records committed token ids and a finalize-boundary fingerprint
@@ -938,16 +947,19 @@ def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b
             t["tokens"] = c["toks"]
         n_tok = sum(len(c["toks"]) for c in commits)
         finished_naturally = not any(r.req_id == rid for r in e._running)
-        # PARITY_GEN is a CAP, not a required length. temp0 counting can emit EOS
-        # before the cap (window3 stopped at 47/48); that is a valid full
-        # sequence as long as BOTH arms produce the same length (the parent
-        # aligns commit counts and compares token ids). Only a pathologically
-        # short finish (< one 8-tick refresh cycle, so replay+refresh were never
-        # both exercised) is a harness fault.
-        if n_tok < SPARSE_REFRESH_TICKS_MIN:
+        # Semantic requirement, NOT a token count: the run must have CROSSED a
+        # cmax doubling boundary, exercising one lazy recapture plus the steady
+        # replay after it. prime lands cmax exactly on the bucket value with
+        # prompt n%16=7, so the next page completes 9 tokens into decode and
+        # cmax_bucket doubles there (fixmisc 5774812215). A length>=N gate
+        # could pass without crossing (window3 hole); assert on the bucket.
+        post_bucket = cmax_bucket(ticks[-1]["cmax"])
+        observed_bucket = cmax_bucket(cmax)
+        if not _cell_crossed_bucket(ticks, observed_bucket):
             raise ProbeError(
-                f"parity {job['arm']} b{bucket} W{depth + 1}: only {n_tok} tokens "
-                f"(< {SPARSE_REFRESH_TICKS_MIN}, graph path not exercised)"
+                f"parity {job['arm']} b{bucket} W{depth + 1}: never crossed the "
+                f"cmax bucket (prime {cmax_bucket(cmax)} -> end {post_bucket}, "
+                f"end_cmax={ticks[-1]['cmax']}, n_tok={n_tok})"
             )
         n_graph = sum(1 for t in ticks if t["path"] == "graph")
         cells.append(
@@ -955,7 +967,8 @@ def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b
                 "bucket": bucket,
                 "W": depth + 1,
                 "observed_cmax": cmax,
-                "observed_bucket": cmax_bucket(cmax),
+                "observed_bucket": observed_bucket,
+                "post_bucket": post_bucket,
                 "n_tokens": n_tokens,
                 "ticks": ticks,
                 "commits": commits,

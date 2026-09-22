@@ -212,6 +212,30 @@ def test_selection_observed_once_after_finalize_via_selected_pages():
     assert job["ticks"][0]["selected_pages"] == []
 
 
+def test_cell_must_cross_cmax_bucket_boundary():
+    """fixmisc 5774812215: a cell is valid only if the decode actually crossed
+    a cmax doubling boundary (lazy recapture + steady replay after), not merely
+    produced >=N tokens. prime lands cmax exactly on the bucket (n%16=7); the
+    next page completes ~9 tokens in and doubles it. A run that ends still in
+    the prime bucket must be rejected even if it emitted 8+ tokens — that was
+    the window3 length-gate hole."""
+    probe = _load_probe()
+
+    def ticks_with(*cmaxs):
+        return [{"cmax": c} for c in cmaxs]
+
+    # prime bucket 512; cmax 512 sits inside 512 (cmax_bucket(512)=512)
+    assert probe._cell_crossed_bucket(ticks_with(512, 512), 512) is False
+    # 8-token run entirely below the next bucket (cmax_bucket(513)=1024 is the
+    # crossing); 512..512 never crosses -> the hole the length>=8 gate missed
+    assert probe._cell_crossed_bucket(ticks_with(*([512] * 8)), 512) is False
+    # crossing observed at tick 9 (513 -> bucket 1024), then steady
+    seq = [512] * 8 + [513] + [520] * 38
+    assert probe._cell_crossed_bucket(ticks_with(*seq), 512) is True
+    # cross early then cmax relaxes back: still crossed (any-tick semantics)
+    assert probe._cell_crossed_bucket(ticks_with(512, 513, 512), 512) is True
+
+
 def test_product_forward_exception_propagates_untagged(monkeypatch, capsys):
     """The other branch of fixmisc's fork: a PRODUCT forward exception
     (tilelang/attention/write_tokens) must bypass the probe observability try
