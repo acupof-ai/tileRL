@@ -28,6 +28,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -209,3 +210,45 @@ def test_selection_observed_once_after_finalize_via_selected_pages():
     assert "selected" not in calls, "hook read sf.selected (D2H observer bias)"
     assert sparse.order == ["finalize", "selected_pages"], sparse.order
     assert job["ticks"][0]["selected_pages"] == []
+
+
+def test_product_forward_exception_propagates_untagged():
+    """The other branch of fixmisc's fork: if the PRODUCT forward (tilelang /
+    attention / write_tokens) raises inside the capture tick, the hook must not
+    swallow or relabel it. orig_fwd is intentionally outside the probe try, so
+    the exception propagates with product frames and no [PROBE-EXC] tag -- that
+    is the #700 capture-failure evidence. In a worker this is an rc13 worker-exc
+    whose traceback shows product frames, never a [PROBE-EXC] hard exit."""
+    probe = _load_probe()
+    srow = {
+        "req_id": 7,
+        "own": [10, 11],
+        "own_len": 200,
+        "q_hi": 200,
+        "tq": 1,
+        "decoding": False,
+        "cand": [0, 1],
+        "force_window": 8,
+        "resolve": lambda p: p,
+        "reserved": set(),
+    }
+    sf = _Sf([srow], device_select=False)
+
+    class ProductKernelError(RuntimeError):
+        pass
+
+    class FailingModel:
+        def forward(self, input_ids, positions, kv, backend, **kw):
+            raise ProductKernelError("simulated tilelang/attention failure")
+
+    eng = _Engine(sf, torch.zeros(1, 1, 8), state_slot=0)
+    eng._model = FailingModel()  # install BEFORE hooks so fwd wraps the failing forward
+    job = _job()
+    probe._install_parity_hooks(eng, job)
+
+    ids = torch.zeros(1, 512, dtype=torch.long)
+    pos = torch.zeros(1, 512, dtype=torch.long)
+    with pytest.raises(ProductKernelError):
+        eng._model.forward(ids, pos, eng._kv, backend=None)
+    # the probe never recorded anything for the failed product forward
+    assert job["prefill_logits"] == []
