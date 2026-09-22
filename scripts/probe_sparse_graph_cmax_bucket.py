@@ -51,7 +51,8 @@ shared by its three buckets):
      (the v5 acceptance gate);
   4. at the divergence tick the inputs are compared and the verdict follows
      fixmisc's table:
-        inputs equal + token differ  -> TOKEN_DIVERGE_INPUT_EQUAL_H1
+        inputs equal + token differ  -> TOKEN_DIVERGE_INPUT_EQUAL_H1_AT_SKETCH_PRECISION
+        (sketch-level equality; a fired H1 is arbitrated byte-exactly)
         inputs differ + token differ -> TOKEN_DIVERGE_INPUT_DIFF_H3:<field>
      The fingerprint sketch is keyed by LOGICAL page (physical block ids and
      state slots differ across the arm processes); the recurrent state/conv is
@@ -537,6 +538,25 @@ def _install_parity_hooks(engine, job):
     orig_graph = rt.run_decode_graph
     orig_fwd = engine._model.forward
     orig_step = engine.step
+    orig_commit = engine._commit
+
+    def commit(req, toks, lps=None):
+        # Both commit paths funnel through _commit: plain decode via
+        # _sample_commit AND the W=2 spec path via _verify -> _commit (which
+        # _sample_commit would miss). Record one entry per actual commit with
+        # its pre-commit lengths, so the parent can attribute EVERY token to
+        # its own tick even when a verify accepts 2 in one step (B1).
+        out_before, seq_before = len(req.output), int(req.seq_len)
+        rc = orig_commit(req, toks, lps)
+        if job["rid"] is not None and req.req_id == job["rid"] and int(req.phase) == _PHASE_DECODE:
+            job["commits"].append(
+                {
+                    "out_before": out_before,
+                    "seq_before": seq_before,
+                    "toks": list(toks)[: len(req.output) - out_before],
+                }
+            )
+        return rc
 
     def fwd(input_ids, positions, kv, backend, **kw):
         # Input state MUST be read before the forward (the forward writes the
@@ -685,6 +705,7 @@ def _install_parity_hooks(engine, job):
     rt.finalize = finalize
     rt.run_decode_graph = run_graph
     engine.step = step
+    engine._commit = commit
 
 
 def _raw_dump(engine, pages, job):
@@ -736,9 +757,20 @@ def prime_counting(engine, tok, bucket, depth, tag, job):
     nfill = tokens_for_bucket(bucket) - len(instr)
     for attempt in range(6):
         ids = fid * nfill + instr
-        job["rid"] = engine.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=PARITY_GEN, seed=0))
+        # N1: bind rid BEFORE every probe step and reset ALL per-attempt
+        # collections here. A sparse-graph capture during a priming step then
+        # still runs under a live rid and the run_graph os._exit(12) guard, so a
+        # capture failure cannot poison the allocator and surface as rc13.
+        job["rid"] = engine.submit(
+            ids, SamplingParams(temperature=0.0, max_new_tokens=PARITY_GEN, seed=0)
+        )
+        job["ticks"] = []
+        job["commits"] = []
+        job["immutable"] = {}
+        job["imm_conflict"] = []
         job["prefill_logits"] = []
         job["prefill_boundary"] = None
+        job["cur"] = None
         engine.step()
         for _ in range(40000):
             row = next((r for r in engine._running if r.req_id == job["rid"]), None)
@@ -752,6 +784,10 @@ def prime_counting(engine, tok, bucket, depth, tag, job):
         srows = engine._sparse.decode_rows([_row(engine, job["rid"], "cmax")], [1 + depth])
         cmax = max((len(x["cand"]) for x in srows), default=0)
         if cmax_bucket(cmax) == bucket:
+            # Discard any records the probe steps beyond prefill appended; the
+            # decode measurement starts from the prefill boundary only.
+            job["ticks"] = []
+            job["commits"] = []
             return job["rid"], cmax, len(ids)
         nfill += (bucket - cmax) * 16
         _cancel_and_drain(engine, job["rid"], f"{tag} attempt{attempt}")
@@ -803,6 +839,7 @@ def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b
     job = {
         "rid": None,
         "ticks": [],
+        "commits": [],
         "prefill_logits": [],
         "prefill_boundary": None,
         "immutable": {},
@@ -818,29 +855,38 @@ def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b
     cells = []
     for bucket in PARITY_BUCKETS:
         job["bucket"] = bucket
-        job["ticks"], job["prefill_logits"] = [], []
-        job["immutable"], job["imm_conflict"] = {}, []
-        job["prefill_boundary"] = None
-        rid, cmax, n_tokens = prime_counting(e, tok, bucket, depth, f"parity b{bucket}")
-        job["rid"] = rid
-        seen = 0
+        rid, cmax, n_tokens = prime_counting(e, tok, bucket, depth, f"parity b{bucket}", job)
         for _ in range(PARITY_GEN * 12 + 200):
-            mark = len(job["ticks"])
             e.step()
             torch.cuda.synchronize()
+            n_tok = sum(len(c["toks"]) for c in job["commits"])
             live = next((r for r in e._running if r.req_id == rid), None)
-            cur_out = list(live.output) if live is not None else list(e.poll()[rid])
-            appended = cur_out[seen:]
-            seen = len(cur_out)
-            for rec in job["ticks"][mark:]:
-                rec["tokens"] = appended  # forward(s) this step committed these
-            if live is None or seen >= PARITY_GEN:
+            if live is None or n_tok >= PARITY_GEN:
                 break
-        if seen < PARITY_GEN:
+        # One decode forward = one finalize boundary AND exactly one _commit
+        # (plain: 1 token; W=2 verify: 1-2 tokens). Equal-length index
+        # alignment is the B1 invariant the parent cross-checks.
+        ticks, commits = job["ticks"], job["commits"]
+        if len(ticks) != len(commits):
             raise ProbeError(
-                f"parity {job['arm']} b{bucket} W{depth + 1}: only {seen}/{PARITY_GEN} tokens"
+                f"parity {job['arm']} b{bucket} W{depth + 1}: "
+                f"{len(ticks)} tick boundaries vs {len(commits)} commits"
             )
-        n_graph = sum(1 for t in job["ticks"] if t["path"] == "graph")
+        for t, c in zip(ticks, commits):
+            if t["out_before"] != c["out_before"] or t["seq_before"] != c["seq_before"]:
+                raise ProbeError(
+                    f"parity {job['arm']} b{bucket} W{depth + 1}: tick/commit "
+                    f"misaligned ({t['out_before']},{t['seq_before']}) vs "
+                    f"({c['out_before']},{c['seq_before']})"
+                )
+            t["tokens"] = c["toks"]
+        n_tok = sum(len(c["toks"]) for c in commits)
+        if n_tok < PARITY_GEN:
+            raise ProbeError(
+                f"parity {job['arm']} b{bucket} W{depth + 1}: only {n_tok}/{PARITY_GEN} tokens"
+            )
+        n_graph = sum(1 for t in ticks if t["path"] == "graph")
+        final_out = list(e.poll()[rid]) if not any(r.req_id == rid for r in e._running) else None
         cells.append(
             {
                 "bucket": bucket,
@@ -848,16 +894,18 @@ def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b
                 "observed_cmax": cmax,
                 "observed_bucket": cmax_bucket(cmax),
                 "n_tokens": n_tokens,
-                "ticks": job["ticks"],
+                "ticks": ticks,
+                "commits": commits,
                 "n_graph": n_graph,
                 "prefill_logits": job["prefill_logits"][-1] if job["prefill_logits"] else None,
                 "prefill_own_fp": (job["prefill_boundary"] or {}).get("own_fp"),
                 "immutable": job["immutable"],
                 "imm_conflict": job["imm_conflict"],
-                "head": cur_out[:16],
+                "head": [t for c in commits for t in c["toks"]][:16],
             }
         )
-        job["rid"] = None
+        if final_out is not None and len(final_out) < PARITY_GEN:
+            raise ProbeError(f"parity {job['arm']} b{bucket}: finished with {len(final_out)}")
 
     e.shutdown()
     gc.collect()  # never empty_cache on sm70 after capture
@@ -899,8 +947,11 @@ def compare_parity(source, draft, depth):
     """Spawn graph first (a capture failure ends the run before the eager 27B
     load pays), then eager. Per cell: prefill-logits parity gate, then walk the
     committed token streams; at the first divergent token classify per fixmisc:
-      inputs equal + token differ  -> FORWARD_CAPTURE_H1
-      inputs differ + token differ -> UPSTREAM_STATE_DRIFT_H3 (field named)
+      inputs equal + token differ  -> ..._H1_AT_SKETCH_PRECISION (byte dump
+        arbitrates); inputs differ + token differ -> ..._H3:<field>
+      Before either, an elementwise alignment gate compares per-tick
+      seq_before and commit counts; any mismatch is ALIGNMENT_UNMATCHED
+      (harness fault), since the two arms are independent autoregressions.
     """
     g = spawn_worker("parity", source, draft, "graph", depth)
     if g.get("arm") in ("capture-failed", "illegal-access", "worker-error", "worker-timeout"):
@@ -949,6 +1000,30 @@ def compare_parity(source, draft, depth):
             rows.append(cell)
             continue
 
+        # B1 alignment gate: the two arms are independent autoregressions, so a
+        # token comparison is only meaningful tick-for-tick. Their finalize
+        # boundary count, per-tick seq_before and per-tick commit counts must
+        # agree elementwise. A W=2 verify accepts 1 or 2 tokens; if the arms'
+        # acceptance patterns diverged, the streams cannot be aligned -- that is
+        # a harness fault (ALIGNMENT_UNMATCHED), never an H1/H3 verdict.
+        g_seq = [t["seq_before"] for t in gc_["ticks"]]
+        e_seq = [t["seq_before"] for t in ec["ticks"]]
+        g_nc = [len(c["toks"]) for c in gc_["commits"]]
+        e_nc = [len(c["toks"]) for c in ec["commits"]]
+        if g_seq != e_seq or g_nc != e_nc:
+            cell["verdict"] = "ALIGNMENT_UNMATCHED"
+            cell["align"] = {
+                "tick_count": (len(g_seq), len(e_seq)),
+                "first_seq_diff": next(
+                    (i for i in range(min(len(g_seq), len(e_seq))) if g_seq[i] != e_seq[i]),
+                    None,
+                ),
+                "commit_counts_g": g_nc,
+                "commit_counts_e": e_nc,
+            }
+            harness.append(cell)
+            rows.append(cell)
+            continue
         g_flat, g_owner, e_flat, e_owner = [], [], [], []
         for ti, t in enumerate(gc_["ticks"]):
             for tok in t["tokens"]:
@@ -974,7 +1049,7 @@ def compare_parity(source, draft, depth):
         gt, et = gc_["ticks"][gti], ec["ticks"][eti]
         field = _input_diff(_input_view(gc_, gti), _input_view(ec, eti))
         cell["verdict"] = (
-            "TOKEN_DIVERGE_INPUT_EQUAL_H1"
+            "TOKEN_DIVERGE_INPUT_EQUAL_H1_AT_SKETCH_PRECISION"
             if field is None
             else f"TOKEN_DIVERGE_INPUT_DIFF_H3:{field}"
         )
