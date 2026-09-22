@@ -517,6 +517,32 @@ def _pages_fp(engine, pages: list[int], rid: int) -> dict:
     return out
 
 
+def _probe_die(where: str):
+    """Boundary between a PROBE observation bug and a PRODUCT failure.
+
+    make_sparse_graph catches every exception type around capture, so a
+    product capture failure and a probe raising inside the capture tick would
+    otherwise take one indistinguishable path. The hooks call this ONLY around
+    their own observation code -- orig_fwd / orig_finalize / orig_run_decode_graph
+    stay OUTSIDE the try, so a product kernel exception (tilelang/attention/
+    write_tokens) propagates with product frames and no [PROBE-EXC] tag.
+
+    In a real worker process this hard-exits 13 (harness) before any further
+    CUDA call; outside a worker (unit tests) it re-raises so red-before-green
+    gates can observe the exact probe frame."""
+    import traceback
+
+    sys.stderr.write(f"[PROBE-EXC] probe observation failed in {where}\n")
+    traceback.print_exc(file=sys.stderr)
+    sys.stderr.flush()
+    if _IN_WORKER:
+        os._exit(13)
+    raise
+
+
+_IN_WORKER = False
+
+
 def _install_parity_hooks(engine, job):
     """Two hooks per forward, both instance attributes (tree untouched):
 
@@ -573,39 +599,44 @@ def _install_parity_hooks(engine, job):
         sf0 = getattr(kv, "sparse", None)
         pre = {}
         if sf0 is not None and job["rid"] is not None:
-            for bi0, rw0 in enumerate(getattr(sf0, "rows", []) or []):
-                if rw0["req_id"] == job["rid"] and rw0.get("decoding"):
-                    pre[bi0] = {
-                        "ids": [int(x) for x in input_ids[bi0]],
-                        "pos": [int(x) for x in positions[bi0]],
-                        "state": _state_fp(engine, int(kv.state_slot[bi0])),
-                    }
-        out = orig_fwd(input_ids, positions, kv, backend, **kw)
+            try:
+                for bi0, rw0 in enumerate(getattr(sf0, "rows", []) or []):
+                    if rw0["req_id"] == job["rid"] and rw0.get("decoding"):
+                        pre[bi0] = {
+                            "ids": [int(x) for x in input_ids[bi0]],
+                            "pos": [int(x) for x in positions[bi0]],
+                            "state": _state_fp(engine, int(kv.state_slot[bi0])),
+                        }
+            except BaseException:
+                _probe_die("fwd.entry")
+        out = orig_fwd(input_ids, positions, kv, backend, **kw)  # product frame, NOT wrapped
         if sf0 is not None and job["rid"] is not None:
-            for bi, rw in enumerate(getattr(sf0, "rows", []) or []):
-                if rw["req_id"] != job["rid"] or rw.get("decoding"):
-                    continue
-                # Requirement 1: the two arms' LAST prefill-position logits
-                # must be bit-identical. Cryptographic hash of the exact
-                # float32 bytes (one vocab-sized vector ~151k values), not a
-                # sketch -- a sketch could not certify per-element equality.
-                # The engine passes last_only=seq_q, so the RETURNED tensor for
-                # a prefill row is already sliced to [1, V] (its last valid
-                # position); the full chunk width lives only in seq_q_lens.
-                # out[bi, seq_q_lens-1] indexed a [B,1,V] tensor at 511.
-                import hashlib
+            try:
+                for bi, rw in enumerate(getattr(sf0, "rows", []) or []):
+                    if rw["req_id"] != job["rid"] or rw.get("decoding"):
+                        continue
+                    # Requirement 1: the two arms' LAST prefill-position logits
+                    # must be bit-identical. Cryptographic hash of the exact
+                    # float32 bytes (one vocab-sized vector ~151k values), not a
+                    # sketch -- a sketch could not certify per-element equality.
+                    # The engine passes last_only=seq_q, so the RETURNED tensor for
+                    # a prefill row is already sliced to [1, V] (its last valid
+                    # position); the full chunk width lives only in seq_q_lens.
+                    import hashlib
 
-                vec = out[bi, -1].detach().float().contiguous()
-                b = vec.cpu().numpy().tobytes()
-                job["prefill_logits"].append(
-                    {
-                        "sha1": hashlib.sha1(b).hexdigest(),
-                        "argmax": int(vec.argmax()),
-                        "n": int(vec.numel()),
-                    }
-                )
-                if bi in pre:  # decode entry on a mixed tick (defensive)
-                    job["cur"] = pre[bi]
+                    vec = out[bi, -1].detach().float().contiguous()
+                    b = vec.cpu().numpy().tobytes()
+                    job["prefill_logits"].append(
+                        {
+                            "sha1": hashlib.sha1(b).hexdigest(),
+                            "argmax": int(vec.argmax()),
+                            "n": int(vec.numel()),
+                        }
+                    )
+                    if bi in pre:  # decode entry on a mixed tick (defensive)
+                        job["cur"] = pre[bi]
+            except BaseException:
+                _probe_die("fwd.prefill_logits")
         return out
 
     def finalize(sf, rows, hidden=None):
@@ -617,79 +648,89 @@ def _install_parity_hooks(engine, job):
         # clears its cache every tick) -- two mechanisms, a fabricated H3.
         # r.output/seq_len are still pre-commit here: commit runs AFTER
         # finalize on both paths.
-        dropped = orig_finalize(sf, rows, hidden)
+        dropped = orig_finalize(sf, rows, hidden)  # product frame, NOT wrapped
         if job["rid"] is None:
             return dropped
-        for bi, r in enumerate(rows):  # rows are _Req on both paths
-            if r.req_id != job["rid"]:
-                continue
-            srow = sf.rows[bi]  # build_rows-shaped dict
-            own = list(srow["own"])
-            kept = sorted(sf.selected_pages(bi))  # post-finalize pin set
-            earlier = [p for p in kept if p not in own]
-            # Earlier complete pages are immutable once written (the forward
-            # writes only the own window's trailing page, and candidates
-            # exclude the own span). Fingerprint first sightings; on refresh
-            # ticks (device_select=False, one per SPARSE_REFRESH_TICKS in BOTH
-            # arms) re-fingerprint the whole selection so immutability is
-            # verified by a guard that can fire, not trusted.
-            is_refresh = not sf.device_select
-            target = (
-                earlier if is_refresh else [p for p in earlier if str(p) not in job["immutable"]]
-            )
-            fp_sel = _pages_fp(engine, target, job["rid"]) if target else {}
-            if is_refresh:
-                for p in earlier:
-                    v = fp_sel[str(p)]
-                    old = job["immutable"].get(str(p))
-                    if old is not None and old != v:
-                        job["imm_conflict"].append(str(p))
-                    job["immutable"][str(p)] = v
-            else:
-                job["immutable"].update(fp_sel)
-            boundary = {
-                "out_before": len(r.output),
-                "seq_before": int(r.seq_len),
-                "cmax": len(srow["cand"]),
-                "phase": int(r.phase),
-                "path": job["path"],
-                "device_select": bool(sf.device_select),
-                "own": own,
-                "selected_pages": kept,
-                # forward-POST state of the own window: the trailing partial
-                # page here already contains THIS tick's write, so the
-                # parent takes tick k's own fingerprints from boundary k-1.
-                "own_fp": {str(p): fp_ for p, fp_ in _pages_fp(engine, own, job["rid"]).items()},
-            }
-            if int(r.phase) == _PHASE_PREFILL:
-                job["prefill_boundary"] = boundary
-                if (
-                    os.environ.get("H2_DUMP_CELL") == f"{job['bucket']}:{job['W']}"
-                    and os.environ.get("H2_DUMP_WHEN", "decode") == "prefill"
-                ):
+        try:
+            for bi, r in enumerate(rows):  # rows are _Req on both paths
+                if r.req_id != job["rid"]:
+                    continue
+                srow = sf.rows[bi]  # build_rows-shaped dict
+                own = list(srow["own"])
+                kept = sorted(sf.selected_pages(bi))  # post-finalize pin set
+                earlier = [p for p in kept if p not in own]
+                # Earlier complete pages are immutable once written (the forward
+                # writes only the own window's trailing page, and candidates
+                # exclude the own span). Fingerprint first sightings; on refresh
+                # ticks (device_select=False, one per SPARSE_REFRESH_TICKS in BOTH
+                # arms) re-fingerprint the whole selection so immutability is
+                # verified by a guard that can fire, not trusted.
+                is_refresh = not sf.device_select
+                target = (
+                    earlier
+                    if is_refresh
+                    else [p for p in earlier if str(p) not in job["immutable"]]
+                )
+                fp_sel = _pages_fp(engine, target, job["rid"]) if target else {}
+                if is_refresh:
+                    for p in earlier:
+                        v = fp_sel[str(p)]
+                        old = job["immutable"].get(str(p))
+                        if old is not None and old != v:
+                            job["imm_conflict"].append(str(p))
+                        job["immutable"][str(p)] = v
+                else:
+                    job["immutable"].update(fp_sel)
+                boundary = {
+                    "out_before": len(r.output),
+                    "seq_before": int(r.seq_len),
+                    "cmax": len(srow["cand"]),
+                    "phase": int(r.phase),
+                    "path": job["path"],
+                    "device_select": bool(sf.device_select),
+                    "own": own,
+                    "selected_pages": kept,
+                    # forward-POST state of the own window: the trailing partial
+                    # page here already contains THIS tick's write, so the
+                    # parent takes tick k's own fingerprints from boundary k-1.
+                    "own_fp": {
+                        str(p): fp_ for p, fp_ in _pages_fp(engine, own, job["rid"]).items()
+                    },
+                }
+                if int(r.phase) == _PHASE_PREFILL:
+                    job["prefill_boundary"] = boundary
+                    if (
+                        os.environ.get("H2_DUMP_CELL") == f"{job['bucket']}:{job['W']}"
+                        and os.environ.get("H2_DUMP_WHEN", "decode") == "prefill"
+                    ):
+                        _raw_dump(engine, kept, job)
+                    continue
+                cur = job["cur"] or {"ids": None, "pos": None, "state": None}
+                boundary.update({"ids": cur["ids"], "pos": cur["pos"], "state": cur["state"]})
+                job["ticks"].append(boundary)
+                job["cur"] = None
+                if os.environ.get("H2_DUMP_CELL") == f"{job['bucket']}:{job['W']}" and str(
+                    len(r.output)
+                ) in set(os.environ.get("H2_DUMP_STEPS", "").split(",")):
                     _raw_dump(engine, kept, job)
-                continue
-            cur = job["cur"] or {"ids": None, "pos": None, "state": None}
-            boundary.update({"ids": cur["ids"], "pos": cur["pos"], "state": cur["state"]})
-            job["ticks"].append(boundary)
-            job["cur"] = None
-            if os.environ.get("H2_DUMP_CELL") == f"{job['bucket']}:{job['W']}" and str(
-                len(r.output)
-            ) in set(os.environ.get("H2_DUMP_STEPS", "").split(",")):
-                _raw_dump(engine, kept, job)
+        except BaseException:
+            _probe_die("finalize.observe")
         return dropped
 
     def run_graph(reqs, chains=None):
         job["path"] = "graph"
-        r0 = next((r for r in reqs if r.req_id == job["rid"]), None)
-        if r0 is not None:
-            ch = chains[reqs.index(r0)] if chains is not None else [r0.output[-1]]
-            job["cur"] = {
-                "ids": [int(x) for x in ch],
-                "pos": [int(r0.seq_len) - 1 + j for j in range(len(ch))],
-                "state": _state_fp(engine, int(r0.state_slot)),
-            }
-        ok = orig_graph(reqs, chains)
+        try:
+            r0 = next((r for r in reqs if r.req_id == job["rid"]), None)
+            if r0 is not None:
+                ch = chains[reqs.index(r0)] if chains is not None else [r0.output[-1]]
+                job["cur"] = {
+                    "ids": [int(x) for x in ch],
+                    "pos": [int(r0.seq_len) - 1 + j for j in range(len(ch))],
+                    "state": _state_fp(engine, int(r0.state_slot)),
+                }
+        except BaseException:
+            _probe_die("run_graph.pre")
+        ok = orig_graph(reqs, chains)  # product capture/replay frame, NOT wrapped
         if not ok:
             # Refresh/failed-capture tick: the engine now runs the EAGER sparse
             # forward, whose finalize owns this tick's record. Drop the stale
@@ -1170,6 +1211,8 @@ def main() -> int:
 
     # --- in-process worker (one fresh CUDA context per process) ---
     if args.worker is not None:
+        global _IN_WORKER
+        _IN_WORKER = True  # _probe_die hard-exits 13 instead of re-raising
         try:
             kind = args.worker[0]
             if kind == "arm":
