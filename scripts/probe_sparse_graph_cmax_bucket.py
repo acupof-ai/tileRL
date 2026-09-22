@@ -496,24 +496,44 @@ def _state_fp(engine, slot) -> dict:
 
 
 def _pages_fp(engine, pages: list[int], rid: int) -> dict:
-    """K/V fingerprints keyed by LOGICAL page (physical block ids differ across
-    the two arm processes). Per page four aggregates over ALL planes
-    (k-sum, k-sumsq, v-sum, v-sumsq): enough to place a mismatch on a page; the
-    H2_DUMP_* rerun supplies per-layer raw bytes. A sum+sumsq pair cannot
-    self-cancel on a real perturbation."""
+    """Per-page logical-content fingerprints keyed by LOGICAL page.
+
+    For a demoted page the authoritative bytes are its cold host blob
+    (PagedKvPool.cold keyed (rid, page)); the blob's k/v are read back and
+    sha1-hashed, which is immune to the f32->f16->f32 device round-trip and to
+    a promotion landing on a different physical block. For a still-resident
+    page with no held blob, the current physical frame is sketched at a
+    dtype-appropriate tolerance. The H2_DUMP_* rerun gives raw per-layer bytes.
+    """
     if not pages:
         return {}
     tr = engine._sparse.tracker
     pool = engine._kv
-    phys = [tr.resident[rid][p] for p in pages]  # all selected+own resident pre-finalize
+    cold = getattr(pool, "cold", None)
     out = {}
-    for name, src in (("k", pool.k_pool), ("v", pool.v_pool)):
-        t = src[:, phys].float()  # [L, P, H, T, D]
-        f = t.reshape(t.shape[0], t.shape[1], -1)
-        sm = f.sum((0, 2))
-        sq = (f * f).sum((0, 2))
-        for j, p in enumerate(pages):
-            out.setdefault(str(p), {})[name] = [_sig(sm[j]), _sig(sq[j])]
+    for p in pages:
+        blob = cold.peek((rid, p)) if cold is not None else None
+        if blob is not None:
+            import hashlib
+
+            hk = hashlib.sha1(blob["k"].contiguous().numpy().tobytes()).hexdigest()
+            hv = hashlib.sha1(blob["v"].contiguous().numpy().tobytes()).hexdigest()
+            out[str(p)] = {"src": "blob", "k": hk, "v": hv}
+            continue
+        phys = tr.resident[rid].get(p)
+        if phys is None:
+            # Selected but neither resident nor blobs-held: cannot fingerprint
+            # from stable storage; record an explicit miss the caller treats as
+            # unobservable, never as equal.
+            out[str(p)] = {"src": "miss"}
+            continue
+        rec = {"src": "frame"}
+        # frame sketch is the f32 device view at the fixed _sig 1e-6 bound; only
+        # pages that never left device reach this branch (no f16 round-trip).
+        for name, src in (("k", pool.k_pool), ("v", pool.v_pool)):
+            t = src[:, phys].float().reshape(src.shape[0], -1)
+            rec[name] = [_sig(t.sum()), _sig((t * t).sum())]
+        out[str(p)] = rec
     return out
 
 
@@ -660,28 +680,17 @@ def _install_parity_hooks(engine, job):
                 own = list(srow["own"])
                 kept = sorted(sf.selected_pages(bi))  # post-finalize pin set
                 earlier = [p for p in kept if p not in own]
-                # Earlier complete pages are immutable once written (the forward
-                # writes only the own window's trailing page, and candidates
-                # exclude the own span). Fingerprint first sightings; on refresh
-                # ticks (device_select=False, one per SPARSE_REFRESH_TICKS in BOTH
-                # arms) re-fingerprint the whole selection so immutability is
-                # verified by a guard that can fire, not trusted.
-                is_refresh = not sf.device_select
-                target = (
-                    earlier
-                    if is_refresh
-                    else [p for p in earlier if str(p) not in job["immutable"]]
-                )
-                fp_sel = _pages_fp(engine, target, job["rid"]) if target else {}
-                if is_refresh:
-                    for p in earlier:
-                        v = fp_sel[str(p)]
-                        old = job["immutable"].get(str(p))
-                        if old is not None and old != v:
-                            job["imm_conflict"].append(str(p))
-                        job["immutable"][str(p)] = v
-                else:
-                    job["immutable"].update(fp_sel)
+                # Logical-page content, recorded once per page and never
+                # re-checked against a recycled device frame. _pages_fp prefers
+                # the stable cold host blob (exact bytes, survives demote/
+                # promote and f16 round-trips); only a never-demoted resident
+                # page uses its first-seen physical frame. This is SYMMETRIC
+                # across arms -- no dependence on sf.device_select / refresh
+                # parity (the old not-device_select refresh-only recheck ran on
+                # eager but never on the graph reuse object).
+                newp = [p for p in earlier if str(p) not in job["immutable"]]
+                if newp:
+                    job["immutable"].update(_pages_fp(engine, newp, job["rid"]))
                 boundary = {
                     "out_before": len(r.output),
                     "seq_before": int(r.seq_len),
@@ -820,7 +829,6 @@ def prime_counting(engine, tok, bucket, depth, tag, job):
         job["ticks"] = []
         job["commits"] = []
         job["immutable"] = {}
-        job["imm_conflict"] = []
         job["prefill_logits"] = []
         job["prefill_boundary"] = None
         job["cur"] = None
@@ -908,7 +916,6 @@ def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b
         "prefill_logits": [],
         "prefill_boundary": None,
         "immutable": {},
-        "imm_conflict": [],
         "cur": None,
         "path": "eager",
         "arm": "graph" if graph else "eager",
@@ -978,7 +985,6 @@ def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b
                 "prefill_logits": job["prefill_logits"][-1] if job["prefill_logits"] else None,
                 "prefill_own_fp": (job["prefill_boundary"] or {}).get("own_fp"),
                 "immutable": job["immutable"],
-                "imm_conflict": job["imm_conflict"],
                 "head": [t for c in commits for t in c["toks"]][:16],
             }
         )
@@ -1011,23 +1017,58 @@ def _input_view(cell, tick_idx):
     }
 
 
+def _page_rec_equal(a, b):
+    """Compare one logical page's content fingerprint across the two arms.
+
+    * blob/blob: the cold host bytes are the authoritative stored content
+      (f16 on sm70); k/v sha1 must match exactly.
+    * frame/frame: both pages stayed resident and were never demoted, so their
+      f32 device frames carry no cold round-trip; the 1e-6 sketches compare
+      directly (no widened tolerance -> cannot hide a real f32 corruption).
+    * mismatched source (one blob, one frame) or either "miss": the online
+      sketch cannot place the pages on the same basis -> None = UNDECIDABLE,
+      which the caller turns into a harness verdict and resolves with the
+      H2_DUMP byte rerun, never an H1/H3 classification."""
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return a == b
+    if a.get("src") != b.get("src") or a.get("src") == "miss":
+        return None
+    if a["src"] == "blob":
+        return a.get("k") == b.get("k") and a.get("v") == b.get("v")
+    return a.get("k") == b.get("k") and a.get("v") == b.get("v")
+
+
+def _sel_fp_diff(a_pages, b_pages):
+    """Compare the selected-earlier-page fingerprints of one tick. Returns
+    None if every page is provably equal, or a descriptor of the first problem:
+      ("sel_fp", page, "undecidable") when source bases differ / a page misses;
+      ("sel_fp", page, "differ") when equal-basis fingerprints disagree."""
+    pages = sorted(set(a_pages) | set(b_pages), key=lambda x: int(x))
+    for p in pages:
+        x, y = a_pages.get(p), b_pages.get(p)
+        if x is None or y is None:
+            return ("sel_fp", p, "missing")
+        r = _page_rec_equal(x, y)
+        if r is None:
+            return ("sel_fp", p, "undecidable")
+        if r is False:
+            return ("sel_fp", p, "differ")
+    return None
+
+
 def _input_diff(a, b):
-    """First unequal component of two tick input views, or None."""
+    """First unequal component of two tick input views, or None. Bit-exact
+    scalar/geometry fields first; page K/V (own window and selected earlier)
+    uses the source-aware comparator (blob-exact / frame-1e-6 / undecidable)."""
     if a is None or b is None:
         return "missing-input-view"
-    for k in (
-        "ids",
-        "pos",
-        "state",
-        "seq_before",
-        "cmax",
-        "own",
-        "selected_pages",
-        "own_fp",
-        "sel_fp",
-    ):
+    for k in ("ids", "pos", "state", "seq_before", "cmax", "own", "selected_pages"):
         if a.get(k) != b.get(k):
             return k
+    for k in ("own_fp", "sel_fp"):
+        d = _sel_fp_diff(a.get(k) or {}, b.get(k) or {})
+        if d is not None:
+            return (k,) + d[1:]
     return None
 
 
@@ -1078,12 +1119,6 @@ def compare_parity(source, draft, depth):
         if pl_g["sha1"] != pl_e["sha1"] or pl_g["n"] != pl_e["n"]:
             cell["verdict"] = "PREFILL_LOGITS_DIFFER"
             cell["prefill"] = (pl_g, pl_e)
-            harness.append(cell)
-            rows.append(cell)
-            continue
-        if gc_.get("imm_conflict") or ec.get("imm_conflict"):
-            cell["verdict"] = "IMMUTABLE_PAGE_CHANGED"
-            cell["conflicts"] = (gc_.get("imm_conflict"), ec.get("imm_conflict"))
             harness.append(cell)
             rows.append(cell)
             continue

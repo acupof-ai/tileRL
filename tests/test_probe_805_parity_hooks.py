@@ -212,6 +212,28 @@ def test_selection_observed_once_after_finalize_via_selected_pages():
     assert job["ticks"][0]["selected_pages"] == []
 
 
+def test_page_content_comparator_source_aware():
+    """fixmisc req #2/#4 follow-up: earlier-page K/V is compared by stable
+    logical content. blob/blob = exact byte hash; frame/frame = the 1e-6 f32
+    sketch (page never demoted); mixed source or a miss is UNDECIDABLE (None),
+    not equal and not a corruption verdict -- it routes to the byte-dump rerun.
+    A global widened tolerance must never be used."""
+    probe = _load_probe()
+    blob1 = {"src": "blob", "k": "aa", "v": "bb"}
+    blob2 = {"src": "blob", "k": "aa", "v": "bb"}
+    blob_diff = {"src": "blob", "k": "xx", "v": "bb"}
+    frame1 = {"src": "frame", "k": [1.0, 2.0], "v": [3.0, 4.0]}
+    assert probe._page_rec_equal(blob1, blob2) is True
+    assert probe._page_rec_equal(blob1, blob_diff) is False
+    assert probe._page_rec_equal(frame1, dict(frame1)) is True
+    assert probe._page_rec_equal(blob1, frame1) is None  # mixed basis
+    assert probe._page_rec_equal({"src": "miss"}, blob1) is None
+    assert probe._sel_fp_diff({"1": blob1}, {"1": blob2}) is None
+    assert probe._sel_fp_diff({"1": blob1}, {"1": blob_diff}) == ("sel_fp", "1", "differ")
+    assert probe._sel_fp_diff({"1": blob1}, {"1": frame1}) == ("sel_fp", "1", "undecidable")
+    assert probe._sel_fp_diff({"1": blob1}, {"2": blob1})[2] == "missing"
+
+
 def test_cell_must_cross_cmax_bucket_boundary():
     """fixmisc 5774812215: a cell is valid only if the decode actually crossed
     a cmax doubling boundary (lazy recapture + steady replay after), not merely
