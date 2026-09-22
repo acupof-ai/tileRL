@@ -20,6 +20,18 @@ If a control's guard is weakened so the mutation no longer fails, that gate
 exits 1 and this parameter goes red — the "guard removed -> red" proof is the
 gate's own exit code, asserted in CI rather than by hand.
 
+A nonzero exit is split into two causes (#794). A rendezvous/transport INIT
+failure (the pick-then-bind MASTER_PORT race under xdist) is INFRASTRUCTURE,
+not a weak guard: it is reported with an `INFRA_RENDEZVOUS` marker and the
+subprocess stdout/stderr is landed to tmp_path, so the raw EADDRINUSE artifact
+is what CI shows. Only FAILURE-BEARING phrases count (EADDRINUSE / address
+already in use / errno 48|98 / connection refused / connect() failed /
+ChildFailedError / ProcessRaisedException); subsystem names a healthy init also
+prints (TCPStore, rendezvous, init_process_group, Gloo) do not, so they cannot
+turn a later real vacuous-gate failure into a false infra verdict. Everything
+else nonzero is the control itself (vacuous or a real error). The two must
+never share a verdict, or an infra flake reads as a control failure.
+
 The paired POSITIVE runs live in the CI "Distributed gates" workflow step; here
 we only cover the controls that step never invoked.
 """
@@ -27,6 +39,7 @@ we only cover the controls that step never invoked.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -38,6 +51,18 @@ os.environ.setdefault("TILERL_TARGET", "cpu")
 
 _TESTS = Path(__file__).resolve().parent
 _ROOT = _TESTS.parent
+
+#: Strict rendezvous/transport-INIT failure phrases. Only FAILURE-BEARING text.
+#: Subsystem NAMES a healthy init also prints (TCPStore / rendezvous /
+#: init_process_group / Gloo) are deliberately absent: pairing those with a
+#: later real vacuous-gate failure would classify a weak guard as a port flake
+#: and hide it (a review caught exactly that masking direction).
+_INFRA_INIT = re.compile(
+    r"address already in use|eaddrinuse|errno ?(?:48|98)|"
+    r"connection refused|connect\(\) failed|"
+    r"childfailederror|processraisedexception",
+    re.IGNORECASE,
+)
 
 
 def _free_port() -> int:
@@ -101,20 +126,66 @@ def test_the_control_table_covers_every_distributed_gate():
         f"(and the table) when adding or removing a guard")
 
 
+#: Failure-bearing init phrases the classifier must catch.
+_INFRA_FAILURE_TEXTS = [
+    "OSError: [Errno 48] Address already in use",
+    "RuntimeError: EADDRINUSE on MASTER_PORT",
+    "errno 98: bind failed",
+    "connect() failed: Connection refused by the TCPStore peer",
+    "torch.distributed.elastic.multiprocessing.errors.ChildFailedError",
+    "ProcessRaisedException: rank 1 died during startup",
+]
+
+#: Subsystem names a HEALTHY init prints too; none of these is a failure signal,
+#: and pairing one with a later real vacuous verdict must NOT read as infra.
+_HEALTHY_INIT_TEXTS = [
+    "Initializing TCPStore with world size 2",
+    "init_process_group(backend=gloo): rendezvous via env://",
+    "Using backend: Gloo",
+    "rendezvous handler ready",
+]
+
+
+def test_infra_init_classifier_matches_only_failure_phrases():
+    # Pure-string, no subprocess: the infra classifier must fire on a real
+    # bind/connect/child-failure phrase and stay silent on subsystem names a
+    # successful init also prints.
+    for text in _INFRA_FAILURE_TEXTS:
+        assert _INFRA_INIT.search(text), f"must classify as infra: {text!r}"
+    for text in _HEALTHY_INIT_TEXTS:
+        assert not _INFRA_INIT.search(text), f"healthy init is not infra: {text!r}"
+
+
+def test_infra_init_classifier_does_not_mask_a_vacuous_gate():
+    # The failure direction that matters: a healthy init banner followed by a
+    # REAL vacuous-gate failure must be the control verdict, not INFRA_RENDEZVOUS.
+    # Matching the subsystem name here would hide a weak guard behind a flake.
+    output = (
+        "Initializing TCPStore; init_process_group(backend=gloo) rendezvous ok\n"
+        "PASSED -- vacuous gate: the mutated collective still matched\n"
+    )
+    assert "vacuous gate" in output
+    assert not _INFRA_INIT.search(output), (
+        "healthy-init subsystem names must not make a vacuous gate look like infra")
+
+
 @pytest.mark.parametrize("gate,flag", _CONTROLS,
                          ids=[f"{g.removesuffix('.py')}[{f}]" for g, f in _CONTROLS])
-def test_world_negative_control_fails_as_designed(gate: str, flag: str):
+def test_world_negative_control_fails_as_designed(gate: str, flag: str, tmp_path):
     """The guard removed by `flag` must make the distributed comparison fail:
     the gate subprocess exits 0 (its own 'control correctly FAILED' verdict) and
-    never prints 'vacuous gate'. A control that passes exits 1 here."""
+    never prints 'vacuous gate'. A control that passes exits 1 here.
+
+    On a nonzero exit the cause is split: a rendezvous/transport INIT failure is
+    INFRA_RENDEZVOUS (the #794 port race), never conflated with a weak guard; the
+    raw subprocess output is landed under tmp_path either way."""
     env = dict(os.environ, TILERL_TARGET="cpu")
     # Unique rendezvous ports per control: the gates hardcode one MASTER_PORT per
     # world (and two world sizes collide), so under xdist parallel controls hit
     # EADDRINUSE and fail as infrastructure noise instead of vacuous-control
     # failures. Every gate reads MASTER_PORT via setdefault (dp_world4 honors an
     # injected base plus MASTER_PORT_2 for its second, different-size world).
-    port = _free_port()
-    env["MASTER_PORT"] = str(port)
+    env["MASTER_PORT"] = str(_free_port())
     env["MASTER_PORT_2"] = str(_free_port())
     env["MASTER_ADDR"] = "127.0.0.1"
     proc = subprocess.run(
@@ -122,10 +193,20 @@ def test_world_negative_control_fails_as_designed(gate: str, flag: str):
         cwd=_ROOT, env=env, capture_output=True, text=True, timeout=600,
     )
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 0, (
-        f"{gate} {flag}: negative control did not fail the comparison as required "
-        f"(exit {proc.returncode}); either the guard is vacuous (control passed) or "
-        f"the control errored.\n--- output ---\n{out[-2000:]}")
+    if proc.returncode != 0:
+        # Land the raw artifact so CI preserves the actual failure primitive.
+        log = tmp_path / f"{gate.removesuffix('.py')}{flag.replace('--', '-')}.log"
+        log.write_text(out)
+        infra = _INFRA_INIT.search(out)
+        if infra:
+            pytest.fail(
+                f"INFRA_RENDEZVOUS {gate} {flag}: transport init failed "
+                f"({infra.group(0)!r}), not a control verdict — port race, "
+                f"not a weak guard. raw log: {log}\n--- output ---\n{out[-3000:]}")
+        pytest.fail(
+            f"{gate} {flag}: negative control did not fail the comparison as required "
+            f"(exit {proc.returncode}); either the guard is vacuous (control passed) or "
+            f"the control errored. raw log: {log}.\n--- output ---\n{out[-3000:]}")
     assert "control" in out.lower(), (
         f"{gate} {flag}: exited 0 but ran no identifiable control path.\n{out[-1000:]}")
     assert "vacuous gate" not in out.lower(), (
