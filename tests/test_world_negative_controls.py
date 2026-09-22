@@ -20,6 +20,14 @@ If a control's guard is weakened so the mutation no longer fails, that gate
 exits 1 and this parameter goes red — the "guard removed -> red" proof is the
 gate's own exit code, asserted in CI rather than by hand.
 
+A nonzero exit is split into two causes (#794). A rendezvous/transport INIT
+failure (the pick-then-bind MASTER_PORT race under xdist) is INFRASTRUCTURE,
+not a weak guard: it is reported with an `INFRA_RENDEZVOUS` marker and the
+subprocess stdout/stderr is landed to tmp_path, so the raw EADDRINUSE artifact
+is what CI shows. Everything else nonzero is the control itself (vacuous or a
+real error). The two must never share a verdict, or an infra flake reads as a
+control failure.
+
 The paired POSITIVE runs live in the CI "Distributed gates" workflow step; here
 we only cover the controls that step never invoked.
 """
@@ -27,6 +35,7 @@ we only cover the controls that step never invoked.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -38,6 +47,17 @@ os.environ.setdefault("TILERL_TARGET", "cpu")
 
 _TESTS = Path(__file__).resolve().parent
 _ROOT = _TESTS.parent
+
+#: Strict rendezvous/transport-INIT failure primitives. Bare "gloo" is absent on
+#: purpose: the backend banner prints "Gloo" on every healthy run, so it is not a
+#: failure signal (a #794 probe produced 66 false positives matching it).
+_INFRA_INIT = re.compile(
+    r"address already in use|eaddrinuse|errno ?(?:48|98)|"
+    r"tcpstore|rendezvous|init_(?:tcp|process_group)|"
+    r"connection refused|connect\(\) failed|"
+    r"childfailederror|processraisedexception",
+    re.IGNORECASE,
+)
 
 
 def _free_port() -> int:
@@ -103,18 +123,21 @@ def test_the_control_table_covers_every_distributed_gate():
 
 @pytest.mark.parametrize("gate,flag", _CONTROLS,
                          ids=[f"{g.removesuffix('.py')}[{f}]" for g, f in _CONTROLS])
-def test_world_negative_control_fails_as_designed(gate: str, flag: str):
+def test_world_negative_control_fails_as_designed(gate: str, flag: str, tmp_path):
     """The guard removed by `flag` must make the distributed comparison fail:
     the gate subprocess exits 0 (its own 'control correctly FAILED' verdict) and
-    never prints 'vacuous gate'. A control that passes exits 1 here."""
+    never prints 'vacuous gate'. A control that passes exits 1 here.
+
+    On a nonzero exit the cause is split: a rendezvous/transport INIT failure is
+    INFRA_RENDEZVOUS (the #794 port race), never conflated with a weak guard; the
+    raw subprocess output is landed under tmp_path either way."""
     env = dict(os.environ, TILERL_TARGET="cpu")
     # Unique rendezvous ports per control: the gates hardcode one MASTER_PORT per
     # world (and two world sizes collide), so under xdist parallel controls hit
     # EADDRINUSE and fail as infrastructure noise instead of vacuous-control
     # failures. Every gate reads MASTER_PORT via setdefault (dp_world4 honors an
     # injected base plus MASTER_PORT_2 for its second, different-size world).
-    port = _free_port()
-    env["MASTER_PORT"] = str(port)
+    env["MASTER_PORT"] = str(_free_port())
     env["MASTER_PORT_2"] = str(_free_port())
     env["MASTER_ADDR"] = "127.0.0.1"
     proc = subprocess.run(
@@ -122,10 +145,20 @@ def test_world_negative_control_fails_as_designed(gate: str, flag: str):
         cwd=_ROOT, env=env, capture_output=True, text=True, timeout=600,
     )
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 0, (
-        f"{gate} {flag}: negative control did not fail the comparison as required "
-        f"(exit {proc.returncode}); either the guard is vacuous (control passed) or "
-        f"the control errored.\n--- output ---\n{out[-2000:]}")
+    if proc.returncode != 0:
+        # Land the raw artifact so CI preserves the actual failure primitive.
+        log = tmp_path / f"{gate.removesuffix('.py')}{flag.replace('--', '-')}.log"
+        log.write_text(out)
+        infra = _INFRA_INIT.search(out)
+        if infra:
+            pytest.fail(
+                f"INFRA_RENDEZVOUS {gate} {flag}: transport init failed "
+                f"({infra.group(0)!r}), not a control verdict — port race, "
+                f"not a weak guard. raw log: {log}\n--- output ---\n{out[-3000:]}")
+        pytest.fail(
+            f"{gate} {flag}: negative control did not fail the comparison as required "
+            f"(exit {proc.returncode}); either the guard is vacuous (control passed) or "
+            f"the control errored. raw log: {log}.\n--- output ---\n{out[-3000:]}")
     assert "control" in out.lower(), (
         f"{gate} {flag}: exited 0 but ran no identifiable control path.\n{out[-1000:]}")
     assert "vacuous gate" not in out.lower(), (
