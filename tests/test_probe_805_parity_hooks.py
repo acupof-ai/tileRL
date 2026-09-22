@@ -118,7 +118,6 @@ def _job():
         "prefill_logits": [],
         "prefill_boundary": None,
         "immutable": {},
-        "imm_conflict": [],
         "cur": None,
         "path": "eager",
         "arm": "eager",
@@ -232,6 +231,76 @@ def test_page_content_comparator_source_aware():
     assert probe._sel_fp_diff({"1": blob1}, {"1": blob_diff}) == ("sel_fp", "1", "differ")
     assert probe._sel_fp_diff({"1": blob1}, {"1": frame1}) == ("sel_fp", "1", "undecidable")
     assert probe._sel_fp_diff({"1": blob1}, {"2": blob1})[2] == "missing"
+
+
+def test_undecidable_input_is_harness_not_h3():
+    """fixmisc 5775711783 blocker: at a token-divergent tick, if the page K/V
+    cannot be compared on the same basis (one arm cold blob, other resident
+    frame), the verdict must be a HARNESS UNDECIDABLE -- not H3 and not a BAD
+    rc10 conclusion -- so it routes to the byte-dump rerun. Real inequality on
+    the same basis is still H3; equal inputs is still H1."""
+    probe = _load_probe()
+
+    def cells(sel1, st=None):
+        def tick():  # one tick, token 99 vs eager 11
+            return {
+                "out_before": 0,
+                "seq_before": 100,
+                "cmax": 512,
+                "path": "graph",
+                "device_select": True,
+                "ids": [10],
+                "pos": [99],
+                "state": {"x": 1},
+                "own": [5, 6],
+                "selected_pages": [1, 5, 6],
+                "own_fp": {},
+            }
+
+        tg, te = tick(), tick()
+        tg["tokens"] = [99]
+        te["tokens"] = [11]
+        commit_g = {"out_before": 0, "seq_before": 100, "toks": [99]}
+        commit_e = {"out_before": 0, "seq_before": 100, "toks": [11]}
+
+        def mk(tick, commit, graph):
+            c = {
+                "bucket": 512,
+                "W": 1,
+                "n_tokens": 8311,
+                "n_graph": 1,
+                "prefill_logits": {"sha1": "a" * 40, "n": 8},
+                "prefill_own_fp": {},
+                "ticks": [tick],
+                "commits": [commit],
+                "head": [commit["toks"][0]],
+            }
+            c["immutable"] = {"1": sel1} if graph else {"1": sel1}
+            return [c]
+
+        return mk(tg, commit_g, True), mk(te, commit_e, False)
+
+    # mixed basis at the diverging tick -> UNDECIDABLE harness, never H3
+    g, e = cells({"src": "blob", "k": "x", "v": "y"})
+    e[0]["immutable"]["1"] = {"src": "frame", "k": [9.0], "v": [9.0]}
+    seq = iter([{"arm": "graph", "W": 1, "cells": g}, {"arm": "eager", "W": 1, "cells": e}])
+    probe.spawn_worker = lambda *a: next(seq)
+    r = probe.compare_parity("s", "d", 0)
+    assert r["verdict"] == "PROBE", r
+    cell = r["rows"][0]
+    assert cell["verdict"] == "TOKEN_DIVERGE_INPUT_UNDECIDABLE", cell["verdict"]
+    assert "H3" not in cell["verdict"]
+    assert cell["first"]["input_diff"][0] == "undecidable"
+    assert cell["first"]["dump_cell"] == "512:1"
+
+    # same basis, real inequality -> H3 / BAD
+    g2, e2 = cells({"src": "blob", "k": "x", "v": "y"})
+    e2[0]["immutable"]["1"] = {"src": "blob", "k": "different", "v": "y"}
+    seq = iter([{"arm": "graph", "W": 1, "cells": g2}, {"arm": "eager", "W": 1, "cells": e2}])
+    probe.spawn_worker = lambda *a: next(seq)
+    r2 = probe.compare_parity("s", "d", 0)
+    assert r2["verdict"] == "BAD", r2
+    assert r2["rows"][0]["verdict"].startswith("TOKEN_DIVERGE_INPUT_DIFF_H3")
 
 
 def test_cell_must_cross_cmax_bucket_boundary():

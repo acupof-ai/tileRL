@@ -1057,18 +1057,31 @@ def _sel_fp_diff(a_pages, b_pages):
 
 
 def _input_diff(a, b):
-    """First unequal component of two tick input views, or None. Bit-exact
-    scalar/geometry fields first; page K/V (own window and selected earlier)
-    uses the source-aware comparator (blob-exact / frame-1e-6 / undecidable)."""
+    """Classify the inputs of one tick across the two arms. Three outcomes:
+
+    * None                         -> every compared input is equal;
+    * ("unequal", field[, page,reason]) -> a real, comparable difference (H3);
+    * ("undecidable", field, ...)  -> the inputs cannot be placed on the same
+      basis (page blob/frame mismatch, a miss, a missing input view). This is
+      NOT a corruption verdict: the caller routes it to harness and triggers
+      the H2_DUMP byte rerun, never prints H3.
+
+    Bit-exact scalar/geometry fields are a plain difference; page K/V (own and
+    selected earlier) goes through the source-aware comparator whose
+    undecidable/missing outcomes must stay undecidable here."""
     if a is None or b is None:
-        return "missing-input-view"
+        return ("undecidable", "missing-input-view")
     for k in ("ids", "pos", "state", "seq_before", "cmax", "own", "selected_pages"):
         if a.get(k) != b.get(k):
-            return k
+            return ("unequal", k)
     for k in ("own_fp", "sel_fp"):
         d = _sel_fp_diff(a.get(k) or {}, b.get(k) or {})
-        if d is not None:
-            return (k,) + d[1:]
+        if d is None:
+            continue
+        _, page, why = d
+        if why in ("undecidable", "missing"):
+            return ("undecidable", k, page, why)
+        return ("unequal", k, page, why)
     return None
 
 
@@ -1170,12 +1183,7 @@ def compare_parity(source, draft, depth):
 
         gti, eti = g_owner[k], e_owner[k]
         gt, et = gc_["ticks"][gti], ec["ticks"][eti]
-        field = _input_diff(_input_view(gc_, gti), _input_view(ec, eti))
-        cell["verdict"] = (
-            "TOKEN_DIVERGE_INPUT_EQUAL_H1_AT_SKETCH_PRECISION"
-            if field is None
-            else f"TOKEN_DIVERGE_INPUT_DIFF_H3:{field}"
-        )
+        diff = _input_diff(_input_view(gc_, gti), _input_view(ec, eti))
         cell["first"] = {
             "token_pos": k,
             "graph_tick": gti,
@@ -1184,11 +1192,30 @@ def compare_parity(source, draft, depth):
             "eager_token": e_flat[k],
             "graph_path": gt["path"],
             "graph_device_select": gt["device_select"],
-            "input_field": field,
+            "input_diff": diff,
             "graph_tick_ids": gt["ids"],
             "eager_tick_ids": et["ids"],
+            # H2_DUMP rerun selector: the cell/tick and pre-commit output length
+            # so the byte dump captures exactly the unobservable tick's inputs.
+            "dump_cell": f"{gc_['bucket']}:{gc_['W']}",
+            "dump_out_len": gt["out_before"],
         }
-        bad.append(cell)
+        if diff is None:
+            # Tokens differ with every comparable input equal -> capture/forward
+            # (H1). Sketch-level equality; the H2_DUMP byte rerun confirms.
+            cell["verdict"] = "TOKEN_DIVERGE_INPUT_EQUAL_H1_AT_SKETCH_PRECISION"
+            bad.append(cell)
+        elif diff[0] == "undecidable":
+            # Inputs could not be compared on the same basis (blob/frame mixed,
+            # a missing page/view). NOT a corruption verdict: harness fault, and
+            # the recorded dump_cell/dump_out_len drives the byte-exact rerun.
+            cell["verdict"] = "TOKEN_DIVERGE_INPUT_UNDECIDABLE"
+            harness.append(cell)
+        else:
+            # A real, comparable input difference co-occurring with the token
+            # divergence -> upstream state drift (H3), field named.
+            cell["verdict"] = f"TOKEN_DIVERGE_INPUT_DIFF_H3:{diff[1]}"
+            bad.append(cell)
         rows.append(cell)
 
     if harness:
