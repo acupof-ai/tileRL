@@ -590,16 +590,30 @@ def _install_parity_hooks(engine, job):
                 own = list(srow["own"])
                 sel = [sf.selected(bi, g) for g in range(sf.n_groups)]
                 sel_pages = sorted({p for grp in sel for p in grp})
-                # Earlier complete pages are immutable once written: register
-                # their fingerprint in the cell-wide table; a later mismatch on
-                # the SAME logical page means that assumption broke (harness
-                # fault, recorded as imm_conflict, not a verdict).
-                fp_sel = _pages_fp(engine, sel_pages, job["rid"]) if sel_pages else {}
-                for p, v in fp_sel.items():
-                    old = job["immutable"].get(p)
-                    if old is not None and old != v:
-                        job["imm_conflict"].append(p)
-                    job["immutable"].setdefault(p, v)
+                # Earlier complete pages are immutable once written (the forward
+                # writes only the own window's trailing page, and candidates
+                # exclude the own span). Fingerprint first sightings every tick;
+                # on refresh ticks (device_select=False, one per
+                # SPARSE_REFRESH_TICKS in BOTH arms) re-fingerprint the whole
+                # selection so the immutability assumption is verified by a
+                # guard that can fire, not trusted (a gather of all 128 pages
+                # per tick would cost more than the decode under test).
+                is_refresh = not sf.device_select
+                target = (
+                    sel_pages
+                    if is_refresh
+                    else [p for p in sel_pages if str(p) not in job["immutable"]]
+                )
+                fp_sel = _pages_fp(engine, target, job["rid"]) if target else {}
+                if is_refresh:
+                    for p in sel_pages:
+                        v = fp_sel[str(p)]
+                        old = job["immutable"].get(str(p))
+                        if old is not None and old != v:
+                            job["imm_conflict"].append(str(p))
+                        job["immutable"][str(p)] = v
+                else:
+                    job["immutable"].update(fp_sel)
                 boundary = {
                     "out_before": len(r.output),
                     "seq_before": int(r.seq_len),
