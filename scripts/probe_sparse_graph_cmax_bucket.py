@@ -33,11 +33,34 @@ Run (parent):
 
 Modes:
   (default)        all bucket/W comparisons + B=4, one subprocess per engine
+  --parity         #804: per-tick token-ID + inputs parity, 6 cells (see below)
   --only-b4        just the B=4 child
   --skip-b4        only the bucket/W comparisons
   --buckets …      sparse cmax buckets (default 512/1024/2048)
   --worker arm <source> <draft> <bucket> <depth> <graph|eager>
+  --worker parity <source> <draft> <graph|eager> <depth>   (internal)
   --worker b4  <source> <draft>      (internal; spawned by the parent)
+
+--parity (#804) four jobs in ONE window (one 27B model load per arm process,
+shared by its three buckets):
+  1. first-token question: the LAST prefill-position logits are sha1-hashed
+     elementwise and must match between arms before any decode is compared;
+  2. per committed token: graph vs eager token ids, stop at the first divergent
+     position (A arbitration);
+  3. all 6 cells (cmax 512/1024/2048 x W=1/2) must show full-sequence parity
+     (the v5 acceptance gate);
+  4. at the divergence tick the inputs are compared and the verdict follows
+     fixmisc's table:
+        inputs equal + token differ  -> TOKEN_DIVERGE_INPUT_EQUAL_H1
+        inputs differ + token differ -> TOKEN_DIVERGE_INPUT_DIFF_H3:<field>
+     The fingerprint sketch is keyed by LOGICAL page (physical block ids and
+     state slots differ across the arm processes); the recurrent state/conv is
+     read per layer at FORWARD ENTRY, own-window K/V at the previous boundary,
+     selected earlier pages from an immutable-page table. A fired divergence is
+     arbitrated byte-exactly by rerunning with H2_DUMP_CELL=b:W and
+     H2_DUMP_STEPS=<out_len>, which dumps states/conv/parity/per-page K/V of
+     both arms to parity_dump_*.pt.
+  Parent exit codes add: PARITY 0 match / 10 bad / 12 capture / 13 probe bug.
 
 Both arms are built with sparse_min_tokens=0 and sparse_device_select=True so
 the graph gate can pass and graph/eager differ ONLY in decode_graph. The
@@ -60,6 +83,7 @@ import sys
 
 CMAX_BUCKETS = [512, 1024, 2048]  # all sparse; n = 8311 / 16503 / 32887
 MAX_NEW = 32  # v4: row survives many decode ticks so the first one is caught
+_PHASE_PREFILL = 1
 _PHASE_DECODE = 2
 _PHASE_DONE = 3
 # 27B load + up to 32.9k-token chunked prefill + 32 decodes per arm; the bucket
@@ -434,6 +458,544 @@ def _repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+PARITY_BUCKETS = [512, 1024, 2048]  # 3 cmax buckets x W=1,2 = the 6 v5 cells
+PARITY_GEN = 48  # counting sequence length per cell; crosses a cmax doubling mid-run
+
+
+def _sig(x) -> float:
+    """6-significant-fingerprint of a device reduction. Bit-equal inputs run the
+    same torch reduction over the same layout and come out identical; the 1e-6
+    relative rounding only absorbs reorder noise. A fired mismatch is confirmed
+    at byte precision on the H2_DUMP_* rerun, never trusted from the sketch."""
+    return float(f"{float(x):.6e}")
+
+
+def _state_fp(engine, slot) -> dict:
+    """Per-layer (sum, sumsq) of the recurrent state and conv window, plus the
+    window parity. The cross-process state SLOT number is not comparable (each
+    arm allocates slots independently), only the slot the live row names is."""
+    sp = engine._states
+    s = sp.states[slot].float().reshape(sp.states.shape[1], -1)
+    out = {
+        "st": [
+            v
+            for pair in zip(s.sum(1).tolist(), (s * s).sum(1).tolist())
+            for v in (_sig(pair[0]), _sig(pair[1]))
+        ]
+    }
+    if sp.conv_windows is not None:
+        c = sp.conv_windows[slot].float().reshape(sp.conv_windows.shape[1], -1)
+        out["cv"] = [
+            v
+            for pair in zip(c.sum(1).tolist(), (c * c).sum(1).tolist())
+            for v in (_sig(pair[0]), _sig(pair[1]))
+        ]
+    out["parity"] = int(sp.win_parity[slot].item())
+    return out
+
+
+def _pages_fp(engine, pages: list[int], rid: int) -> dict:
+    """K/V fingerprints keyed by LOGICAL page (physical block ids differ across
+    the two arm processes). Per page four aggregates over ALL planes
+    (k-sum, k-sumsq, v-sum, v-sumsq): enough to place a mismatch on a page; the
+    H2_DUMP_* rerun supplies per-layer raw bytes. A sum+sumsq pair cannot
+    self-cancel on a real perturbation."""
+    tr = engine._sparse.tracker
+    pool = engine._kv
+    phys = [tr.resident[rid][p] for p in pages]  # all selected+own resident pre-finalize
+    out = {}
+    for name, src in (("k", pool.k_pool), ("v", pool.v_pool)):
+        t = src[:, phys].float()  # [L, P, H, T, D]
+        f = t.reshape(t.shape[0], t.shape[1], -1)
+        sm = f.sum((0, 2))
+        sq = (f * f).sum((0, 2))
+        for j, p in enumerate(pages):
+            out.setdefault(str(p), {})[name] = [_sig(sm[j]), _sig(sq[j])]
+    return out
+
+
+def _install_parity_hooks(engine, job):
+    """Two hooks per forward, both instance attributes (tree untouched):
+
+    * model.forward ENTRY: the true inputs of this tick -- ids/positions, the
+      recurrent state, conv window and parity for the row's slot, BEFORE the
+      forward runs. This is exactly what "inputs equal" in the H1/H3 table
+      means; taking it at finalize would miss a W=2 verify rewrite (verify
+      runs after finalize). The last prefill chunk's logits are hashed on
+      return for the prefill-parity precondition.
+    * SparseRuntime.finalize: the one boundary both sparse forwards share
+      (eager after model.forward; graph replay right after g.run), where the
+      tick's selected logical pages are known. Earlier complete pages are
+      immutable, so per-page K/V fingerprints accumulate across ticks; a
+      selected page is byte-comparable to every earlier sighting.
+
+    Physical block ids and state slot numbers differ across the two arm
+    processes, so every K/V fingerprint is keyed by LOGICAL page and the
+    state is read through the row's own slot."""
+    rt = engine._sparse
+    orig_finalize = rt.finalize
+    orig_graph = rt.run_decode_graph
+    orig_fwd = engine._model.forward
+    orig_step = engine.step
+
+    def fwd(input_ids, positions, kv, backend, **kw):
+        # Input state MUST be read before the forward (the forward writes the
+        # new recurrent state); graph arm reads it pre-replay in run_graph.
+        sf0 = getattr(kv, "sparse", None)
+        pre = {}
+        if sf0 is not None and job["rid"] is not None:
+            for bi0, rw0 in enumerate(getattr(sf0, "rows", []) or []):
+                r0 = rw0.get("req", rw0)
+                if r0.req_id == job["rid"] and int(r0.phase) == _PHASE_DECODE:
+                    pre[bi0] = {
+                        "ids": [int(x) for x in input_ids[bi0]],
+                        "pos": [int(x) for x in positions[bi0]],
+                        "state": _state_fp(engine, int(r0.state_slot)),
+                    }
+        out = orig_fwd(input_ids, positions, kv, backend, **kw)
+        sf = getattr(kv, "sparse", None)
+        if sf is not None and job["rid"] is not None:
+            rows = getattr(sf, "rows", []) or []
+            for bi, rw in enumerate(rows):
+                r = rw.get("req", rw)
+                if r.req_id != job["rid"]:
+                    continue
+                if int(r.phase) == _PHASE_PREFILL:
+                    # Requirement 1: the two arms' LAST prefill-position logits
+                    # must be bit-identical. Cryptographic hash of the exact
+                    # float32 bytes (one vocab-sized vector ~151k values), not a
+                    # sketch -- a sketch could not certify per-element equality.
+                    import hashlib
+
+                    last = int(kv.seq_q_lens[bi]) - 1
+                    vec = out[bi, last].detach().float().contiguous()
+                    b = vec.cpu().numpy().tobytes()
+                    job["prefill_logits"].append(
+                        {
+                            "sha1": hashlib.sha1(b).hexdigest(),
+                            "argmax": int(vec.argmax()),
+                            "n": int(vec.numel()),
+                        }
+                    )
+                elif bi in pre:
+                    job["cur"] = pre[bi]
+        return out
+
+    def finalize(sf, rows, hidden=None):
+        if job["rid"] is not None:
+            for bi, r in enumerate(rows):
+                if r.req_id != job["rid"]:
+                    continue
+                srow = sf.rows[bi]
+                own = list(srow["own"])
+                sel = [sf.selected(bi, g) for g in range(sf.n_groups)]
+                sel_pages = sorted({p for grp in sel for p in grp})
+                # Earlier complete pages are immutable once written: register
+                # their fingerprint in the cell-wide table; a later mismatch on
+                # the SAME logical page means that assumption broke (harness
+                # fault, recorded as imm_conflict, not a verdict).
+                fp_sel = _pages_fp(engine, sel_pages, job["rid"]) if sel_pages else {}
+                for p, v in fp_sel.items():
+                    old = job["immutable"].get(p)
+                    if old is not None and old != v:
+                        job["imm_conflict"].append(p)
+                    job["immutable"].setdefault(p, v)
+                boundary = {
+                    "out_before": len(r.output),
+                    "seq_before": int(r.seq_len),
+                    "cmax": len(srow["cand"]),
+                    "phase": int(r.phase),
+                    "path": job["path"],
+                    "device_select": bool(sf.device_select),
+                    "own": own,
+                    "selected": sel,
+                    # forward-POST state of the own window: the trailing partial
+                    # page here already contains THIS tick's write, so the
+                    # parent takes tick k's own fingerprints from boundary k-1.
+                    "own_fp": {
+                        str(p): fp_ for p, fp_ in _pages_fp(engine, own, job["rid"]).items()
+                    },
+                }
+                if int(r.phase) == _PHASE_PREFILL:
+                    job["prefill_boundary"] = boundary
+                    if (
+                        os.environ.get("H2_DUMP_CELL") == f"{job['bucket']}:{job['W']}"
+                        and os.environ.get("H2_DUMP_WHEN", "decode") == "prefill"
+                    ):
+                        _raw_dump(engine, sorted(set(own) | set(sel_pages)), job)
+                    continue
+                cur = job["cur"] or {"ids": None, "pos": None, "state": None}
+                boundary.update({"ids": cur["ids"], "pos": cur["pos"], "state": cur["state"]})
+                job["ticks"].append(boundary)
+                job["cur"] = None
+                if os.environ.get("H2_DUMP_CELL") == f"{job['bucket']}:{job['W']}" and str(
+                    len(r.output)
+                ) in set(os.environ.get("H2_DUMP_STEPS", "").split(",")):
+                    _raw_dump(engine, sorted(set(own) | set(sel_pages)), job)
+        return orig_finalize(sf, rows, hidden)
+
+    def run_graph(reqs, chains=None):
+        job["path"] = "graph"
+        r0 = next((r for r in reqs if r.req_id == job["rid"]), None)
+        if r0 is not None:
+            ch = chains[reqs.index(r0)] if chains is not None else [r0.output[-1]]
+            job["cur"] = {
+                "ids": [int(x) for x in ch],
+                "pos": [int(r0.seq_len) - 1 + j for j in range(len(ch))],
+                "state": _state_fp(engine, int(r0.state_slot)),
+            }
+        ok = orig_graph(reqs, chains)
+        if not ok:
+            # Refresh/failed-capture tick: the engine now runs the EAGER sparse
+            # forward, whose finalize owns this tick's record. Drop the stale
+            # graph entry and relabel so the refresh is not counted as replay.
+            job["path"] = "eager"
+            job["cur"] = None
+            if not getattr(rt, "graph_on", True):
+                # Failed sm70 capture poisons the allocator: hard-exit 12 NOW,
+                # before another CUDA call (same rule as the arm worker).
+                print(
+                    "[FATAL parity] sparse graph capture failed; poisoned context",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                os._exit(12)
+        return ok
+
+    def step():
+        job["path"] = "eager"
+        job["cur"] = None
+        return orig_step()
+
+    engine._model.forward = fwd
+    rt.finalize = finalize
+    rt.run_decode_graph = run_graph
+    engine.step = step
+
+
+def _raw_dump(engine, pages, job):
+    """Byte-exact rerun artifact at the divergence step (H2_DUMP_CELL=b:W and
+    H2_DUMP_STEPS=comma pre-commit out_len): the row's state/conv/parity and
+    every selected+own page's K/V. This is the inputs_for-equivalent arbiter
+    when the sketch fingerprints classify a tick."""
+    import torch
+
+    rid = job["rid"]
+    r = next(x for x in engine._running if x.req_id == rid)
+    slot = int(r.state_slot)
+    sp, tr, kv = engine._states, engine._sparse.tracker, engine._kv
+    blob = {
+        "out_len": len(r.output),
+        "seq_len": int(r.seq_len),
+        "slot": slot,
+        "states": sp.states[slot].cpu().clone(),
+        "win_parity": sp.win_parity[slot].cpu().clone(),
+        "output": list(r.output),
+        "pages": {},
+    }
+    for p in pages:
+        ph = tr.resident[rid].get(p)
+        if ph is not None:
+            blob["pages"][str(p)] = (kv.k_pool[:, ph].cpu().clone(), kv.v_pool[:, ph].cpu().clone())
+    if sp.conv_windows is not None:
+        blob["conv_windows"] = sp.conv_windows[slot].cpu().clone()
+    path = os.path.abspath(
+        f"parity_dump_{job['arm']}_{job['bucket']}_w{job['W']}_o{len(r.output)}.pt"
+    )
+    torch.save(blob, path)
+    print(f"RAW_DUMP {path}", flush=True)
+
+
+def prime_counting(engine, tok, bucket, depth, tag, job):
+    """Prime the counting prompt whose FIRST decode tick lands in `bucket`.
+    Filler is repeated single ' z' tokens (exact length, unlike a join whose BPE
+    length drifts); eager produces the correct 1,2,3 sequence after it on device.
+    Same measure-and-correct loop as prime_at_bucket. Returns (rid, cmax, n).
+
+    job["rid"] is bound at submit so the forward hook hashes the successful
+    attempt's prefill logits; per-attempt state is reset before each submit."""
+    from tilerl.engine import SamplingParams
+    from tilerl.sparse_engine import cmax_bucket
+
+    instr = tok.encode(" Count aloud from one to forty, one number per line:")
+    fid = tok.encode(" z")[-1:]
+    nfill = tokens_for_bucket(bucket) - len(instr)
+    for attempt in range(6):
+        ids = fid * nfill + instr
+        job["rid"] = engine.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=PARITY_GEN, seed=0))
+        job["prefill_logits"] = []
+        job["prefill_boundary"] = None
+        engine.step()
+        for _ in range(40000):
+            row = next((r for r in engine._running if r.req_id == job["rid"]), None)
+            if row is None:
+                _row(engine, job["rid"], f"{tag} attempt{attempt} after prefill")
+            if row.phase == _PHASE_DECODE:
+                break
+            if row.phase == _PHASE_DONE:
+                raise ProbeError(f"{tag}: DONE before decode")
+            engine.step()
+        srows = engine._sparse.decode_rows([_row(engine, job["rid"], "cmax")], [1 + depth])
+        cmax = max((len(x["cand"]) for x in srows), default=0)
+        if cmax_bucket(cmax) == bucket:
+            return job["rid"], cmax, len(ids)
+        nfill += (bucket - cmax) * 16
+        _cancel_and_drain(engine, job["rid"], f"{tag} attempt{attempt}")
+    raise ProbeError(f"{tag}: counting prompt never landed in bucket {bucket}")
+
+
+def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b"):
+    """One arm process, ONE model load for all three buckets at this W. Per
+    decode tick records committed token ids and a finalize-boundary fingerprint
+    (selection by logical page, per-page K/V, recurrent state, conv, parity)."""
+    import torch
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl import build
+    from tilerl.build import build_engine, build_model
+    from tilerl.cli import _qwen38_tokenizer
+    from tilerl.sparse_engine import cmax_bucket
+    from tilerl.spec import load_draft
+
+    if model_name != "qwen38-27b":
+        raise ProbeError("parity mode has no tiny dry-run")
+    build.QWEN38_SOURCE = source
+    be = get_backend()
+    if be.device.type != "cuda":
+        raise ProbeError("parity mode needs CUDA")
+    cfg, model = build_model(model_name, seed=0, fuse_projections=True)
+    draft = load_draft(model, draft_path) if depth else None
+    e = build_engine(
+        cfg,
+        model,
+        be,
+        num_slots=4,
+        max_batch=4,
+        max_total_tokens=131072,
+        max_num_batched_tokens=512,
+        sparse_k=128,
+        sparse_min_tokens=0,
+        sparse_device_select=True,
+        scorer="bounds",
+        kv_cold_bytes=int(os.environ.get("H2_COLD_BYTES", str(1 << 30))),
+        cold_ssd_path=os.environ.get("H2_COLD_SSD", ""),
+        cold_ssd_bytes=int(os.environ.get("H2_COLD_SSD_BYTES", "0")),
+        cold_format="f16",
+        decode_graph=graph,  # sole arm difference
+        draft=draft,
+        spec_depth=depth if depth else None,
+    )
+    tok = _qwen38_tokenizer()
+    job = {
+        "rid": None,
+        "ticks": [],
+        "prefill_logits": [],
+        "prefill_boundary": None,
+        "immutable": {},
+        "imm_conflict": [],
+        "cur": None,
+        "path": "eager",
+        "arm": "graph" if graph else "eager",
+        "bucket": None,
+        "W": depth + 1,
+    }
+    _install_parity_hooks(e, job)
+
+    cells = []
+    for bucket in PARITY_BUCKETS:
+        job["bucket"] = bucket
+        job["ticks"], job["prefill_logits"] = [], []
+        job["immutable"], job["imm_conflict"] = {}, []
+        job["prefill_boundary"] = None
+        rid, cmax, n_tokens = prime_counting(e, tok, bucket, depth, f"parity b{bucket}")
+        job["rid"] = rid
+        seen = 0
+        for _ in range(PARITY_GEN * 12 + 200):
+            mark = len(job["ticks"])
+            e.step()
+            torch.cuda.synchronize()
+            live = next((r for r in e._running if r.req_id == rid), None)
+            cur_out = list(live.output) if live is not None else list(e.poll()[rid])
+            appended = cur_out[seen:]
+            seen = len(cur_out)
+            for rec in job["ticks"][mark:]:
+                rec["tokens"] = appended  # forward(s) this step committed these
+            if live is None or seen >= PARITY_GEN:
+                break
+        if seen < PARITY_GEN:
+            raise ProbeError(
+                f"parity {job['arm']} b{bucket} W{depth + 1}: only {seen}/{PARITY_GEN} tokens"
+            )
+        n_graph = sum(1 for t in job["ticks"] if t["path"] == "graph")
+        cells.append(
+            {
+                "bucket": bucket,
+                "W": depth + 1,
+                "observed_cmax": cmax,
+                "observed_bucket": cmax_bucket(cmax),
+                "n_tokens": n_tokens,
+                "ticks": job["ticks"],
+                "n_graph": n_graph,
+                "prefill_logits": job["prefill_logits"][-1] if job["prefill_logits"] else None,
+                "prefill_own_fp": (job["prefill_boundary"] or {}).get("own_fp"),
+                "immutable": job["immutable"],
+                "imm_conflict": job["imm_conflict"],
+                "head": cur_out[:16],
+            }
+        )
+        job["rid"] = None
+
+    e.shutdown()
+    gc.collect()  # never empty_cache on sm70 after capture
+    return {"arm": job["arm"], "W": depth + 1, "cells": cells}
+
+
+def _input_view(cell, tick_idx):
+    """Tick k's INPUTS assembled from boundary k-1: ids/pos/state captured at
+    forward entry, geometry from boundary k, own-window K/V as boundary k-1 left
+    it (boundary k already contains tick k's write in the trailing page), and
+    every selected earlier page from the immutable table (those pages never
+    change after write). Tick 0's own window is the prefill boundary."""
+    t = cell["ticks"][tick_idx]
+    prev = cell["ticks"][tick_idx - 1]["own_fp"] if tick_idx else cell.get("prefill_own_fp")
+    return {
+        "ids": t["ids"],
+        "pos": t["pos"],
+        "state": t["state"],
+        "seq_before": t["seq_before"],
+        "cmax": t["cmax"],
+        "own": t["own"],
+        "selected": t["selected"],
+        "own_fp": prev,
+        "sel_fp": {p: cell["immutable"].get(str(p)) for grp in t["selected"] for p in grp},
+    }
+
+
+def _input_diff(a, b):
+    """First unequal component of two tick input views, or None."""
+    if a is None or b is None:
+        return "missing-input-view"
+    for k in ("ids", "pos", "state", "seq_before", "cmax", "own", "selected", "own_fp", "sel_fp"):
+        if a.get(k) != b.get(k):
+            return k
+    return None
+
+
+def compare_parity(source, draft, depth):
+    """Spawn graph first (a capture failure ends the run before the eager 27B
+    load pays), then eager. Per cell: prefill-logits parity gate, then walk the
+    committed token streams; at the first divergent token classify per fixmisc:
+      inputs equal + token differ  -> FORWARD_CAPTURE_H1
+      inputs differ + token differ -> UPSTREAM_STATE_DRIFT_H3 (field named)
+    """
+    g = spawn_worker("parity", source, draft, "graph", depth)
+    if g.get("arm") in ("capture-failed", "illegal-access", "worker-error", "worker-timeout"):
+        return {"W": depth + 1, "verdict": "PROBE/CAPTURE", "graph": g, "rows": []}
+    e = spawn_worker("parity", source, draft, "eager", depth)
+    if e.get("arm") in ("illegal-access", "worker-error", "worker-timeout", "capture-failed"):
+        return {"W": depth + 1, "verdict": "PROBE/CAPTURE", "eager": e, "rows": []}
+
+    rows, harness, bad = [], [], []
+    for gc_, ec in zip(g.get("cells", []), e.get("cells", [])):
+        cell = {
+            "bucket": gc_["bucket"],
+            "W": depth + 1,
+            "observed_bucket": gc_.get("observed_bucket"),
+            "n_tokens": (gc_.get("n_tokens"), ec.get("n_tokens")),
+            "graph_replays": gc_.get("n_graph"),
+            "graph_head": gc_.get("head"),
+            "eager_head": ec.get("head"),
+        }
+        if gc_.get("n_tokens") != ec.get("n_tokens"):
+            cell["verdict"] = "PROMPT_GEOMETRY_MISMATCH"
+            harness.append(cell)
+            rows.append(cell)
+            continue
+        if gc_.get("n_graph", 0) == 0:
+            cell["verdict"] = "NO_GRAPH_COVERAGE"
+            harness.append(cell)
+            rows.append(cell)
+            continue
+        pl_g, pl_e = gc_.get("prefill_logits"), ec.get("prefill_logits")
+        if pl_g is None or pl_e is None:
+            cell["verdict"] = "NO_PREFILL_LOGITS"
+            harness.append(cell)
+            rows.append(cell)
+            continue
+        if pl_g["sha1"] != pl_e["sha1"] or pl_g["n"] != pl_e["n"]:
+            cell["verdict"] = "PREFILL_LOGITS_DIFFER"
+            cell["prefill"] = (pl_g, pl_e)
+            harness.append(cell)
+            rows.append(cell)
+            continue
+        if gc_.get("imm_conflict") or ec.get("imm_conflict"):
+            cell["verdict"] = "IMMUTABLE_PAGE_CHANGED"
+            cell["conflicts"] = (gc_.get("imm_conflict"), ec.get("imm_conflict"))
+            harness.append(cell)
+            rows.append(cell)
+            continue
+
+        g_flat, g_owner, e_flat, e_owner = [], [], [], []
+        for ti, t in enumerate(gc_["ticks"]):
+            for tok in t["tokens"]:
+                g_flat.append(tok)
+                g_owner.append(ti)
+        for ti, t in enumerate(ec["ticks"]):
+            for tok in t["tokens"]:
+                e_flat.append(tok)
+                e_owner.append(ti)
+        cell["produced"] = (len(g_flat), len(e_flat))
+        k = next((i for i in range(min(len(g_flat), len(e_flat))) if g_flat[i] != e_flat[i]), None)
+        if k is None and len(g_flat) == len(e_flat):
+            cell["verdict"] = "MATCH"
+            rows.append(cell)
+            continue
+        if k is None:
+            cell["verdict"] = f"LENGTH_DIVERGE({len(g_flat)} vs {len(e_flat)})"
+            harness.append(cell)
+            rows.append(cell)
+            continue
+
+        gti, eti = g_owner[k], e_owner[k]
+        gt, et = gc_["ticks"][gti], ec["ticks"][eti]
+        field = _input_diff(_input_view(gc_, gti), _input_view(ec, eti))
+        cell["verdict"] = (
+            "TOKEN_DIVERGE_INPUT_EQUAL_H1"
+            if field is None
+            else f"TOKEN_DIVERGE_INPUT_DIFF_H3:{field}"
+        )
+        cell["first"] = {
+            "token_pos": k,
+            "graph_tick": gti,
+            "eager_tick": eti,
+            "graph_token": g_flat[k],
+            "eager_token": e_flat[k],
+            "graph_path": gt["path"],
+            "graph_device_select": gt["device_select"],
+            "input_field": field,
+            "graph_tick_ids": gt["ids"],
+            "eager_tick_ids": et["ids"],
+        }
+        bad.append(cell)
+        rows.append(cell)
+
+    if harness:
+        return {
+            "W": depth + 1,
+            "verdict": "PROBE",
+            "rows": rows,
+            "faults": [c["verdict"] for c in rows if c["verdict"] != "MATCH"],
+        }
+    if bad:
+        return {
+            "W": depth + 1,
+            "verdict": "BAD",
+            "rows": rows,
+            "faults": [c["verdict"] for c in rows if c["verdict"] != "MATCH"],
+        }
+    return {"W": depth + 1, "verdict": "MATCH", "rows": rows, "faults": []}
+
+
 def compare_bucket(source, draft, bucket, depth):
     g = spawn_worker("arm", source, draft, bucket, depth, "graph")
     # First capture failure ends the sweep in main(): do not pay a 27B eager
@@ -485,6 +1047,12 @@ def main() -> int:
     ap.add_argument("--buckets", type=int, nargs="*", default=CMAX_BUCKETS)
     ap.add_argument("--only-b4", action="store_true")
     ap.add_argument("--skip-b4", action="store_true")
+    ap.add_argument(
+        "--parity",
+        action="store_true",
+        help="#804 per-tick graph-vs-eager token+inputs parity over 6 cells",
+    )
+    ap.add_argument("--parity-out", default="parity_result.json")
     ap.add_argument("--worker", nargs="*", default=None)
     args = ap.parse_args()
 
@@ -503,6 +1071,9 @@ def main() -> int:
                     mode == "graph",
                     model_name=model_name,
                 )
+            elif kind == "parity":
+                _, source, draft, mode, depth = args.worker
+                out = build_parity_worker(source, draft, mode == "graph", int(depth))
             elif kind == "b4":
                 _, source, draft = args.worker
                 out = build_b4(source, draft)
@@ -521,6 +1092,44 @@ def main() -> int:
             if "illegal" in note.lower():
                 return 11
             return 13
+
+    # --- #804 parity: 6 cells (3 cmax buckets x W=1,2), 2 arm processes/W ---
+    if args.parity:
+        if not args.source or not args.draft:
+            print("source and --draft required", file=sys.stderr)
+            return 13
+        out = []
+        verdict = "MATCH"
+        for depth in (0, 1):
+            r = compare_parity(args.source, args.draft, depth)
+            out.append(r)
+            for c in r.get("rows", []):
+                print(
+                    f"[parity b{c['bucket']:5d} W={c['W']}] {c['verdict']} "
+                    f"cmax={c.get('observed_bucket')} graph_replays={c.get('graph_replays')} "
+                    f"g_head={c.get('graph_head')} e_head={c.get('eager_head')}",
+                    flush=True,
+                )
+                if c.get("first"):
+                    print(json.dumps(c["first"], indent=1), flush=True)
+            if r["verdict"] == "PROBE/CAPTURE":
+                verdict = "CAPTURE_OR_PROBE"
+            elif r["verdict"] == "PROBE":
+                verdict = "PROBE"
+            elif r["verdict"] == "BAD" and verdict == "MATCH":
+                verdict = "BAD"
+        with open(args.parity_out, "w") as fh:
+            json.dump(out, fh, indent=1)
+        print("=" * 60)
+        print(
+            {
+                "MATCH": "PARITY_MATCH",
+                "BAD": "PARITY_BAD",
+                "PROBE": "PARITY_PROBE_ERROR",
+                "CAPTURE_OR_PROBE": "PARITY_CAPTURE_OR_PROBE",
+            }[verdict]
+        )
+        return {"MATCH": 0, "BAD": 10, "PROBE": 13, "CAPTURE_OR_PROBE": 12}[verdict]
 
     # --- B=4 only ---
     if args.only_b4:
