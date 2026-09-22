@@ -24,9 +24,13 @@ A nonzero exit is split into two causes (#794). A rendezvous/transport INIT
 failure (the pick-then-bind MASTER_PORT race under xdist) is INFRASTRUCTURE,
 not a weak guard: it is reported with an `INFRA_RENDEZVOUS` marker and the
 subprocess stdout/stderr is landed to tmp_path, so the raw EADDRINUSE artifact
-is what CI shows. Everything else nonzero is the control itself (vacuous or a
-real error). The two must never share a verdict, or an infra flake reads as a
-control failure.
+is what CI shows. Only FAILURE-BEARING phrases count (EADDRINUSE / address
+already in use / errno 48|98 / connection refused / connect() failed /
+ChildFailedError / ProcessRaisedException); subsystem names a healthy init also
+prints (TCPStore, rendezvous, init_process_group, Gloo) do not, so they cannot
+turn a later real vacuous-gate failure into a false infra verdict. Everything
+else nonzero is the control itself (vacuous or a real error). The two must
+never share a verdict, or an infra flake reads as a control failure.
 
 The paired POSITIVE runs live in the CI "Distributed gates" workflow step; here
 we only cover the controls that step never invoked.
@@ -48,12 +52,13 @@ os.environ.setdefault("TILERL_TARGET", "cpu")
 _TESTS = Path(__file__).resolve().parent
 _ROOT = _TESTS.parent
 
-#: Strict rendezvous/transport-INIT failure primitives. Bare "gloo" is absent on
-#: purpose: the backend banner prints "Gloo" on every healthy run, so it is not a
-#: failure signal (a #794 probe produced 66 false positives matching it).
+#: Strict rendezvous/transport-INIT failure phrases. Only FAILURE-BEARING text.
+#: Subsystem NAMES a healthy init also prints (TCPStore / rendezvous /
+#: init_process_group / Gloo) are deliberately absent: pairing those with a
+#: later real vacuous-gate failure would classify a weak guard as a port flake
+#: and hide it (a review caught exactly that masking direction).
 _INFRA_INIT = re.compile(
     r"address already in use|eaddrinuse|errno ?(?:48|98)|"
-    r"tcpstore|rendezvous|init_(?:tcp|process_group)|"
     r"connection refused|connect\(\) failed|"
     r"childfailederror|processraisedexception",
     re.IGNORECASE,
@@ -119,6 +124,49 @@ def test_the_control_table_covers_every_distributed_gate():
     assert len(_CONTROLS) == 23, (
         f"expected the 23 documented controls, found {len(_CONTROLS)}; update this "
         f"(and the table) when adding or removing a guard")
+
+
+#: Failure-bearing init phrases the classifier must catch.
+_INFRA_FAILURE_TEXTS = [
+    "OSError: [Errno 48] Address already in use",
+    "RuntimeError: EADDRINUSE on MASTER_PORT",
+    "errno 98: bind failed",
+    "connect() failed: Connection refused by the TCPStore peer",
+    "torch.distributed.elastic.multiprocessing.errors.ChildFailedError",
+    "ProcessRaisedException: rank 1 died during startup",
+]
+
+#: Subsystem names a HEALTHY init prints too; none of these is a failure signal,
+#: and pairing one with a later real vacuous verdict must NOT read as infra.
+_HEALTHY_INIT_TEXTS = [
+    "Initializing TCPStore with world size 2",
+    "init_process_group(backend=gloo): rendezvous via env://",
+    "Using backend: Gloo",
+    "rendezvous handler ready",
+]
+
+
+def test_infra_init_classifier_matches_only_failure_phrases():
+    # Pure-string, no subprocess: the infra classifier must fire on a real
+    # bind/connect/child-failure phrase and stay silent on subsystem names a
+    # successful init also prints.
+    for text in _INFRA_FAILURE_TEXTS:
+        assert _INFRA_INIT.search(text), f"must classify as infra: {text!r}"
+    for text in _HEALTHY_INIT_TEXTS:
+        assert not _INFRA_INIT.search(text), f"healthy init is not infra: {text!r}"
+
+
+def test_infra_init_classifier_does_not_mask_a_vacuous_gate():
+    # The failure direction that matters: a healthy init banner followed by a
+    # REAL vacuous-gate failure must be the control verdict, not INFRA_RENDEZVOUS.
+    # Matching the subsystem name here would hide a weak guard behind a flake.
+    output = (
+        "Initializing TCPStore; init_process_group(backend=gloo) rendezvous ok\n"
+        "PASSED -- vacuous gate: the mutated collective still matched\n"
+    )
+    assert "vacuous gate" in output
+    assert not _INFRA_INIT.search(output), (
+        "healthy-init subsystem names must not make a vacuous gate look like infra")
 
 
 @pytest.mark.parametrize("gate,flag", _CONTROLS,
