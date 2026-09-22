@@ -1198,6 +1198,13 @@ def main() -> int:
             return 13
         except Exception as exc:
             note = f"EXC {type(exc).__name__}: {exc}"
+            # Full traceback to STDERR (spawn_worker captures it); the stdout
+            # line stays a single JSON record so the parent's last-line parse
+            # keeps working. Window2 burned on a one-line note that could not
+            # distinguish a probe bug from an engine capture failure.
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
             print(json.dumps({"arm": "worker-exc", "note": note}), flush=True)
             # CUDA illegal memory access surfaces as a runtime error mid-tick;
             # keep it distinct (11) from harness faults (13) and capture (12).
