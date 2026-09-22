@@ -143,13 +143,20 @@ def test_build_rows_shaped_srow_does_not_crash_forward_hook():
         "reserved": set(),
     }
     sf = _Sf([srow], device_select=False)
+    # The engine passes last_only=seq_q to model.forward, so for a prefill
+    # chunk the RETURNED logits are sliced to [B, 1, V] (last valid position
+    # per row), even though seq_q_lens is the full chunk width (512). The
+    # hook must read out[bi, -1], not out[bi, seq_q_lens - 1] -> the latter
+    # raised "IndexError: index 511 out of bounds for dimension 1 size 1"
+    # on-card in window2 before any decode ran.
     out = torch.zeros(1, 1, 8)
     eng = _Engine(sf, out, state_slot=0)
+    eng._kv.seq_q_lens = torch.tensor([512], dtype=torch.long)
     job = _job()
     probe._install_parity_hooks(eng, job)
 
-    ids = torch.zeros(1, 1, dtype=torch.long)
-    pos = torch.zeros(1, 1, dtype=torch.long)
+    ids = torch.zeros(1, 512, dtype=torch.long)
+    pos = torch.zeros(1, 512, dtype=torch.long)
     eng._model.forward(ids, pos, eng._kv, backend=None)  # must not raise
 
     assert len(job["prefill_logits"]) == 1

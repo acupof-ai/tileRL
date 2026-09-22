@@ -589,10 +589,13 @@ def _install_parity_hooks(engine, job):
                 # must be bit-identical. Cryptographic hash of the exact
                 # float32 bytes (one vocab-sized vector ~151k values), not a
                 # sketch -- a sketch could not certify per-element equality.
+                # The engine passes last_only=seq_q, so the RETURNED tensor for
+                # a prefill row is already sliced to [1, V] (its last valid
+                # position); the full chunk width lives only in seq_q_lens.
+                # out[bi, seq_q_lens-1] indexed a [B,1,V] tensor at 511.
                 import hashlib
 
-                last = int(kv.seq_q_lens[bi]) - 1
-                vec = out[bi, last].detach().float().contiguous()
+                vec = out[bi, -1].detach().float().contiguous()
                 b = vec.cpu().numpy().tobytes()
                 job["prefill_logits"].append(
                     {
