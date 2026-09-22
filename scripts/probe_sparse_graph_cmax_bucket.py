@@ -501,6 +501,8 @@ def _pages_fp(engine, pages: list[int], rid: int) -> dict:
     (k-sum, k-sumsq, v-sum, v-sumsq): enough to place a mismatch on a page; the
     H2_DUMP_* rerun supplies per-layer raw bytes. A sum+sumsq pair cannot
     self-cancel on a real perturbation."""
+    if not pages:
+        return {}
     tr = engine._sparse.tracker
     pool = engine._kv
     phys = [tr.resident[rid][p] for p in pages]  # all selected+own resident pre-finalize
@@ -564,112 +566,115 @@ def _install_parity_hooks(engine, job):
     def fwd(input_ids, positions, kv, backend, **kw):
         # Input state MUST be read before the forward (the forward writes the
         # new recurrent state); graph arm reads it pre-replay in run_graph.
+        # sf.rows are srow DICTS in the build_rows shape on BOTH arms: keys
+        # req_id/own/cand/decoding/... and NO req object (decode_rows rows carry
+        # req=r but never reach sf.rows). Read only dict keys and the BatchKv
+        # tensors (state_slot/seq_q_lens) -- never a .req attribute.
         sf0 = getattr(kv, "sparse", None)
         pre = {}
         if sf0 is not None and job["rid"] is not None:
             for bi0, rw0 in enumerate(getattr(sf0, "rows", []) or []):
-                r0 = rw0.get("req", rw0)
-                if r0.req_id == job["rid"] and int(r0.phase) == _PHASE_DECODE:
+                if rw0["req_id"] == job["rid"] and rw0.get("decoding"):
                     pre[bi0] = {
                         "ids": [int(x) for x in input_ids[bi0]],
                         "pos": [int(x) for x in positions[bi0]],
-                        "state": _state_fp(engine, int(r0.state_slot)),
+                        "state": _state_fp(engine, int(kv.state_slot[bi0])),
                     }
         out = orig_fwd(input_ids, positions, kv, backend, **kw)
-        sf = getattr(kv, "sparse", None)
-        if sf is not None and job["rid"] is not None:
-            rows = getattr(sf, "rows", []) or []
-            for bi, rw in enumerate(rows):
-                r = rw.get("req", rw)
-                if r.req_id != job["rid"]:
+        if sf0 is not None and job["rid"] is not None:
+            for bi, rw in enumerate(getattr(sf0, "rows", []) or []):
+                if rw["req_id"] != job["rid"] or rw.get("decoding"):
                     continue
-                if int(r.phase) == _PHASE_PREFILL:
-                    # Requirement 1: the two arms' LAST prefill-position logits
-                    # must be bit-identical. Cryptographic hash of the exact
-                    # float32 bytes (one vocab-sized vector ~151k values), not a
-                    # sketch -- a sketch could not certify per-element equality.
-                    import hashlib
+                # Requirement 1: the two arms' LAST prefill-position logits
+                # must be bit-identical. Cryptographic hash of the exact
+                # float32 bytes (one vocab-sized vector ~151k values), not a
+                # sketch -- a sketch could not certify per-element equality.
+                import hashlib
 
-                    last = int(kv.seq_q_lens[bi]) - 1
-                    vec = out[bi, last].detach().float().contiguous()
-                    b = vec.cpu().numpy().tobytes()
-                    job["prefill_logits"].append(
-                        {
-                            "sha1": hashlib.sha1(b).hexdigest(),
-                            "argmax": int(vec.argmax()),
-                            "n": int(vec.numel()),
-                        }
-                    )
-                elif bi in pre:
+                last = int(kv.seq_q_lens[bi]) - 1
+                vec = out[bi, last].detach().float().contiguous()
+                b = vec.cpu().numpy().tobytes()
+                job["prefill_logits"].append(
+                    {
+                        "sha1": hashlib.sha1(b).hexdigest(),
+                        "argmax": int(vec.argmax()),
+                        "n": int(vec.numel()),
+                    }
+                )
+                if bi in pre:  # decode entry on a mixed tick (defensive)
                     job["cur"] = pre[bi]
         return out
 
     def finalize(sf, rows, hidden=None):
-        if job["rid"] is not None:
-            for bi, r in enumerate(rows):
-                if r.req_id != job["rid"]:
-                    continue
-                srow = sf.rows[bi]
-                own = list(srow["own"])
-                sel = [sf.selected(bi, g) for g in range(sf.n_groups)]
-                sel_pages = sorted({p for grp in sel for p in grp})
-                # Earlier complete pages are immutable once written (the forward
-                # writes only the own window's trailing page, and candidates
-                # exclude the own span). Fingerprint first sightings every tick;
-                # on refresh ticks (device_select=False, one per
-                # SPARSE_REFRESH_TICKS in BOTH arms) re-fingerprint the whole
-                # selection so the immutability assumption is verified by a
-                # guard that can fire, not trusted (a gather of all 128 pages
-                # per tick would cost more than the decode under test).
-                is_refresh = not sf.device_select
-                target = (
-                    sel_pages
-                    if is_refresh
-                    else [p for p in sel_pages if str(p) not in job["immutable"]]
-                )
-                fp_sel = _pages_fp(engine, target, job["rid"]) if target else {}
-                if is_refresh:
-                    for p in sel_pages:
-                        v = fp_sel[str(p)]
-                        old = job["immutable"].get(str(p))
-                        if old is not None and old != v:
-                            job["imm_conflict"].append(str(p))
-                        job["immutable"][str(p)] = v
-                else:
-                    job["immutable"].update(fp_sel)
-                boundary = {
-                    "out_before": len(r.output),
-                    "seq_before": int(r.seq_len),
-                    "cmax": len(srow["cand"]),
-                    "phase": int(r.phase),
-                    "path": job["path"],
-                    "device_select": bool(sf.device_select),
-                    "own": own,
-                    "selected": sel,
-                    # forward-POST state of the own window: the trailing partial
-                    # page here already contains THIS tick's write, so the
-                    # parent takes tick k's own fingerprints from boundary k-1.
-                    "own_fp": {
-                        str(p): fp_ for p, fp_ in _pages_fp(engine, own, job["rid"]).items()
-                    },
-                }
-                if int(r.phase) == _PHASE_PREFILL:
-                    job["prefill_boundary"] = boundary
-                    if (
-                        os.environ.get("H2_DUMP_CELL") == f"{job['bucket']}:{job['W']}"
-                        and os.environ.get("H2_DUMP_WHEN", "decode") == "prefill"
-                    ):
-                        _raw_dump(engine, sorted(set(own) | set(sel_pages)), job)
-                    continue
-                cur = job["cur"] or {"ids": None, "pos": None, "state": None}
-                boundary.update({"ids": cur["ids"], "pos": cur["pos"], "state": cur["state"]})
-                job["ticks"].append(boundary)
-                job["cur"] = None
-                if os.environ.get("H2_DUMP_CELL") == f"{job['bucket']}:{job['W']}" and str(
-                    len(r.output)
-                ) in set(os.environ.get("H2_DUMP_STEPS", "").split(",")):
-                    _raw_dump(engine, sorted(set(own) | set(sel_pages)), job)
-        return orig_finalize(sf, rows, hidden)
+        # Run finalize FIRST, then observe the selection: selected_pages is the
+        # one point both arms share (eager host _chosen and captured device
+        # _dchosen both surface through it) and it is the exact pin set
+        # finalize just computed. Reading sf.selected per group at the forward
+        # boundary forced a replay-time D2H only on the graph arm (fill()
+        # clears its cache every tick) -- two mechanisms, a fabricated H3.
+        # r.output/seq_len are still pre-commit here: commit runs AFTER
+        # finalize on both paths.
+        dropped = orig_finalize(sf, rows, hidden)
+        if job["rid"] is None:
+            return dropped
+        for bi, r in enumerate(rows):  # rows are _Req on both paths
+            if r.req_id != job["rid"]:
+                continue
+            srow = sf.rows[bi]  # build_rows-shaped dict
+            own = list(srow["own"])
+            kept = sorted(sf.selected_pages(bi))  # post-finalize pin set
+            earlier = [p for p in kept if p not in own]
+            # Earlier complete pages are immutable once written (the forward
+            # writes only the own window's trailing page, and candidates
+            # exclude the own span). Fingerprint first sightings; on refresh
+            # ticks (device_select=False, one per SPARSE_REFRESH_TICKS in BOTH
+            # arms) re-fingerprint the whole selection so immutability is
+            # verified by a guard that can fire, not trusted.
+            is_refresh = not sf.device_select
+            target = (
+                earlier if is_refresh else [p for p in earlier if str(p) not in job["immutable"]]
+            )
+            fp_sel = _pages_fp(engine, target, job["rid"]) if target else {}
+            if is_refresh:
+                for p in earlier:
+                    v = fp_sel[str(p)]
+                    old = job["immutable"].get(str(p))
+                    if old is not None and old != v:
+                        job["imm_conflict"].append(str(p))
+                    job["immutable"][str(p)] = v
+            else:
+                job["immutable"].update(fp_sel)
+            boundary = {
+                "out_before": len(r.output),
+                "seq_before": int(r.seq_len),
+                "cmax": len(srow["cand"]),
+                "phase": int(r.phase),
+                "path": job["path"],
+                "device_select": bool(sf.device_select),
+                "own": own,
+                "selected_pages": kept,
+                # forward-POST state of the own window: the trailing partial
+                # page here already contains THIS tick's write, so the
+                # parent takes tick k's own fingerprints from boundary k-1.
+                "own_fp": {str(p): fp_ for p, fp_ in _pages_fp(engine, own, job["rid"]).items()},
+            }
+            if int(r.phase) == _PHASE_PREFILL:
+                job["prefill_boundary"] = boundary
+                if (
+                    os.environ.get("H2_DUMP_CELL") == f"{job['bucket']}:{job['W']}"
+                    and os.environ.get("H2_DUMP_WHEN", "decode") == "prefill"
+                ):
+                    _raw_dump(engine, kept, job)
+                continue
+            cur = job["cur"] or {"ids": None, "pos": None, "state": None}
+            boundary.update({"ids": cur["ids"], "pos": cur["pos"], "state": cur["state"]})
+            job["ticks"].append(boundary)
+            job["cur"] = None
+            if os.environ.get("H2_DUMP_CELL") == f"{job['bucket']}:{job['W']}" and str(
+                len(r.output)
+            ) in set(os.environ.get("H2_DUMP_STEPS", "").split(",")):
+                _raw_dump(engine, kept, job)
+        return dropped
 
     def run_graph(reqs, chains=None):
         job["path"] = "graph"
@@ -919,10 +924,12 @@ def _input_view(cell, tick_idx):
     """Tick k's INPUTS assembled from boundary k-1: ids/pos/state captured at
     forward entry, geometry from boundary k, own-window K/V as boundary k-1 left
     it (boundary k already contains tick k's write in the trailing page), and
-    every selected earlier page from the immutable table (those pages never
-    change after write). Tick 0's own window is the prefill boundary."""
+    every selected EARLIER page (the kept set minus own) from the immutable
+    table -- those pages never change after write. Tick 0's own window is the
+    prefill boundary."""
     t = cell["ticks"][tick_idx]
     prev = cell["ticks"][tick_idx - 1]["own_fp"] if tick_idx else cell.get("prefill_own_fp")
+    earlier = [p for p in t["selected_pages"] if p not in t["own"]]
     return {
         "ids": t["ids"],
         "pos": t["pos"],
@@ -930,9 +937,9 @@ def _input_view(cell, tick_idx):
         "seq_before": t["seq_before"],
         "cmax": t["cmax"],
         "own": t["own"],
-        "selected": t["selected"],
+        "selected_pages": t["selected_pages"],
         "own_fp": prev,
-        "sel_fp": {p: cell["immutable"].get(str(p)) for grp in t["selected"] for p in grp},
+        "sel_fp": {str(p): cell["immutable"].get(str(p)) for p in earlier},
     }
 
 
@@ -940,7 +947,17 @@ def _input_diff(a, b):
     """First unequal component of two tick input views, or None."""
     if a is None or b is None:
         return "missing-input-view"
-    for k in ("ids", "pos", "state", "seq_before", "cmax", "own", "selected", "own_fp", "sel_fp"):
+    for k in (
+        "ids",
+        "pos",
+        "state",
+        "seq_before",
+        "cmax",
+        "own",
+        "selected_pages",
+        "own_fp",
+        "sel_fp",
+    ):
         if a.get(k) != b.get(k):
             return k
     return None
