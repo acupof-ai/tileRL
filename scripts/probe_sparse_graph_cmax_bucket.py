@@ -527,15 +527,16 @@ def _probe_die(where: str):
     stay OUTSIDE the try, so a product kernel exception (tilelang/attention/
     write_tokens) propagates with product frames and no [PROBE-EXC] tag.
 
-    In a real worker process this hard-exits 13 (harness) before any further
-    CUDA call; outside a worker (unit tests) it re-raises so red-before-green
-    gates can observe the exact probe frame."""
-    import traceback
-
-    sys.stderr.write(f"[PROBE-EXC] probe observation failed in {where}\n")
-    traceback.print_exc(file=sys.stderr)
-    sys.stderr.flush()
+    In a real worker process this prints [PROBE-EXC] + full traceback and
+    hard-exits 13 (harness) before any further CUDA call; outside a worker (unit
+    tests) it only re-raises with NO print, so a gate can assert that a product
+    exception passing through produced no [PROBE-EXC] tag."""
     if _IN_WORKER:
+        import traceback
+
+        sys.stderr.write(f"[PROBE-EXC] probe observation failed in {where}\n")
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
         os._exit(13)
     raise
 

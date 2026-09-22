@@ -212,14 +212,17 @@ def test_selection_observed_once_after_finalize_via_selected_pages():
     assert job["ticks"][0]["selected_pages"] == []
 
 
-def test_product_forward_exception_propagates_untagged():
-    """The other branch of fixmisc's fork: if the PRODUCT forward (tilelang /
-    attention / write_tokens) raises inside the capture tick, the hook must not
-    swallow or relabel it. orig_fwd is intentionally outside the probe try, so
-    the exception propagates with product frames and no [PROBE-EXC] tag -- that
-    is the #700 capture-failure evidence. In a worker this is an rc13 worker-exc
-    whose traceback shows product frames, never a [PROBE-EXC] hard exit."""
+def test_product_forward_exception_propagates_untagged(monkeypatch, capsys):
+    """The other branch of fixmisc's fork: a PRODUCT forward exception
+    (tilelang/attention/write_tokens) must bypass the probe observability try
+    entirely. Three assertions, each of which goes red if orig_fwd is moved
+    inside the try:
+      * the original product exception type propagates;
+      * _probe_die is NEVER called (structural: outside the try);
+      * no [PROBE-EXC] is printed (worker tagging is probe-frame only)."""
     probe = _load_probe()
+    calls = []
+    monkeypatch.setattr(probe, "_probe_die", lambda where: calls.append(where))
     srow = {
         "req_id": 7,
         "own": [10, 11],
@@ -242,7 +245,7 @@ def test_product_forward_exception_propagates_untagged():
             raise ProductKernelError("simulated tilelang/attention failure")
 
     eng = _Engine(sf, torch.zeros(1, 1, 8), state_slot=0)
-    eng._model = FailingModel()  # install BEFORE hooks so fwd wraps the failing forward
+    eng._model = FailingModel()  # BEFORE hooks so fwd wraps the failing forward
     job = _job()
     probe._install_parity_hooks(eng, job)
 
@@ -250,5 +253,30 @@ def test_product_forward_exception_propagates_untagged():
     pos = torch.zeros(1, 512, dtype=torch.long)
     with pytest.raises(ProductKernelError):
         eng._model.forward(ids, pos, eng._kv, backend=None)
-    # the probe never recorded anything for the failed product forward
+    assert calls == [], f"product exception routed through _probe_die: {calls}"
+    assert "[PROBE-EXC]" not in capsys.readouterr().err
     assert job["prefill_logits"] == []
+
+
+def test_probe_observation_error_is_tagged_exit13_in_worker(monkeypatch, capsys):
+    """Worker-branch positive control: when the PROBE's own observation code
+    fails (here a malformed srow missing a key), _probe_die prints [PROBE-EXC]
+    and hard-exits 13. This is the harness half of the mechanical fork.
+    os._exit cannot be caught, so stub it to raise SystemExit in-test."""
+    probe = _load_probe()
+    monkeypatch.setattr(probe.os, "_exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
+    probe._IN_WORKER = True
+    try:
+        # entry loop subscripts rw0["req_id"] for EVERY row, so a malformed
+        # srow lacking it raises inside the probe observation try.
+        sf = _Sf([{}], device_select=False)
+        eng = _Engine(sf, torch.zeros(1, 1, 8), state_slot=0)
+        job = _job()
+        probe._install_parity_hooks(eng, job)
+        ids = torch.zeros(1, 1, dtype=torch.long)
+        with pytest.raises(SystemExit) as ei:
+            eng._model.forward(ids, ids, eng._kv, backend=None)
+        assert ei.value.code == 13
+        assert "[PROBE-EXC]" in capsys.readouterr().err
+    finally:
+        probe._IN_WORKER = False
