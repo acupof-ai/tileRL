@@ -545,10 +545,13 @@ def _install_parity_hooks(engine, job):
         # _sample_commit AND the W=2 spec path via _verify -> _commit (which
         # _sample_commit would miss). Record one entry per actual commit with
         # its pre-commit lengths, so the parent can attribute EVERY token to
-        # its own tick even when a verify accepts 2 in one step (B1).
+        # its own tick even when a verify accepts 2 in one step (B1). Judge
+        # phase PRE-call: a stop-hit token is appended then _finish flips the
+        # row to DONE inside the call, and it must still be recorded.
         out_before, seq_before = len(req.output), int(req.seq_len)
+        was_decode = int(req.phase) == _PHASE_DECODE
         rc = orig_commit(req, toks, lps)
-        if job["rid"] is not None and req.req_id == job["rid"] and int(req.phase) == _PHASE_DECODE:
+        if job["rid"] is not None and req.req_id == job["rid"] and was_decode:
             job["commits"].append(
                 {
                     "out_before": out_before,
