@@ -66,12 +66,15 @@ unbounded read prefix: gating it to 2048 tokens takes `p5_draft` from 119.5 ms t
 this number:
 
 1. **This window cannot price the acceptance cost.** Both w2 arms read
-   `tok/fwd` = 1.977961 and 1.978022 — identical to five decimals — because the
-   synthetic counting prompt's next token is determined by the previous line and
-   always sits inside 2048 tokens. That is a workload that cannot see the loss,
-   not evidence the window is free. The registered sweep on real text measured
-   ~2.4–3.4 points of acceptance lost at W=2048; the end-to-end serving window
-   with real 37.6k prompts is what settles it.
+   `tok/fwd` = 1.977961 and 1.978022 — agreeing to four decimals, differing by
+   6.1e-05 — because the synthetic counting prompt's next token is determined by
+   the previous line and always sits inside 2048 tokens. That is a workload that
+   cannot see the loss, not evidence the window is free. **`tok/fwd` is an
+   accepted count, not a token identity**: under greedy verify speculation is
+   lossless, so a window change moves *how many* drafts are accepted, not *which*
+   tokens are committed. The registered sweep on real text measured ~2.4–3.4
+   points of acceptance lost at W=2048; the end-to-end serving window with real
+   37.6k prompts is what settles it.
 2. **It is a steady-state step, not a server mean.** Prefill and refresh ticks
    (every `SPARSE_REFRESH_TICKS`) are excluded by construction.
 
@@ -97,7 +100,9 @@ orders, `TILERL_STEP_TIMING=1 TILERL_STEP_TIMING_SLOW_MS=0`.
 ORDER B reproduces every cell except b1024, where two arms deviate by ~42 ms of
 outside-graph time — a separate reproducible defect, tracked in
 [errors/2026-09-23-b1024-order-b-outside-graph.md](../errors/2026-09-23-b1024-order-b-outside-graph.md).
-`tok/fwd` is bit-identical between orders in both w2 arms (1.977961 / 1.978022).
+`tok/fwd` is identical between the two orders within each w2 arm (1.977961 for
+`w2_graph`, 1.978022 for `w2_graph_dw2048`); the two arms differ from each other
+by 6.1e-05.
 
 `step − graph` is 3.3–3.9 ms across all arms (~8% of the dw2048 step). Reading it
 against the per-tick log, `stats=3–4 ms` accounts for essentially all of it:
