@@ -73,9 +73,12 @@ def _churn_self_check():
 # --------------------------------------------------------------------------- #
 def install_ssd_byte_meter(e):
     """Wrap every ColdSsdFile reachable from the cold tiers; return
-    (get_bytes, set_in_frame). Sums the byte width of the blobs each read
-    returns — the device-side cost this window cares about."""
-    state = {"total": 0, "frame": 0, "in_frame": False}
+    (get_state, set_in_frame). Sums the byte width of the blobs each read
+    returns — the device-side cost this window cares about. n_targets>0 proves
+    the meter actually attached (a zero byte total with zero targets means the
+    meter missed, not that no disk read happened)."""
+    state = {"total": 0, "frame": 0, "in_frame": False, "n_targets": 0,
+             "n_reads": 0}
     cold = getattr(getattr(e, "_kv", None), "cold", None)
     targets = []
     for attr in ("_ssd",):
@@ -85,6 +88,7 @@ def install_ssd_byte_meter(e):
     for f in getattr(cold, "_shared_ssds", {}).values():
         if hasattr(f, "read"):
             targets.append(f)
+    state["n_targets"] = len(targets)
     for f in targets:
         raw = f.read
 
@@ -92,6 +96,7 @@ def install_ssd_byte_meter(e):
             blob = raw(key, pin)
             n = sum(t.element_size() * t.numel() for t in blob.values())
             state["total"] += n
+            state["n_reads"] += 1
             if state["in_frame"]:
                 state["frame"] += n
             return blob
@@ -123,6 +128,7 @@ def run_window(e, ids, max_new, want_refresh, smoke=False):
     total_refresh = 0
     frame_ticks = []
     churn_between = []
+    pred_mismatch = []
     prev_chosen = {}
 
     for step_i in range(200000):
@@ -161,6 +167,18 @@ def run_window(e, ids, max_new, want_refresh, smoke=False):
                     prev_chosen = chosen
             if framed and not frame_done:
                 frame_ticks.append(kind)
+                # Label integrity: on a PURE decode tick the counter prediction
+                # must equal the observed path (a prefill/mixed tick is eager
+                # regardless of the counter, so it is excluded). A mismatch
+                # means the NVTX tick_* label does not match the bucketed kind
+                # and nsys grouping would be mislabeled.
+                if tm.phase_pre == 0:
+                    pred_kind = "refresh" if pred_refresh else "graph"
+                    if pred_kind != kind:
+                        pred_mismatch.append(
+                            {"tick": len(frame_ticks) - 1,
+                             "pred": pred_kind, "observed": kind,
+                             "ticks_since_refresh": sr})
                 print(f"[nsys-frame] tick {len(frame_ticks) - 1}: {kind} "
                       f"(pred {'refresh' if pred_refresh else 'graph'})",
                       flush=True)
@@ -193,7 +211,20 @@ def run_window(e, ids, max_new, want_refresh, smoke=False):
                              "refresh": frame_ticks.count("refresh")},
             "refreshes_in_frame": refreshes_in_frame,
             "churn_between_adjacent_refreshes": churn_between,
-            "ssd_bytes_read": get_ssd()}
+            "pred_observed_mismatches": pred_mismatch,
+            "ssd_bytes_read": get_ssd(),
+            # How to read this against the nsys report. The measured wall gap
+            # is refresh 203ms vs graph 46ms (stage0 p50), and ~128ms of it
+            # sits in the eager sparse model.forward envelope. nsys decides
+            # kernel-vs-idle: if the two tick kinds have similar GPU kernel
+            # time but the refresh tick shows far more stream-idle/D2H/sync,
+            # lever A' (move selection reconciliation/promotion off the tick)
+            # removes it; if refresh kernel time itself is higher, lever B (a
+            # longer refresh interval) is the cheaper answer. churn decides
+            # whether B's staleness is free (sets stable -> Jaccard ~1).
+            "interpretation": "refresh-graph gap ~157ms wall, ~128ms in "
+                              "eager model envelope; compare nsys kernel vs "
+                              "idle to choose A'(idle/sync-bound) vs B(kernel)"}
 
 
 def main():
@@ -268,18 +299,45 @@ def main():
         import torch
 
         torch.cuda.synchronize()
+    def finish(rc, note=""):
+        if note:
+            rep["gate_note"] = note
+        with open(args.out, "w") as f:
+            json.dump(rep, f, indent=2)
+        print(f"wrote {args.out}: {rep['frame_counts']} "
+              f"ssd={rep['ssd_bytes_read']} {note}".rstrip(), flush=True)
+        return rc
+
+    if rep["pred_observed_mismatches"]:
+        # NVTX tick labels would not match the bucketed tick kinds; the nsys
+        # grouping cannot be trusted.
+        print(f"INSUFFICIENT: {len(rep['pred_observed_mismatches'])} "
+              f"pred-vs-observed tick mismatches: "
+              f"{rep['pred_observed_mismatches'][:5]}", file=sys.stderr)
+        return finish(14, "pred/observed tick-kind mismatch; nsys labels invalid")
+    ssd = rep["ssd_bytes_read"]
+    if ssd["n_targets"] == 0:
+        print("INSUFFICIENT: SSD byte meter attached to ZERO ColdSsdFile "
+              "(cold._ssd / _shared_ssds both absent); configure the spill "
+              "tier (H2_COLD_SSD / H2_COLD_SSD_BYTES). A zero-byte result "
+              "from an unattached meter is not a reading.", file=sys.stderr)
+        return finish(14, "SSD meter unattached")
+    if ssd["total"] == 0 or ssd["n_reads"] == 0:
+        # Meter is attached but never fired across the whole run: either no
+        # page was ever promoted back from SSD at 32k, or the wrap misses the
+        # actual call site. Distinguishing needs this to be loud, not a 0 that
+        # reads as "refresh never touches disk".
+        print(f"INSUFFICIENT: SSD meter attached to {ssd['n_targets']} file(s) "
+              f"but observed 0 reads / 0 bytes over the whole run; cannot "
+              f"certify refresh SSD cost (confirm the prompt actually spills "
+              f"past the host tier)", file=sys.stderr)
+        return finish(14, "SSD meter attached but zero reads")
     if rep["refreshes_in_frame"] < args.want_refresh:
         print(f"INSUFFICIENT: framed only {rep['refreshes_in_frame']} refreshes "
               f"(need {args.want_refresh}); raise --max-new-tokens",
               file=sys.stderr)
-        with open(args.out, "w") as f:
-            json.dump(rep, f, indent=2)
-        return 14
-    with open(args.out, "w") as f:
-        json.dump(rep, f, indent=2)
-    print(f"wrote {args.out}: {rep['frame_counts']} "
-          f"ssd_frame_bytes={rep['ssd_bytes_read']['frame']}", flush=True)
-    return 0
+        return finish(14, "not enough refreshes in frame")
+    return finish(0)
 
 
 if __name__ == "__main__":
