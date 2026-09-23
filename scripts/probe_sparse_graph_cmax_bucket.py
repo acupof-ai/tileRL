@@ -928,6 +928,14 @@ def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b
     for bucket in PARITY_BUCKETS:
         job["bucket"] = bucket
         rid, cmax, n_tokens = prime_counting(e, tok, bucket, depth, f"parity b{bucket}", job)
+        # DECODE TIMING. Bracket the tick loop in wall clock with a sync on both
+        # sides: an unsynced CUDA-event span measures enqueue time and inflates
+        # (a filed lesson). Counts the whole walk to PARITY_GEN, so it is a
+        # steady-state decode rate, not one tick's latency.
+        import time as _time
+
+        torch.cuda.synchronize()
+        _t_dec0 = _time.perf_counter()
         for _ in range(PARITY_GEN * 12 + 200):
             e.step()
             torch.cuda.synchronize()
@@ -935,6 +943,8 @@ def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b
             live = next((r for r in e._running if r.req_id == rid), None)
             if live is None or n_tok >= PARITY_GEN:
                 break
+        torch.cuda.synchronize()
+        job["decode_s"] = _time.perf_counter() - _t_dec0
         # One decode forward = one finalize boundary AND exactly one _commit
         # (plain: 1 token; W=2 verify: 1-2 tokens). Equal-length index
         # alignment is the B1 invariant the parent cross-checks.
@@ -981,6 +991,13 @@ def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b
                 "commits": commits,
                 "n_graph": n_graph,
                 "n_produced": n_tok,
+                # Timing + the tokens the walk actually produced: ms/tick and
+                # tok/s are computed from these two plus len(ticks). Accept rate
+                # is sum(len(c["toks"])) / len(ticks) on a W=2 run -- already
+                # derivable from `commits`, so no extra hook records it.
+                "decode_s": job.get("decode_s"),
+                "n_ticks": len(ticks),
+                "n_tokens_kept": sum(len(t.get("tokens") or []) for t in ticks),
                 "natural_finish": finished_naturally,
                 "prefill_logits": job["prefill_logits"][-1] if job["prefill_logits"] else None,
                 "prefill_own_fp": (job["prefill_boundary"] or {}).get("own_fp"),
@@ -992,6 +1009,41 @@ def build_parity_worker(source, draft_path, graph, depth, model_name="qwen38-27b
     e.shutdown()
     gc.collect()  # never empty_cache on sm70 after capture
     return {"arm": job["arm"], "W": depth + 1, "cells": cells}
+
+
+def _perf_line(cell: dict) -> str:
+    """The two numbers b1 asked for that are not parity: accept rate and decode
+    rate, from data the worker already records.
+
+    `acc` is tokens per forward (`n_produced / n_ticks`), NOT a strict spec
+    accept rate: `n_produced` counts every produced token, including the plain
+    decode ticks that produce one unconditionally. On the recorded W=2 runs it
+    comes out at the same figures quoted for the strict rate (graph 0.382 vs
+    eager 1.000 against the 38% / 100% seen earlier), because the W=2 ticks
+    dominate the walk -- but they are not the same quantity and this line does
+    not claim they are. The strict rate needs per-tick token counts split by
+    tick width, which `commits` carries if a future run wants it.
+
+    `ms/tick` and `tok/s` both divide by `decode_s`, a wall-clock span with a
+    `cuda.synchronize()` on each side.
+    """
+    g, e = cell.get("graph_perf") or {}, cell.get("eager_perf") or {}
+    parts = []
+    for name, p_ in (("g", g), ("e", e)):
+        if not p_:
+            continue
+        n_t, n_k, secs = p_.get("n_ticks"), p_.get("n_produced"), p_.get("decode_s")
+        if not n_t or not secs:
+            continue
+        acc = (n_k / n_t) if n_k is not None else None
+        rate = (n_k / secs) if n_k is not None else None
+        acc_s = f"{acc:.3f}" if acc is not None else "na"
+        rate_s = f"{rate:.1f}" if rate is not None else "na"
+        parts.append(
+            f"{name}_acc={acc_s} {name}_ms/tick={1000 * secs / n_t:.1f} "
+            f"{name}_tok/s={rate_s}"
+        )
+    return " ".join(parts)
 
 
 def _input_view(cell, tick_idx):
@@ -1104,10 +1156,20 @@ def compare_parity(source, draft, depth):
 
     rows, harness, bad = [], [], []
     for gc_, ec in zip(g.get("cells", []), e.get("cells", [])):
+        def _perf(c):
+            return {
+                "n_ticks": c.get("n_ticks"),
+                "n_produced": c.get("n_produced"),
+                "decode_s": c.get("decode_s"),
+            }
+
         cell = {
             "bucket": gc_["bucket"],
             "W": depth + 1,
             "observed_bucket": gc_.get("observed_bucket"),
+            # The two non-parity numbers, per arm, for the printer.
+            "graph_perf": _perf(gc_),
+            "eager_perf": _perf(ec),
             "n_tokens": (gc_.get("n_tokens"), ec.get("n_tokens")),
             "graph_replays": gc_.get("n_graph"),
             "graph_head": gc_.get("head"),
@@ -1355,7 +1417,8 @@ def main() -> int:
                 print(
                     f"[parity b{c['bucket']:5d} W={c['W']}] {c['verdict']} "
                     f"cmax={c.get('observed_bucket')} graph_replays={c.get('graph_replays')} "
-                    f"g_head={c.get('graph_head')} e_head={c.get('eager_head')}",
+                    f"g_head={c.get('graph_head')} e_head={c.get('eager_head')} "
+                    + _perf_line(c),
                     flush=True,
                 )
                 if c.get("first"):
