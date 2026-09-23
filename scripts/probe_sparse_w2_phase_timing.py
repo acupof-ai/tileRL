@@ -204,7 +204,13 @@ def measure_graph_ticks(e, want=N_STEADY, max_attempts=None, require_phases=()):
             continue
         psum = sum(ph.values())
         wall = d["graph"]
+        # Whole engine.step() wall for THIS step (instantaneous, set in
+        # tick_end() before step() returns — not cumulative like tot). Includes
+        # scheduling/sampling/bookkeeping outside the graph envelope.
+        step_ms = float(tm.last_total) * 1000.0
         rows.append({"phases_ms": ph, "sum_ms": psum, "wall_ms": wall,
+                     "graph_envelope_ms": wall, "step_ms": step_ms,
+                     "step_minus_graph_ms": step_ms - wall,
                      "gap": abs(psum - wall) / wall})
 
     if len(rows) < want:
@@ -306,10 +312,13 @@ def _prime_bucket_27b(e, tok, bucket, depth, gen):
     raise ProbeFail(f"b{bucket}: counting prompt never entered decode", rc=14)
 
 
-def run_arm_27b(name, depth, graph, source, draft_path, neg=False):
-    """Device arm on qwen38-27b: ONE engine, the three cmax buckets as three
-    sequential requests in one process; >=N_STEADY steady graph ticks per bucket.
-    depth=0 builds without a draft (the neg control is not used on device)."""
+def run_arm_27b(name, depth, graph, source, draft_path, draft_window=0):
+    """Device arm on qwen38-27b: ONE engine in its OWN process, the three cmax
+    buckets as three sequential requests; >=N_STEADY steady graph ticks per
+    bucket. depth=0 builds without a draft. draft_window>0 truncates the draft's
+    trailing READ window (#734 opt-in); 0 = full prefix. Each cell's verdict is
+    written to its own json as soon as that cell completes, so a later-arm OOM
+    cannot erase it. Returns (cells, tok_per_fwd)."""
     import torch
 
     from tilerl import build as build_mod
@@ -322,7 +331,8 @@ def run_arm_27b(name, depth, graph, source, draft_path, neg=False):
     if be.device.type != "cuda":
         raise ProbeFail("qwen38-27b arm requires a CUDA backend", rc=14)
     cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
-    draft = load_draft(model, draft_path) if depth >= 1 else None
+    draft = (load_draft(model, draft_path, attn_window_tokens=draft_window)
+             if depth >= 1 else None)
 
     e = build_engine(
         cfg, model, be,
@@ -339,12 +349,20 @@ def run_arm_27b(name, depth, graph, source, draft_path, neg=False):
     )
     tok = _qwen38_tokenizer()
     cells = {}
+    fwd0, acc0 = e._decode_forwards, e._spec_accepted
     try:
         for bucket in CMAX_BUCKETS:
             rid = _prime_bucket_27b(e, tok, bucket, depth, gen=max(N_STEADY * 4, 240))
             require = ("p4_verify", "p5_draft") if depth >= 1 else ()
-            cells[bucket] = measure_graph_ticks(e, want=N_STEADY, require_phases=require)
-            # drain/finish this request before priming the next bucket
+            rows = measure_graph_ticks(e, want=N_STEADY, require_phases=require)
+            verdict = _check_cells(name, {bucket: rows})
+            cells[str(bucket)] = {"summary": _summarize_cell(bucket, rows),
+                                  "failures": verdict}
+            # Persist THIS arm's cells incrementally; a later-arm OOM must not
+            # take this arm's per-tick gaps with it.
+            _write_arm_json(name, cells, tok_per_fwd=None)
+            if verdict:
+                raise _ArmGateFail(name, cells, verdict)
             for _ in range(40000):
                 if not any(r.req_id == rid for r in e._running):
                     break
@@ -353,7 +371,30 @@ def run_arm_27b(name, depth, graph, source, draft_path, neg=False):
         e.shutdown()
         if be.device.type == "cuda":
             torch.cuda.synchronize()
-    return cells
+    fwd = e._decode_forwards - fwd0
+    acc = e._spec_accepted - acc0
+    tok_per_fwd = (fwd + acc) / fwd if fwd else None
+    _write_arm_json(name, cells, tok_per_fwd)
+    return cells, tok_per_fwd
+
+
+class _ArmGateFail(Exception):
+    """A device arm tripped the closure/spec gate (rc1, distinct from rc14)."""
+
+    def __init__(self, name, cells, failures):
+        super().__init__("; ".join(failures))
+        self.name, self.cells, self.failures = name, cells, failures
+
+
+def _arm_json_path(name):
+    return f"{os.environ.get('PHASE_OUT_PREFIX', 'phase')}_{name}.json"
+
+
+def _write_arm_json(name, cells, tok_per_fwd):
+    with open(_arm_json_path(name), "w") as f:
+        json.dump({"arm": name, "tok_per_fwd": tok_per_fwd, "cells": cells}, f, indent=2)
+    print(f"[phase-probe] {name}: wrote {_arm_json_path(name)} tok/fwd={tok_per_fwd}",
+          flush=True)
 
 
 def _pct(xs, q):
@@ -404,19 +445,27 @@ def _check_cells(arm, cells, neg=False):
     return out
 
 
+def _summarize_cell(bucket, rows):
+    """p50/p90 for one cell: graph envelope, WHOLE engine.step wall, the
+    step-minus-graph outside work, the closure gap, and each phase."""
+    s = summarize(rows)
+    return {
+        "bucket": bucket, "n": s["n"],
+        "graph_envelope_p50_ms": round(s["wall_ms"]["p50"], 3),
+        "graph_envelope_p90_ms": round(s["wall_ms"]["p90"], 3),
+        "step_p50_ms": round(statistics.median([r["step_ms"] for r in rows]), 3),
+        "step_p90_ms": round(_pct([r["step_ms"] for r in rows], 90), 3),
+        "step_minus_graph_p50_ms": round(
+            statistics.median([r["step_minus_graph_ms"] for r in rows]), 3),
+        "gap_p90": round(s["gap"]["p90"], 4),
+        # p2_replay/p5_draft are EXCLUSIVE host walls (sync fence inside the
+        # phase); the other six are plain host wall. See module docstring.
+        "exclusive_phases": ["p2_replay", "p5_draft"],
+        **{f"{ph}_p50_ms": round(s[ph]["p50"], 3) for ph in PHASE_WALL}}
+
+
 def _brief_cells(cells):
-    brief = {}
-    for bucket, rows in sorted(cells.items()):
-        s = summarize(rows)
-        brief[str(bucket)] = {
-            "n": s["n"], "wall_p50_ms": round(s["wall_ms"]["p50"], 3),
-            "wall_p90_ms": round(s["wall_ms"]["p90"], 3),
-            "gap_p90": round(s["gap"]["p90"], 4),
-            # p2_replay/p5_draft are EXCLUSIVE host walls (sync fence inside the
-            # phase); the other six are plain host wall. See module docstring.
-            "exclusive_phases": ["p2_replay", "p5_draft"],
-            **{f"{ph}_p50_ms": round(s[ph]["p50"], 3) for ph in PHASE_WALL}}
-    return brief
+    return {str(b): _summarize_cell(b, rows) for b, rows in sorted(cells.items())}
 
 
 def _assert_tree(expected: str):
@@ -435,31 +484,121 @@ def _assert_tree(expected: str):
             f"fetch/checkout the expected probe head before running", rc=14)
 
 
+#: (arm name, spec depth, decode graph, draft read window). One arm per process.
+DEVICE_ARMS_A = [
+    ("w2_graph", 1, True, 0),
+    ("w2_graph_dw2048", 1, True, 2048),
+    ("w1_graph", 0, True, 0),
+]
+
+
+def _run_worker(arm, source, draft, expect_tree, out_prefix):
+    """One device arm in this process: assert tree, run three buckets, write its
+    own json incrementally. Exit code: 0 gate green, 1 gate red, 14 insufficient."""
+    os.environ["PHASE_OUT_PREFIX"] = out_prefix
+    spec = next((a for a in DEVICE_ARMS_A if a[0] == arm), None)
+    if spec is None:
+        print(f"PHASE PROBE INSUFFICIENT (rc14): unknown worker arm {arm!r}; "
+              f"have {[a[0] for a in DEVICE_ARMS_A]}", file=sys.stderr)
+        return 14
+    _n, depth, graph, window = spec
+    try:
+        _assert_tree(expect_tree)
+        cells, tok_per_fwd = run_arm_27b(arm, depth, graph, source, draft,
+                                         draft_window=window)
+    except _ArmGateFail as exc:
+        # Per-cell json is already written; print the verdict and exit 1.
+        print(f"PHASE PROBE FAILED [{arm}]", file=sys.stderr)
+        for x in exc.failures:
+            print("  " + x, file=sys.stderr)
+        return 1
+    except ProbeFail as exc:
+        print(f"PHASE PROBE INSUFFICIENT (rc14) [{arm}]: {exc}", file=sys.stderr)
+        return exc.rc
+    print(json.dumps({"arm": arm, "tok_per_fwd": tok_per_fwd,
+                      "cells": list(cells)}, indent=2))
+    return 0
+
+
+def _spawn_arm(arm, source, draft, expect_tree, out_prefix):
+    """Fresh subprocess for one arm so two 27B models never share a 32G context
+    (the in-process A order OOM'd on the second arm's build)."""
+    import subprocess
+
+    cmd = [sys.executable, "-u", os.path.abspath(__file__),
+           "--model", "qwen38-27b", "--worker", arm,
+           "--source", source, "--draft", draft,
+           "--expect-tree", expect_tree, "--out-prefix", out_prefix]
+    proc = subprocess.run(cmd, env=dict(os.environ), cwd=os.getcwd())
+    return proc.returncode
+
+
+def _aggregate(arms, out_prefix):
+    """Read each arm's json; a missing/unreadable one is rc14 (its verdict was
+    lost, e.g. an OOM before the first cell wrote). Returns (aggregated, rc)."""
+    agg, rc = {}, 0
+    for arm in arms:
+        path = f"{out_prefix}_{arm}.json"
+        try:
+            with open(path) as f:
+                agg[arm] = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"PHASE PROBE INSUFFICIENT (rc14): missing/bad arm json {path}: {exc}",
+                  file=sys.stderr)
+            rc = 14
+    return agg, rc
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="tiny", choices=["tiny", "qwen38-27b"])
+    ap.add_argument("--worker", default=None,
+                    help="device worker mode: run one arm by name")
     ap.add_argument("--source", default="", help="qwen38-27b model source dir")
     ap.add_argument("--draft", default="", help="draft MTP path (27b)")
     ap.add_argument("--expect-tree", default="",
                     help="required checked-out short sha (PROBE_SHA); mandatory for 27b")
     ap.add_argument("--out", default="phase_timing.json")
+    ap.add_argument("--out-prefix", default="phase",
+                    help="device per-arm json prefix: <prefix>_<arm>.json")
     ap.add_argument("--neg-depth0-with-draft", action="store_true",
                     help="CPU negative control only: force a draft on the depth-0 arm")
     args = ap.parse_args()
 
-    order_a = [("w2_graph", 1, True), ("w1_graph", 0, True)]
+    # Device worker: one arm, own process.
+    if args.worker:
+        return _run_worker(args.worker, args.source, args.draft,
+                           args.expect_tree, args.out_prefix)
+
+    if args.model == "qwen38-27b":
+        arms_order = ([n for n, *_ in reversed(DEVICE_ARMS_A)]
+                      if os.environ.get("PHASE_ORDER_B")
+                      else [n for n, *_ in DEVICE_ARMS_A])
+        rcs = {}
+        for arm in arms_order:
+            rcs[arm] = _spawn_arm(arm, args.source, args.draft,
+                                  args.expect_tree, args.out_prefix)
+        agg, agg_rc = _aggregate(arms_order, args.out_prefix)
+        with open(args.out, "w") as f:
+            json.dump({"arm_rc": rcs, "arms": agg}, f, indent=2)
+        if any(rc == 1 for rc in rcs.values()):
+            return 1
+        if agg_rc == 14 or any(rc == 14 for rc in rcs.values()):
+            return 14
+        print(json.dumps({a: {"rc": rcs[a],
+                              "tok_per_fwd": agg.get(a, {}).get("tok_per_fwd")}
+                          for a in arms_order}, indent=2))
+        return 0
+
+    # CPU tiny precondition: in-process two arms.
+    order_a = [("w2_graph", 1, True, 0), ("w1_graph", 0, True, 0)]
     order = list(reversed(order_a)) if os.environ.get("PHASE_ORDER_B") else order_a
 
     result, failures = {}, []
     try:
-        if args.model == "qwen38-27b":
-            _assert_tree(args.expect_tree)
-        for arm, depth, graph in order:
+        for arm, depth, graph, _w in order:
             neg = args.neg_depth0_with_draft and arm == "w1_graph"
-            if args.model == "qwen38-27b":
-                cells = run_arm_27b(arm, depth, graph, args.source, args.draft)
-            else:
-                cells = run_arm(arm, depth, graph, neg_depth0_draft=neg)
+            cells = run_arm(arm, depth, graph, neg_depth0_draft=neg)
             failures += _check_cells(arm, cells, neg=neg)
             result[arm] = _brief_cells(cells)
     except ProbeFail as exc:
