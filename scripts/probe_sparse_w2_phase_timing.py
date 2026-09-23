@@ -212,10 +212,6 @@ def measure_graph_ticks(e, want=N_STEADY, max_attempts=None, require_phases=()):
             f"only {len(rows)} qualifying steady graph ticks (<{want}) after "
             f"{attempts} steps; {skipped_req} graph ticks lacked required phases "
             f"{require_phases}", rc=14)
-
-    if len(rows) < want:
-        raise ProbeFail(f"only {len(rows)} steady sparse-graph ticks (<{want}) "
-                        f"after {attempts} steps", rc=14)
     return rows
 
 
