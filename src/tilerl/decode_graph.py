@@ -196,7 +196,7 @@ class SparseDecodeGraph:
             kv_pool=kv_pool,
             state_pool=state_pool,
             seq_q_lens=self._sql,
-            keep_steps=W if W > 1 else 0,  # match eager: a verify tick keeps every step
+            keep_steps=int(W > 1),
             page_base=sf.page_base,
             sparse=sf,
         )
@@ -335,7 +335,7 @@ class CpuSparseGraph:
             kv_pool=self._kv,
             state_pool=self._states,
             seq_q_lens=sql,
-            keep_steps=W if W > 1 else 0,  # match eager: a verify tick keeps every step
+            keep_steps=int(W > 1),
             page_base=sf.page_base,
             sparse=sf,
         )
