@@ -53,7 +53,10 @@ Answers on REAL long prompts at ~32k with the production cold tier:
      never a comparison column. Effective tok/s = (decode_forwards +
      spec_accepted) over summed sparse-decode-tick walls, first WARMUP_DECODE
      ticks of each prompt excluded; per-forward accept ratio, step-wall p50
-     split graph/eager, graph occupancy.
+     split graph/eager, close ticks reported separately. Graph-arm eager ticks
+     are not fraction-gated (the every-8-tick refresh caps graph occupancy at
+     8/9 by construction); instead EVERY eager sparse tick must attribute to a
+     refresh or a prefill/mixed boundary, and an unattributable one is rc14.
 
 Stages:
   --stage 0  one prompt per arm: per-bucket first-replay gate + config only.
@@ -302,12 +305,19 @@ def install_capture_recorder(e):
 
 def run_prompt(e, ids, max_new, on_decode=None, pre_step=None):
     """Submit one temp-0 prompt, drain to done. For every sparse decode tick
-    while the rid is live calls on_decode(idx, wall_ms, tm, d_forwards,
-    d_accepted); pre_step(rid) runs before each step. Returns {output,
-    decode_ticks, graph_ticks} (graph ticks counted from tm.fwd_path)."""
+    while the rid is live calls
+      on_decode(idx, wall_ms, tm, d_forwards, d_accepted, is_close,
+                refresh_after, phase_pre)
+    where is_close marks the tick that finished the request in-step (its wall
+    carries release_cold_forget/release_blocks/ssd_mmap — excluded from the warm
+    window, reported separately), refresh_after is the sparse runtime's
+    ticks_since_refresh AFTER the tick (0 exactly when this tick was the
+    periodic refresh, which runs eager), and phase_pre is the tick's prefill
+    row count (>0 marks a prefill/mixed boundary, also eager). Returns
+    {output, decode_ticks, graph_ticks, close_ticks}."""
     rid = e.submit(list(ids), _sampling(max_new))
     tm = e._step_timing
-    idx = graph_ticks = 0
+    idx = graph_ticks = close_ticks = 0
     for _ in range(200000):
         live = any(r.req_id == rid for r in e._running)
         if live and pre_step is not None:
@@ -316,16 +326,20 @@ def run_prompt(e, ids, max_new, on_decode=None, pre_step=None):
         t0 = time.perf_counter()
         e.step()
         wall = (time.perf_counter() - t0) * 1000.0
+        alive = any(r.req_id == rid for r in e._running)
         df, da = e._decode_forwards - f0, e._spec_accepted - a0
-        if df and tm is not None and tm.fwd_sparse:
-            if live:
-                graph_ticks += int(tm.fwd_path == "graph")
-                if on_decode is not None:
-                    on_decode(idx, wall, tm, df, da)
+        if df and tm is not None and tm.fwd_sparse and live:
+            is_close = not alive
+            close_ticks += int(is_close)
+            graph_ticks += int(tm.fwd_path == "graph")
+            if on_decode is not None:
+                on_decode(idx, wall, tm, df, da, is_close,
+                          e._sparse.ticks_since_refresh, tm.phase_pre)
             idx += 1
-        if not any(r.req_id == rid for r in e._running):
+        if not alive:
             out = list(e.poll().get(rid, []))
-            return {"output": out, "decode_ticks": idx, "graph_ticks": graph_ticks}
+            return {"output": out, "decode_ticks": idx,
+                    "graph_ticks": graph_ticks, "close_ticks": close_ticks}
     raise ProbeFail(f"rid {rid} did not finish within 200000 steps", rc=14)
 
 
@@ -362,7 +376,14 @@ def run_worker(arm, args):
     measure = arm in ("graph_w2048", "baseline") and not smoke
     eff_tokens = 0
     wall_ms = 0.0
-    graph_walls, eager_walls = [], []
+    graph_walls, eager_walls, close_walls = [], [], []
+    # Graph arm only: every eager sparse tick must be attributable to a refresh
+    # (counter reset to 0 after it) or a prefill/mixed boundary (phase_pre>0).
+    # An unattributable eager tick means the graph declined for some unknown
+    # reason — stronger than an occupancy threshold (the 8/9 refresh ceiling
+    # caps graph occupancy at 88.9% by construction, so no fraction is gated).
+    eager_attributed = {"refresh": 0, "prefill_boundary": 0}
+    unattributed_eager = []
 
     def dump():
         # Red is an answer: persist evidence even when a later prompt raises.
@@ -375,10 +396,22 @@ def run_worker(arm, args):
             if arm == "graph_w2048":
                 events, before_step, unwrap = install_capture_recorder(e)
 
-            acc = [0, 0.0]  # [effective tokens post-warmup, wall ms]
+            acc = [0, 0.0]  # [effective tokens, wall ms] over warm ticks
 
-            def on_decode(idx, w, tm, df, da, acc=acc):
-                if measure and idx >= WARMUP_DECODE:
+            def on_decode(idx, w, tm, df, da, is_close, refresh_after, phase_pre,
+                          pi=pi, acc=acc):
+                if is_close:
+                    close_walls.append(w)
+                if arm == "graph_w2048" and tm.fwd_path != "graph":
+                    if refresh_after == 0:
+                        eager_attributed["refresh"] += 1
+                    elif phase_pre > 0:
+                        eager_attributed["prefill_boundary"] += 1
+                    else:
+                        unattributed_eager.append(
+                            {"prompt": pi, "tick": idx,
+                             "refresh_after": refresh_after, "phase_pre": phase_pre})
+                if measure and idx >= WARMUP_DECODE and not is_close:
                     acc[0] += df + da
                     acc[1] += w
                     (graph_walls if tm.fwd_path == "graph" else eager_walls).append(w)
@@ -391,7 +424,8 @@ def run_worker(arm, args):
 
             row = {"i": pi, "n_out": len(r["output"]),
                    "decode_ticks": r["decode_ticks"],
-                   "graph_ticks": r["graph_ticks"]}
+                   "graph_ticks": r["graph_ticks"],
+                   "close_ticks": r["close_ticks"]}
 
             if arm == "ref_eager_w2048":
                 # Forced eager must take ZERO graph paths — the single-variable
@@ -458,11 +492,18 @@ def run_worker(arm, args):
             if args.stage == 0 and arm == "graph_w2048" and new_bucket_seen:
                 break
 
+        # Reported for the graph arm in every mode: every eager sparse tick
+        # must be attributable to a refresh or a prefill/mixed boundary.
+        if arm == "graph_w2048":
+            results["eager_tick_attribution"] = dict(eager_attributed)
+            results["unattributed_eager_ticks"] = unattributed_eager
+
         if measure:
             results["throughput"] = {
                 "comparison": "this window's same-machine engine baseline "
                               "(separate subprocess, in-engine counters); "
                               "earlier-window reads are background",
+                "warm_window": f"ticks [{WARMUP_DECODE}, end), close tick excluded",
                 "warm_effective_tokens": eff_tokens,
                 "warm_wall_ms": round(wall_ms, 2),
                 "warm_effective_tok_s": round(eff_tokens / (wall_ms / 1000.0), 3)
@@ -473,6 +514,12 @@ def run_worker(arm, args):
                     if eager_walls else None,
                 "warm_graph_ticks": len(graph_walls),
                 "warm_eager_ticks": len(eager_walls),
+                # The per-request close tick (release_cold_forget/release_blocks/
+                # ssd_mmap, 9-12 s at 32k) is NOT warm decode: reported on its
+                # own and excluded from the warm window above.
+                "close_ticks": len(close_walls),
+                "close_step_p50_ms": round(statistics.median(close_walls), 3)
+                    if close_walls else None,
             }
     except ProbeFail:
         dump()
@@ -514,6 +561,17 @@ def run_worker(arm, args):
         for x in results["failures"][:10]:
             print("  MISMATCH " + x, file=sys.stderr)
         return 1  # the ONLY rc=1 path: the 09-17 gate actually went red
+    if arm == "graph_w2048" and unattributed_eager:
+        # Every eager sparse tick must be the periodic refresh (counter reset
+        # to 0) or a prefill/mixed boundary. An unattributable one means the
+        # graph declined for an unknown reason; no occupancy fraction covers
+        # that failure mode.
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"INSUFFICIENT: {len(unattributed_eager)} eager sparse tick(s) "
+              f"not attributable to refresh/prefill: "
+              f"{unattributed_eager[:5]}", file=sys.stderr)
+        return 14
     if arm == "graph_w2048":
         n_captures = sum(len(p.get("first_replays", [])) for p in results["prompts"])
         if smoke:
