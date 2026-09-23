@@ -132,14 +132,63 @@ scratch, so output is token-identical with shadow off (CPU gate asserts it).
      (the tail: an occasional two-tick refresh is the real-delay failure).
   All three must hold; any fails → v2 (real delay) is not built.
 
+## Shadow v1 — RESULT (measured 2026-09-24, revision 24898a26, V100 sm70)
+
+Window `~/shadowwin-0924-054509`, `PROBE EXIT=1`, five configs each its own
+subprocess; token gate OK (400 tokens, all configs identical to off).
+
+| config | bg p50 | bg p90 | bg p99 | interval_off p50 | g_off | g_on | slow | exceed |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| off | – | – | – | 45.91 | 45.76 | – | – | – |
+| quest | 22.11 | 23.15 | 31.29 | 46.50 | 46.25 | 68.85 | 1.491 | 0.0 |
+| h2d107 | 33.71 | 71.43 | 75.87 | 61.77 | 47.58 | 56.37 | 1.185 | 0.837 |
+| both107 | 54.77 | 55.60 | 56.55 | 46.59 | 46.12 | 77.99 | 1.691 | 1.0 |
+| h2d206 | 67.01 | 68.50 | 69.15 | 46.43 | 46.19 | 64.45 | 1.395 | 1.0 |
+
+Real cold promotions this window: n=29, p50 69 / p90 138 / max 156 — p90
+bracketed by the 107 and 206 points.
+
+All three v1 gates failed (rc1) for h2d/both. quest — zero H2D, zero residency,
+the minimal config — already failed gate 2 (slow x1.491), so the no-go does not
+depend on any H2D-volume assumption.
+
+**Criterion 2 was specified against the wrong object.** v1 fired the background
+on EVERY graph tick, so every tick paid SM contention. The real design fires
+once per 8-tick cycle and the work overlaps the following ticks. Re-derived
+cycle estimate (8 ticks, current = 7×45.76 + 249.3 = 569.6 ms): if the once-per-
+cycle wait is bg≈56–71 ms, cycle ≈ 7×46 + 56..71 = 389–407 ms (−28–32%, eff
+~34–36 tok/s). That assumes the seven overlapping ticks stay near 46 under side-
+stream contention — exactly what v2 must measure, not assume. The v1 every-tick
+slowdown does not transfer one-for-one to the once-per-cycle design.
+
+Open instrument note: h2d107 interval_off p50 = 61.77 vs 45.9–46.6 for the
+other four configs. OFF segments emit no background, so by construction this
+should be config-independent. Offline parser `probe_shadow_interval.py` splits
+OFF gaps into plain / spans-eager-refresh / other intervening steps and by
+segment, to localize it (non-steady first gaps vs an intervening-step class).
+
+## v2 — real 1-tick delay (ruling 2026-09-24)
+
+Shadow GO/NO-GO as pre-registered is mooted by the object error; build the real
+delay and measure the cycle directly.
+
+- At refresh cadence (every 8 ticks) start the background from the PREVIOUS
+  tick's REAL q: store the per-layer post-rope q in the captured forward.
+- Background: quest + promotion into the reserved blocks on the side stream.
+- On the next graph tick: wait on the event, map the selection into l2p, replay.
+  If promotion is not done yet (bg > interval) that tick WAITS on the event; it
+  does NOT fall back to eager.
+- Measure: whole 8-tick cycle p50/p90, eff tok/s, and the quality gate below.
+- CPU gate: v2 with delay=0 must be token-identical to the synchronous path.
+
 ## Device measurement order
 
 - ANSWERED by the phase window (f7a93e5c/a6b6a511, no nsys needed — nsys
   2022.4.2.1 export is broken): the gap is the eager sparse trunk (97.6%),
   not host sync (0.87%). This picked the 1-tick-delay design over a longer
   refresh interval; see Mechanism.
-- NEXT: shadow mode (env-gated, probe branch only; budget carved from
-  num_blocks). CPU gate: shadow on/off produce token-identical output.
-  Measure whether the background select+promote keeps up within one graph
-  tick and how much it lengthens graph ticks.
-- then the real delay, then the pre-registered gate above.
+- DONE: shadow mode. v1 gates fired red under every-tick emission; criterion 2
+  targeted the every-tick object, not the once-per-8-ticks design, so it does
+  not decide the design — v2 measures the real cycle.
+- NEXT: v2 real delay (above) against the pre-registered quality gate.
+
