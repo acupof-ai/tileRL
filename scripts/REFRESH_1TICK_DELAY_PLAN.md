@@ -309,6 +309,47 @@ promotions, `carved` pages untouched); v2 writes the mapping and moves real
 pages. So 23.15 / 55.60 / 68.50 ms are "at least this much", and a v2 carrying
 tick above them is expected rather than a regression.
 
+## Ceiling — even with refresh eliminated entirely, <= 39.8 tok/s (2026-09-24)
+
+**The `45.5 tok/s` figure that circulated for "refresh excluded" is a
+read-out error and is withdrawn.** It divided all 5957 warm tokens by the
+*2862 graph ticks'* time alone (`2862 x 45.749 ms`) — keeping in the numerator
+the tokens the 408 eager ticks produced while charging those ticks **zero ms**.
+Eliminating refresh does not make those ticks free; it makes them graph ticks.
+
+The correct figure charges them the graph price:
+
+    5957 / (3270 x 45.749 ms) = 39.82 tok/s
+
+**And that is itself an over-estimate**, because it multiplies a *p50*.
+`2862 x 45.749 + 408 x 210.987 = 217016 ms` against a measured warm wall of
+**239094 ms** — a **22078 ms residual, 9.2% of the measured wall** (10.2% only
+if divided by the model itself, which is the wrong denominator). Two p50s do not
+reproduce a
+sum; the mean tick is above the p50 for both classes (the tick distribution has
+a right tail: the 9.9 s and 10.3 s ticks recorded in
+`errors/2026-09-23-b1024-order-b-outside-graph.md`). So the real all-graph
+ceiling is **at or below 39.8**.
+
+**Consequence for this plan: 40 tok/s is not reachable through the refresh
+design.** Reaching 40 at the current tick time would need **45.54 ms/tick** —
+0.21 ms (0.5%) *faster* than today's p50 — and the whole refresh prize is worth
+at most 39.8. The lever is the trunk graph itself: `p2_replay` is **28.219 ms of
+the 42.721 ms graph envelope (66.1%)** at 32.9k, against `p5_draft` 11.891 ms
+(27.8%), `p0_fill` 0.907, `p4_verify` 0.834, `p_rows` 0.497, `p1_h2d` 0.109,
+`p3_finalize` 0.049 (`wins/2026-09-23-sparse-w2-phase-timing.md`, the
+`w2_graph_dw2048` column = production shape). Those seven sum to 42.506 ms
+against the 42.721 ms envelope, so the phases account for all but **0.215 ms
+inside** the envelope. The separate **3.955 ms is `step − envelope`** — host
+work *outside* the captured graph, a different object from the phases and not
+to be listed beside them. Cutting `p2_replay` 20% removes 5.64 ms from the
+whole 46.676 ms step: 41.03 ms, i.e. **1.8217 / 0.04103 ≈ 44.4 tok/s**; v2's
+own contribution is bounded well below that.
+
+What v2 is still for: it converts the 249.3 ms eager refresh tick into a graph
+tick, which is the difference between the measured 24.9 and the <=39.8 ceiling.
+It is a real gain; it is just not a route to 40.
+
 ## Device measurement order
 
 - ANSWERED by the phase window (f7a93e5c/a6b6a511, no nsys needed — nsys
