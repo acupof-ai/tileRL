@@ -629,10 +629,26 @@ def main():
     ap.add_argument("--min-tokens", type=int, default=20000)
     ap.add_argument("--max-tokens", type=int, default=40000)
     ap.add_argument("--max-new-tokens", type=int, default=2048)
+    ap.add_argument("--arms", default=",".join(ARMS),
+                    help="comma-separated subset of " + ",".join(ARMS)
+                         + "; run in canonical order so ref_eager_w2048 always "
+                           "precedes graph_w2048 (graph reads its ref files)")
     ap.add_argument("--smoke", action="store_true",
-                    help="CPU tiny end-to-end plumbing check (all arms, no CUDA, "
-                         "no real prompts, no tree assert); run before any window")
+                    help="CPU tiny end-to-end plumbing check (no CUDA, no real "
+                         "prompts, no tree assert); run before any window")
     args = ap.parse_args()
+
+    selected = [a.strip() for a in args.arms.split(",") if a.strip()]
+    bad = [a for a in selected if a not in ARMS]
+    if bad:
+        print(f"unknown arm(s) {bad}; valid: {ARMS}", file=sys.stderr)
+        return 14
+    if not selected:
+        print("--arms must name at least one arm", file=sys.stderr)
+        return 14
+    # Canonical order regardless of the order given: graph must never run
+    # before its reference has been written.
+    arms = [a for a in ARMS if a in selected]
 
     if args.worker:
         try:
@@ -655,11 +671,24 @@ def main():
     import subprocess
 
     tag = "smoke" if args.smoke else f"stage{args.stage}"
-    args.reference_dir = args.reference_dir or "serve805_refs"
+    # Per-window reference dir: a stale ref file from an earlier window would
+    # let graph align against the wrong run and go green, so never reuse the
+    # default across windows and refuse a non-empty explicit one.
+    args.reference_dir = args.reference_dir or f"{args.out_prefix}_refs"
+    if os.path.isdir(args.reference_dir) and any(os.scandir(args.reference_dir)):
+        print(f"reference dir {args.reference_dir!r} is not empty; use a fresh "
+              f"--reference-dir per window (stale ref files fake a green)",
+              file=sys.stderr)
+        return 14
     os.makedirs(args.reference_dir, exist_ok=True)
-    # ref must precede graph (graph reads its per-prompt reference files).
+    if "graph_w2048" in arms and "ref_eager_w2048" not in arms:
+        # graph needs this window's ref files; running it against an old dir is
+        # exactly the fake-green above.
+        print("graph_w2048 requires ref_eager_w2048 in the same --arms",
+              file=sys.stderr)
+        return 14
     rcs = {}
-    for arm in ARMS:
+    for arm in arms:
         cmd = [sys.executable, "-u", os.path.abspath(__file__),
                "--worker", arm, "--model", args.model, "--source", args.source,
                "--draft", args.draft, "--prompts", args.prompts,
