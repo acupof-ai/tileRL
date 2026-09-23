@@ -155,6 +155,15 @@ class PhaseMeter:
     def _gpu_span(self, name, fn, *a, **k):
         if not (self.active and self.cuda):
             return fn(*a, **k)
+        # A graph's first tick per bucket key calls model.forward INSIDE
+        # torch.cuda.graph capture, yet the engine still labels that tick
+        # fwd_path=graph. Timing it would put a capture-length (seconds) span
+        # in the graph group's eager_trunk p50 — and a replay never calls
+        # forward at all, so the median would be over captures only. Skip
+        # recording while a stream is capturing. (Recording events during
+        # capture is otherwise safe; this is sampling, not capture safety.)
+        if self.t.cuda.is_current_stream_capturing():
+            return fn(*a, **k)
         s, z = self.t.cuda.Event(enable_timing=True), self.t.cuda.Event(enable_timing=True)
         s.record()
         try:
@@ -335,6 +344,16 @@ def run_window(e, ids, max_new, want_refresh, smoke=False):
         alive = any(r.req_id == rid for r in e._running)
         if live and df and tm is not None and tm.fwd_sparse:
             kind = "refresh" if tm.fwd_path != "graph" else "graph"
+            # Label integrity is PROCESS-WIDE (the phase meter groups every
+            # decode tick, not just the frame): on a PURE decode tick the
+            # counter prediction must equal the observed path (prefill/mixed
+            # is eager regardless of the counter, excluded by phase_pre).
+            if tm.phase_pre == 0:
+                pred_kind = "refresh" if pred_refresh else "graph"
+                if pred_kind != kind:
+                    pred_mismatch.append(
+                        {"step": step_i, "pred": pred_kind,
+                         "observed": kind, "ticks_since_refresh": sr})
             if kind == "refresh":
                 total_refresh += 1
                 chosen = {}
@@ -347,18 +366,6 @@ def run_window(e, ids, max_new, want_refresh, smoke=False):
                     prev_chosen = chosen
             if framed and not frame_done:
                 frame_ticks.append(kind)
-                # Label integrity: on a PURE decode tick the counter prediction
-                # must equal the observed path (a prefill/mixed tick is eager
-                # regardless of the counter, so it is excluded). A mismatch
-                # means the NVTX tick_* label does not match the bucketed kind
-                # and nsys grouping would be mislabeled.
-                if tm.phase_pre == 0:
-                    pred_kind = "refresh" if pred_refresh else "graph"
-                    if pred_kind != kind:
-                        pred_mismatch.append(
-                            {"tick": len(frame_ticks) - 1,
-                             "pred": pred_kind, "observed": kind,
-                             "ticks_since_refresh": sr})
                 print(f"[nsys-frame] tick {len(frame_ticks) - 1}: {kind} "
                       f"(pred {'refresh' if pred_refresh else 'graph'})",
                       flush=True)
@@ -400,19 +407,30 @@ def run_window(e, ids, max_new, want_refresh, smoke=False):
             keys = set()
             for d in rows:
                 keys |= set(d["spans_ms"]) | set(d["wall_ms"])
-            med = {}
+            # Per-key {p50, n}: a median over 1 tick must not look like one
+            # over 70 (the capture-tick grouping bug read exactly that way).
+            per_key = {}
             for k in sorted(keys):
-                vals = [d["spans_ms"].get(k, d["wall_ms"].get(k, 0.0))
-                        for d in rows
-                        if k in d["spans_ms"] or k in d["wall_ms"]]
+                vals = []
+                for d in rows:
+                    if k in d["spans_ms"]:
+                        vals.append(d["spans_ms"][k])
+                    elif k in d["wall_ms"]:
+                        vals.append(d["wall_ms"][k])
                 if vals:
-                    med[k] = round(statistics.median(vals), 3)
+                    per_key[k] = {"p50_ms": round(statistics.median(vals), 3),
+                                  "n": len(vals)}
             counts = {k: sum(d[k] for d in rows)
                       for k in ("n_item", "n_tolist", "n_cpu", "n_synchronize")}
-            return {"n_ticks": len(rows), "p50_ms": med,
+            return {"n_ticks": len(rows), "per_key": per_key,
                     "total_counts": counts}
 
         phase_summary = {"refresh": agg("refresh"), "graph": agg("graph")}
+        # Capture health, surfaced before the gate: a failed sparse capture
+        # sets graph_on=False and every tick would then be mislabeled refresh.
+        sp = e._sparse
+        phase_summary["graph_on"] = bool(getattr(sp, "graph_on", False))
+        phase_summary["n_graphs_captured"] = len(getattr(sp, "graphs", {}))
     return {"n_out": len(out),
             "total_refresh_ticks": total_refresh,
             "frame_tick_kinds": frame_ticks,
@@ -457,19 +475,40 @@ def gate_verdict(rep, want_refresh):
         # tier the refresh tick promotes from SSD (stage0 showed ssd_mmap
         # ticks), so zero here means the meter is not on the call path. Loud.
         return 14, "ColdSsdFile exists but zero reads (meter miss?)"
+    pb = rep.get("refresh_phase_breakdown")
+    if pb is None:
+        # Window ran without TILERL_REFRESH_PHASES=1: the A'-vs-B question has
+        # no data even though the churn/frame checks pass.
+        return 14, "refresh_phase_breakdown missing (set TILERL_REFRESH_PHASES=1)"
+    if not pb.get("graph_on") or pb.get("n_graphs_captured", 0) == 0:
+        # A failed capture sets graph_on=False; every tick then classifies
+        # refresh and the frame fills with no graph control — green, no answer.
+        return 14, "sparse graph never captured (graph_on/captured=0)"
+    if pb.get("refresh") is None or pb.get("graph") is None:
+        return 14, "phase breakdown missing a tick group"
+    if pb["graph"]["n_ticks"] == 0:
+        # Frame held only refresh ticks; there is no graph control to diff.
+        return 14, "zero graph ticks in breakdown"
+    if pb["refresh"]["n_ticks"] == 0:
+        return 14, "zero refresh ticks in breakdown"
     if rep["refreshes_in_frame"] < want_refresh:
         return 14, "not enough refreshes in frame"
     return 0, ""
 
 
 def _gate_self_check():
-    """Negative controls for the two self-proof gates against synthetic reps:
-    a mismatch and an unattached/zero-read meter MUST each yield rc14; a good
-    rep must yield 0. Guards against a gate that cannot fire."""
+    """Negative controls against synthetic reps: every failure mode MUST yield
+    rc14 and a good rep 0. Guards against a gate that cannot fire."""
+    def grp(n):
+        return {"n_ticks": n, "per_key": {}, "total_counts": {}} if n else None
+
+    pb_ok = {"graph_on": True, "n_graphs_captured": 3,
+             "refresh": grp(9), "graph": grp(70)}
     good = {"pred_observed_mismatches": [],
             "ssd_bytes_read": {"meter_attached": True, "n_instances": 1,
                                "n_reads": 5, "total": 100, "frame": 100},
-            "refreshes_in_frame": 5}
+            "refreshes_in_frame": 5,
+            "refresh_phase_breakdown": pb_ok}
     assert gate_verdict(good, 5) == (0, ""), gate_verdict(good, 5)
     bad_label = dict(good, pred_observed_mismatches=[{"tick": 7}])
     assert gate_verdict(bad_label, 5)[0] == 14
@@ -485,6 +524,20 @@ def _gate_self_check():
     assert gate_verdict(zero_read, 5)[0] == 14
     few = dict(good, refreshes_in_frame=4)
     assert gate_verdict(few, 5)[0] == 14
+    no_breakdown = dict(good)
+    no_breakdown.pop("refresh_phase_breakdown")
+    assert gate_verdict(no_breakdown, 5)[0] == 14
+    graph_off = dict(good, refresh_phase_breakdown={**pb_ok, "graph_on": False})
+    assert gate_verdict(graph_off, 5)[0] == 14
+    no_capture = dict(good, refresh_phase_breakdown={**pb_ok,
+                                                     "n_graphs_captured": 0})
+    assert gate_verdict(no_capture, 5)[0] == 14
+    graph_empty = dict(good, refresh_phase_breakdown={
+        **pb_ok, "graph": grp(0)})
+    assert gate_verdict(graph_empty, 5)[0] == 14
+    no_refresh = dict(good, refresh_phase_breakdown={
+        **pb_ok, "refresh": {"n_ticks": 0, "per_key": {}, "total_counts": {}}})
+    assert gate_verdict(no_refresh, 5)[0] == 14
 
 
 def main():
@@ -528,6 +581,14 @@ def main():
                   file=sys.stderr)
             return 14
         print(f"[smoke] frame kinds = {rep['frame_counts']}", flush=True)
+        if os.environ.get("TILERL_REFRESH_PHASES"):
+            pb = rep.get("refresh_phase_breakdown")
+            assert pb is not None and pb.get("refresh") and pb.get("graph"), pb
+            print(f"[smoke] phase groups: "
+                  f"refresh n={pb['refresh']['n_ticks']} "
+                  f"graph n={pb['graph']['n_ticks']} "
+                  f"graph_on={pb['graph_on']} captured={pb['n_graphs_captured']}",
+                  flush=True)
         with open(args.out, "w") as f:
             json.dump(rep, f, indent=2)
         print(f"[smoke] wrote {args.out}", flush=True)
@@ -589,6 +650,20 @@ def main():
                   f"the patched read fired 0 times / 0 bytes; refresh promotes "
                   f"from SSD at 32k (stage0 ssd_mmap), so the meter is missing "
                   f"the call path", file=sys.stderr)
+        elif "phase_breakdown missing" in note:
+            print("INSUFFICIENT: no refresh phase breakdown — rerun with "
+                  "TILERL_REFRESH_PHASES=1; the A'-vs-B attribution is the "
+                  "window's question", file=sys.stderr)
+        elif "never captured" in note:
+            pb0 = rep.get("refresh_phase_breakdown", {})
+            print(f"INSUFFICIENT: sparse graph not captured (graph_on="
+                  f"{pb0.get('graph_on')}, n_graphs={pb0.get('n_graphs_captured')}"
+                  f"); every tick would mislabel refresh and the frame has no "
+                  f"graph control", file=sys.stderr)
+        elif "tick group" in note or "graph ticks" in note \
+                or "refresh ticks" in note:
+            print(f"INSUFFICIENT: phase breakdown lacks a valid graph/refresh "
+                  f"group: {rep.get('refresh_phase_breakdown')}", file=sys.stderr)
         else:
             print(f"INSUFFICIENT: framed only {rep['refreshes_in_frame']} "
                   f"refreshes (need {args.want_refresh}); raise --max-new-tokens",
