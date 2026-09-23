@@ -50,21 +50,13 @@ os.environ.setdefault("TILERL_DRAFT_TIMING", "1")
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+from tilerl_kernels.backend import get_backend  # noqa: E402
 
 from tilerl.build import build_engine  # noqa: E402
 from tilerl.config import tiny  # noqa: E402
 from tilerl.engine import SamplingParams  # noqa: E402
 from tilerl.kv_cache import BLOCK_TOKENS  # noqa: E402
 from tilerl.model import build_random  # noqa: E402
-from tilerl.testing import RefBackend  # noqa: E402
-
-
-class _ProbeBackend(RefBackend):
-    """RefBackend + the draft-serve probe _serve_draft queries (the real
-    get_backend() pulls tilelang, which the CPU precondition box lacks)."""
-
-    def has_kernel(self, name):
-        return False
 
 PHASE_WALL = (
     "p_rows", "p0_fill", "p1_h2d", "p2_replay", "p3_finalize",
@@ -94,8 +86,14 @@ class OracleDraft:
     def set_depth(self, depth):
         self.depth = depth
 
-    def attach(self, *a, **k):
-        pass
+    def attach(self, backend, num_blocks, dtype=None):
+        # The engine capacity check reads self.kv.num_blocks; give the oracle a
+        # real dense draft pool (it is never populated — step() is a no-op).
+        from tilerl.kv_cache import PagedKvPool
+
+        self.kv = PagedKvPool(
+            num_blocks, self.cfg.num_kv_heads, self.cfg.head_dim,
+            num_layers=self.cfg.num_layers, device=backend.device)
 
     def forward(self, hidden, ids, positions, kv, backend, hidden_out=None, last_only=False):
         pos = np.atleast_2d(np.asarray(positions))
@@ -112,7 +110,16 @@ class OracleDraft:
         return probs
 
     def step(self, rows):
-        pass
+        # Leave a one-token chain so the NEXT tick is a real W=2 verify
+        # ([last, draft]). The token matches what the trunk draws (expected), so
+        # the chain is accepted. The phase precondition does not assert token
+        # correctness (that is test_sparse_graph_verify_tick_w2_*); it only
+        # needs the spec phases (p4_verify/p5_draft) to actually execute.
+        for r in rows:
+            if getattr(r, "done", False):
+                continue
+            r.drafts = [self.expected.get(r.seq_len, 0)]
+            r.draft_pos = max(getattr(r, "draft_pos", r.seq_len - 1), r.seq_len - 1)
 
 
 def _drain(engine, pid, n):
@@ -133,7 +140,7 @@ def run_arm(name, depth, graph, neg_depth0_draft=False):
     no draft unless the negative control forces one (which must trip the gate)."""
     cfg = tiny()
     model = build_random(cfg, seed=11)
-    be = _ProbeBackend()
+    be = get_backend()
     prompt = np.arange(7, 7 + 4 * BLOCK_TOKENS + 15, dtype=np.int64)
 
     has_draft = (depth >= 1) or neg_depth0_draft
@@ -176,32 +183,40 @@ def run_arm(name, depth, graph, neg_depth0_draft=False):
     runtime = e._sparse
     raw_call = runtime.run_decode_graph
     rows = []
-    import time
+    TRACK = PHASE_WALL + ("graph",)
+
+    def snap():
+        # _StepTiming moves cur -> tot in tick_end() (which runs before step()
+        # returns), so read the cumulative totals and diff one tick at a time.
+        return {k: tm.tot.get(k, 0.0) for k in TRACK}
 
     attempts = 0
+    prev = snap()
+    prev_graph_ticks = e._decode_forwards
     while len(rows) < N_STEADY and attempts < N_STEADY * 8:
         attempts += 1
-        cur0 = {k: tm.cur.get(k, 0.0) for k in PHASE_WALL}
-        called = {"ran": False, "wall": 0.0}
+        ran = {"v": False}
 
-        def wrapper(reqs, chains=None, raw=raw_call, called=called):
-            t0 = time.perf_counter()
+        def wrapper(reqs, chains=None, raw=raw_call, ran=ran):
             ok = raw(reqs, chains)
-            called["wall"] = time.perf_counter() - t0
-            called["ran"] = bool(ok)  # a refresh tick returns False and runs eager
+            ran["v"] = bool(ok)  # a refresh tick returns False and runs eager
             return ok
 
         runtime.run_decode_graph = wrapper
         e.step()
         runtime.run_decode_graph = raw_call
-        wall = called["wall"]
-        if not called["ran"]:
-            continue  # refresh / prefill / capture-declined tick: excluded
+        cur = snap()
+        d = {k: (cur[k] - prev[k]) * 1000.0 for k in TRACK}
+        graph_ticks = e._decode_forwards - prev_graph_ticks
+        prev, prev_graph_ticks = cur, e._decode_forwards
+        if not ran["v"] or graph_ticks != 1 or d["graph"] <= 0.0:
+            continue  # refresh / prefill / mixed / no-graph tick: excluded
 
-        ph = {k: (tm.cur.get(k, 0.0) - cur0[k]) * 1000.0 for k in PHASE_WALL}
+        wall = d["graph"]  # the product graph envelope brackets run_decode_graph
+        ph = {k: d[k] for k in PHASE_WALL}
         psum = sum(ph.values())
-        gap = abs(psum - wall * 1000.0) / (wall * 1000.0)
-        rows.append({"phases_ms": ph, "sum_ms": psum, "wall_ms": wall * 1000.0, "gap": gap})
+        gap = abs(psum - wall) / wall
+        rows.append({"phases_ms": ph, "sum_ms": psum, "wall_ms": wall, "gap": gap})
 
     e.shutdown()
     return rows, name, depth, graph
@@ -232,7 +247,7 @@ def main() -> int:
     ap.add_argument("--neg-depth0-with-draft", action="store_true",
                     help="negative control: attach a draft to the depth-0 arm; gate must fail")
     args = ap.parse_args()
-    # This checked-in probe is the CPU precondition (tiny + RefBackend). The
+    # This checked-in probe is the CPU precondition (tiny + get_backend(cpu)). The
     # device 27B window lands through the identical code path; fixmisc swaps the
     # build_* args (qwen38-27b / cuda / real draft) at the window, no phase change.
 
@@ -256,17 +271,19 @@ def main() -> int:
                 break
         result[name] = summarize(rows)
 
-    # Spec-only gate: a draft-free depth-0 arm must never record p4_verify or
-    # p5_draft. The forced-draft negative control makes p5_draft non-zero, which
-    # MUST trip this — if it stays green the gate is vacuous.
+    # The depth-0 arm is asserted SPEC-FREE: no p4_verify and no p5_draft on any
+    # steady tick. The negative control builds that arm WITH a draft, which routes
+    # it through the spec phases; the SAME assertion must then go RED. There is no
+    # special-cased branch — if it stays green with a draft forced in, the gate is
+    # vacuous and the probe fails for a different reason.
     d0 = result["w1_graph"]["ticks"]
     d0_dirty = [i for i, r in enumerate(d0)
                 if r["phases_ms"]["p4_verify"] > 0.0 or r["phases_ms"]["p5_draft"] > 0.0]
-    if args.neg_depth0_with_draft:
-        if not d0_dirty:
-            failures.append("NEG CONTROL DID NOT FIRE: depth0-with-draft recorded no p4/p5")
-    elif d0_dirty:
-        failures.append(f"w1_graph: spec phase recorded on draft-free ticks {d0_dirty[:5]}")
+    if d0_dirty:
+        failures.append(
+            f"w1_graph: spec phase (p4_verify/p5_draft) recorded on the "
+            f"{'forced-draft NEGATIVE CONTROL' if args.neg_depth0_with_draft else 'draft-free'} "
+            f"arm at ticks {d0_dirty[:5]}")
 
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)
