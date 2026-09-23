@@ -25,5 +25,6 @@
     "refresh": 421,
     "prefill_boundary": 0
   },
-  "source": "servewin-0924-003135/serve_graph_w2048.stage1.json"
+  "source": "servewin-0924-003135/serve_graph_w2048.stage1.json",
+  "reading_note": "refresh=421 (eager_tick_attribution) and warm_eager_ticks=408 (throughput) are the SAME quantity over DIFFERENT windows: 421 counts the whole run, 408 counts the warm window (ticks [16, end), close tick excluded). The 13-tick difference is the eager ticks in the dropped prefix (ticks 0-15). Do not subtract them against each other: 2862 warm graph ticks + 408 warm eager ticks = 3270 warm ticks, which is the denominator behind warm_effective_tokens."
 }
