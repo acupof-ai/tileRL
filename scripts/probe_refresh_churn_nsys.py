@@ -138,6 +138,12 @@ class PhaseMeter:
         self.e = e
         self.cuda = torch.cuda.is_available()
         self.active = False
+        # True while a sparse graph is being CONSTRUCTED: SparseDecodeGraph
+        # runs two eager warmup forwards on a side stream (decode_graph.py)
+        # before capture. Those are neither refresh nor replay; without this
+        # suppress they land in whichever tick triggered the build as a
+        # hundreds-of-ms eager_trunk span. Covers warmup and capture alike.
+        self.in_graph_build = False
         self.kind = None
         self.tick_i = -1
         self.ticks = {}  # tick_i -> {kind, spans:{...ms}, walls, counts}
@@ -153,16 +159,7 @@ class PhaseMeter:
         return d
 
     def _gpu_span(self, name, fn, *a, **k):
-        if not (self.active and self.cuda):
-            return fn(*a, **k)
-        # A graph's first tick per bucket key calls model.forward INSIDE
-        # torch.cuda.graph capture, yet the engine still labels that tick
-        # fwd_path=graph. Timing it would put a capture-length (seconds) span
-        # in the graph group's eager_trunk p50 — and a replay never calls
-        # forward at all, so the median would be over captures only. Skip
-        # recording while a stream is capturing. (Recording events during
-        # capture is otherwise safe; this is sampling, not capture safety.)
-        if self.t.cuda.is_current_stream_capturing():
+        if not (self.active and self.cuda) or self.in_graph_build:
             return fn(*a, **k)
         s, z = self.t.cuda.Event(enable_timing=True), self.t.cuda.Event(enable_timing=True)
         s.record()
@@ -173,7 +170,7 @@ class PhaseMeter:
             self._events.append((self.tick_i, name, s, z))
 
     def _wall(self, name, fn, *a, **k):
-        if not self.active:
+        if not self.active or self.in_graph_build:
             return fn(*a, **k)
         import time
 
@@ -205,6 +202,26 @@ class PhaseMeter:
             self.patches.append((obj, attr, orig))
 
         from tilerl import sparse_engine as se
+        from tilerl import sparse_runtime as srt
+
+        # Suppress timing across the whole sparse-graph CONSTRUCTION (the two
+        # eager warmup forwards on a side stream plus the captured forward);
+        # it runs inside the build-triggering tick but is neither refresh nor
+        # replay and would add a ~865 ms fake eager_trunk span. Patch the name
+        # sparse_runtime actually calls (it did `from decode_graph import
+        # make_sparse_graph`, so patching decode_graph would not intercept).
+        orig_make = srt.make_sparse_graph
+
+        def make_wrap(*a, **k):
+            prev = self.in_graph_build
+            self.in_graph_build = True
+            try:
+                return orig_make(*a, **k)
+            finally:
+                self.in_graph_build = prev
+
+        srt.make_sparse_graph = make_wrap
+        self.patches.append((srt, "make_sparse_graph", orig_make))
 
         patch(se, "quest_scores", "select_quest_score", gpu=True)
         patch(e._backend, "select_pages", "select_pages", gpu=True)
@@ -226,7 +243,7 @@ class PhaseMeter:
             try:
                 return sync0(*a, **k)
             finally:
-                if self.active:
+                if self.active and not self.in_graph_build:
                     d = self._rec()
                     d["n_synchronize"] += 1
                     d["wall_ms"]["cuda.synchronize"] = d["wall_ms"].get(
@@ -239,7 +256,7 @@ class PhaseMeter:
             orig = getattr(cls, attr)
 
             def wrapped(selfx, *a, **k):
-                if self.active:
+                if self.active and not self.in_graph_build:
                     self._rec()[key] += 1
                 return orig(selfx, *a, **k)
 
