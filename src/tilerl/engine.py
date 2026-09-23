@@ -84,16 +84,18 @@ _sm70_graph_warned = False
 def _sparse_capture_allowed(backend, has_draft: bool, spec_depth: int | None) -> bool:
     """Whether the sparse captured decode graph may be armed for this engine.
 
-    Guard A (#805): on CUDA the captured sparse graph is only correct on the
-    d=0 single-token path. With speculation (spec_depth>=1) the width-2
-    captured verify replays trunk logits/hidden that disagree with eager and
-    drafts stop accepting; it diverged on sm70 and is unverified on sm90, so it
-    is disabled on every CUDA arch and sparse decode runs eager. The CPU cell
-    uses the CpuSparseGraph eager reference, which is token-exact at W=2 (the
-    width-2 oracle gate), so it stays enabled. Same device-type axis
-    ``_graph_on`` uses — no separate arch-string branch."""
+    PROBE-ONLY NARROWING (#805 serve window, branch probe/805-serve-sm70; NOT on
+    main): the keep_steps=W fix (#808) makes the captured sparse width-2 verify
+    correct on sm70 (device three-arm window: bit-equal to eager). So this branch
+    OPENS d>=1 sparse capture on sm70. sm90 stays CLOSED — #808 was validated on
+    sm70 only and the width-2 GDN/attention path has never been checked there.
+    Every other CUDA arch also stays closed (conservative). The CPU cell uses the
+    CpuSparseGraph eager reference and is token-exact at W=2, so it stays enabled.
+    This predicate is the single gate; no separate arch-string branch is added."""
     if backend.device.type != "cuda":
         return True
+    if getattr(backend, "arch", "") == "sm70":
+        return True  # probe branch: #808 verified on sm70
     return not (has_draft and (spec_depth or 0) >= 1)
 
 
