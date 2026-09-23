@@ -281,20 +281,27 @@ v2's cycle is `7 x plain + 1 x carrying tick`.
    mod8==0 clustering applies only to the delayed run, since the floor has no
    diverged prompt to cluster.
 
-5. **RESULT — the gate that decides go.** Measured effective tok/s for the
-   same configuration the baseline used (sparse graph + draft W=2 + W2048 +
-   `sparse_min_tokens=0`), **>= 24.9 x 1.2 = 29.9 tok/s**. The 24.9 baseline is
-   committed at `scripts/v2_baseline_24p915.json` (`warm_effective_tok_s` =
-   24.915, warm window = ticks [16, end) with the close tick excluded, from
-   the `graph_w2048` stage-1 window on the same machine).
+5. **RESULT — the gate that decides go.** Run **control -> v2 -> control**,
+   each in its own process, on the SAME prompts, in the same window (the two
+   controls are the placement control: **if they differ by > 5% the whole
+   window is invalid**).
 
-   **Provenance caveat, stated because it changes how a near-miss reads.**
-   That baseline was measured on an earlier revision with a different prompt
-   set, so it is a *historical* reference, not a same-run control. The v2
-   window should re-measure the current configuration as a control **in the
-   same window and on the same prompts** and report both against the 29.9
-   line; if the control itself lands away from 24.9, the 29.9 line is the
-   wrong ruler and that must be said before the result is read, not after.
+   The control is the current configuration (sparse graph + draft W=2 + W2048
+   + `sparse_min_tokens=0`), i.e. the delayed design off. **The gate is the
+   ratio:**
+
+       v2 eff tok/s / same-window control eff tok/s >= 1.20
+
+   **Both absolute values are reported**, alongside the historical reference
+   24.9 tok/s. The ratio is the ruling: if the control deviates from 24.9 by
+   more than 10%, then 29.9 is no longer used as the line, but the deviation
+   **must be explained separately in the verdict and cannot be skipped** —
+   otherwise a control that drifted for an unrelated reason silently re-sets
+   the bar.
+
+   Why the baseline is a separate committed artifact at all: it is the only
+   cross-window anchor, and it is what the ratio is checked *against* for
+   sanity, not what the gate divides by.
 
 **The v1 background figures are a LOWER BOUND, not the v2 budget.** v1's
 background was a synthetic load with zero side effects (no l2p writes, no
