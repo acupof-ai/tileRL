@@ -684,6 +684,7 @@ class Engine:
         self._kv = kv_pool
         self._states = state_pool
         self._sparse: SparseRuntime | None = None
+        self._sparse_shadow = None  # PROBE-ONLY #805 shadow v1, env-gated
         self._sparse_k = sparse_k
         # Hybrid mode (sparse engine only): prompts longer than this go sparse;
         # shorter ones run dense on the captured graph and pin their whole context.
@@ -953,6 +954,17 @@ class Engine:
                 bump_decode_forwards=self._bump_decode_forwards,
                 step_timing=self._step_timing,
             )
+            # PROBE-ONLY (#805): shadow v1 background timing. Env-gated; the
+            # object is a no-op unless TILERL_SPARSE_SHADOW is set, so default
+            # behavior is unchanged. Only the captured-graph arm shadows — the
+            # forced-eager/baseline arms never replay, so carving their pool
+            # would only starve the eager path. Lives on this probe branch.
+            if sparse_graph_on and os.environ.get("TILERL_SPARSE_SHADOW",
+                                                   "off") != "off":
+                from .sparse_shadow import SparseShadow
+
+                self._sparse_shadow = SparseShadow(self._sparse.ctx,
+                                                   self._sparse.tracker)
 
     # ------------------------------------------------------------------ API
 
@@ -1624,6 +1636,8 @@ class Engine:
         if t is not None:
             t.join(timeout)
         self._thread = None
+        if self._sparse_shadow is not None:
+            self._sparse_shadow.close()  # PROBE-ONLY #805
         if self._sparse is not None and self._sparse.prefix is not None:
             self._sparse.prefix.clear()  # release shared prefix blobs to the cold tier
 
@@ -2013,6 +2027,13 @@ class Engine:
                 _tm.fwd_path = "graph"
                 _tm.fwd_sparse = True
             self._hybrid_charge(True)
+            # PROBE-ONLY (#805): launch shadow v1 background select+promote on
+            # a side stream after each captured sparse graph tick. No residency
+            # side effect, so tokens are unchanged.
+            sh = self._sparse_shadow
+            if sh is not None and sh.enabled:
+                q_dec = [len(c) for c in chains] if chains else [1] * len(decodes)
+                sh.after_graph_tick(self._sparse.decode_rows(decodes, q_dec))
             return
         rows = decodes + prefills
         seq_q = q_dec + chunks
