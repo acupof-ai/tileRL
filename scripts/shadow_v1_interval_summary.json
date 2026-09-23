@@ -1,0 +1,157 @@
+{
+  "raw_dir": "/home/chenkailun.c/shadowwin-0924-054509",
+  "parser": "scripts/probe_shadow_interval.py",
+  "parser_sha": "96bc4fa0",
+  "configs": {
+    "off": {
+      "steps": 309,
+      "graph_decode": 206,
+      "seg0": {
+        "n": 50,
+        "graph_p50": 42.0,
+        "stats_p50": 3.0
+      },
+      "seg2": {
+        "n": 50,
+        "graph_p50": 42.0,
+        "stats_p50": 3.0
+      },
+      "seg0_plain_gaps": {
+        "n": 43,
+        "p50": 46,
+        "min": 40,
+        "max": 1155
+      },
+      "seg0_gaps_with_intervening_step": {
+        "n": 7,
+        "p50": 278
+      },
+      "off_segments_past_first": {
+        "n": 55,
+        "p50": 45
+      },
+      "tick80_raw": "[step-timing] tick 80 total=40ms dec=1 pre=0 plan=0ms stats=3ms graph=37ms forward=37ms charge=0ms ssd_mmap=0ms free=3914MiB reserved=28058MiB path=graph sparse=1 fwd_host=37ms fwd_gpu=37ms stall=0ms d_malloc=0 d_free=0 seg+=0 seg-=0 retries=0 sync_streams=0 oom=0 reject=0 alloc_conf=default why=gpu_drain",
+      "parser_analyze": "== /home/chenkailun.c/shadowwin-0924-054509/shadow_v1_off.dev.err\n   steps=309 graph_decode=206\n   off-seg 0: n=50 p50=46 p90=271 min=40 max=1155\n   off-seg 2: n=50 p50=45 p90=235 min=40 max=346\n   off-seg 4: n=5 p50=46 p90=258 min=46 max=258\n   OFF gaps total n=105 p50=46 p90=263\n   plain   n=90 p50=45 p90=47 max=1155\n   refresh n=15 p50=266 min=229 max=361\n   OTHER   n=0\n"
+    },
+    "quest": {
+      "steps": 309,
+      "graph_decode": 206,
+      "seg0": {
+        "n": 50,
+        "graph_p50": 42.0,
+        "stats_p50": 3.0
+      },
+      "seg2": {
+        "n": 50,
+        "graph_p50": 42.0,
+        "stats_p50": 4.0
+      },
+      "seg0_plain_gaps": {
+        "n": 43,
+        "p50": 46,
+        "min": 40,
+        "max": 1167
+      },
+      "seg0_gaps_with_intervening_step": {
+        "n": 7,
+        "p50": 282
+      },
+      "off_segments_past_first": {
+        "n": 55,
+        "p50": 46
+      },
+      "tick80_raw": "[step-timing] tick 80 total=40ms dec=1 pre=0 plan=0ms stats=3ms graph=37ms forward=37ms charge=0ms ssd_mmap=0ms free=3914MiB reserved=28058MiB path=graph sparse=1 fwd_host=37ms fwd_gpu=37ms stall=0ms d_malloc=0 d_free=0 seg+=0 seg-=0 retries=0 sync_streams=0 oom=0 reject=0 alloc_conf=default why=gpu_drain",
+      "parser_analyze": "== /home/chenkailun.c/shadowwin-0924-054509/shadow_v1_quest.dev.err\n   steps=309 graph_decode=206\n   off-seg 0: n=50 p50=46 p90=272 min=40 max=1167\n   off-seg 2: n=50 p50=46 p90=242 min=40 max=1571\n   off-seg 4: n=5 p50=46 p90=249 min=45 max=249\n   OFF gaps total n=105 p50=46 p90=267\n   plain   n=90 p50=46 p90=100 max=1167\n   refresh n=15 p50=272 min=229 max=1571\n   OTHER   n=0\n"
+    },
+    "h2d107": {
+      "steps": 309,
+      "graph_decode": 206,
+      "seg0": {
+        "n": 50,
+        "graph_p50": 84.0,
+        "stats_p50": 41.0
+      },
+      "seg2": {
+        "n": 50,
+        "graph_p50": 42.0,
+        "stats_p50": 3.0
+      },
+      "seg0_plain_gaps": {
+        "n": 43,
+        "p50": 127,
+        "min": 40,
+        "max": 1393
+      },
+      "seg0_gaps_with_intervening_step": {
+        "n": 7,
+        "p50": 1742
+      },
+      "off_segments_past_first": {
+        "n": 55,
+        "p50": 46
+      },
+      "tick80_raw": "[step-timing] tick 80 total=123ms dec=1 pre=0 plan=0ms stats=43ms graph=79ms forward=80ms charge=0ms ssd_mmap=0ms free=3914MiB reserved=28058MiB path=graph sparse=1 fwd_host=80ms fwd_gpu=80ms stall=0ms d_malloc=0 d_free=0 seg+=0 seg-=0 retries=0 sync_streams=0 oom=0 reject=0 alloc_conf=default why=gpu_drain",
+      "parser_analyze": "== /home/chenkailun.c/shadowwin-0924-054509/shadow_v1_h2d107.dev.err\n   steps=309 graph_decode=206\n   off-seg 0: n=50 p50=128 p90=1393 min=40 max=2402\n   off-seg 2: n=50 p50=45 p90=235 min=40 max=298\n   off-seg 4: n=5 p50=48 p90=246 min=45 max=246\n   OFF gaps total n=105 p50=61 p90=251\n   plain   n=90 p50=47 p90=135 max=1393\n   refresh n=15 p50=298 min=232 max=2402\n   OTHER   n=0\n"
+    },
+    "both107": {
+      "steps": 309,
+      "graph_decode": 206,
+      "seg0": {
+        "n": 50,
+        "graph_p50": 45.5,
+        "stats_p50": 5.0
+      },
+      "seg2": {
+        "n": 50,
+        "graph_p50": 42.0,
+        "stats_p50": 3.0
+      },
+      "seg0_plain_gaps": {
+        "n": 43,
+        "p50": 53,
+        "min": 43,
+        "max": 7783
+      },
+      "seg0_gaps_with_intervening_step": {
+        "n": 7,
+        "p50": 349
+      },
+      "off_segments_past_first": {
+        "n": 55,
+        "p50": 45
+      },
+      "tick80_raw": "[step-timing] tick 80 total=84ms dec=1 pre=0 plan=0ms stats=22ms graph=62ms forward=62ms charge=0ms ssd_mmap=0ms free=3914MiB reserved=28058MiB path=graph sparse=1 fwd_host=62ms fwd_gpu=62ms stall=0ms d_malloc=0 d_free=0 seg+=0 seg-=0 retries=0 sync_streams=0 oom=0 reject=0 alloc_conf=default why=gpu_drain",
+      "parser_analyze": "== /home/chenkailun.c/shadowwin-0924-054509/shadow_v1_both107.dev.err\n   steps=309 graph_decode=206\n   off-seg 0: n=50 p50=59 p90=282 min=43 max=7783\n   off-seg 2: n=50 p50=45 p90=232 min=40 max=294\n   off-seg 4: n=5 p50=48 p90=239 min=45 max=239\n   OFF gaps total n=105 p50=46 p90=249\n   plain   n=90 p50=46 p90=125 max=7783\n   refresh n=15 p50=264 min=226 max=2406\n   OTHER   n=0\n"
+    },
+    "h2d206": {
+      "steps": 309,
+      "graph_decode": 206,
+      "seg0": {
+        "n": 50,
+        "graph_p50": 42.0,
+        "stats_p50": 4.0
+      },
+      "seg2": {
+        "n": 50,
+        "graph_p50": 42.0,
+        "stats_p50": 3.0
+      },
+      "seg0_plain_gaps": {
+        "n": 43,
+        "p50": 46,
+        "min": 41,
+        "max": 1926
+      },
+      "seg0_gaps_with_intervening_step": {
+        "n": 7,
+        "p50": 292
+      },
+      "off_segments_past_first": {
+        "n": 55,
+        "p50": 46
+      },
+      "tick80_raw": "[step-timing] tick 80 total=119ms dec=1 pre=0 plan=0ms stats=36ms graph=82ms forward=83ms charge=0ms ssd_mmap=0ms free=3914MiB reserved=28058MiB path=graph sparse=1 fwd_host=83ms fwd_gpu=83ms stall=0ms d_malloc=0 d_free=0 seg+=0 seg-=0 retries=0 sync_streams=0 oom=0 reject=0 alloc_conf=default why=gpu_drain",
+      "parser_analyze": "== /home/chenkailun.c/shadowwin-0924-054509/shadow_v1_h2d206.dev.err\n   steps=309 graph_decode=206\n   off-seg 0: n=50 p50=46 p90=292 min=41 max=2316\n   off-seg 2: n=50 p50=46 p90=244 min=40 max=337\n   off-seg 4: n=5 p50=47 p90=242 min=46 max=242\n   OFF gaps total n=105 p50=46 p90=268\n   plain   n=90 p50=46 p90=83 max=1926\n   refresh n=15 p50=272 min=236 max=2316\n   OTHER   n=0\n"
+    }
+  }
+}
