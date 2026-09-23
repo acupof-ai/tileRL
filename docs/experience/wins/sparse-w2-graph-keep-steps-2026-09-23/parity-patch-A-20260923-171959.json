@@ -1,0 +1,406 @@
+[
+ {
+  "W": 1,
+  "verdict": "MATCH",
+  "rows": [
+   {
+    "bucket": 512,
+    "W": 1,
+    "observed_bucket": 512,
+    "graph_perf": {
+     "n_ticks": 47,
+     "n_produced": 47,
+     "decode_s": 4.060751922428608,
+     "n_w2_ticks": null,
+     "strict_accept": null
+    },
+    "eager_perf": {
+     "n_ticks": 47,
+     "n_produced": 47,
+     "decode_s": 7.933929572813213,
+     "n_w2_ticks": null,
+     "strict_accept": null
+    },
+    "n_tokens": [
+     8311,
+     8311
+    ],
+    "graph_replays": 42,
+    "graph_head": [
+     16,
+     220,
+     17,
+     220,
+     18,
+     220,
+     19,
+     220,
+     20,
+     220,
+     21,
+     220,
+     22,
+     220,
+     23,
+     220
+    ],
+    "eager_head": [
+     16,
+     220,
+     17,
+     220,
+     18,
+     220,
+     19,
+     220,
+     20,
+     220,
+     21,
+     220,
+     22,
+     220,
+     23,
+     220
+    ],
+    "produced": [
+     47,
+     47
+    ],
+    "verdict": "MATCH"
+   },
+   {
+    "bucket": 1024,
+    "W": 1,
+    "observed_bucket": 1024,
+    "graph_perf": {
+     "n_ticks": 47,
+     "n_produced": 47,
+     "decode_s": 3.1633687978610396,
+     "n_w2_ticks": null,
+     "strict_accept": null
+    },
+    "eager_perf": {
+     "n_ticks": 47,
+     "n_produced": 47,
+     "decode_s": 7.5126833897084,
+     "n_w2_ticks": null,
+     "strict_accept": null
+    },
+    "n_tokens": [
+     16503,
+     16503
+    ],
+    "graph_replays": 41,
+    "graph_head": [
+     16,
+     198,
+     17,
+     198,
+     18,
+     198,
+     19,
+     198,
+     20,
+     198,
+     21,
+     198,
+     22,
+     198,
+     23,
+     198
+    ],
+    "eager_head": [
+     16,
+     198,
+     17,
+     198,
+     18,
+     198,
+     19,
+     198,
+     20,
+     198,
+     21,
+     198,
+     22,
+     198,
+     23,
+     198
+    ],
+    "produced": [
+     47,
+     47
+    ],
+    "verdict": "MATCH"
+   },
+   {
+    "bucket": 2048,
+    "W": 1,
+    "observed_bucket": 2048,
+    "graph_perf": {
+     "n_ticks": 47,
+     "n_produced": 47,
+     "decode_s": 4.058625993318856,
+     "n_w2_ticks": null,
+     "strict_accept": null
+    },
+    "eager_perf": {
+     "n_ticks": 47,
+     "n_produced": 47,
+     "decode_s": 8.964363843202591,
+     "n_w2_ticks": null,
+     "strict_accept": null
+    },
+    "n_tokens": [
+     32887,
+     32887
+    ],
+    "graph_replays": 41,
+    "graph_head": [
+     16,
+     198,
+     17,
+     198,
+     18,
+     198,
+     19,
+     198,
+     20,
+     198,
+     21,
+     198,
+     22,
+     198,
+     23,
+     198
+    ],
+    "eager_head": [
+     16,
+     198,
+     17,
+     198,
+     18,
+     198,
+     19,
+     198,
+     20,
+     198,
+     21,
+     198,
+     22,
+     198,
+     23,
+     198
+    ],
+    "produced": [
+     47,
+     47
+    ],
+    "verdict": "MATCH"
+   }
+  ],
+  "faults": []
+ },
+ {
+  "W": 2,
+  "verdict": "MATCH",
+  "rows": [
+   {
+    "bucket": 512,
+    "W": 2,
+    "observed_bucket": 512,
+    "graph_perf": {
+     "n_ticks": 24,
+     "n_produced": 47,
+     "decode_s": 4.694512862712145,
+     "n_w2_ticks": 24,
+     "strict_accept": 1.9583333333333333
+    },
+    "eager_perf": {
+     "n_ticks": 24,
+     "n_produced": 47,
+     "decode_s": 5.8504781275987625,
+     "n_w2_ticks": 24,
+     "strict_accept": 1.9583333333333333
+    },
+    "n_tokens": [
+     8311,
+     8311
+    ],
+    "graph_replays": 21,
+    "graph_head": [
+     16,
+     220,
+     17,
+     220,
+     18,
+     220,
+     19,
+     220,
+     20,
+     220,
+     21,
+     220,
+     22,
+     220,
+     23,
+     220
+    ],
+    "eager_head": [
+     16,
+     220,
+     17,
+     220,
+     18,
+     220,
+     19,
+     220,
+     20,
+     220,
+     21,
+     220,
+     22,
+     220,
+     23,
+     220
+    ],
+    "produced": [
+     47,
+     47
+    ],
+    "verdict": "MATCH"
+   },
+   {
+    "bucket": 1024,
+    "W": 2,
+    "observed_bucket": 1024,
+    "graph_perf": {
+     "n_ticks": 24,
+     "n_produced": 47,
+     "decode_s": 3.7020844193175435,
+     "n_w2_ticks": 24,
+     "strict_accept": 1.9583333333333333
+    },
+    "eager_perf": {
+     "n_ticks": 24,
+     "n_produced": 47,
+     "decode_s": 5.704308464191854,
+     "n_w2_ticks": 24,
+     "strict_accept": 1.9583333333333333
+    },
+    "n_tokens": [
+     16503,
+     16503
+    ],
+    "graph_replays": 21,
+    "graph_head": [
+     16,
+     198,
+     17,
+     198,
+     18,
+     198,
+     19,
+     198,
+     20,
+     198,
+     21,
+     198,
+     22,
+     198,
+     23,
+     198
+    ],
+    "eager_head": [
+     16,
+     198,
+     17,
+     198,
+     18,
+     198,
+     19,
+     198,
+     20,
+     198,
+     21,
+     198,
+     22,
+     198,
+     23,
+     198
+    ],
+    "produced": [
+     47,
+     47
+    ],
+    "verdict": "MATCH"
+   },
+   {
+    "bucket": 2048,
+    "W": 2,
+    "observed_bucket": 2048,
+    "graph_perf": {
+     "n_ticks": 24,
+     "n_produced": 47,
+     "decode_s": 6.433615917339921,
+     "n_w2_ticks": 24,
+     "strict_accept": 1.9583333333333333
+    },
+    "eager_perf": {
+     "n_ticks": 24,
+     "n_produced": 47,
+     "decode_s": 8.515388898551464,
+     "n_w2_ticks": 24,
+     "strict_accept": 1.9583333333333333
+    },
+    "n_tokens": [
+     32887,
+     32887
+    ],
+    "graph_replays": 21,
+    "graph_head": [
+     16,
+     198,
+     17,
+     198,
+     18,
+     198,
+     19,
+     198,
+     20,
+     198,
+     21,
+     198,
+     22,
+     198,
+     23,
+     198
+    ],
+    "eager_head": [
+     16,
+     198,
+     17,
+     198,
+     18,
+     198,
+     19,
+     198,
+     20,
+     198,
+     21,
+     198,
+     22,
+     198,
+     23,
+     198
+    ],
+    "produced": [
+     47,
+     47
+    ],
+    "verdict": "MATCH"
+   }
+  ],
+  "faults": []
+ }
+]
