@@ -81,20 +81,33 @@ def _decode_extra_blocks(seq_len: int, q: int, held: int) -> int:
 _sm70_graph_warned = False
 
 
+#: Archs on which the speculated sparse captured decode graph has been
+#: measured correct. sm70 only: the #805 keep_steps=W fix was verified there by
+#: the 09-17 first-replay value gate (per-bucket first replay aligned to an
+#: eager reference, 6/6 prompts, both widths) and by a same-window serve run at
+#: 24.915 tok/s. sm90 is UNVERIFIED — keep it guarded until its own measurement.
+_SPEC_SPARSE_GRAPH_VERIFIED_ARCHS = ("sm70",)
+
+
 def _sparse_capture_allowed(backend, has_draft: bool, spec_depth: int | None) -> bool:
     """Whether the sparse captured decode graph may be armed for this engine.
 
     Guard A (#805): on CUDA the captured sparse graph is only correct on the
     d=0 single-token path. With speculation (spec_depth>=1) the width-2
     captured verify replays trunk logits/hidden that disagree with eager and
-    drafts stop accepting; it diverged on sm70 and is unverified on sm90, so it
-    is disabled on every CUDA arch and sparse decode runs eager. The CPU cell
-    uses the CpuSparseGraph eager reference, which is token-exact at W=2 (the
-    width-2 oracle gate), so it stays enabled. Same device-type axis
-    ``_graph_on`` uses — no separate arch-string branch."""
+    drafts stop accepting. That was true of the pre-#805 build on every CUDA
+    arch; the `keep_steps=W` fix (PR #808) was then measured correct on **sm70**
+    by the 09-17 first-replay value gate against an eager reference, so sm70 may
+    now be armed under speculation. Any arch not in
+    ``_SPEC_SPARSE_GRAPH_VERIFIED_ARCHS`` stays guarded — unverified is not the
+    same as fixed, and sm90 has not been measured. The CPU cell uses the
+    CpuSparseGraph eager reference, which is token-exact at W=2 (the width-2
+    oracle gate), so it stays enabled. Device-type axis as ``_graph_on``."""
     if backend.device.type != "cuda":
         return True
-    return not (has_draft and (spec_depth or 0) >= 1)
+    if not (has_draft and (spec_depth or 0) >= 1):
+        return True
+    return getattr(backend, "arch", "") in _SPEC_SPARSE_GRAPH_VERIFIED_ARCHS
 
 
 def _graph_on(backend, decode_graph: bool | None) -> bool:
@@ -727,21 +740,24 @@ class Engine:
         #
         # Guard A (#805): on CUDA the captured sparse graph is only correct on
         # the d=0 single-token path. With speculation (spec_depth>=1) the
-        # width-2 captured verify replays trunk logits/hidden that disagree with
-        # eager and drafts stop accepting; it is unverified on every CUDA arch
-        # (observed diverging on sm70, not validated on sm90), so disable the
-        # sparse capture there and run sparse decode eager. Scope is CUDA only:
-        # the CPU cell uses the CpuSparseGraph eager reference recording, which
-        # is token-exact at W=2 and stays enabled (the W=2 CPU gate is the
-        # oracle for the width-2 root-cause triage). Same device-type axis
-        # _graph_on already uses; no separate arch string branch.
+        # width-2 captured verify replayed trunk logits/hidden that disagreed
+        # with eager and drafts stopped accepting; the keep_steps=W fix (#805,
+        # PR #808) was then measured correct on sm70 by the 09-17 first-replay
+        # value gate, so sm70 arms the capture under speculation. Other CUDA
+        # archs stay guarded: unverified is not the same as fixed. Scope is the
+        # arch list in _sparse_capture_allowed, not the device type alone; the
+        # CPU cell uses the CpuSparseGraph eager reference recording, which is
+        # token-exact at W=2 and stays enabled (the W=2 CPU gate is the oracle
+        # for the width-2 root-cause triage).
         cuda_spec_guard = not _sparse_capture_allowed(backend, draft is not None, spec_depth)
         if cuda_spec_guard:
             warnings.warn(
                 "sparse decode graph auto-disabled with speculation on CUDA "
-                f"(spec_depth={spec_depth}): captured sparse width-2 verify is "
-                "unverified on this arch (diverges on sm70, #805); sparse "
-                "decode runs eager. CPU reference is unaffected.",
+                f"(spec_depth={spec_depth}, arch="
+                f"{getattr(backend, 'arch', '?')!r}): the captured sparse "
+                "width-2 verify is verified only on sm70 (#805, PR #808); this "
+                "arch is unmeasured, so sparse decode runs eager. CPU reference "
+                "is unaffected.",
                 stacklevel=2,
             )
         sparse_graph_on = (

@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-09-24
+- **default flip (sparse, #805)** — the speculated sparse captured decode graph
+  is armed on **sm70 only**. `_sparse_capture_allowed` (guard A) kept it off on
+  every CUDA arch at `spec_depth>=1` because the width-2 captured verify
+  replayed logits/hidden that disagreed with eager; the `keep_steps=W` fix
+  (PR #808) changed what that verify replays and was device-measured correct on
+  sm70 (**6/6 cells MATCH**, `tok/fwd` strictly equal to eager, both orders).
+  The predicate now returns membership in an explicit
+  `_SPEC_SPARSE_GRAPH_VERIFIED_ARCHS = ("sm70",)`: sm90 and every other CUDA
+  arch stay guarded (unverified is not fixed), and an arch the backend does not
+  identify **fails safe** rather than being allowed by omission. `spec_depth=0`,
+  non-CUDA and the CPU cell are unchanged. Service-shape correctness at the new
+  default and the same-window speed ratio are `pending-remote`, to be supplied
+  by the production cutover window (full-sequence comparison, both arms, temp0);
+  the earlier window's 24.915 tok/s stands as a measurement but that window
+  exited rc14 (`only 6 prompts, floor 20`) and has no same-window eager arm, so
+  no "vs eager" figure may be quoted from it.
+  — [wins/2026-09-23-sm70-spec-sparse-graph-armed.md](docs/experience/wins/2026-09-23-sm70-spec-sparse-graph-armed.md)
+
 ## 2026-09-23
 - **accept (sparse, #805)** — root cause found for the divergence the guard
   above fences. `SparseDecodeGraph` built its per-tick `BatchKv` with
