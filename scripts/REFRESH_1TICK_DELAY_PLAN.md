@@ -51,16 +51,30 @@ the real delay only if shadow shows it fits.
 Churn is not quality. The delayed configuration is judged against the CURRENT
 R=8 synchronous refresh on the same prompts, temp 0, same seed.
 
-1. NOISE FLOOR (measured first). Run the synchronous R=8 configuration TWICE
-   on the same prompts/seed; per-prompt token agreement between the two runs
-   is `floor_i` (sm70 temp 0 need not be bit-deterministic). The delayed run
-   is judged against this floor, never against 100%.
+1. NOISE FLOOR — MEASURED 2026-09-24, revision 768c3f8c, V100 sm70, same
+   machine, two back-to-back synchronous R=8 graph floor runs (no other job in
+   between), 6 real 37.6k wikitext prompts, 1024 generated each:
+   `compare_refresh_runs.py floorA_pp floorB_pp`:
+   - min/mean/median per-prompt agreement all **1.0**; n_diverged_prompts 0;
+     every prompt matched 1024/1024; first divergence null; mod8 null.
+   So the temp-0 noise floor on this machine is exactly 0, not an assumption.
+   Distinct inodes, 25 min apart; cross-prompt runs differ at position 0, so
+   the identical result is run-to-run determinism, not a vacuous comparator.
+   Consequences, locked with the measurement:
+   - the −1.0pp / −0.5pp slacks now absorb ONLY the delayed side's drift, not
+     measurement noise (measured noise is zero);
+   - `median first-divergence >= 128` is the binding divergence criterion (an
+     agreement of 0.9951 would still clear 0.99);
+   - the mod8==0 clustering check has no object in the floor (n_diverged=0);
+     it applies only to the delayed run.
 
 2. PASS LINE, fixed BEFORE any delayed run and not adjusted afterward:
-   - per-prompt agreement `>= floor_i - 1.0 percentage point` for every prompt;
-   - mean agreement across prompts `>= floor_mean - 0.5 percentage point`;
+   - per-prompt agreement `>= floor_i - 1.0 percentage point` for every prompt
+     (floor_i measured = 1.0, so effective line 0.99);
+   - mean agreement across prompts `>= floor_mean - 0.5 percentage point`
+     (effective 0.995);
    - median first-divergence position `>= 128` generated tokens (16 refresh
-     periods; a divergence in the first 128 tokens fails);
+     periods; a divergence in the first 128 tokens fails) — the binding line;
    - divergences must not be monotonic-clustering at refresh boundaries
      (record divergence position mod 8; a run dominated by position 0 fails
      even if the aggregate agreement passes).
