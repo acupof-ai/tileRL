@@ -167,6 +167,21 @@ should be config-independent. Offline parser `probe_shadow_interval.py` splits
 OFF gaps into plain / spans-eager-refresh / other intervening steps and by
 segment, to localize it (non-steady first gaps vs an intervening-step class).
 
+RESOLVED 2026-09-24 (fixmisc, parser + raw ticks): probe artifact, not device.
+The anomalous mass is entirely in segment 0 (the FIRST 50 graph ticks, the
+non-steady startup window): h2d107 seg0 graph p50 84 / stats p50 41 vs seg2
+42 / 3; the other four configs are 42 / 3 in BOTH segments. OTHER n=0 in every
+file. seg0 happened to contain ~10 high-cost steps (a periodic `stats` ~40 ms,
+why=gpu_drain, same free MiB, no malloc/stall) that the steady segments do not.
+Steady-state (seg>0, n=55) OFF p50 = 46 for h2d107, 45 for off. Carve does not
+elevate steady ticks (h2d107 seg2 == off seg2 == 42). Conclusion unchanged:
+gate 1 was 71.43 ≤ 61.77 → False, and is even falser at the honest denominator
+46; the no-go is independent of which denominator is used. The v1 probe is not
+re-run (verdict locked, window is costly). Measurement rule carried into v2:
+**discard the startup segment before taking cycle p50/p90**, and the cycle's
+8th-tick wait IS part of the design and stays in the steady-state distribution.
+
+
 ## v2 — real 1-tick delay (ruling 2026-09-24)
 
 Shadow GO/NO-GO as pre-registered is mooted by the object error; build the real
