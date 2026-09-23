@@ -694,6 +694,12 @@ def _install_parity_hooks(engine, job):
                 boundary = {
                     "out_before": len(r.output),
                     "seq_before": int(r.seq_len),
+                    # This forward's query width (chain length on a verify tick,
+                    # 1 on a plain decode). The STRICT accept rate is
+                    # tokens_committed/width per tick, so the width has to be
+                    # recorded with the tick; `n_produced/n_ticks` is a different
+                    # quantity and both are reported.
+                    "width": int(srow.get("tq") or 1),
                     "cmax": len(srow["cand"]),
                     "phase": int(r.phase),
                     "path": job["path"],
@@ -1039,9 +1045,11 @@ def _perf_line(cell: dict) -> str:
         rate = (n_k / secs) if n_k is not None else None
         acc_s = f"{acc:.3f}" if acc is not None else "na"
         rate_s = f"{rate:.1f}" if rate is not None else "na"
+        st = p_.get("strict_accept")
+        st_s = f"{st:.3f}" if st is not None else "na"
         parts.append(
-            f"{name}_acc={acc_s} {name}_ms/tick={1000 * secs / n_t:.1f} "
-            f"{name}_tok/s={rate_s}"
+            f"{name}_tok/fwd={acc_s} {name}_accept={st_s} "
+            f"{name}_ms/tick={1000 * secs / n_t:.1f} {name}_tok/s={rate_s}"
         )
     return " ".join(parts)
 
@@ -1157,10 +1165,22 @@ def compare_parity(source, draft, depth):
     rows, harness, bad = [], [], []
     for gc_, ec in zip(g.get("cells", []), e.get("cells", [])):
         def _perf(c):
+            ticks_ = c.get("ticks") or []
+            # Strict accept rate: per tick, committed tokens over that tick's
+            # query width, averaged. On a verify tick width=W and the commit is
+            # 1..W tokens; a plain decode tick has width 1 and always commits 1,
+            # so including it would dilute the rate -- hence the split.
+            w2 = [t for t in ticks_ if int(t.get("width") or 1) > 1]
+            strict = (
+                sum(len(t.get("tokens") or []) for t in w2) / len(w2)
+                if w2 else None
+            )
             return {
                 "n_ticks": c.get("n_ticks"),
                 "n_produced": c.get("n_produced"),
                 "decode_s": c.get("decode_s"),
+                "n_w2_ticks": len(w2) or None,
+                "strict_accept": strict,
             }
 
         cell = {
