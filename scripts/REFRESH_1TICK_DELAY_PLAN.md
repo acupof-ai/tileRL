@@ -146,8 +146,10 @@ process, 106 OFF / 100 ON graph ticks per config.
 | both107 | 54.77 | 55.60 | 56.55 | 46.59 | 46.12 | 77.99 | **1.691** | **1.0** | 107 |
 | h2d206 | 67.01 | 68.50 | 69.15 | 46.43 | 46.19 | 64.45 | 1.395 | **1.0** | 206 |
 
-All three H2D configs failed the pre-registered GO line (rc1). The token
-gate passed everywhere (`OK (400 tokens)`), which is the one v1 property
+All three H2D configs failed the pre-registered GO line (rc1). **This
+no-go is v1's verdict.** It is not a verdict on the 1-tick design, whose
+binding gates are the measured 8-step cycle time and the quality gate
+above. The token gate passed everywhere (`OK (400 tokens)`), which is the one v1 property
 that was being tested and held: shadow on/off produce identical output, so
 the background has no residency side effect. Measured cold-promotion
 distribution: n=29, p50 69, **p90 138**, max 156 — the p90 sits between the
@@ -184,11 +186,38 @@ not the 40+ the per-tick arithmetic suggested. These are arithmetic on v1
 numbers and are labelled estimates; the delayed configuration's cycle time
 must be measured, and that measurement is a binding gate, not this table.
 
-One instrument reading is unexplained and is handed to the probe owner:
-`h2d107`'s OFF interval p50 is 61.77 ms while all four other configs read
-45.9–46.6 ms. OFF segments emit no background, so that quantity should not
-depend on the config; it raises `h2d107`'s criterion-1 denominator, but all
-three of its gates fail regardless.
+### The `h2d107` OFF-interval anomaly — attributed (`96bc4fa0`)
+
+`h2d107`'s OFF interval p50 read 61.77 ms while all four other configs read
+45.9–46.6 ms, and OFF segments emit no background, so that quantity should not
+depend on the config. An offline parser over the `[step-timing]` log
+(`scripts/probe_shadow_interval.py`, splitting each OFF gap into
+plain / spans-a-refresh / other) locates it: it is **`h2d107`'s first OFF
+segment only**.
+
+| config | seg0 graph p50 | seg0 `stats` p50 | seg2 graph p50 | seg2 `stats` p50 |
+|---|---:|---:|---:|---:|
+| off | 42 | **3** | 42 | 3 |
+| quest | 42 | 3 | 42 | 4 |
+| **h2d107** | **84** | **41** | 42 | 3 |
+| both107 | 45.5 | 5 | 42 | 3 |
+| h2d206 | 42 | 4 | 42 | 3 |
+
+`OTHER n=0` in all five files, so no extra class of gap exists. Raw lines at
+the same tick show the extra is host-side: `h2d107` tick 80 is
+`total=123 stats=43 graph=79` against `off` tick 80 `total=40 stats=3
+graph=37`, at the same `free=3914 MiB`, `why=gpu_drain`, `d_malloc=0`, no
+stall.
+
+**Cause is the probe's segmentation, not the device.** `run_one_mode` cuts
+segments by **graph-tick ordinal**, but the `stats` block runs on every
+`step()`, so segment 0 holds ~60 steps of which ~10 are non-graph; `h2d107`
+happened to carry expensive ones in that window. Corrected denominator (OFF
+segments past the first, n=55 each): `h2d107` **46**, `off` 45, `both107` 45.
+Criterion 1 was `71.43 <= 61.77 → False`; at 46 it is more False. **All three
+gates fail under either denominator, so the v1 no-go does not depend on this
+denominator.** The fix (adopted for the v2 probe) is to cut segments by step
+index rather than by graph-tick ordinal.
 
 ## Device measurement order
 
@@ -198,6 +227,7 @@ three of its gates fail regardless.
   refresh interval; see Mechanism.
 - DONE (shadow v1, 0195bcce..24898a26). See "Shadow v1 — result" above.
 - NEXT: v2 (real lagged-q + mapping), background launched only on refresh
-  ticks. Binding gates: the quality gate above (floor 1.0; median
-  first-divergence >= 128) **plus a measured cycle time** from the delayed
-  configuration itself.
+  ticks. Binding gates for v2 are the quality gate above (floor 1.0;
+  median first-divergence >= 128) **plus a measured 8-step cycle time**
+  from the delayed configuration itself. v1's own no-go is v1's verdict,
+  not a verdict on the design.
