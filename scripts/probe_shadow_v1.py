@@ -36,15 +36,21 @@ SEGMENT = 50  # graph ticks per off/on segment; n >= 50 per side, alternating
 # volumes: 107 = offers_pages p90 (proxy), 206 = observed max eviction (real
 # bound seen on device), 512 = 4*k supremum. The gate is read at the volume
 # matching the measured real promotion p90 (reported per run).
-QUEST_MODE = ("quest", None)
-H2D_VOLUMES = (107, 206, 512)
+# Trimmed to a realistic set. cold_promotions measured 40-66 in the crashed
+# window, so 107 brackets the real promotion p90 and 206 is the observed
+# eviction max / realistic upper bound. 512 (4*k supremum) dropped: it is 8x
+# the measured rate and only ever saturated PCIe. "off" runs the same engine
+# with the shadow disabled for an in-process baseline.
+H2D_VOLUMES = (107, 206)
 
 
 def configs(smoke: bool):
     if smoke:
-        # Tiny CPU pool cannot hold the device volumes; one small h2d point.
-        return [QUEST_MODE, ("h2d", 16), ("both", 16)]
-    return [QUEST_MODE] + [(m, p) for p in H2D_VOLUMES for m in ("h2d", "both")]
+        # Tiny CPU pool cannot hold the device volumes; small h2d points only.
+        return [("off", None), ("quest", None), ("h2d", 16),
+                ("both", 16)]
+    return [("off", None), ("quest", None),
+            ("h2d", 107), ("both", 107), ("h2d", 206)]
 
 
 def label(mode, pages):
@@ -71,8 +77,9 @@ def run_one_mode(arm_mode, e, ids, max_new):
         PREVIOUS tick's background end event is already complete. Fraction NOT
         complete = refreshes that would miss a one-tick deadline (tail gate).
     """
-    sh = e._sparse_shadow
-    sh.set_active(False)
+    sh = e._sparse_shadow  # None for the dedicated "off" baseline config
+    if sh is not None:
+        sh.set_active(False)
 
     rid = e.submit(list(ids), _sampling(max_new))
     tm = e._step_timing
@@ -100,7 +107,7 @@ def run_one_mode(arm_mode, e, ids, max_new):
         # immediately: an eager refresh tick between two graph ticks must NOT
         # re-query the same event (that would inflate the denominator and can
         # turn a real miss into a later "complete").
-        if prev_was_on:
+        if prev_was_on and sh is not None:
             prev_was_on = False
             ev = sh.last_event
             if ev is not None:
@@ -121,7 +128,7 @@ def run_one_mode(arm_mode, e, ids, max_new):
             (on_w if seg_state == "on" else off_w).append(wall)
             seg_n += 1
             prev_was_on = seg_state == "on"
-            if seg_n >= SEGMENT:
+            if sh is not None and seg_n >= SEGMENT:
                 if seg_state == "on":
                     sh.wait_pending()  # don't leak background across boundary
                 seg_state = "on" if seg_state == "off" else "off"
@@ -149,7 +156,9 @@ def run_one_mode(arm_mode, e, ids, max_new):
         raise AssertionError(
             f"{arm_mode}: tail queries {bg_total} > n_graph_on {len(on_w)} "
             f"(an event was queried more than once)")
+    out = list(e.poll().get(rid, []))
     return {"mode": arm_mode, "h2d_pages": info.get("carved_scratch_pages"),
+            "n_out": len(out), "output": out,
             "n_graph_off": len(off_w), "n_graph_on": len(on_w),
             "graph_p50_off": pct(off_w, 50), "graph_p90_off": pct(off_w, 90),
             "graph_p50_on": pct(on_w, 50), "graph_p90_on": pct(on_w, 90),
@@ -185,10 +194,107 @@ def verdict_for(rep):
     rep["go_slowdown_le_1p05"] = slow_ok
     rep["go_tail_exceed_fraction_le_0p05"] = tail_ok
     go = fits and slow_ok and tail_ok
-    return (0 if go else 14), (
+    rep["go"] = go
+    # rc1 = a measured gate red (no-go, v2 not built); rc14 above =
+    # insufficiency (could not even measure). The two must be separable.
+    return (0 if go else 1), (
         f"bg_p90 {bg90} <= interval_off_p50 {interval_off50}: {fits}; "
         f"graph p50 slowdown x{slow:.4f} <=1.05: {slow_ok}; "
         f"bg exceed-1-interval fraction {exceed} <=0.05: {tail_ok}")
+
+
+def run_worker(mode, pages, args):
+    """One config in its own process: build one engine, run one prompt, write
+    one json, exit so the OS reclaims the ~31 GiB of model memory before the
+    next config (building all configs in one process OOMs on V100)."""
+    os.environ["TILERL_SPARSE_SHADOW"] = mode
+    if pages is not None:
+        os.environ["TILERL_SPARSE_SHADOW_PAGES"] = str(pages)
+    else:
+        os.environ.pop("TILERL_SPARSE_SHADOW_PAGES", None)
+    os.environ.setdefault("TILERL_STEP_TIMING", "1")
+    os.environ.setdefault("TILERL_STEP_TIMING_SLOW_MS", "0")
+
+    name = label(mode, pages)
+    out_json = f"{args.out_prefix}_{name}.json"
+    if args.smoke:
+        ids = [7 + (i % 300) for i in range(400)]
+        e, _be, _cfg = build_smoke_engine("graph_w2048")
+        try:
+            rep = run_one_mode(name, e, ids, 80)
+        finally:
+            e.shutdown()
+    else:
+        import subprocess
+
+        if not args.expect_tree:
+            print("--expect-tree required", file=sys.stderr)
+            return 14
+        sha = subprocess.run(["git", "rev-parse", "--short=8", "HEAD"],
+                             capture_output=True, text=True).stdout.strip()
+        if sha != args.expect_tree[:8]:
+            print(f"tree {sha} != {args.expect_tree[:8]}", file=sys.stderr)
+            return 14
+        from tilerl.cli import _qwen38_tokenizer
+
+        tok = _qwen38_tokenizer()
+        prompts = load_prompts(args.prompts, tok, 1, 20000, 40000)
+        e, _be, _cfg = build_arm_engine(args.model, args.source, args.draft,
+                                        "graph_w2048")
+        try:
+            rep = run_one_mode(name, e, prompts[0], args.max_new_tokens)
+        finally:
+            e.shutdown()
+            torch.cuda.synchronize()
+
+    # Smoke is a plumbing/token check: CPU background runs inline and ~3ms
+    # graph ticks are noise, so the timing gates are device-only. The driver
+    # enforces token identity in both.
+    if mode == "off" or args.smoke:
+        rep["verdict_rc"] = 0
+        rep["verdict"] = (
+            "informational baseline (shadow off)" if mode == "off"
+            else "smoke: timing gates skipped (CPU; token-identity is the gate)")
+        rep["go"] = None
+        rc = 0
+    elif mode == "quest":
+        rep["verdict_rc"] = 0
+        rep["verdict"] = "informational (quest SM contention; no H2D gate)"
+        rep["go"] = None
+        rc = 0
+    else:
+        rc, note = verdict_for(rep)
+        rep["verdict_rc"] = rc
+        rep["verdict"] = note
+    with open(out_json, "w") as f:
+        json.dump(rep, f, indent=2)
+    print(f"[{name}] rc={rc} {rep['verdict']} -> {out_json}", flush=True)
+    return rc
+
+
+def token_identity_gate(reps):
+    """Compare every enabled config's output to the 'off' baseline. Returns
+    {config_name: rc}: length mismatch -> 14 (cannot align), aligned but
+    differing -> 1 (a real shadow side effect), equal -> absent (0)."""
+    out = {}
+    base = next((r for r in reps if r["mode"] == "off"), None)
+    if base is None:
+        return {"_baseline": 14}
+    bo = base["output"]
+    for r in reps:
+        if r["mode"] == "off":
+            continue
+        o = r["output"]
+        if len(o) != len(bo):
+            r["token_identity"] = "LENGTH_MISMATCH"
+            out[r["mode"]] = 14
+        elif o != bo:
+            d = next(i for i, (a, b) in enumerate(zip(o, bo)) if a != b)
+            r["token_identity"] = f"DIVERGE@{d}"
+            out[r["mode"]] = 1
+        else:
+            r["token_identity"] = f"OK ({len(o)} tokens)"
+    return out
 
 
 def main():
@@ -199,76 +305,96 @@ def main():
     ap.add_argument("--prompts", default="")
     ap.add_argument("--expect-tree", default="")
     ap.add_argument("--max-new-tokens", type=int, default=400)
-    ap.add_argument("--out", default="shadow_v1.json")
+    ap.add_argument("--out-prefix", default="shadow_v1")
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--worker", default="",
+                    help="worker entry: 'mode' or 'mode:pages' (e.g. h2d:107)")
     args = ap.parse_args()
 
-    os.environ.setdefault("TILERL_STEP_TIMING", "1")
-    os.environ.setdefault("TILERL_STEP_TIMING_SLOW_MS", "0")
+    if args.worker:
+        try:
+            if ":" in args.worker:
+                wmode, wpagestr = args.worker.split(":", 1)
+                wpages = int(wpagestr) if wpagestr else None
+            else:
+                wmode, wpages = args.worker, None
+            if wmode not in ("off", "quest", "h2d", "both"):
+                print(f"unknown worker mode {wmode!r}", file=sys.stderr)
+                return 14
+            return run_worker(wmode, wpages, args)
+        except Exception:
+            # Any crash (build failure, OOM, invariant) is an INSTRUMENT
+            # failure: rc14, never rc1 (a measured gate red). Separable from
+            # the exit code alone.
+            import traceback
 
-    if args.smoke:
-        reps = []
-        ids = [7 + (i % 300) for i in range(400)]
-        for mode, pages in configs(True):
-            os.environ["TILERL_SPARSE_SHADOW"] = mode
-            if pages is not None:
-                os.environ["TILERL_SPARSE_SHADOW_PAGES"] = str(pages)
-            e, _be, _cfg = build_smoke_engine("graph_w2048")
-            rep = run_one_mode(label(mode, pages), e, ids, 80)
-            e.shutdown()
-            reps.append(rep)
-        with open(args.out, "w") as f:
-            json.dump(reps, f, indent=2)
-        print(f"[smoke] wrote {args.out} configs={len(reps)}", flush=True)
-        return 0
+            traceback.print_exc()
+            print(f"INSTRUMENT ERROR(rc14) [{args.worker}]: uncaught exception; "
+                  f"this is not a gate red", file=sys.stderr)
+            return 14
 
+    # Driver: one subprocess per config. It only spawns and aggregates; it
+    # never builds an engine itself.
     import subprocess
 
-    if not args.expect_tree:
-        print("--expect-tree required", file=sys.stderr)
-        return 14
-    sha = subprocess.run(["git", "rev-parse", "--short=8", "HEAD"],
-                         capture_output=True, text=True).stdout.strip()
-    if sha != args.expect_tree[:8]:
-        print(f"tree {sha} != {args.expect_tree[:8]}", file=sys.stderr)
-        return 14
+    tag = "smoke" if args.smoke else "dev"
+    rcs = {}
+    for mode, pages in configs(args.smoke):
+        name = label(mode, pages)
+        cfg_arg = mode if pages is None else f"{mode}:{pages}"
+        cmd = [sys.executable, "-u", os.path.abspath(__file__),
+               "--worker", cfg_arg, "--model", args.model,
+               "--source", args.source, "--draft", args.draft,
+               "--prompts", args.prompts, "--expect-tree", args.expect_tree,
+               "--max-new-tokens", str(args.max_new_tokens),
+               "--out-prefix", args.out_prefix]
+        if args.smoke:
+            cmd.append("--smoke")
+        out_json = f"{args.out_prefix}_{name}.json"
+        # Remove a stale json first: after a crash only the json THIS worker
+        # writes may count.
+        if os.path.exists(out_json):
+            os.remove(out_json)
+        with open(f"{args.out_prefix}_{name}.{tag}.out", "w") as out_f, \
+                open(f"{args.out_prefix}_{name}.{tag}.err", "w") as err_f:
+            rcs[name] = subprocess.run(cmd, stdout=out_f,
+                                       stderr=err_f).returncode
+        # A crashed worker writes no json: rc14, do not aggregate a missing
+        # result as a green.
+        if not os.path.exists(out_json):
+            print(f"{name}: no {out_json} (worker rc={rcs[name]}) -> rc14",
+                  file=sys.stderr)
+            rcs[name] = 14
 
-    from tilerl.cli import _qwen38_tokenizer
+    reps = []
+    for mode, pages in configs(args.smoke):
+        name = label(mode, pages)
+        out_json = f"{args.out_prefix}_{name}.json"
+        if not os.path.exists(out_json):
+            continue  # already counted as rc14 above
+        with open(out_json) as f:
+            reps.append(json.load(f))
 
-    tok = _qwen38_tokenizer()
-    prompts = load_prompts(args.prompts, tok, 1, 20000, 40000)
-    reps, worst = [], 0
-    for mode, pages in configs(False):
-        os.environ["TILERL_SPARSE_SHADOW"] = mode
-        if pages is not None:
-            os.environ["TILERL_SPARSE_SHADOW_PAGES"] = str(pages)
-        else:
-            os.environ.pop("TILERL_SPARSE_SHADOW_PAGES", None)
-        e, _be, _cfg = build_arm_engine(args.model, args.source, args.draft,
-                                        "graph_w2048")
-        try:
-            rep = run_one_mode(label(mode, pages), e, prompts[0],
-                               args.max_new_tokens)
-        finally:
-            e.shutdown()
-            torch.cuda.synchronize()
-        # quest has no H2D volume: report SM contention/slowdown only, no
-        # fits/tail verdict. h2d/both carry the three pre-registered gates.
-        if mode == "quest":
-            rep["verdict_rc"] = 0
-            rep["verdict"] = "informational (quest SM contention; no H2D gate)"
-        else:
-            rc, note = verdict_for(rep)
-            rep["verdict_rc"] = rc
-            rep["verdict"] = note
-            worst = max(worst, rc)
-        reps.append(rep)
-        print(f"[{rep['mode']}] rc={rep['verdict_rc']} {rep['verdict']}",
-              flush=True)
-    with open(args.out, "w") as f:
+    # Token-identity gate (plan, Shadow v1): shadow launches background work
+    # but changes no residency, so every enabled config MUST reproduce the
+    # "off" output token-for-token.
+    tok_rc = token_identity_gate(reps)
+    for k, v in tok_rc.items():
+        rcs[f"token:{k}"] = v
+        if k == "_baseline":
+            print("token gate: no 'off' baseline json -> rc14", file=sys.stderr)
+        elif v == 14:
+            print(f"token gate: {k} length mismatch -> rc14", file=sys.stderr)
+        elif v == 1:
+            print(f"token gate: {k} diverges from off -> rc1", file=sys.stderr)
+
+    agg = f"{args.out_prefix}.json"
+    with open(agg, "w") as f:
         json.dump(reps, f, indent=2)
-    print(f"wrote {args.out}; worst rc {worst}", flush=True)
-    return worst
+    print(json.dumps(rcs, indent=2))
+    print(f"wrote {agg}", flush=True)
+    # 1 = a measured no-go; 14 = a crash/insufficiency/missing json.
+    return 1 if 1 in rcs.values() else (14 if 14 in rcs.values() else 0)
 
 
 if __name__ == "__main__":
