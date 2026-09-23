@@ -7,7 +7,7 @@
 
 ## Context
 
-Publish-once M3 (#782, [2026-09-21-close-zero-bytes.md](2026-09-21-close-zero-bytes.md))
+Publish-once M3 (#782, [2026-09-21-close-zero-bytes.md](../wins/2026-09-21-close-zero-bytes.md))
 deleted the forced prompt-end frontier closure at request finish: a page
 reaches the shared prefix only when it leaves the k+window resident union
 (`offer_drop`). That is correct for the training disjoint-span workload that

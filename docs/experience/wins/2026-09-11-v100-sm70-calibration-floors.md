@@ -7,7 +7,7 @@
 ## Context
 
 The kernel roofline divides declared bytes/flops by a MEASURED floor, never a
-datasheet ([calibration.py](../../src/tilerl/calibration.py)). Only the H20
+datasheet ([calibration.py](../../../src/tilerl/calibration.py)). Only the H20
 sm90 had floors (3292 GB/s, 136 TFLOP/s bf16). ckl named the V100 a target
 for the long-context work, so its two floors had to be measured before any
 `%bound` column could render there.

@@ -6,7 +6,7 @@
 
 ## Context
 
-Sparse-KV unit A ([design](../design-sparse-kv.md)): the memory ledger has to
+Sparse-KV unit A ([design](../../design-sparse-kv.md)): the memory ledger has to
 price a sparse deployment before the selection kernels land. The device holds
 the weights, a small learned index key per page, and the selected hot pages;
 the rest of the KV sits on the host. Three new owners enter `memory.plan` and

@@ -8,7 +8,7 @@ until it knows the state the chunk before it produced — and that chunk lives o
 another rank.
 
 `init_tp`'s cp-only defect had to be fixed first
-([entry](2026-09-06-a-cp-only-mesh-inherited-the-world-as-tp.md), #182); it
+([entry](../errors/2026-09-06-a-cp-only-mesh-inherited-the-world-as-tp.md), #182); it
 dominated every number here and is not repeated below.
 
 ## What zigzag costs the recurrence

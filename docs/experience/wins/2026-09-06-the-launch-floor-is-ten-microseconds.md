@@ -2,13 +2,13 @@
 
 > Status: Measured and shipped. The gate now tests utilization, the floor is a number, and
 > all five citations carry it. Closes
-> [a number with no instrument](2026-09-06-a-number-with-no-instrument.md).
+> [a number with no instrument](../errors/2026-09-06-a-number-with-no-instrument.md).
 
 ## Context
 
 Five files assert a "~60 µs eager launch floor regardless of shape" with no instrument
 behind any of them; three cite one of the others
-([a number with no instrument](2026-09-06-a-number-with-no-instrument.md)). It is the
+([a number with no instrument](../errors/2026-09-06-a-number-with-no-instrument.md)). It is the
 stated reason task #21 says to measure in the captured graph first, so the figure decides
 where kernel work gets aimed.
 

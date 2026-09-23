@@ -4,7 +4,7 @@ Runbook step 3 ([PENDING-REMOTE-CARDS](../PENDING-REMOTE-CARDS.md) §3): the
 `bench --kernels` table with measured ms / roofline bound / %bound for the
 Qwen3.8-27B on one H20, decode B=1/B=8 against 4096 pooled context and one
 S=4096 prefill. Raw table:
-[2026-09-11-h20-roofline-step3.log](2026-09-11-h20-roofline-step3.log).
+the raw run log (`2026-09-11-h20-roofline-step3.log`, not committed).
 
 ```
 tilerl bench --model qwen38-27b --kernels --checkpoint /work/Qwen3.8-27B-NVFP4 --batches 1,8

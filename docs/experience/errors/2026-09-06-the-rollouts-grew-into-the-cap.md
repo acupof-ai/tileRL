@@ -6,7 +6,7 @@
 
 > Status: REJECTED (the run) / **closed (code) 2026-09-14.** Fix 3 (the
 > length term in the reward) landed on CPU
-> ([wins/2026-09-08](2026-09-08-a-length-term-in-the-grpo-reward.md) — λ
+> ([wins/2026-09-08](../wins/2026-09-08-a-length-term-in-the-grpo-reward.md) — λ
 > default 0.1, all-right groups now order by length), #131's pre-flight
 > `_refuse_short_rollouts` covers fix 2's launch reading, and the periodic
 > drift half is the `rollouts_within_cap` gate (`cli.py`, logged every
