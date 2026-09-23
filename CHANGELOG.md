@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-09-23
+- **guard (sparse, #805 / PR pending)** — the sparse captured decode graph is
+  now armed only on the single-token path. With speculation enabled
+  (`draft` + `spec_depth>=1`) the width-2 captured verify replays trunk
+  logits/hidden that disagree with the eager verify: drafts stop accepting
+  after the first 1–2 ticks and valid-but-wrong in-vocab tokens appear
+  (device V100 sm70 parity, d=0 sparse graph proven token-exact across all
+  cmax buckets; d=1 diverges). `Engine.__init__` now forces the sparse graph
+  OFF (sparse decode falls back to eager, which is token-exact) and warns once
+  when a draft is present with spec_depth>=1; the dense captured graph and
+  sparse device selection are unaffected. This is a guard, not a fix to the
+  width-2 replay (that root cause is triaged separately). CPU gate asserts the
+  sparse graph stays on at depth 0 and is off (with the warning) at depth 1;
+  deleting the guard fails the depth-1 assertion (negative control).
+  **Device impact: none on the current production geometry** —
+  `--sparse-min-tokens 8192` already routes 32k sparse decode through eager;
+  the guard only changes the `sparse_min_tokens=0` + spec combination that
+  production never runs. Device perf/parity confirmation pending-remote.
+
 ## 2026-09-21
 - **accept (kv, #796 / PR #800)** — scoped revert of one piece of M3 for the
   serving geometry: after the M3 close-time forced publish was removed, an

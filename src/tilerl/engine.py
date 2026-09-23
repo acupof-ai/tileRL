@@ -708,11 +708,26 @@ class Engine:
         # Hybrid mode runs sparse ticks EAGER on purpose: it needs only the dense
         # precaptured graph, so the sparse capture (and its warmup-frame hazard)
         # is not required; eager sparse is token-exact on sm70.
+        spec_enabled = draft is not None and (spec_depth or 0) >= 1
+        if spec_enabled:
+            # The sparse captured decode graph is only correct on the d=0
+            # (single-token) path. Under speculation the width-2 verify replay
+            # produces trunk logits/hidden that disagree with eager verify and
+            # the drafts stop accepting (#805). Rather than silently capture a
+            # wrong graph, force sparse decode to eager when a draft is present;
+            # the dense capture (non-sparse ticks) is unaffected.
+            warnings.warn(
+                "sparse decode graph auto-disabled with speculation "
+                f"(spec_depth={spec_depth}): captured sparse verify is only "
+                "correct at spec_depth=0; sparse decode runs eager",
+                stacklevel=2,
+            )
         sparse_graph_on = (
             sparse_tracker is not None
             and not self._sparse_min_tokens
             and sparse_device_on
             and (self._decode_graph_on or backend.device.type != "cuda")
+            and not spec_enabled
         )
         if sparse_tracker is not None:
             self._sparse = SparseRuntime(sparse_tracker, sparse_device_on, sparse_graph_on)
