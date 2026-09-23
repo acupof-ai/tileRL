@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-09-23
+- **guard (sparse, #805 / PR #807)** — on CUDA the sparse captured decode
+  graph is armed only on the single-token path. With speculation enabled
+  (`draft` + `spec_depth>=1`) the width-2 captured verify replays trunk
+  logits/hidden that disagree with the eager verify: drafts stop accepting
+  after the first 1–2 ticks and valid-but-wrong in-vocab tokens appear
+  (device V100 sm70 parity, d=0 sparse graph proven token-exact across all
+  cmax buckets; d=1 diverges, unverified on sm90 too). `_sparse_capture_allowed`
+  keeps the sparse graph OFF on CUDA with a draft at depth>=1 (a warning is
+  emitted each time such an engine is built; sparse decode falls back to
+  token-exact eager); the dense captured
+  graph and sparse device selection are unaffected. Scope is CUDA only: the
+  CPU cell runs the CpuSparseGraph eager reference, token-exact at W=2 and
+  left enabled (its W=2 token-equality gate is the oracle for the separate
+  width-2 root-cause triage; not fixed here). CPU gate over a device-only
+  backend stub asserts CUDA depth-1 off / depth-0 on and CPU depth-1 on;
+  deleting the guard fails the CUDA depth-1 assertion (negative control).
+  **Device impact: none on the current production geometry** —
+  `--sparse-min-tokens 8192` already routes 32k sparse decode through eager;
+  the guard only changes the `sparse_min_tokens=0` + spec combination on
+  CUDA that production never runs. Device confirmation pending-remote.
+
 ## 2026-09-21
 - **accept (kv, #796 / PR #800)** — scoped revert of one piece of M3 for the
   serving geometry: after the M3 close-time forced publish was removed, an
