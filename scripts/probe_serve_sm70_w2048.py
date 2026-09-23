@@ -438,53 +438,82 @@ def run_worker(arm, args):
                           "w") as f:
                     json.dump({"output": r["output"]}, f)
 
+            # Per-prompt token dump for EVERY arm (comparator/noise-floor
+            # input); independent of the correctness gate.
+            pp_dir = getattr(args, "per_prompt_dir", "")
+            if pp_dir:
+                with open(os.path.join(pp_dir, f"{pi:03d}.json"), "w") as f:
+                    json.dump({"output": r["output"]}, f)
+
             if arm == "graph_w2048":
-                ref_path = os.path.join(args.reference_dir, f"ref_{pi:03d}.json")
-                if not os.path.exists(ref_path):
-                    raise ProbeFail(f"prompt {pi}: missing ref {ref_path} "
-                                   f"(run ref_eager_w2048 first)", rc=14)
-                with open(ref_path) as rf:
-                    ref = json.load(rf)["output"]
-                # Length precondition BEFORE any token compare: unequal output
-                # lengths are an instrument/sequence divergence (rc14), never a
-                # 09-17 wrong-token report.
-                if len(ref) != len(r["output"]):
-                    raise ProbeFail(
-                        f"prompt {pi}: ref len {len(ref)} != graph len "
-                        f"{len(r['output'])} — cannot value-align; not a 09-17 "
-                        f"mismatch", rc=14)
-                first_bucket = events[0]["bucket"] if events else None
-                gate = []
-                new_bucket_seen = False
-                transition_seen = False
-                for ev in events:
-                    sb = ev["seq_before"]
-                    got = ev["committed"]
-                    want_ids = ref[sb:sb + len(got)]
-                    match = got == want_ids
-                    gate.append({"bucket": ev["bucket"], "B": ev["B"], "W": ev["W"],
-                                 "own_w": ev["own_w"], "seq_before": sb,
-                                 "n_committed": len(got), "match": match,
-                                 "graph_tokens": got[:8], "ref_tokens": want_ids[:8]})
-                    if not match:
-                        results["failures"].append(
-                            f"prompt{pi} B={ev['B']} W={ev['W']} bucket={ev['bucket']} "
-                            f"own_w={ev['own_w']} FIRST replay mismatch: "
-                            f"seq_before={sb} graph={got[:6]} ref={want_ids[:6]} "
-                            f"(errors/2026-09-17 shape)")
-                    # The bucket this window arms for the first time. A 33k
-                    # prompt transitions into it during generation; a 37.6k
-                    # prompt's first decode tick is already on it.
-                    if ev["bucket"] >= MIN_NEW_BUCKET:
-                        new_bucket_seen = True
-                    if sb > 0 and first_bucket is not None \
-                            and ev["bucket"] > first_bucket:
-                        transition_seen = True
-                row["first_replays"] = gate
-                row["first_decode_bucket"] = first_bucket
-                row["buckets_seen"] = sorted({g["bucket"] for g in gate})
-                row["generation_bucket_transition"] = transition_seen
-                row["new_bucket_armed"] = new_bucket_seen
+                floor_run = bool(getattr(args, "floor_run", False))
+                if floor_run:
+                    # No reference in this run: the 09-17 first-replay value
+                    # gate is NOT executed. Record that in plain words on every
+                    # prompt and in the verdict; a green floor run proves
+                    # nothing about correctness.
+                    row["correctness_gate"] = "NOT_RUN (floor-run, no ref)"
+                    row["first_replays"] = [
+                        {"bucket": ev["bucket"], "B": ev["B"], "W": ev["W"],
+                         "own_w": ev["own_w"], "seq_before": ev["seq_before"],
+                         "n_committed": len(ev["committed"]),
+                         "match": None}
+                        for ev in events]
+                    row["first_decode_bucket"] = (
+                        events[0]["bucket"] if events else None)
+                    row["buckets_seen"] = sorted({ev["bucket"] for ev in events})
+                    new_bucket_seen = any(ev["bucket"] >= MIN_NEW_BUCKET
+                                          for ev in events)
+                    row["new_bucket_armed"] = new_bucket_seen
+                    results["correctness_gate"] = \
+                        "NOT_RUN (floor-run, no ref)"
+                else:
+                    ref_path = os.path.join(args.reference_dir, f"ref_{pi:03d}.json")
+                    if not os.path.exists(ref_path):
+                        raise ProbeFail(f"prompt {pi}: missing ref {ref_path} "
+                                       f"(run ref_eager_w2048 first)", rc=14)
+                    with open(ref_path) as rf:
+                        ref = json.load(rf)["output"]
+                    # Length precondition BEFORE any token compare: unequal output
+                    # lengths are an instrument/sequence divergence (rc14), never
+                    # a 09-17 wrong-token report.
+                    if len(ref) != len(r["output"]):
+                        raise ProbeFail(
+                            f"prompt {pi}: ref len {len(ref)} != graph len "
+                            f"{len(r['output'])} — cannot value-align; not a 09-17 "
+                            f"mismatch", rc=14)
+                    first_bucket = events[0]["bucket"] if events else None
+                    gate = []
+                    new_bucket_seen = False
+                    transition_seen = False
+                    for ev in events:
+                        sb = ev["seq_before"]
+                        got = ev["committed"]
+                        want_ids = ref[sb:sb + len(got)]
+                        match = got == want_ids
+                        gate.append({"bucket": ev["bucket"], "B": ev["B"], "W": ev["W"],
+                                     "own_w": ev["own_w"], "seq_before": sb,
+                                     "n_committed": len(got), "match": match,
+                                     "graph_tokens": got[:8], "ref_tokens": want_ids[:8]})
+                        if not match:
+                            results["failures"].append(
+                                f"prompt{pi} B={ev['B']} W={ev['W']} bucket={ev['bucket']} "
+                                f"own_w={ev['own_w']} FIRST replay mismatch: "
+                                f"seq_before={sb} graph={got[:6]} ref={want_ids[:6]} "
+                                f"(errors/2026-09-17 shape)")
+                        # The bucket this window arms for the first time. A 33k
+                        # prompt transitions into it during generation; a 37.6k
+                        # prompt's first decode tick is already on it.
+                        if ev["bucket"] >= MIN_NEW_BUCKET:
+                            new_bucket_seen = True
+                        if sb > 0 and first_bucket is not None \
+                                and ev["bucket"] > first_bucket:
+                            transition_seen = True
+                    row["first_replays"] = gate
+                    row["first_decode_bucket"] = first_bucket
+                    row["buckets_seen"] = sorted({g["bucket"] for g in gate})
+                    row["generation_bucket_transition"] = transition_seen
+                    row["new_bucket_armed"] = new_bucket_seen
 
             results["prompts"].append(row)
             dump()
@@ -599,6 +628,8 @@ def run_worker(arm, args):
             results["verdict"] = {
                 "prompts": len(results["prompts"]),
                 "floor_min_prompts": args.min_prompts,
+                "correctness_gate": results.get(
+                    "correctness_gate", "RUN (aligned against ref arm)"),
                 "first_replay_failures": len(results["failures"]),
                 "unattributed_eager_ticks": len(unattributed_eager)}
             with open(out_path, "w") as f:
@@ -645,6 +676,14 @@ def main():
                     help="comma-separated subset of " + ",".join(ARMS)
                          + "; run in canonical order so ref_eager_w2048 always "
                            "precedes graph_w2048 (graph reads its ref files)")
+    ap.add_argument("--per-prompt-dir", default="",
+                    help="write {output:[ids]} per prompt per arm here (the "
+                         "comparator/noise-floor input); default <prefix>_pp")
+    ap.add_argument("--floor-run", action="store_true",
+                    help="noise-floor run: --arms graph_w2048 alone is allowed "
+                         "and the 09-17 ref value gate is SKIPPED (the json "
+                         "records NOT_RUN); green here says nothing about "
+                         "correctness")
     ap.add_argument("--smoke", action="store_true",
                     help="CPU tiny end-to-end plumbing check (no CUDA, no real "
                          "prompts, no tree assert); run before any window")
@@ -680,25 +719,47 @@ def main():
                   f"this is not a 09-17 gate red", file=sys.stderr)
             return 14
 
+    # Driver-only arm-set guards (a worker subprocess is one arm already).
+    if not args.floor_run and "graph_w2048" in arms \
+            and "ref_eager_w2048" not in arms:
+        print("graph_w2048 requires ref_eager_w2048 in the same --arms "
+              "(or pass --floor-run to intentionally skip the correctness "
+              "gate)", file=sys.stderr)
+        return 14
+    if args.floor_run and set(arms) != {"graph_w2048"}:
+        print("--floor-run runs graph_w2048 alone; do not combine other arms",
+              file=sys.stderr)
+        return 14
+
     import subprocess
 
     tag = "smoke" if args.smoke else f"stage{args.stage}"
-    # Per-window reference dir: a stale ref file from an earlier window would
-    # let graph align against the wrong run and go green, so never reuse the
-    # default across windows and refuse a non-empty explicit one.
-    args.reference_dir = args.reference_dir or f"{args.out_prefix}_refs"
-    if os.path.isdir(args.reference_dir) and any(os.scandir(args.reference_dir)):
-        print(f"reference dir {args.reference_dir!r} is not empty; use a fresh "
-              f"--reference-dir per window (stale ref files fake a green)",
+    # Per-prompt token dump (comparator / noise-floor input).
+    args.per_prompt_dir = args.per_prompt_dir or f"{args.out_prefix}_pp"
+    if os.path.isdir(args.per_prompt_dir) and any(os.scandir(args.per_prompt_dir)):
+        print(f"per-prompt dir {args.per_prompt_dir!r} is not empty; use a "
+              f"fresh one per run (stale outputs fake a noise floor)",
               file=sys.stderr)
         return 14
-    os.makedirs(args.reference_dir, exist_ok=True)
-    if "graph_w2048" in arms and "ref_eager_w2048" not in arms:
-        # graph needs this window's ref files; running it against an old dir is
-        # exactly the fake-green above.
-        print("graph_w2048 requires ref_eager_w2048 in the same --arms",
-              file=sys.stderr)
-        return 14
+    os.makedirs(args.per_prompt_dir, exist_ok=True)
+    # Per-window reference dir. A floor run has no ref arm, so it neither
+    # creates nor consults this; a non-empty explicit one is refused so the
+    # flag cannot sneak into a real window.
+    if args.floor_run:
+        if args.reference_dir:
+            rd = args.reference_dir
+            if os.path.isdir(rd) and any(os.scandir(rd)):
+                print(f"--floor-run with non-empty --reference-dir {rd!r}; a "
+                      f"floor run takes no ref", file=sys.stderr)
+                return 14
+    else:
+        args.reference_dir = args.reference_dir or f"{args.out_prefix}_refs"
+        if os.path.isdir(args.reference_dir) and any(os.scandir(args.reference_dir)):
+            print(f"reference dir {args.reference_dir!r} is not empty; use a "
+                  f"fresh --reference-dir per window (stale ref files fake a "
+                  f"green)", file=sys.stderr)
+            return 14
+        os.makedirs(args.reference_dir, exist_ok=True)
     rcs = {}
     for arm in arms:
         cmd = [sys.executable, "-u", os.path.abspath(__file__),
@@ -708,11 +769,14 @@ def main():
                "--out-prefix", args.out_prefix, "--stage", str(args.stage),
                "--n-prompts", str(args.n_prompts),
                "--min-prompts", str(args.min_prompts),
+               "--per-prompt-dir", args.per_prompt_dir,
                "--min-tokens", str(args.min_tokens),
                "--max-tokens", str(args.max_tokens),
                "--max-new-tokens", str(args.max_new_tokens)]
         if args.smoke:
             cmd.append("--smoke")
+        if args.floor_run:
+            cmd.append("--floor-run")
         with open(f"{args.out_prefix}_{arm}.{tag}.out", "w") as out_f, \
                 open(f"{args.out_prefix}_{arm}.{tag}.err", "w") as err_f:
             rcs[arm] = subprocess.run(cmd, stdout=out_f, stderr=err_f).returncode
