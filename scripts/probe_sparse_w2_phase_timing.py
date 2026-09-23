@@ -67,9 +67,6 @@ CLOSURE_TOL = 0.05
 N_STEADY = 50
 CMAX_BUCKETS = [512, 1024, 2048]
 PHASE_DECODE = 2
-#: Tree the device window must run on (the PATCH tree: correct keep_steps=W).
-EXPECTED_TREE = "260b66f8"
-
 
 class ProbeFail(Exception):
     """A hard instrument/precondition failure. Raised with an exit-class tag so
@@ -395,17 +392,20 @@ def _brief_cells(cells):
     return brief
 
 
-def _assert_tree():
-    """Device precondition: this script must run on the PATCH tree. Reads the
-    checked-out commit from git (the window script fetch/checkout pins it)."""
+def _assert_tree(expected: str):
+    """Device precondition: the checked-out tree must equal the sha the window
+    command passed (PROBE_SHA), not a constant baked into the script — the probe
+    head advances and a hardcoded sha would rc14 on the first line."""
     import subprocess
 
+    if not expected:
+        raise ProbeFail("--expect-tree PROBE_SHA is required for --model qwen38-27b", rc=14)
     sha = subprocess.run(["git", "rev-parse", "--short=8", "HEAD"],
                          capture_output=True, text=True).stdout.strip()
-    if sha != EXPECTED_TREE:
+    if sha != expected[:8]:
         raise ProbeFail(
-            f"tree is {sha}, expected {EXPECTED_TREE} (PATCH: keep_steps=W); "
-            f"checkout {EXPECTED_TREE} before the device window", rc=14)
+            f"tree is {sha}, window expected {expected[:8]} (PROBE_SHA); "
+            f"fetch/checkout the expected probe head before running", rc=14)
 
 
 def main() -> int:
@@ -413,6 +413,8 @@ def main() -> int:
     ap.add_argument("--model", default="tiny", choices=["tiny", "qwen38-27b"])
     ap.add_argument("--source", default="", help="qwen38-27b model source dir")
     ap.add_argument("--draft", default="", help="draft MTP path (27b)")
+    ap.add_argument("--expect-tree", default="",
+                    help="required checked-out short sha (PROBE_SHA); mandatory for 27b")
     ap.add_argument("--out", default="phase_timing.json")
     ap.add_argument("--neg-depth0-with-draft", action="store_true",
                     help="CPU negative control only: force a draft on the depth-0 arm")
@@ -423,10 +425,11 @@ def main() -> int:
 
     result, failures = {}, []
     try:
+        if args.model == "qwen38-27b":
+            _assert_tree(args.expect_tree)
         for arm, depth, graph in order:
             neg = args.neg_depth0_with_draft and arm == "w1_graph"
             if args.model == "qwen38-27b":
-                _assert_tree()
                 cells = run_arm_27b(arm, depth, graph, args.source, args.draft)
             else:
                 cells = run_arm(arm, depth, graph, neg_depth0_draft=neg)
