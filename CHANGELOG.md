@@ -1,6 +1,26 @@
 # Changelog
 
 ## 2026-09-23
+- **accept (sparse, #805)** — root cause found for the divergence the guard
+  above fences. `SparseDecodeGraph` built its per-tick `BatchKv` with
+  `keep_steps=int(W > 1)` (1 at W=2) while the eager verify passes
+  `keep_steps=width` (2); `keep_steps=1` fails the `gdn_decode_fused`
+  eligibility gate (`t > 1 and keep_steps != t`, `backend.py:1488-1490`), so
+  the captured arm fell back to the GDN chunk kernel and cast q/k/v/z through
+  bf16 where eager kept the fused f32 path. Both sparse graphs now build with
+  `keep_steps=W if W > 1 else 0`. Device V100 sm70 A/B, two trees differing
+  only in those two lines: patch 6/6 cells MATCH with
+  `tok/fwd = strict accept = 1.958`, equal to eager, against control 3/3 W=2
+  cells `ALIGNMENT_UNMATCHED` at 1.382 / 1.880 / 1.679 (1.382 = the old
+  1 + 0.382). Both arms ran in both orders; no position effect. The CPU token
+  gate cannot see this — the CPU cell registers no `gdn_decode_fused`, so both
+  arms fall back to the same reference kernel and stay token-exact — which is
+  why the fence is a structural gate. **The guard stays**: `_sparse_capture_allowed`
+  is unchanged and still keeps the CUDA sparse capture off at `spec_depth>=1`,
+  so no device behavior changes here; whether to lift it on the new evidence is
+  a separate call. **This is a correctness fix, not a speed-up**: W=2 graph
+  still runs 7–13 tok/s against its own W=1 11.6–14.9.
+  — [wins/2026-09-23-sparse-w2-graph-keep-steps.md](docs/experience/wins/2026-09-23-sparse-w2-graph-keep-steps.md)
 - **guard (sparse, #805 / PR #807)** — on CUDA the sparse captured decode
   graph is armed only on the single-token path. With speculation enabled
   (`draft` + `spec_depth>=1`) the width-2 captured verify replays trunk
