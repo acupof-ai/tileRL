@@ -3308,25 +3308,34 @@ def test_health_namespaces_sparse_prefix_counters_separately_from_dense():
 def test_sparse_capture_allowed_guard_a():
     """#805 guard A: _sparse_capture_allowed keeps the sparse captured decode
     graph on everywhere at spec_depth=0 and on the CPU reference at any depth
-    (CpuSparseGraph is the token-exact W=2 oracle), but DISABLES it on CUDA
-    when speculation is enabled (captured width-2 verify diverges on sm70 and
-    is unverified on sm90). Pure predicate over a backend stub carrying only
-    device.type, so the gate needs no CUDA/tilelang."""
+    (CpuSparseGraph is the token-exact W=2 oracle). Under speculation on CUDA it
+    is scoped by ARCH: sm70 is verified (the keep_steps=W fix, #808, passed the
+    09-17 first-replay value gate there) and is allowed; every other CUDA arch
+    is unverified and stays guarded. Pure predicate over a backend stub carrying
+    device.type and arch, so the gate needs no CUDA/tilelang."""
     import types
 
     from tilerl.engine import _sparse_capture_allowed
 
-    def backend(dev_type):
-        return types.SimpleNamespace(device=torch.device(dev_type))
+    def backend(dev_type, arch=""):
+        return types.SimpleNamespace(device=torch.device(dev_type), arch=arch)
 
-    cuda, cpu = backend("cuda"), backend("cpu")
+    cuda70, cuda90, cuda_noarch = backend("cuda", "sm70"), backend("cuda", "sm90"), backend("cuda")
+    cpu = backend("cpu")
 
-    # CUDA: off with a draft at depth>=1, on at depth 0 / no draft
-    assert _sparse_capture_allowed(cuda, True, 1) is False
-    assert _sparse_capture_allowed(cuda, True, 3) is False
-    assert _sparse_capture_allowed(cuda, True, 0) is True
-    assert _sparse_capture_allowed(cuda, True, None) is True
-    assert _sparse_capture_allowed(cuda, False, 1) is True
+    # sm70 under speculation: ALLOWED (the verified arch)
+    assert _sparse_capture_allowed(cuda70, True, 1) is True
+    assert _sparse_capture_allowed(cuda70, True, 3) is True
+    # non-sm70 CUDA under speculation: still guarded
+    assert _sparse_capture_allowed(cuda90, True, 1) is False
+    assert _sparse_capture_allowed(cuda90, True, 3) is False
+    # an unidentified CUDA arch must fail SAFE, not fall through to allowed
+    assert _sparse_capture_allowed(cuda_noarch, True, 1) is False
+    # depth 0 / no draft is on for every arch
+    for b in (cuda70, cuda90):
+        assert _sparse_capture_allowed(b, True, 0) is True
+        assert _sparse_capture_allowed(b, True, None) is True
+        assert _sparse_capture_allowed(b, False, 1) is True
     # CPU reference stays enabled even with speculation (W=2 oracle path)
     assert _sparse_capture_allowed(cpu, True, 1) is True
     assert _sparse_capture_allowed(cpu, True, 3) is True
@@ -3335,12 +3344,16 @@ def test_sparse_capture_allowed_guard_a():
 
 def test_sparse_capture_guard_is_wired_into_engine():
     """#805 guard A, Engine-level: the predicate must actually gate the running
-    engine. A CUDA-stub backend (RefBackend tensors/materialize, but device.type
-    cuda) over real donor-built CPU pools/tracker + a minimal constructor-only
-    drafter must yield a built Engine whose sparse graph is OFF at spec_depth=1
-    (with the warning) and ON at depth 0. Deleting the `and not cuda_spec_guard`
-    wiring in Engine.__init__ fails the depth-1 assertion even though the
-    predicate gate above still passes — this is what rev 5789359652 required."""
+    engine, and the arch scope must reach the engine too. A CUDA-stub backend
+    (RefBackend tensors/materialize, but device.type cuda) over real donor-built
+    CPU pools/tracker + a minimal constructor-only drafter must yield a built
+    Engine whose sparse graph is OFF at spec_depth=1 (with the warning) and ON at
+    depth 0 on an UNVERIFIED arch, and ON at spec_depth=1 on sm70 (the verified
+    arch). Deleting the `and not cuda_spec_guard` wiring in Engine.__init__ fails
+    the depth-1 assertion even though the predicate gate above still passes —
+    this is what rev 5789359652 required. Deleting the sm70 branch of
+    _sparse_capture_allowed flips the sm70 case, which is this gate's negative
+    control."""
     import warnings
 
     from tilerl.engine import Engine
@@ -3351,11 +3364,14 @@ def test_sparse_capture_guard_is_wired_into_engine():
         # __init__ query (has_kernel, verify width, arch). No CUDA tensors:
         # the kv/state pools are the donor engine's CPU pools.
         device = torch.device("cuda")
-        arch = "sm90"
+        arch = "sm90"  # UNVERIFIED arch: must stay guarded
         max_verify_width = 16
 
         def has_kernel(self, name):
             return False
+
+    class _CudaStubSm70(_CudaStub):
+        arch = "sm70"  # verified arch: speculation may arm the sparse graph
 
     class _FakeDrafter:
         aux_layers = ()
@@ -3402,6 +3418,19 @@ def test_sparse_capture_guard_is_wired_into_engine():
             e0 = Engine(backend=_CudaStub(), draft=None, **parts)
             assert e0._sparse_graph_on is True, "depth 0 keeps the sparse graph on"
             assert not any("auto-disabled" in str(w.message) for w in caught0)
+
+        # sm70 (the verified arch) may arm the capture under speculation: the
+        # same construction that is OFF on sm90 above must be ON here. This is
+        # the negative control for the arch branch — dropping sm70 from
+        # _SPEC_SPARSE_GRAPH_VERIFIED_ARCHS turns this assertion red.
+        with warnings.catch_warnings(record=True) as caught70:
+            warnings.simplefilter("always")
+            e70 = Engine(backend=_CudaStubSm70(), draft=_FakeDrafter(),
+                         spec_depth=1, **parts)
+            assert e70._sparse_graph_on is True, (
+                "sm70 + spec_depth=1 must arm the sparse graph (verified arch)")
+            assert not any("auto-disabled" in str(w.message) for w in caught70), (
+                [str(w.message) for w in caught70])
     finally:
         donor.shutdown()
 
