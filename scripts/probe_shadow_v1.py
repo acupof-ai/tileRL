@@ -96,8 +96,12 @@ def run_one_mode(arm_mode, e, ids, max_new):
         if prev_start is not None:
             gap = (t_start - prev_start) * 1000.0
         # Tail gate, checked BEFORE this tick's step: did the previous ON
-        # tick's background complete in the intervening interval?
+        # tick's background complete in the intervening interval? Consumed
+        # immediately: an eager refresh tick between two graph ticks must NOT
+        # re-query the same event (that would inflate the denominator and can
+        # turn a real miss into a later "complete").
         if prev_was_on:
+            prev_was_on = False
             ev = sh.last_event
             if ev is not None:
                 done = True if ev == "inline-done" else bool(ev.query())
@@ -139,6 +143,12 @@ def run_one_mode(arm_mode, e, ids, max_new):
         raise AssertionError(
             f"{arm_mode}: n_bg {len(bg)} != n_graph_on {len(on_w)} "
             f"(shadow must emit exactly once per ON graph tick)")
+    # Each launch is tail-queried at most once (the segment's last ON tick has
+    # no successor and is not queried), so queries cannot exceed ON ticks.
+    if bg_total > len(on_w):
+        raise AssertionError(
+            f"{arm_mode}: tail queries {bg_total} > n_graph_on {len(on_w)} "
+            f"(an event was queried more than once)")
     return {"mode": arm_mode, "h2d_pages": info.get("carved_scratch_pages"),
             "n_graph_off": len(off_w), "n_graph_on": len(on_w),
             "graph_p50_off": pct(off_w, 50), "graph_p90_off": pct(off_w, 90),
