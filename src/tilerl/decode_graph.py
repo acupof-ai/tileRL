@@ -9,6 +9,7 @@ pools, model and backend arrive as arguments.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import torch
@@ -182,6 +183,7 @@ class SparseDecodeGraph:
         B, W = batch_size, width
         self._b, self._w = B, W
         self.sf = sf
+        self.tm = None  # set by SparseRuntime.run_decode_graph when step timing is on
         self._ids = torch.zeros(B, W, dtype=torch.long, device=device)
         self._pos = torch.zeros(B, W, dtype=torch.long, device=device)
         self._slots = torch.zeros(B, dtype=torch.long, device=device)
@@ -242,7 +244,12 @@ class SparseDecodeGraph:
         n use ``(slot, block)``."""
         W = self._w
         sf = self.sf
+        tm = self.tm
+        t = time.perf_counter()
         sf.fill(srows)
+        if tm is not None:
+            tm.mark("p0_fill", t)
+            t = time.perf_counter()
         self.fill_staging(
             srows,
             chains,
@@ -260,7 +267,12 @@ class SparseDecodeGraph:
         self._sl.copy_(self._sl_h, non_blocking=True)
         self._slots.copy_(self._slots_h, non_blocking=True)
         self._sql.copy_(self._sql_h, non_blocking=True)
+        if tm is not None:
+            tm.mark("p1_h2d", t)
+            t = time.perf_counter()
         self._graph.replay()
+        if tm is not None:
+            tm.mark("p2_replay", t)
         return self._logits
 
     @staticmethod
@@ -303,13 +315,19 @@ class CpuSparseGraph:
 
     def __init__(self, model, backend, kv_pool, state_pool, sf, B, W):
         self.sf = sf
+        self.tm = None  # set by SparseRuntime.run_decode_graph when step timing is on
         self._model, self._backend, self._kv, self._states = (model, backend, kv_pool, state_pool)
         self._b, self._w = B, W
         self.hidden = None
 
     def run(self, srows, chains, pad=None):
         sf = self.sf
+        tm = self.tm
+        t = time.perf_counter()
         sf.fill(srows)
+        if tm is not None:
+            tm.mark("p0_fill", t)
+            t = time.perf_counter()
         B, W = self._b, self._w
         ids = torch.zeros(B, W, dtype=torch.long)
         pos = torch.zeros(B, W, dtype=torch.long)
@@ -339,9 +357,15 @@ class CpuSparseGraph:
             page_base=sf.page_base,
             sparse=sf,
         )
+        if tm is not None:
+            # CPU has no device H2D; this is the host staging-build analogue.
+            tm.mark("p1_h2d", t)
+            t = time.perf_counter()
         hid: list = []
         logits = self._model.forward(ids, pos, kv, self._backend, hidden_out=hid, last_only=False)
         self.hidden = hid[-1] if hid else None
+        if tm is not None:
+            tm.mark("p2_replay", t)
         return logits
 
 

@@ -780,6 +780,8 @@ class SparseRuntime:
         configuration, or a failed capture. The refresh counter is advanced ONLY
         on a captured tick; eager goes through ``_sparse_rows`` which owns it."""
         ctx = self.ctx
+        tm = ctx.step_timing
+        pt = time.perf_counter()
         from .sparse_engine import SPARSE_REFRESH_TICKS, SparseForward, cmax_bucket
         from .sparse_index import WINDOW_PAGES as _WP
 
@@ -831,28 +833,53 @@ class SparseRuntime:
                 self.graph_on = False
                 return False
             self.graphs[key] = g
+        # The graph's run() marks p0/p1/p2 into this same timer; cheap to rebind
+        # each tick (the steady state reuses the same object).
+        g.tm = tm
+        if tm is not None:
+            # decode_rows + bucket/graph lookup; the capture itself is excluded
+            # by the steady-only gate (first tick is not counted).
+            tm.mark("p_rows", pt)
         logits = g.run(
             rows,
             chains or [(r.output[-1],) for r in reqs],
             pad=ctx.graph_capture.pad,
         )
+        if tm is not None:
+            # g.run() timed p0/p1/p2 against its own local anchor; restart here
+            # so p3 measures only finalize, not the replay it followed.
+            pt = time.perf_counter()
         self.ticks_since_refresh += 1
         ctx.bump_decode_forwards()
         # Finalize residency immediately after the forward (same order as the
         # eager path (finalize before sample/verify): the pin reads
         # this tick's selection out of the captured sf and demotes the rest.
         self.finalize(g.sf, reqs)
+        if tm is not None:
+            # run() left the anchor at the replay end.
+            tm.mark("p3_finalize", pt)
+            pt = time.perf_counter()
         if chains:
             ctx.verify(reqs, chains, logits, g.hidden)
+            if tm is not None:
+                # Spec-only phase; a depth-0 tick never records it.
+                tm.mark("p4_verify", pt)
+                pt = time.perf_counter()
         else:
             if ctx.draft is not None and g.hidden is not None:
                 for i, r in enumerate(reqs):
                     r.hidden_prev = None if r.hidden is None else r.hidden[:, -1:]
                     r.hidden, r.hidden_from = g.hidden[i : i + 1], r.seq_len - 1
             ctx.sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
+            if tm is not None:
+                # The depth-0 analogue of p4_verify (plain sample commit).
+                tm.mark("p_sample", pt)
+                pt = time.perf_counter()
         if ctx.draft is not None:
             end = ctx.width - 1
             for r in reqs:
                 assert len(r.draft_blocks) * BLOCK_TOKENS > r.seq_len - 1 + end
             ctx.draft_step(reqs)
+            if tm is not None:
+                tm.mark("p5_draft", pt)
         return True
