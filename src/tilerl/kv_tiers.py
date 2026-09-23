@@ -523,63 +523,11 @@ class HostKvPages:
         #: one RAM LRU across private and shared pages: ("p",key)/("s",key) -> n.
         self._ram_order: OrderedDict[tuple[str, Any], int] = OrderedDict()
 
-    def _ensure_shared_ssd(self, blob: dict):
-        """Open (once) and return the cold-layout {k,v,bounds} shared bucket.
-        Seam kept separate from _open_shared_bucket so gates can inject around
-        the cold lift; identical semantics."""
-        return self._open_shared_bucket(_SHARED_SIG_COLD, blob)
-
-    def _open_shared_bucket(self, sig, blob):
-        """Lazily open the shared spill bucket for a recognized blob layout.
-        Returns the file, or None when spilling is off/disabled, the field set
-        is unrecognized (it stays in RAM rather than opening an unbounded number
-        of sibling files), or the sibling-file cap is reached / open failed."""
-        with self._tlock:
-            bucket = self._shared_ssds.get(sig)
-            if bucket is not None:
-                # The field-name signature matched; the concrete dtype/shape must
-                # too, or the bucket cannot hold this blob. Reject to RAM.
-                if bucket._spec != _blob_spec(blob):
-                    self.shared_spec_failures += 1
-                    return None
-                return bucket
-            if (
-                not self._ssd_path
-                or self.shared_spill_disabled
-                or len(self._shared_ssds) >= _MAX_SHARED_BUCKETS
-            ):
-                return None
-            try:
-                bucket = ColdSsdFile(
-                    _shared_bucket_path(self._ssd_path, sig),
-                    _blob_spec(blob),
-                    step_timing=self.step_timing,
-                    reclaim=self.prefix_spill_bounded,
-                )
-            except OSError:
-                self._disable_shared_spill()
-                return None
-            self._shared_ssds[sig] = bucket
-            return bucket
-
     @property
     def _shared_ssd(self):
         """The cold-layout ({k,v,bounds}) shared bucket; None until first cold
         spill. Compatibility seam for callers/gates that predate warm buckets."""
         return self._shared_ssds.get(_SHARED_SIG_COLD)
-
-    def _disable_shared_spill(self) -> None:
-        with self._tlock:
-            if self.shared_spill_disabled:
-                return
-            self.shared_spill_disabled = True
-            self.shared_spill_error = "shared spill write failure"
-            print(
-                f"[cold] shared-prefix spill to {_shared_ssd_path(self._ssd_path)!r} "
-                "failed once; shared SSD spill disabled for this process, "
-                "shared pages stay in RAM",
-                flush=True,
-            )
 
     @property
     def bytes_held(self) -> int:
