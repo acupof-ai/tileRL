@@ -186,14 +186,22 @@ not the 40+ the per-tick arithmetic suggested. These are arithmetic on v1
 numbers and are labelled estimates; the delayed configuration's cycle time
 must be measured, and that measurement is a binding gate, not this table.
 
-### The `h2d107` OFF-interval anomaly — attributed (`96bc4fa0`)
+### The `h2d107` OFF-interval anomaly — attributed
 
 `h2d107`'s OFF interval p50 read 61.77 ms while all four other configs read
 45.9–46.6 ms, and OFF segments emit no background, so that quantity should not
 depend on the config. An offline parser over the `[step-timing]` log
-(`scripts/probe_shadow_interval.py`, splitting each OFF gap into
-plain / spans-a-refresh / other) locates it: it is **`h2d107`'s first OFF
-segment only**.
+(splitting each OFF gap into plain / spans-a-refresh / other) locates it: it is
+**`h2d107`'s first OFF segment only**.
+
+**Artifact.** Every number in this section is in
+`scripts/shadow_v1_interval_summary.json`, produced by
+`scripts/probe_shadow_interval.py` at probe-branch commit `96bc4fa0`
+(pushed), run over the five raw `shadow_v1_*.dev.err` files in
+`/home/chenkailun.c/shadowwin-0924-054509` on the V100. The summary carries the
+seg0/seg2 table, the tick-80 raw line per config, the plain/mixed gap split,
+and the OFF-segments-past-the-first denominator (n=55) for all five configs;
+the raw directory is readable read-only over `ssh v100` for cross-checking.
 
 | config | seg0 graph p50 | seg0 `stats` p50 | seg2 graph p50 | seg2 `stats` p50 |
 |---|---:|---:|---:|---:|
@@ -221,8 +229,9 @@ p50 **127 ms** against `off`'s 46 ms, and its `stats` p50 is 41 ms against 3 ms.
 By the second segment every config reads 42–46 ms graph and 3 ms `stats`,
 including `h2d107` — so the carve itself costs nothing in steady state.
 
-Corrected denominator (OFF segments past the first, n=55 each): `h2d107`
-**46**, `off` 45, `both107` 45. Criterion 1 was `71.43 <= 61.77 → False`; at
+Corrected denominator (OFF segments past the first — the artifact's
+`off_segments_past_first`, n=55 each): `h2d107` **46**, `off` 45, `both107`
+45, `quest` 46, `h2d206` 46. Criterion 1 was `71.43 <= 61.77 → False`; at
 46 it is more False. **All three gates fail under either denominator, so the
 v1 no-go does not depend on this denominator.**
 
