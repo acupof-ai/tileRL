@@ -46,12 +46,18 @@ class SparseShadow:
         self.device = ctx.backend.device
         self.cuda = self.device.type == "cuda"
         self.mode = os.environ.get("TILERL_SPARSE_SHADOW", "off")
+        if self.mode not in ("off", "quest", "h2d", "both"):
+            # A truthy junk value (e.g. "1") would otherwise enable a shadow
+            # that does neither quest nor h2d and look like a real run.
+            raise ValueError(
+                f"TILERL_SPARSE_SHADOW={self.mode!r}; "
+                f"want one of off|quest|h2d|both")
         self.enabled = self.mode in ("quest", "h2d", "both")
         self.do_quest = self.mode in ("quest", "both")
         self.do_h2d = self.mode in ("h2d", "both")
-        if self.enabled and self.mode not in ("quest", "h2d", "both"):
-            raise ValueError(
-                f"TILERL_SPARSE_SHADOW={self.mode!r}; want off|quest|h2d|both")
+        # Event handle of the most recent background launch (engine is the sole
+        # emitter; the timing driver queries it for the tail gate).
+        self.last_event = None
         self.stream = torch.cuda.Stream(self.device) if self.cuda else None
         self.kv = ctx.kv
         self.cfg = tracker.cfg

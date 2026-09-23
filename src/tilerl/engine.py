@@ -2027,13 +2027,13 @@ class Engine:
                 _tm.fwd_path = "graph"
                 _tm.fwd_sparse = True
             self._hybrid_charge(True)
-            # PROBE-ONLY (#805): launch shadow v1 background select+promote on
-            # a side stream after each captured sparse graph tick. No residency
-            # side effect, so tokens are unchanged.
+            # PROBE-ONLY (#805): the shadow is the SOLE emitter of background
+            # work, here inside the tick (the driver only reads sh.last_event).
             sh = self._sparse_shadow
-            if sh is not None and sh.enabled:
+            if sh is not None and sh.enabled and sh.active_seg:
                 q_dec = [len(c) for c in chains] if chains else [1] * len(decodes)
-                sh.after_graph_tick(self._sparse.decode_rows(decodes, q_dec))
+                sh.last_event = sh.after_graph_tick(
+                    self._sparse.decode_rows(decodes, q_dec))
             return
         rows = decodes + prefills
         seq_q = q_dec + chunks

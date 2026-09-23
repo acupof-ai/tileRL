@@ -81,8 +81,10 @@ def run_one_mode(arm_mode, e, ids, max_new):
     off_w, on_w, intervals_off = [], [], []
     bg_complete = 0
     bg_missed = 0
-    last_bg_event = None
-    pending_had_bg = False
+    # The engine is the SOLE emitter: each ON graph tick's step() launches the
+    # background and stores its end event on sh.last_event. At the NEXT graph
+    # tick we non-blocking-query whether it finished within one interval.
+    prev_was_on = False
     prev_start = None
     import time
 
@@ -93,6 +95,16 @@ def run_one_mode(arm_mode, e, ids, max_new):
         t_start = time.perf_counter()
         if prev_start is not None:
             gap = (t_start - prev_start) * 1000.0
+        # Tail gate, checked BEFORE this tick's step: did the previous ON
+        # tick's background complete in the intervening interval?
+        if prev_was_on:
+            ev = sh.last_event
+            if ev is not None:
+                done = True if ev == "inline-done" else bool(ev.query())
+                if done:
+                    bg_complete += 1
+                else:
+                    bg_missed += 1
         e.step()
         df = e._decode_forwards - f0
         alive = any(r.req_id == rid for r in e._running)
@@ -103,32 +115,15 @@ def run_one_mode(arm_mode, e, ids, max_new):
             if prev_start is not None and seg_state == "off":
                 intervals_off.append(gap)
             (on_w if seg_state == "on" else off_w).append(wall)
-            # Tail gate: did the previous ON tick's background finish before
-            # this tick started? (non-blocking event query, no wait).
-            if seg_state == "on" and pending_had_bg:
-                done = True
-                if last_bg_event not in (None, "inline-done"):
-                    done = bool(last_bg_event.query())
-                if done:
-                    bg_complete += 1
-                else:
-                    bg_missed += 1
             seg_n += 1
+            prev_was_on = seg_state == "on"
             if seg_n >= SEGMENT:
                 if seg_state == "on":
-                    sh.wait_pending()  # don't leak bg across the boundary
+                    sh.wait_pending()  # don't leak background across boundary
                 seg_state = "on" if seg_state == "off" else "off"
                 seg_n = 0
                 sh.set_active(seg_state == "on")
-            # Launch this tick's background AFTER recording the segment; the
-            # event is checked at the next graph tick start. live_row is the
-            # pre-step request (still present for a decode tick).
-            if seg_state == "on":
-                rows = e._sparse.decode_rows([live_row], [1])
-                last_bg_event = sh.after_graph_tick(rows)
-                pending_had_bg = last_bg_event is not None
-            else:
-                last_bg_event, pending_had_bg = None, False
+                prev_was_on = False  # boundary tick: no predecessor in new seg
             prev_start = t_start
         if not alive:
             break
@@ -137,6 +132,13 @@ def run_one_mode(arm_mode, e, ids, max_new):
     info = sh.info() if sh is not None else {}
     promo = list(getattr(e._sparse, "refresh_promotions", []))
     bg_total = bg_complete + bg_missed
+    # Single-emitter invariant: the engine launches background exactly once
+    # per ON graph tick. quest/h2d/both all emit; a mismatch means a double
+    # emitter (the bug this guards) or a missing launch.
+    if len(on_w) and len(bg) != len(on_w):
+        raise AssertionError(
+            f"{arm_mode}: n_bg {len(bg)} != n_graph_on {len(on_w)} "
+            f"(shadow must emit exactly once per ON graph tick)")
     return {"mode": arm_mode, "h2d_pages": info.get("carved_scratch_pages"),
             "n_graph_off": len(off_w), "n_graph_on": len(on_w),
             "graph_p50_off": pct(off_w, 50), "graph_p90_off": pct(off_w, 90),
