@@ -66,3 +66,34 @@ qwen38-27b, `sparse_min_tokens=0`, 50 steady graph ticks per cell, closure gate
 Raw artifacts: `wins/sparse-w2-phase-timing-2026-09-23/arm_B_w2_graph.json`,
 `…/arm_B_w2_graph_dw2048.json`, `…/arm_A_w2_graph.json`,
 `…/arm_A_w2_graph_dw2048.json` (probe revision `1d106e6a`).
+
+## Second sample, 2026-09-24 — a different measurand, recorded not concluded
+
+The refresh-phase window (`probe/805-serve-sm70` @ `f7a93e5c`, V100 sm70,
+qwen38-27b, `graph_w2048`, one real 37.6k wikitext prompt,
+`TILERL_REFRESH_PHASES=1`, no nsys, dir `phasewin-0924-025040`) contains one
+graph-path tick that stalled on the storage tier:
+
+| tick | step ms | graph ms | `step − graph` ms | ssd_mmap ms | note |
+|---:|---:|---:|---:|---:|---|
+| 197 (last of run) | 9904 | 9901 | 3 | 8031 | `release_cold_forget=9870`, `pub_cold_transfer=7771`, `pub_bounds_d2h=309`, `pub_draft_clone=348`, `pub_frame_d2h=278`, `pub_share_hold=383` |
+
+Every other graph tick in the same run reads 37–46 ms. The segments above are
+that tick's own phase marks and overlap; they do not sum to the total.
+
+**This is not a sample of the b1024 / ORDER B phenomenon.** Two differences, both
+load-bearing:
+
+1. **Opposite measurand.** b1024/ORDER B is defined by `step − graph` ≈ 41.9 ms
+   with the graph itself short. Here `step − graph` is 3 ms: 9901 of the 9904 ms
+   is inside the graph envelope, so the cost is on the captured path, not host
+   work outside it.
+2. **Different bucket and different position.** The window ran one 37.6k prompt
+   at the steady bucket (`own_w=8`, `table_w=137`), not bucket 1024, and tick 197
+   is the run's final tick — the request's departure-release path, not steady
+   state. Its phase marks are dominated by `release_cold_forget` and
+   `pub_cold_transfer`, which the b1024 cells do not show.
+
+Recorded because an unexplained ~9.9 s sparse graph tick is worth knowing about,
+not because it corroborates anything. One sample, no mechanism, no fix. A third
+distinct measurement on this path would be worth its own entry.
