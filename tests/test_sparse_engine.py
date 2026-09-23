@@ -1811,10 +1811,20 @@ def test_sparse_graph_verify_tick_w2_tokens_equal_dense():
     n = {"g": 0}
     orig = e._run_sparse_decode_graph
     e._run_sparse_decode_graph = lambda r, c, n=n: n.__setitem__("g", n["g"] + 1) or orig(r, c)
-    rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
-    got = _drain(e, rid, 8)
-    e.shutdown()
+    # CPU kernels are exact at any keep_steps, so the token check is blind to #805:
+    # on sm70 keep_steps=1 routes GDN off the f32 decode kernel. Record it directly.
+    import tilerl.decode_graph as dg
+
+    ks, real_kv = [], dg.BatchKv
+    dg.BatchKv = lambda **kw: ks.append(kw["keep_steps"]) or real_kv(**kw)
+    try:
+        rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
+        got = _drain(e, rid, 8)
+    finally:
+        dg.BatchKv = real_kv
+        e.shutdown()
     assert n["g"] >= 1, "the W=2 verify graph never ran"
+    assert ks and set(ks) == {2}, f"W=2 sparse verify must keep every step like eager: {ks}"
     assert got == base, f"graph verify {got} != dense {base}"
 
 
