@@ -871,7 +871,8 @@ class Engine:
         #: snapshot and looks healthy).
         self._last_progress_ts: float = time.perf_counter()
         #: Memoized dense ledger: weights/pools/slots are static after build, and
-        #: _build_stats (twice a step) used to re-walk every param tensor per tick.
+        #: _build_stats (every tick, plus admit ticks twice) used to re-walk every
+        #: param tensor per tick.
         #: Keyed on len(params): add_lora attaches adapter tensors post-build, so
         #: the train manifest's ledger must recompute after an attach.
         self._mem_rows: tuple[int, list] | None = None
@@ -1229,6 +1230,7 @@ class Engine:
         idle = False
         with self._lock:
             _tm = self._step_timing
+            slots_before = self._slots_used
             if _tm is not None:
                 _tm.tick_start()
                 _t = time.perf_counter()
@@ -1249,9 +1251,17 @@ class Engine:
                 if _tm is not None:
                     _tm.mark("plan", _t)
                     _t = time.perf_counter()
-                # Before the forward too: without this the FIRST forward has no snapshot and
-                # `stats()` falls back to the locking path.
-                self._stats_snapshot = self._build_stats()
+                # Publish before the forward only when state changed since the last
+                # tick's end snapshot: THIS tick admitted rows, or submit() queued
+                # new waiters. Otherwise the end snapshot is current, and rebuilding
+                # doubles the per-tick stats cost. A first tick always admits (and a
+                # long multi-chunk prefill admits on its first tick), so stats() never
+                # falls back to its locking path while a forward holds this lock
+                # (test_health_does_not_wait_on_the_engine_lock).
+                admitted = self._slots_used > slots_before
+                prev_waiting = (self._stats_snapshot or {}).get("waiting")
+                if admitted or prev_waiting != len(self._waiting):
+                    self._stats_snapshot = self._build_stats()
                 tick_sparse = bool((decodes + prefills) and (decodes + prefills)[0].sparse_on)
                 if _tm is not None:
                     _tm.mark("stats", _t)

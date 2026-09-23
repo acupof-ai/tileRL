@@ -1048,6 +1048,75 @@ def test_health_does_not_wait_on_the_engine_lock(tmp_path):
     assert isinstance(snap, dict) and "pool_used_blocks" in snap, snap
 
 
+def test_stats_snapshot_is_built_once_per_tick_and_carries_tick_end_state():
+    """step()'s stats snapshot is built once per steady tick, not twice, and the
+    published dict is the tick's END state. Regression for the perf change that
+    made the pre-forward _build_stats conditional: it still fires on an admit
+    tick and when submit() queues a waiter that cannot be admitted yet.
+
+    Negative control that must be red: keep ONLY the old unconditional
+    pre-forward build. The run then builds once per tick (builds == ticks)
+    instead of once per tick plus one per demand tick, and the final tick's
+    snapshot is its PRE-forward state -- the finished row still reads
+    running=1, finished=0, tokens_generated one short -- so the comparison
+    against a fresh build fails.
+    """
+    cfg = tiny()
+    engine = build_engine(cfg, build_random(cfg, seed=42), get_backend(),
+                          num_blocks=32, num_slots=4, max_batch=1,
+                          max_total_tokens=4096, sparse_k=0)
+    orig_build = engine._build_stats
+    builds = 0
+
+    def counting_build():
+        nonlocal builds
+        builds += 1
+        return orig_build()
+
+    engine._build_stats = counting_build
+    # The invariant the conditional build protects: while a forward runs, a
+    # snapshot must already be published, or stats() falls back to its locking
+    # path -- a silent slowdown, not an error. Checked at EVERY forward entry,
+    # so it covers both the admit tick and later no-admit decode ticks.
+    orig_forward = engine._run_forward
+    forward_ticks = 0
+
+    def forward_with_snapshot(decodes, prefills, chunks):
+        nonlocal forward_ticks
+        forward_ticks += 1
+        assert engine._stats_snapshot is not None, "no lock-free snapshot during the forward"
+        return orig_forward(decodes, prefills, chunks)
+
+    engine._run_forward = forward_with_snapshot
+    rid = engine.submit([7, 11, 13], SamplingParams(temperature=0.0, max_new_tokens=6))
+    ticks = 0
+    out = None
+    blocked = None
+    for _ in range(100):
+        ticks += 1
+        engine.step()
+        if ticks == 1:
+            # max_batch=1 and rid still occupies the batch, so this parks in the
+            # waiting queue and exercises the submit-driven pre-forward build.
+            blocked = engine.submit([5] * 10, SamplingParams(max_new_tokens=1))
+        out = engine.take(rid)
+        if out is not None:
+            break
+    assert out is not None, "the row never finished"
+    assert engine.take(blocked) is None, "the oversized prompt unexpectedly admitted"
+
+    # One end build per tick, plus one pre-forward build per demand tick: the
+    # first tick (admit) and the tick after the blocked waiter appeared.
+    assert forward_ticks == ticks
+    assert builds == ticks + 2, f"{builds} builds over {ticks} ticks"
+    snap = engine._stats_snapshot
+    assert snap is not None
+    assert snap["running"] == 0 and snap["finished"] == 1 and snap["waiting"] == 1
+    assert snap["tokens_generated"] == len(out)
+    fresh = orig_build()
+    assert snap == fresh
+
+
 def test_messages_route_records_token_ids(client, tmp_path, monkeypatch):
     """The Messages shim answers Claude Code's shape and records the ids.
 
