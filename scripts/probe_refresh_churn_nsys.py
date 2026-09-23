@@ -227,6 +227,46 @@ def run_window(e, ids, max_new, want_refresh, smoke=False):
                               "idle to choose A'(idle/sync-bound) vs B(kernel)"}
 
 
+def gate_verdict(rep, want_refresh):
+    """Pure device-window gate. Returns (rc, note). rc14 means the result
+    cannot certify the question: a mislabeled nsys frame, an SSD meter that did
+    not attach or never fired, or too few refreshes in frame. Kept separate
+    from main so the two self-proof gates get real negative controls."""
+    if rep["pred_observed_mismatches"]:
+        return 14, "pred/observed tick-kind mismatch; nsys labels invalid"
+    ssd = rep["ssd_bytes_read"]
+    if ssd["n_targets"] == 0:
+        return 14, "SSD meter unattached"
+    if ssd["total"] == 0 or ssd["n_reads"] == 0:
+        return 14, "SSD meter attached but zero reads"
+    if rep["refreshes_in_frame"] < want_refresh:
+        return 14, "not enough refreshes in frame"
+    return 0, ""
+
+
+def _gate_self_check():
+    """Negative controls for the two self-proof gates against synthetic reps:
+    a mismatch and an unattached/zero-read meter MUST each yield rc14; a good
+    rep must yield 0. Guards against a gate that cannot fire."""
+    good = {"pred_observed_mismatches": [],
+            "ssd_bytes_read": {"n_targets": 1, "n_reads": 5, "total": 100,
+                               "frame": 100},
+            "refreshes_in_frame": 5}
+    assert gate_verdict(good, 5) == (0, ""), gate_verdict(good, 5)
+    bad_label = dict(good, pred_observed_mismatches=[{"tick": 7}])
+    assert gate_verdict(bad_label, 5)[0] == 14
+    no_target = dict(good, ssd_bytes_read={**good["ssd_bytes_read"],
+                                           "n_targets": 0, "n_reads": 0,
+                                           "total": 0})
+    assert gate_verdict(no_target, 5)[0] == 14
+    zero_read = dict(good, ssd_bytes_read={**good["ssd_bytes_read"],
+                                           "n_targets": 1, "n_reads": 0,
+                                           "total": 0})
+    assert gate_verdict(zero_read, 5)[0] == 14
+    few = dict(good, refreshes_in_frame=4)
+    assert gate_verdict(few, 5)[0] == 14
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="qwen38-27b")
@@ -248,7 +288,8 @@ def main():
     os.environ.setdefault("TILERL_STEP_TIMING_SLOW_MS", "0")
 
     _churn_self_check()
-    print("[self-check] churn math: fixed=0, perturbed>0  OK", flush=True)
+    _gate_self_check()
+    print("[self-check] churn math + window gates: OK", flush=True)
 
     if args.smoke:
         from probe_serve_sm70_w2048 import build_smoke_engine
@@ -308,35 +349,28 @@ def main():
               f"ssd={rep['ssd_bytes_read']} {note}".rstrip(), flush=True)
         return rc
 
-    if rep["pred_observed_mismatches"]:
-        # NVTX tick labels would not match the bucketed tick kinds; the nsys
-        # grouping cannot be trusted.
-        print(f"INSUFFICIENT: {len(rep['pred_observed_mismatches'])} "
-              f"pred-vs-observed tick mismatches: "
-              f"{rep['pred_observed_mismatches'][:5]}", file=sys.stderr)
-        return finish(14, "pred/observed tick-kind mismatch; nsys labels invalid")
-    ssd = rep["ssd_bytes_read"]
-    if ssd["n_targets"] == 0:
-        print("INSUFFICIENT: SSD byte meter attached to ZERO ColdSsdFile "
-              "(cold._ssd / _shared_ssds both absent); configure the spill "
-              "tier (H2_COLD_SSD / H2_COLD_SSD_BYTES). A zero-byte result "
-              "from an unattached meter is not a reading.", file=sys.stderr)
-        return finish(14, "SSD meter unattached")
-    if ssd["total"] == 0 or ssd["n_reads"] == 0:
-        # Meter is attached but never fired across the whole run: either no
-        # page was ever promoted back from SSD at 32k, or the wrap misses the
-        # actual call site. Distinguishing needs this to be loud, not a 0 that
-        # reads as "refresh never touches disk".
-        print(f"INSUFFICIENT: SSD meter attached to {ssd['n_targets']} file(s) "
-              f"but observed 0 reads / 0 bytes over the whole run; cannot "
-              f"certify refresh SSD cost (confirm the prompt actually spills "
-              f"past the host tier)", file=sys.stderr)
-        return finish(14, "SSD meter attached but zero reads")
-    if rep["refreshes_in_frame"] < args.want_refresh:
-        print(f"INSUFFICIENT: framed only {rep['refreshes_in_frame']} refreshes "
-              f"(need {args.want_refresh}); raise --max-new-tokens",
-              file=sys.stderr)
-        return finish(14, "not enough refreshes in frame")
+    rc, note = gate_verdict(rep, args.want_refresh)
+    if rc == 14:
+        if "mismatch" in note:
+            print(f"INSUFFICIENT: {len(rep['pred_observed_mismatches'])} "
+                  f"pred-vs-observed tick mismatches: "
+                  f"{rep['pred_observed_mismatches'][:5]}", file=sys.stderr)
+        elif note == "SSD meter unattached":
+            print("INSUFFICIENT: SSD byte meter attached to ZERO ColdSsdFile "
+                  "(cold._ssd / _shared_ssds both absent); configure the spill "
+                  "tier (H2_COLD_SSD / H2_COLD_SSD_BYTES). A zero-byte result "
+                  "from an unattached meter is not a reading.", file=sys.stderr)
+        elif "zero reads" in note:
+            ssd0 = rep["ssd_bytes_read"]
+            print(f"INSUFFICIENT: SSD meter attached to {ssd0['n_targets']} "
+                  f"file(s) but observed 0 reads / 0 bytes over the whole run; "
+                  f"cannot certify refresh SSD cost (confirm the prompt spills "
+                  f"past the host tier)", file=sys.stderr)
+        else:
+            print(f"INSUFFICIENT: framed only {rep['refreshes_in_frame']} "
+                  f"refreshes (need {args.want_refresh}); raise --max-new-tokens",
+                  file=sys.stderr)
+        return finish(14, note)
     return finish(0)
 
 
