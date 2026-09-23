@@ -64,7 +64,7 @@ physical card per run.
 Shipped — 27B built-engine `--record-residency` on card 2, every derived row
 equal measured to the byte: peak 76,451,655,680 = static 76,338,610,340 +
 transient 113,045,340 (row `edb5d8328af3`), in
-[wins/2026-09-11-h20-kernel-roofline-step3.md](../wins/2026-09-11-h20-kernel-roofline-step3.md).
+[wins/2026-09-11-h20-kernel-roofline-step3.md](wins/2026-09-11-h20-kernel-roofline-step3.md).
 That entry pins the 314-vs-315 cause: the captured decode graph reserves one
 pad slot+block, so pool num_blocks is one more than usable_blocks.
 
@@ -89,7 +89,7 @@ CUDA_VISIBLE_DEVICES=0 TILERL_TARGET=cuda uv run tilerl serve \
 
 Shipped — every timed row in (0,100] on sm90 card 2, decode B=1/B=8 and
 prefill S=4096, against measured bw/bf16/**fp8** floors. See
-[wins/2026-09-11-h20-kernel-roofline-step3.md](../wins/2026-09-11-h20-kernel-roofline-step3.md).
+[wins/2026-09-11-h20-kernel-roofline-step3.md](wins/2026-09-11-h20-kernel-roofline-step3.md).
 Two rules that run established: the ceiling is the kernel's MMA-dtype peak
 (w4a8 prefill rides the fp8 peak, decode the bf16 one), and the timer times the
 priced launch M (decode M=b, not b·s). Still pending — deferred with H20 (2026-09-16 shutdown, see status
@@ -217,7 +217,7 @@ Off cuda the command refuses at model load (the 27B needs its checkpoint dir).
 
 ## 7 — Recapture-after-update: token equality then wall clock (P2.0 step 0)
 
-DONE on H20 sm90 (27B NVFP4), LoRA path — [wins/2026-09-11-lora-recapture-after-update-kept-graph-27b.md](../wins/2026-09-11-lora-recapture-after-update-kept-graph-27b.md). `scripts/recapture_lora.py`: the kept graph replays an in-place rank-16 LoRA update, post-step tokens bit-equal to a fresh eager engine, the no-step control unchanged, graphs held; steady-state post-step tick 24.4 ms captured vs 158.2 ms eager (6.5×). Full-parameter SFT does not coexist with the captured engine on one card — [errors/2026-09-11-full-sft-oom-does-not-coexist-with-serving-engine.md](../errors/2026-09-11-full-sft-oom-does-not-coexist-with-serving-engine.md).
+DONE on H20 sm90 (27B NVFP4), LoRA path — [wins/2026-09-11-lora-recapture-after-update-kept-graph-27b.md](wins/2026-09-11-lora-recapture-after-update-kept-graph-27b.md). `scripts/recapture_lora.py`: the kept graph replays an in-place rank-16 LoRA update, post-step tokens bit-equal to a fresh eager engine, the no-step control unchanged, graphs held; steady-state post-step tick 24.4 ms captured vs 158.2 ms eager (6.5×). Full-parameter SFT does not coexist with the captured engine on one card — [errors/2026-09-11-full-sft-oom-does-not-coexist-with-serving-engine.md](errors/2026-09-11-full-sft-oom-does-not-coexist-with-serving-engine.md).
 
 Original spec:
 

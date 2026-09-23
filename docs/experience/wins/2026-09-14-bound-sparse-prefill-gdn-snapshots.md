@@ -7,7 +7,7 @@
 ## Context
 
 The V100 sparse 256k prefill was OOM-killed with zero SSD spill
-([the kill record](2026-09-13-v100-256k-sparse-prefill-host-oom.md)). The
+([the kill record](../errors/2026-09-13-v100-256k-sparse-prefill-host-oom.md)). The
 hypothesis was own-span K/V pages pinning into the 10 GiB host tier faster than
 prefill demoted them. That hypothesis was wrong: `HostKvPages` pins K/V blobs
 under its byte budget and LRU-spills past it, so K/V alone cannot grow to the

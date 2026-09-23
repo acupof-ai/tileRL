@@ -11,7 +11,7 @@ compiling, and the memory bracket I gave a peer before the run did not contain t
 B=8 fills the tensor core 50% and B=16 fills it 100% with no valley in between — the sweet
 spot is exactly 16, since past it a request enters the prefill bucket and bM jumps to 32
 (53% fill). The bandwidth side says the move is nearly free: from the
-[per-tick floor table](2026-09-08-four-rulers-the-wrong-size-for-their-object.md), only the
+[per-tick floor table](../errors/2026-09-08-four-rulers-the-wrong-size-for-their-object.md), only the
 per-batch terms double, **+5.6% of bytes for 2x the tokens**.
 
 Capacity is the one term that table does not compute, and the training path never measures it
