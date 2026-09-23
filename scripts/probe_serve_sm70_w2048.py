@@ -462,9 +462,16 @@ def run_worker(arm, args):
                     row["first_decode_bucket"] = (
                         events[0]["bucket"] if events else None)
                     row["buckets_seen"] = sorted({ev["bucket"] for ev in events})
+                    first_b = events[0]["bucket"] if events else None
                     new_bucket_seen = any(ev["bucket"] >= MIN_NEW_BUCKET
                                           for ev in events)
                     row["new_bucket_armed"] = new_bucket_seen
+                    # Keep the per-prompt schema identical to the non-floor
+                    # branch (no token comparison reads it, but column-aligned
+                    # reporting should not lose a field).
+                    row["generation_bucket_transition"] = any(
+                        ev["seq_before"] > 0 and first_b is not None
+                        and ev["bucket"] > first_b for ev in events)
                     results["correctness_gate"] = \
                         "NOT_RUN (floor-run, no ref)"
                 else:
