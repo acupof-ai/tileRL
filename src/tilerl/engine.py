@@ -81,6 +81,22 @@ def _decode_extra_blocks(seq_len: int, q: int, held: int) -> int:
 _sm70_graph_warned = False
 
 
+def _sparse_capture_allowed(backend, has_draft: bool, spec_depth: int | None) -> bool:
+    """Whether the sparse captured decode graph may be armed for this engine.
+
+    Guard A (#805): on CUDA the captured sparse graph is only correct on the
+    d=0 single-token path. With speculation (spec_depth>=1) the width-2
+    captured verify replays trunk logits/hidden that disagree with eager and
+    drafts stop accepting; it diverged on sm70 and is unverified on sm90, so it
+    is disabled on every CUDA arch and sparse decode runs eager. The CPU cell
+    uses the CpuSparseGraph eager reference, which is token-exact at W=2 (the
+    width-2 oracle gate), so it stays enabled. Same device-type axis
+    ``_graph_on`` uses — no separate arch-string branch."""
+    if backend.device.type != "cuda":
+        return True
+    return not (has_draft and (spec_depth or 0) >= 1)
+
+
 def _graph_on(backend, decode_graph: bool | None) -> bool:
     """The captured decode tick is on by default on CUDA only. One definition:
     ``build_engine`` sizes the pools for the pad row from the same answer the
@@ -708,18 +724,24 @@ class Engine:
         # Hybrid mode runs sparse ticks EAGER on purpose: it needs only the dense
         # precaptured graph, so the sparse capture (and its warmup-frame hazard)
         # is not required; eager sparse is token-exact on sm70.
-        spec_enabled = draft is not None and (spec_depth or 0) >= 1
-        if spec_enabled:
-            # The sparse captured decode graph is only correct on the d=0
-            # (single-token) path. Under speculation the width-2 verify replay
-            # produces trunk logits/hidden that disagree with eager verify and
-            # the drafts stop accepting (#805). Rather than silently capture a
-            # wrong graph, force sparse decode to eager when a draft is present;
-            # the dense capture (non-sparse ticks) is unaffected.
+        #
+        # Guard A (#805): on CUDA the captured sparse graph is only correct on
+        # the d=0 single-token path. With speculation (spec_depth>=1) the
+        # width-2 captured verify replays trunk logits/hidden that disagree with
+        # eager and drafts stop accepting; it is unverified on every CUDA arch
+        # (observed diverging on sm70, not validated on sm90), so disable the
+        # sparse capture there and run sparse decode eager. Scope is CUDA only:
+        # the CPU cell uses the CpuSparseGraph eager reference recording, which
+        # is token-exact at W=2 and stays enabled (the W=2 CPU gate is the
+        # oracle for the width-2 root-cause triage). Same device-type axis
+        # _graph_on already uses; no separate arch string branch.
+        cuda_spec_guard = not _sparse_capture_allowed(backend, draft is not None, spec_depth)
+        if cuda_spec_guard:
             warnings.warn(
-                "sparse decode graph auto-disabled with speculation "
-                f"(spec_depth={spec_depth}): captured sparse verify is only "
-                "correct at spec_depth=0; sparse decode runs eager",
+                "sparse decode graph auto-disabled with speculation on CUDA "
+                f"(spec_depth={spec_depth}): captured sparse width-2 verify is "
+                "unverified on this arch (diverges on sm70, #805); sparse "
+                "decode runs eager. CPU reference is unaffected.",
                 stacklevel=2,
             )
         sparse_graph_on = (
@@ -727,7 +749,7 @@ class Engine:
             and not self._sparse_min_tokens
             and sparse_device_on
             and (self._decode_graph_on or backend.device.type != "cuda")
-            and not spec_enabled
+            and not cuda_spec_guard
         )
         if sparse_tracker is not None:
             self._sparse = SparseRuntime(sparse_tracker, sparse_device_on, sparse_graph_on)

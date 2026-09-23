@@ -3295,75 +3295,30 @@ def test_health_namespaces_sparse_prefix_counters_separately_from_dense():
         dense.shutdown()
 
 
-def test_sparse_capture_graph_disabled_with_spec_depth():
-    """#805 guard A: the sparse captured decode graph is only correct on the
-    d=0 single-token path; the width-2 verify replay diverges from eager. With
-    speculation enabled (draft + spec_depth>=1) the engine must NOT arm the
-    sparse graph (sparse decode falls back to eager) and must say so once.
-    spec_depth=0 keeps the sparse graph armed."""
-    import warnings
+def test_sparse_capture_allowed_guard_a():
+    """#805 guard A: _sparse_capture_allowed keeps the sparse captured decode
+    graph on everywhere at spec_depth=0 and on the CPU reference at any depth
+    (CpuSparseGraph is the token-exact W=2 oracle), but DISABLES it on CUDA
+    when speculation is enabled (captured width-2 verify diverges on sm70 and
+    is unverified on sm90). Pure predicate over a backend stub carrying only
+    device.type, so the gate needs no CUDA/tilelang."""
+    import types
 
-    class _GuardBackend(RefBackend):
-        # RefBackend serves the draft (materialize) but omits has_kernel and
-        # max_verify_width (both pull in the tilelang kernels module, absent on
-        # the CPU cell); supply CPU-friendly values (_serve_draft queries
-        # has_kernel; __init__ checks the verify width against max_verify_width).
-        max_verify_width = 16
-        arch = ""
+    from tilerl.engine import _sparse_capture_allowed
 
-        def has_kernel(self, name):
-            return False
+    def backend(dev_type):
+        return types.SimpleNamespace(device=torch.device(dev_type))
 
-    class _FakeDrafter:
-        # Minimal drafter satisfying the Engine CONSTRUCTOR contract (the
-        # guard runs in __init__ before any step) without tilelang kernels.
+    cuda, cpu = backend("cuda"), backend("cpu")
 
-        aux_layers = ()
-        width = 2
-        forwards = 0
-        no_quant = True
-        params: dict = {}
-        kv = None
-        cfg = None
+    # CUDA: off with a draft at depth>=1, on at depth 0 / no draft
+    assert _sparse_capture_allowed(cuda, True, 1) is False
+    assert _sparse_capture_allowed(cuda, True, 3) is False
+    assert _sparse_capture_allowed(cuda, True, 0) is True
+    assert _sparse_capture_allowed(cuda, True, None) is True
+    assert _sparse_capture_allowed(cuda, False, 1) is True
+    # CPU reference stays enabled even with speculation (W=2 oracle path)
+    assert _sparse_capture_allowed(cpu, True, 1) is True
+    assert _sparse_capture_allowed(cpu, True, 3) is True
+    assert _sparse_capture_allowed(cpu, False, 0) is True
 
-        def set_depth(self, depth):
-            self.depth = depth
-
-        def attach(self, *a, **k):
-            pass
-
-        def step(self, rows):
-            raise AssertionError("guard gate must not run a draft step")
-
-    cfg = tiny()
-    model = build_random(cfg, seed=11)
-    common = dict(
-        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-        max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
-        sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30,
-        sparse_device_select=True, decode_graph=True,
-    )
-
-    # depth 0 (no draft): sparse capture graph stays ON
-    e0 = build_engine(cfg=cfg, model=model, backend=_GuardBackend(), **common)
-    try:
-        assert e0._sparse_graph_on is True, "depth0 must keep the sparse graph on"
-    finally:
-        e0.shutdown()
-
-    # depth 1 (draft + spec_depth=1): sparse capture graph forced OFF + warn
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        e1 = build_engine(
-            cfg=cfg, model=model, backend=_GuardBackend(),
-            draft=_FakeDrafter(), spec_depth=1, **common)
-        try:
-            assert e1._sparse_graph_on is False, (
-                "spec_depth>=1 must auto-disable the sparse captured graph "
-                "(width-2 verify diverges, #805)")
-            assert e1._sparse_device_select is True, (
-                "guard disables only the sparse graph, not device selection")
-        finally:
-            e1.shutdown()
-    assert any("sparse decode graph auto-disabled" in str(w.message) for w in caught), (
-        [str(w.message) for w in caught])
