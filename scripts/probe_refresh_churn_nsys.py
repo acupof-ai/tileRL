@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 
@@ -72,37 +73,204 @@ def _churn_self_check():
 # SSD read-byte meter (ColdSsdFile only exposes ssd_ms, not bytes)
 # --------------------------------------------------------------------------- #
 def install_ssd_byte_meter(e):
-    """Wrap every ColdSsdFile reachable from the cold tiers; return
-    (get_state, set_in_frame). Sums the byte width of the blobs each read
-    returns — the device-side cost this window cares about. n_targets>0 proves
-    the meter actually attached (a zero byte total with zero targets means the
-    meter missed, not that no disk read happened)."""
-    state = {"total": 0, "frame": 0, "in_frame": False, "n_targets": 0,
-             "n_reads": 0}
-    cold = getattr(getattr(e, "_kv", None), "cold", None)
-    targets = []
-    for attr in ("_ssd",):
-        f = getattr(cold, attr, None)
-        if f is not None and hasattr(f, "read"):
-            targets.append(f)
-    for f in getattr(cold, "_shared_ssds", {}).values():
-        if hasattr(f, "read"):
-            targets.append(f)
-    state["n_targets"] = len(targets)
-    for f in targets:
-        raw = f.read
+    """Meter EVERY ColdSsdFile regardless of when it is created. The spill file
+    is lazy: HostKvPages._ssd is None until the first page spills past the host
+    budget (kv_tiers.py creates it inside hold/take), so patching instances at
+    engine build attaches to nothing and silently reads 0. Patch the CLASS read
+    instead; an instance created later is metered on its first call. Returns
+    (get_state, set_in_frame); n_instances>0 proves attachment."""
+    from tilerl import kv_tiers
 
-        def wrapped(key, pin, raw=raw):
-            blob = raw(key, pin)
-            n = sum(t.element_size() * t.numel() for t in blob.values())
-            state["total"] += n
-            state["n_reads"] += 1
-            if state["in_frame"]:
-                state["frame"] += n
-            return blob
+    state = {"total": 0, "frame": 0, "in_frame": False,
+             "n_instances": 0, "n_reads": 0,
+             "n_instances_at_window_start": 0}
+    cls = kv_tiers.ColdSsdFile
+    orig_read = cls.read
 
-        f.read = wrapped
-    return (lambda: dict(state)), lambda v: state.__setitem__("in_frame", v)
+    def metered_read(self, key, pin):
+        blob = orig_read(self, key, pin)
+        n = sum(t.element_size() * t.numel() for t in blob.values())
+        state["total"] += n
+        state["n_reads"] += 1
+        if state["in_frame"]:
+            state["frame"] += n
+        return blob
+
+    cls.read = metered_read
+    # Count instances whenever one is constructed (covers lazy creation).
+    orig_init = cls.__init__
+
+    def metered_init(self, *a, **k):
+        orig_init(self, *a, **k)
+        state["n_instances"] += 1
+
+    cls.__init__ = metered_init
+    state["n_instances_at_window_start"] = state["n_instances"]
+
+    def get_state():
+        d = dict(state)
+        d.pop("in_frame", None)
+        d["meter_attached"] = True
+        return d
+
+    return get_state, lambda v: state.__setitem__("in_frame", v)
+
+
+# --------------------------------------------------------------------------- #
+# task 2: nsys-free refresh-tick phase breakdown
+# --------------------------------------------------------------------------- #
+class PhaseMeter:
+    """Per-tick sub-phase meter for the EAGER refresh tick, no nsys. CUDA
+    events time GPU spans (quest scoring, select_pages, promote, shared
+    promote, evict, the whole eager model.forward); wall time times host
+    blocking points (torch.cuda.synchronize, .item/.tolist/.cpu readbacks).
+    Counts every host readback — the D2H/sync census nsys would give as raw
+    memcpy counts — without changing engine behavior. Attaches by patching
+    module/instance/class functions; restore() undoes every patch.
+
+    GPU spans nest/overlap (select runs inside model.forward), so spans are
+    reported, not summed into a total; the tick total is the step wall."""
+
+    def __init__(self, e):
+        import torch
+
+        self.t = torch
+        self.e = e
+        self.cuda = torch.cuda.is_available()
+        self.active = False
+        self.kind = None
+        self.tick_i = -1
+        self.ticks = {}  # tick_i -> {kind, spans:{...ms}, walls, counts}
+        self._events = []  # (tick_i, name, start, end)
+        self._cur = None
+        self.patches = []
+
+    def _rec(self):
+        d = self.ticks.setdefault(self.tick_i, {
+            "kind": self.kind,
+            "spans_ms": {}, "wall_ms": {},
+            "n_item": 0, "n_tolist": 0, "n_cpu": 0, "n_synchronize": 0})
+        return d
+
+    def _gpu_span(self, name, fn, *a, **k):
+        if not (self.active and self.cuda):
+            return fn(*a, **k)
+        s, z = self.t.cuda.Event(enable_timing=True), self.t.cuda.Event(enable_timing=True)
+        s.record()
+        try:
+            return fn(*a, **k)
+        finally:
+            z.record()
+            self._events.append((self.tick_i, name, s, z))
+
+    def _wall(self, name, fn, *a, **k):
+        if not self.active:
+            return fn(*a, **k)
+        import time
+
+        t0 = time.perf_counter()
+        try:
+            return fn(*a, **k)
+        finally:
+            d = self._rec()
+            d["wall_ms"][name] = d["wall_ms"].get(name, 0.0) + (
+                time.perf_counter() - t0) * 1000.0
+
+    def install(self):
+        import time
+
+        t = self.t
+        e = self.e
+        # --- module/instance GPU spans ---
+        def patch(obj, attr, name, gpu=True):
+            orig = getattr(obj, attr)
+
+            def wrapped(*a, **k):
+                if not self.active:
+                    return orig(*a, **k)
+                if gpu and self.cuda:
+                    return self._gpu_span(name, orig, *a, **k)
+                return self._wall(name, orig, *a, **k)
+
+            setattr(obj, attr, wrapped)
+            self.patches.append((obj, attr, orig))
+
+        from tilerl import sparse_engine as se
+
+        patch(se, "quest_scores", "select_quest_score", gpu=True)
+        patch(e._backend, "select_pages", "select_pages", gpu=True)
+        kv = e._kv
+        if hasattr(kv, "promote_keyed"):
+            patch(kv, "promote_keyed", "promote_keyed", gpu=True)
+        if hasattr(kv, "shared_promote"):
+            # shared_promote itself ends in a per-page cuda.synchronize; the
+            # event span includes that host wait on the stream timeline.
+            patch(kv, "shared_promote", "shared_promote_sync", gpu=True)
+        patch(e._sparse, "evict_victim", "evict_victim", gpu=False)
+        patch(e._model, "forward", "eager_trunk_forward", gpu=True)
+
+        # --- host blocking points / readback census ---
+        sync0 = t.cuda.synchronize
+
+        def sync_wrapped(*a, **k):
+            t0 = time.perf_counter()
+            try:
+                return sync0(*a, **k)
+            finally:
+                if self.active:
+                    d = self._rec()
+                    d["n_synchronize"] += 1
+                    d["wall_ms"]["cuda.synchronize"] = d["wall_ms"].get(
+                        "cuda.synchronize", 0.0) + (time.perf_counter() - t0) * 1000
+
+        t.cuda.synchronize = sync_wrapped
+        self.patches.append((t.cuda, "synchronize", sync0))
+
+        def count_patch(cls, attr, key):
+            orig = getattr(cls, attr)
+
+            def wrapped(selfx, *a, **k):
+                if self.active:
+                    self._rec()[key] += 1
+                return orig(selfx, *a, **k)
+
+            setattr(cls, attr, wrapped)
+            self.patches.append((cls, attr, orig))
+
+        if self.cuda:
+            count_patch(t.Tensor, "item", "n_item")
+            count_patch(t.Tensor, "tolist", "n_tolist")
+            count_patch(t.Tensor, "cpu", "n_cpu")
+        return self
+
+    def begin_tick(self, kind, tick_i):
+        import time
+
+        self.kind, self.tick_i, self.active = kind, tick_i, True
+        self._t0 = time.perf_counter()
+
+    def end_tick(self):
+        import time
+
+        if self.active:
+            d = self._rec()
+            d["wall_ms"]["step_total"] = (time.perf_counter() - self._t0) * 1000
+        self.active = False
+
+    def resolve(self):
+        """Sum recorded GPU event spans per tick, once; clears the event log."""
+        evs, self._events = self._events, []
+        for tick_i, name, s, z in evs:
+            d = self.ticks.get(tick_i)
+            if d is None:
+                continue
+            d["spans_ms"][name] = d["spans_ms"].get(name, 0.0) + s.elapsed_time(z)
+        return self.ticks
+
+    def restore(self):
+        for obj, attr, orig in reversed(self.patches):
+            setattr(obj, attr, orig)
+        self.patches = []
 
 
 # --------------------------------------------------------------------------- #
@@ -119,6 +287,9 @@ def run_window(e, ids, max_new, want_refresh, smoke=False):
     get_ssd, set_frame = install_ssd_byte_meter(e)
     cudart = torch.cuda.cudart() if torch.cuda.is_available() else None
     have_nvtx = torch.cuda.is_available() and hasattr(torch.cuda, "nvtx")
+    phase_meter = None
+    if os.environ.get("TILERL_REFRESH_PHASES"):
+        phase_meter = PhaseMeter(e).install()
 
     rid = e.submit(list(ids), _sampling(max_new))
     warmup = 0 if smoke else 24
@@ -138,6 +309,13 @@ def run_window(e, ids, max_new, want_refresh, smoke=False):
         # peeks the same counter). Confirmed against fwd_path after the step.
         sr = e._sparse.ticks_since_refresh if e._sparse is not None else 0
         pred_refresh = sr + 1 >= 8
+        # Phase meter brackets every sparse decode tick (not just the nsys
+        # frame) by the predicted kind; verified against fwd_path below.
+        if live and phase_meter is not None:
+            live_row = next((x for x in e._running if x.req_id == rid), None)
+            if live_row is not None and live_row.phase == 2:  # _PHASE_DECODE
+                phase_meter.begin_tick("refresh" if pred_refresh else "graph",
+                                       step_i)
         if not framed and step_i >= warmup and live:
             framed = True
             set_frame(True)
@@ -149,6 +327,8 @@ def run_window(e, ids, max_new, want_refresh, smoke=False):
                 f"tick_{'refresh' if pred_refresh else 'graph'}")
         f0 = e._decode_forwards
         e.step()
+        if phase_meter is not None and phase_meter.active:
+            phase_meter.end_tick()
         if framed and not frame_done and have_nvtx:
             torch.cuda.nvtx.range_pop()
         df = e._decode_forwards - f0
@@ -204,6 +384,35 @@ def run_window(e, ids, max_new, want_refresh, smoke=False):
               f"refresh={refreshes_in_frame}", flush=True)
 
     out = list(e.poll().get(rid, []))
+    phase_summary = None
+    if phase_meter is not None:
+        import statistics
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # all recorded events must be queryable
+        ticks = phase_meter.resolve()
+        phase_meter.restore()
+
+        def agg(kind):
+            rows = [d for d in ticks.values() if d["kind"] == kind]
+            if not rows:
+                return None
+            keys = set()
+            for d in rows:
+                keys |= set(d["spans_ms"]) | set(d["wall_ms"])
+            med = {}
+            for k in sorted(keys):
+                vals = [d["spans_ms"].get(k, d["wall_ms"].get(k, 0.0))
+                        for d in rows
+                        if k in d["spans_ms"] or k in d["wall_ms"]]
+                if vals:
+                    med[k] = round(statistics.median(vals), 3)
+            counts = {k: sum(d[k] for d in rows)
+                      for k in ("n_item", "n_tolist", "n_cpu", "n_synchronize")}
+            return {"n_ticks": len(rows), "p50_ms": med,
+                    "total_counts": counts}
+
+        phase_summary = {"refresh": agg("refresh"), "graph": agg("graph")}
     return {"n_out": len(out),
             "total_refresh_ticks": total_refresh,
             "frame_tick_kinds": frame_ticks,
@@ -213,18 +422,20 @@ def run_window(e, ids, max_new, want_refresh, smoke=False):
             "churn_between_adjacent_refreshes": churn_between,
             "pred_observed_mismatches": pred_mismatch,
             "ssd_bytes_read": get_ssd(),
-            # How to read this against the nsys report. The measured wall gap
-            # is refresh 203ms vs graph 46ms (stage0 p50), and ~128ms of it
-            # sits in the eager sparse model.forward envelope. nsys decides
-            # kernel-vs-idle: if the two tick kinds have similar GPU kernel
-            # time but the refresh tick shows far more stream-idle/D2H/sync,
-            # lever A' (move selection reconciliation/promotion off the tick)
-            # removes it; if refresh kernel time itself is higher, lever B (a
-            # longer refresh interval) is the cheaper answer. churn decides
-            # whether B's staleness is free (sets stable -> Jaccard ~1).
-            "interpretation": "refresh-graph gap ~157ms wall, ~128ms in "
-                              "eager model envelope; compare nsys kernel vs "
-                              "idle to choose A'(idle/sync-bound) vs B(kernel)"}
+            "refresh_phase_breakdown": phase_summary,
+            # How to read: refresh p50 203ms vs graph 46ms (stage0), ~128ms
+            # in the eager sparse forward envelope. The breakdown attributes it
+            # without nsys (nsys 2022.4.2.1 export is broken on the device):
+            # GPU-event spans for quest scoring/select_pages/promote/shared
+            # promote/eager trunk, wall time for synchronize/evict, and raw
+            # counts of .item/.tolist/.cpu readbacks. A large eager_trunk span
+            # with many readbacks and synchronize walls => idle/sync-bound =>
+            # 1-tick-delay async refresh (A') removes it; eager_trunk GPU time
+            # genuinely higher => longer refresh interval (B). churn Jaccard
+            # 0.438 means B/R=16 staleness is not free.
+            "interpretation": "spans_ms are GPU-event time (nested, do not "
+                              "sum); wall_ms host blocking; see refresh_phase_"
+                              "breakdown to choose A' vs B"}
 
 
 def gate_verdict(rep, want_refresh):
@@ -235,10 +446,17 @@ def gate_verdict(rep, want_refresh):
     if rep["pred_observed_mismatches"]:
         return 14, "pred/observed tick-kind mismatch; nsys labels invalid"
     ssd = rep["ssd_bytes_read"]
-    if ssd["n_targets"] == 0:
-        return 14, "SSD meter unattached"
+    if not ssd.get("meter_attached"):
+        return 14, "SSD meter class patch missing"
+    if ssd["n_instances"] == 0:
+        # Class is patched but no spill file was ever lazily created: the run
+        # never spilled past the host budget, so refresh-from-SSD is untested.
+        return 14, "no ColdSsdFile created (prompt never spilled)"
     if ssd["total"] == 0 or ssd["n_reads"] == 0:
-        return 14, "SSD meter attached but zero reads"
+        # File exists but the wrapped read never fired: at 32k with the spill
+        # tier the refresh tick promotes from SSD (stage0 showed ssd_mmap
+        # ticks), so zero here means the meter is not on the call path. Loud.
+        return 14, "ColdSsdFile exists but zero reads (meter miss?)"
     if rep["refreshes_in_frame"] < want_refresh:
         return 14, "not enough refreshes in frame"
     return 0, ""
@@ -249,19 +467,21 @@ def _gate_self_check():
     a mismatch and an unattached/zero-read meter MUST each yield rc14; a good
     rep must yield 0. Guards against a gate that cannot fire."""
     good = {"pred_observed_mismatches": [],
-            "ssd_bytes_read": {"n_targets": 1, "n_reads": 5, "total": 100,
-                               "frame": 100},
+            "ssd_bytes_read": {"meter_attached": True, "n_instances": 1,
+                               "n_reads": 5, "total": 100, "frame": 100},
             "refreshes_in_frame": 5}
     assert gate_verdict(good, 5) == (0, ""), gate_verdict(good, 5)
     bad_label = dict(good, pred_observed_mismatches=[{"tick": 7}])
     assert gate_verdict(bad_label, 5)[0] == 14
-    no_target = dict(good, ssd_bytes_read={**good["ssd_bytes_read"],
-                                           "n_targets": 0, "n_reads": 0,
-                                           "total": 0})
-    assert gate_verdict(no_target, 5)[0] == 14
+    no_patch = dict(good, ssd_bytes_read={**good["ssd_bytes_read"],
+                                          "meter_attached": False})
+    assert gate_verdict(no_patch, 5)[0] == 14
+    no_file = dict(good, ssd_bytes_read={**good["ssd_bytes_read"],
+                                         "n_instances": 0, "n_reads": 0,
+                                         "total": 0})
+    assert gate_verdict(no_file, 5)[0] == 14
     zero_read = dict(good, ssd_bytes_read={**good["ssd_bytes_read"],
-                                           "n_targets": 1, "n_reads": 0,
-                                           "total": 0})
+                                           "n_reads": 0, "total": 0})
     assert gate_verdict(zero_read, 5)[0] == 14
     few = dict(good, refreshes_in_frame=4)
     assert gate_verdict(few, 5)[0] == 14
@@ -355,17 +575,20 @@ def main():
             print(f"INSUFFICIENT: {len(rep['pred_observed_mismatches'])} "
                   f"pred-vs-observed tick mismatches: "
                   f"{rep['pred_observed_mismatches'][:5]}", file=sys.stderr)
-        elif note == "SSD meter unattached":
-            print("INSUFFICIENT: SSD byte meter attached to ZERO ColdSsdFile "
-                  "(cold._ssd / _shared_ssds both absent); configure the spill "
-                  "tier (H2_COLD_SSD / H2_COLD_SSD_BYTES). A zero-byte result "
-                  "from an unattached meter is not a reading.", file=sys.stderr)
+        elif note == "SSD meter class patch missing":
+            print("INSUFFICIENT: ColdSsdFile.read class patch not installed",
+                  file=sys.stderr)
+        elif "never spilled" in note:
+            print("INSUFFICIENT: no ColdSsdFile was created — the prompt never "
+                  "spilled past the host tier; refresh-from-SSD untested "
+                  "(set H2_COLD_SSD / H2_COLD_SSD_BYTES and a smaller host "
+                  "budget)", file=sys.stderr)
         elif "zero reads" in note:
             ssd0 = rep["ssd_bytes_read"]
-            print(f"INSUFFICIENT: SSD meter attached to {ssd0['n_targets']} "
-                  f"file(s) but observed 0 reads / 0 bytes over the whole run; "
-                  f"cannot certify refresh SSD cost (confirm the prompt spills "
-                  f"past the host tier)", file=sys.stderr)
+            print(f"INSUFFICIENT: ColdSsdFile created x{ssd0['n_instances']} but "
+                  f"the patched read fired 0 times / 0 bytes; refresh promotes "
+                  f"from SSD at 32k (stage0 ssd_mmap), so the meter is missing "
+                  f"the call path", file=sys.stderr)
         else:
             print(f"INSUFFICIENT: framed only {rep['refreshes_in_frame']} "
                   f"refreshes (need {args.want_refresh}); raise --max-new-tokens",
