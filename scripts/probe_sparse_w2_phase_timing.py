@@ -20,10 +20,10 @@ phases are wall-clock (they carry the GPU drain they block on); p2/p5 are device
 spans, so the sum CAN exceed the single-stream wall and the assert is non-vacuous.
 Failure aborts with a non-zero exit and prints the offending tick, never a table.
 
-Three arms run in ONE process, order A then reversed B:
+Two arms run in ONE process, order A then reversed B:
     w2_graph  depth=1, sparse graph on   (the cost under question)
     w1_graph  depth=0, no draft          (p4_verify and p5_draft must be 0)
-    w2_eager  depth=1, decode_graph off  (splits replay from fill/finalize)
+The device window runs three cmax buckets (512/1024/2048) per arm.
 
 Refresh ticks (every SPARSE_REFRESH_TICKS the sparse graph declines and the tick
 runs eager) and the first capture tick are excluded; n>=50 steady graph ticks per
@@ -33,7 +33,7 @@ CPU precondition (must pass before any device window): ``--model tiny`` builds
 the random model + an always-accept oracle draft on the CPU reference and runs
 all three arms end to end; the depth-0 arm must have p4_verify = p5_draft = 0.
 Negative control: ``--neg-depth0-with-draft`` builds that arm WITH a draft and
-the closure/phase gate must go RED.
+the spec-phase gate must go RED.
 """
 
 from __future__ import annotations
@@ -65,6 +65,20 @@ PHASE_WALL = (
 # A draft-free arm must never record these (p5_draft wall mark is the gate).
 CLOSURE_TOL = 0.05
 N_STEADY = 50
+CMAX_BUCKETS = [512, 1024, 2048]
+PHASE_DECODE = 2
+#: Tree the device window must run on (the PATCH tree: correct keep_steps=W).
+EXPECTED_TREE = "260b66f8"
+
+
+class ProbeFail(Exception):
+    """A hard instrument/precondition failure. Raised with an exit-class tag so
+    main maps a missing/incomplete observation to rc=14 (INSUFFICIENT), distinct
+    from a closure-gate failure (rc=1)."""
+
+    def __init__(self, msg: str, rc: int = 14):
+        super().__init__(msg)
+        self.rc = rc
 
 
 class OracleDraft:
@@ -134,10 +148,60 @@ def _drain(engine, pid, n):
     return out
 
 
+def measure_graph_ticks(e, want=N_STEADY, max_attempts=None):
+    """Step one engine and collect `want` STEADY sparse-graph ticks from the
+    product _StepTiming buckets. Each returned row carries every PHASE_WALL value
+    (missing keys are a hard error, never silently 0), the product 'graph'
+    envelope as wall, and the per-tick closure gap. Refresh/prefill/mixed ticks
+    and ticks that did not run exactly one sparse graph are SKIPPED, not counted.
+    Raises ProbeFail(rc=14) if `want` steady ticks are not observed."""
+    max_attempts = max_attempts or want * 16
+    tm = e._step_timing
+    if tm is None:
+        raise ProbeFail("engine built without _StepTiming (set TILERL_STEP_TIMING=1)")
+    runtime = e._sparse
+    raw_call = runtime.run_decode_graph
+    track = PHASE_WALL + ("graph",)
+
+    def snap():
+        # cur is moved to tot in tick_end() before step() returns, so diff the
+        # cumulative totals one tick at a time.
+        return {k: tm.tot.get(k, 0.0) for k in track}
+
+    rows, attempts, prev, prev_fwd = [], 0, snap(), e._decode_forwards
+    while len(rows) < want and attempts < max_attempts:
+        attempts += 1
+        ran = {"v": False}
+
+        def wrapper(reqs, chains=None, raw=raw_call, ran=ran):
+            ok = raw(reqs, chains)
+            ran["v"] = bool(ok)
+            return ok
+
+        runtime.run_decode_graph = wrapper
+        e.step()
+        runtime.run_decode_graph = raw_call
+        cur = snap()
+        d = {k: (cur[k] - prev[k]) * 1000.0 for k in track}
+        graph_ticks = e._decode_forwards - prev_fwd
+        prev, prev_fwd = cur, e._decode_forwards
+        if not ran["v"] or graph_ticks != 1 or d["graph"] <= 0.0:
+            continue  # refresh / prefill / capture-declined: excluded
+
+        ph = {k: d[k] for k in PHASE_WALL}  # every p_* key must exist
+        psum = sum(ph.values())
+        wall = d["graph"]
+        rows.append({"phases_ms": ph, "sum_ms": psum, "wall_ms": wall,
+                     "gap": abs(psum - wall) / wall})
+
+    if len(rows) < want:
+        raise ProbeFail(f"only {len(rows)} steady sparse-graph ticks (<{want}) "
+                        f"after {attempts} steps", rc=14)
+    return rows
+
+
 def run_arm(name, depth, graph, neg_depth0_draft=False):
-    """One arm: build, prime past capture, measure N_STEADY graph ticks from the
-    product _StepTiming wall buckets, return per-tick phase rows. depth=0 carries
-    no draft unless the negative control forces one (which must trip the gate)."""
+    """Tiny CPU arm: build, prime past capture, measure N_STEADY graph ticks."""
     cfg = tiny()
     model = build_random(cfg, seed=11)
     be = get_backend()
@@ -179,47 +243,96 @@ def run_arm(name, depth, graph, neg_depth0_draft=False):
     for _ in range(20):
         e.step()
 
-    tm = e._step_timing
-    runtime = e._sparse
-    raw_call = runtime.run_decode_graph
-    rows = []
-    TRACK = PHASE_WALL + ("graph",)
-
-    def snap():
-        # _StepTiming moves cur -> tot in tick_end() (which runs before step()
-        # returns), so read the cumulative totals and diff one tick at a time.
-        return {k: tm.tot.get(k, 0.0) for k in TRACK}
-
-    attempts = 0
-    prev = snap()
-    prev_graph_ticks = e._decode_forwards
-    while len(rows) < N_STEADY and attempts < N_STEADY * 8:
-        attempts += 1
-        ran = {"v": False}
-
-        def wrapper(reqs, chains=None, raw=raw_call, ran=ran):
-            ok = raw(reqs, chains)
-            ran["v"] = bool(ok)  # a refresh tick returns False and runs eager
-            return ok
-
-        runtime.run_decode_graph = wrapper
-        e.step()
-        runtime.run_decode_graph = raw_call
-        cur = snap()
-        d = {k: (cur[k] - prev[k]) * 1000.0 for k in TRACK}
-        graph_ticks = e._decode_forwards - prev_graph_ticks
-        prev, prev_graph_ticks = cur, e._decode_forwards
-        if not ran["v"] or graph_ticks != 1 or d["graph"] <= 0.0:
-            continue  # refresh / prefill / mixed / no-graph tick: excluded
-
-        wall = d["graph"]  # the product graph envelope brackets run_decode_graph
-        ph = {k: d[k] for k in PHASE_WALL}
-        psum = sum(ph.values())
-        gap = abs(psum - wall) / wall
-        rows.append({"phases_ms": ph, "sum_ms": psum, "wall_ms": wall, "gap": gap})
-
+    rows = measure_graph_ticks(e)
     e.shutdown()
-    return rows, name, depth, graph
+    return {0: rows}  # one synthetic cell for the CPU precondition
+
+
+def _tokens_for_bucket(bucket: int) -> int:
+    # Same geometry as scripts/probe_sparse_graph_cmax_bucket.py tokens_for_bucket:
+    # linear 1 cmax per 16 tokens; midpoint of the 16-wide window so a one-token
+    # scheduling slip cannot push the tick into the adjacent bucket.
+    return (bucket + 7) * 16 + 7
+
+
+def _prime_bucket_27b(e, tok, bucket, depth, gen):
+    """Submit the counting prompt whose FIRST decode tick lands in `bucket` and
+    wait until decode begins (measure-and-correct, mirroring prime_counting).
+    Returns the rid. Does NOT drain decode — measure_graph_ticks owns that."""
+    from tilerl.sparse_engine import cmax_bucket
+
+    instr = tok.encode(" Count aloud from one to forty, one number per line:")
+    fid = tok.encode(" z")[-1:]
+    nfill = _tokens_for_bucket(bucket) - len(instr)
+    for _ in range(6):
+        ids = fid * nfill + instr
+        rid = e.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=gen, seed=0))
+        for _ in range(40000):
+            e.step()
+            row = next((r for r in e._running if r.req_id == rid), None)
+            if row is None:
+                raise ProbeFail(f"b{bucket}: row vanished before decode")
+            if row.phase == PHASE_DECODE:
+                srows = e._sparse.decode_rows([row], [1 + depth])
+                cmax = max((len(x["cand"]) for x in srows), default=0)
+                if cmax_bucket(cmax) != bucket:
+                    raise ProbeFail(
+                        f"b{bucket}: first decode tick in cmax bucket {cmax_bucket(cmax)} "
+                        f"(cmax={cmax}), expected {bucket}", rc=14)
+                return rid
+            if getattr(row, "phase", None) > PHASE_DECODE:
+                raise ProbeFail(f"b{bucket}: request DONE before decode", rc=14)
+        nfill += bucket * 16  # never reached: loop above returns on first decode
+    raise ProbeFail(f"b{bucket}: counting prompt never entered decode", rc=14)
+
+
+def run_arm_27b(name, depth, graph, source, draft_path, neg=False):
+    """Device arm on qwen38-27b: ONE engine, the three cmax buckets as three
+    sequential requests in one process; >=N_STEADY steady graph ticks per bucket.
+    depth=0 builds without a draft (the neg control is not used on device)."""
+    import torch
+
+    from tilerl import build as build_mod
+    from tilerl.build import build_model
+    from tilerl.cli import _qwen38_tokenizer
+    from tilerl.spec import load_draft
+
+    build_mod.QWEN38_SOURCE = source
+    be = get_backend()
+    if be.device.type != "cuda":
+        raise ProbeFail("qwen38-27b arm requires a CUDA backend", rc=14)
+    cfg, model = build_model("qwen38-27b", seed=0, fuse_projections=True)
+    draft = load_draft(model, draft_path) if depth >= 1 else None
+
+    e = build_engine(
+        cfg, model, be,
+        num_slots=4, max_batch=4, max_total_tokens=131072,
+        max_num_batched_tokens=512,
+        sparse_k=128, sparse_min_tokens=0, sparse_device_select=True,
+        scorer="bounds",
+        kv_cold_bytes=int(os.environ.get("H2_COLD_BYTES", str(1 << 30))),
+        cold_ssd_path=os.environ.get("H2_COLD_SSD", ""),
+        cold_ssd_bytes=int(os.environ.get("H2_COLD_SSD_BYTES", "0")),
+        cold_format="f16",
+        decode_graph=graph, draft=draft,
+        spec_depth=depth if draft is not None else None,
+    )
+    tok = _qwen38_tokenizer()
+    cells = {}
+    try:
+        for bucket in CMAX_BUCKETS:
+            rid = _prime_bucket_27b(e, tok, bucket, depth, gen=max(N_STEADY * 4, 240))
+            cells[bucket] = measure_graph_ticks(e, want=N_STEADY)
+            # drain/finish this request before priming the next bucket
+            for _ in range(40000):
+                if not any(r.req_id == rid for r in e._running):
+                    break
+                e.step()
+    finally:
+        e.shutdown()
+        if be.device.type == "cuda":
+            torch.cuda.synchronize()
+    return cells
 
 
 def _pct(xs, q):
@@ -241,49 +354,87 @@ def summarize(rows):
     return out
 
 
+def _check_cells(arm, cells, neg=False):
+    """Apply the gates to one arm's per-cell tick rows. Returns failure strings:
+    per-cell steady-count + every-phase-present (enforced at collection) + the
+    per-tick 5% closure gate (numerator and denominator printed), and the
+    draft-free spec-phase gate for w1_graph."""
+    out = []
+    for bucket, rows in sorted(cells.items()):
+        tag = f"{arm} b{bucket}"
+        if len(rows) < N_STEADY:
+            out.append(f"{tag}: {len(rows)} steady ticks < {N_STEADY}")
+            continue
+        for i, r in enumerate(rows):
+            if r["gap"] > CLOSURE_TOL:
+                out.append(
+                    f"{tag} tick{i}: closure gap {r['gap']:.1%} > {CLOSURE_TOL:.0%} "
+                    f"(numerator sum={r['sum_ms']:.4f}ms denominator graph={r['wall_ms']:.4f}ms)")
+                break
+    if arm == "w1_graph":
+        # Depth-0 is spec-free. The negative control forces a draft in, which
+        # must trip the SAME assertion (no neg branch -> cannot pass vacuously).
+        dirty = [(b, i) for b, rows in sorted(cells.items()) for i, r in enumerate(rows)
+                 if r["phases_ms"]["p4_verify"] > 0.0 or r["phases_ms"]["p5_draft"] > 0.0]
+        if dirty:
+            kind = "forced-draft NEGATIVE CONTROL" if neg else "draft-free"
+            out.append(f"w1_graph: spec phase recorded on the {kind} arm at "
+                       f"{[(b, i) for b, i in dirty[:5]]}")
+    return out
+
+
+def _brief_cells(cells):
+    brief = {}
+    for bucket, rows in sorted(cells.items()):
+        s = summarize(rows)
+        brief[str(bucket)] = {
+            "n": s["n"], "wall_p50_ms": round(s["wall_ms"]["p50"], 3),
+            "wall_p90_ms": round(s["wall_ms"]["p90"], 3),
+            "gap_p90": round(s["gap"]["p90"], 4),
+            **{f"{ph}_p50_ms": round(s[ph]["p50"], 3) for ph in PHASE_WALL}}
+    return brief
+
+
+def _assert_tree():
+    """Device precondition: this script must run on the PATCH tree. Reads the
+    checked-out commit from git (the window script fetch/checkout pins it)."""
+    import subprocess
+
+    sha = subprocess.run(["git", "rev-parse", "--short=8", "HEAD"],
+                         capture_output=True, text=True).stdout.strip()
+    if sha != EXPECTED_TREE:
+        raise ProbeFail(
+            f"tree is {sha}, expected {EXPECTED_TREE} (PATCH: keep_steps=W); "
+            f"checkout {EXPECTED_TREE} before the device window", rc=14)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="tiny", choices=["tiny", "qwen38-27b"])
+    ap.add_argument("--source", default="", help="qwen38-27b model source dir")
+    ap.add_argument("--draft", default="", help="draft MTP path (27b)")
     ap.add_argument("--out", default="phase_timing.json")
     ap.add_argument("--neg-depth0-with-draft", action="store_true",
-                    help="negative control: attach a draft to the depth-0 arm; gate must fail")
+                    help="CPU negative control only: force a draft on the depth-0 arm")
     args = ap.parse_args()
-    # This checked-in probe is the CPU precondition (tiny + get_backend(cpu)). The
-    # device 27B window lands through the identical code path; fixmisc swaps the
-    # build_* args (qwen38-27b / cuda / real draft) at the window, no phase change.
 
-    # w2_eager (decode_graph off) maps onto the pre-existing eager buckets
-    # (sparse_select/model/sparse_finalize/sample/draft_step) and is the next step;
-    # this first cut answers the W2-vs-W1 graph-tick delta with the new p_* buckets.
     order_a = [("w2_graph", 1, True), ("w1_graph", 0, True)]
     order = list(reversed(order_a)) if os.environ.get("PHASE_ORDER_B") else order_a
 
     result, failures = {}, []
-    for name, depth, graph in order:
-        neg = args.neg_depth0_with_draft and name == "w1_graph"
-        rows, _, _, _ = run_arm(name, depth, graph, neg_depth0_draft=neg)
-        if len(rows) < N_STEADY:
-            failures.append(f"{name}: only {len(rows)} steady graph ticks (<{N_STEADY})")
-        for i, r in enumerate(rows):
-            if r["gap"] > CLOSURE_TOL:
-                failures.append(
-                    f"{name} tick{i}: closure gap {r['gap']:.1%} > {CLOSURE_TOL:.0%} "
-                    f"(sum={r['sum_ms']:.3f} wall={r['wall_ms']:.3f})")
-                break
-        result[name] = summarize(rows)
-
-    # The depth-0 arm is asserted SPEC-FREE: no p4_verify and no p5_draft on any
-    # steady tick. The negative control builds that arm WITH a draft, which routes
-    # it through the spec phases; the SAME assertion must then go RED. There is no
-    # special-cased branch — if it stays green with a draft forced in, the gate is
-    # vacuous and the probe fails for a different reason.
-    d0 = result["w1_graph"]["ticks"]
-    d0_dirty = [i for i, r in enumerate(d0)
-                if r["phases_ms"]["p4_verify"] > 0.0 or r["phases_ms"]["p5_draft"] > 0.0]
-    if d0_dirty:
-        failures.append(
-            f"w1_graph: spec phase (p4_verify/p5_draft) recorded on the "
-            f"{'forced-draft NEGATIVE CONTROL' if args.neg_depth0_with_draft else 'draft-free'} "
-            f"arm at ticks {d0_dirty[:5]}")
+    try:
+        for arm, depth, graph in order:
+            neg = args.neg_depth0_with_draft and arm == "w1_graph"
+            if args.model == "qwen38-27b":
+                _assert_tree()
+                cells = run_arm_27b(arm, depth, graph, args.source, args.draft)
+            else:
+                cells = run_arm(arm, depth, graph, neg_depth0_draft=neg)
+            failures += _check_cells(arm, cells, neg=neg)
+            result[arm] = _brief_cells(cells)
+    except ProbeFail as exc:
+        print(f"PHASE PROBE INSUFFICIENT (rc14): {exc}", file=sys.stderr)
+        return exc.rc
 
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)
@@ -293,12 +444,7 @@ def main() -> int:
         for x in failures:
             print("  " + x, file=sys.stderr)
         return 1
-    brief = {}
-    for k, v in result.items():
-        brief[k] = {"n": v["n"], "wall_p50_ms": round(v["wall_ms"]["p50"], 3),
-                    "gap_p90": round(v["gap"]["p90"], 4),
-                    **{f"{ph}_p50_ms": round(v[ph]["p50"], 3) for ph in PHASE_WALL}}
-    print(json.dumps(brief, indent=2))
+    print(json.dumps(result, indent=2))
     return 0
 
 
