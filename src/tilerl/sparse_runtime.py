@@ -121,6 +121,23 @@ class SparseRuntime:
         self.graphs: dict = {}
         self.warm_adoptions = 0
         self.ctx: SparseCtx | None = None
+        # PROBE-ONLY #805 v2: lag-1 refresh controller, lazily built from env.
+        self._lag_obj = None
+        self._lag_checked = False
+
+    def _lag(self):
+        """PROBE-ONLY #805 v2: lazily build the lag controller from env so a
+        non-v2 run constructs nothing and pays nothing."""
+        if not self._lag_checked:
+            self._lag_checked = True
+            from .sparse_lag import lag_mode
+
+            m = lag_mode()
+            if m is not None:
+                from .sparse_lag import LagController
+
+                self._lag_obj = LagController(self, m)
+        return self._lag_obj
 
     # ------------------------------------------------ tracker read proxies
     @property
@@ -787,8 +804,14 @@ class SparseRuntime:
         if tr.scorer != "bounds":
             return False
         q_dec = [len(c) for c in chains] if chains else [1] * len(reqs)
-        # Read-only peek: let _sparse_rows do the reset when this tick is a refresh.
-        if self.ticks_since_refresh + 1 >= SPARSE_REFRESH_TICKS:
+        # PROBE-ONLY #805 v2: a lag controller replaces the every-8-tick eager
+        # refresh with a carry graph replay armed from the previous tick's q.
+        lag = self._lag()
+        carry = lag is not None and lag.is_carry()
+        # Read-only peek: let _sparse_rows do the reset when this tick is a
+        # refresh. Under v2 the cadence tick stays a graph tick (carry) unless
+        # no selection was prepared, in which case eager is the safe fallback.
+        if self.ticks_since_refresh + 1 >= SPARSE_REFRESH_TICKS and not carry:
             return False
         rows = self.decode_rows(reqs, q_dec)
         n = len(reqs)
@@ -831,17 +854,45 @@ class SparseRuntime:
                 self.graph_on = False
                 return False
             self.graphs[key] = g
+            self.graphs[key] = g
+        if lag is not None:
+            g.sf.lag_enabled = True
+        # v2 carry tick: if the previous plain tick prepared no selection
+        # (first interval / reservation short / timed out), fall back to the
+        # normal eager refresh for THIS cycle and count it.
+        pre_replay = None
+        if carry:
+            if lag.is_ready():
+                pre_replay = lag.arm_callback
+            else:
+                lag.fallback_cycles += 1
+                self.ticks_since_refresh = 0
+                return False
         logits = g.run(
             rows,
             chains or [(r.output[-1],) for r in reqs],
             pad=ctx.graph_capture.pad,
+            pre_replay=pre_replay,
         )
-        self.ticks_since_refresh += 1
+        if carry:
+            # Carry consumed one full cadence: reset counter like an eager
+            # refresh would, so the next seven ticks are plain graph replays.
+            self.ticks_since_refresh = 0
+        else:
+            self.ticks_since_refresh += 1
         ctx.bump_decode_forwards()
         # Finalize residency immediately after the forward (same order as the
         # eager path (finalize before sample/verify): the pin reads
         # this tick's selection out of the captured sf and demotes the rest.
         self.finalize(g.sf, reqs)
+        # v2: at the LAST PLAIN tick of a cycle (counter reaches
+        # SPARSE_REFRESH_TICKS-1 after the increment), prepare the NEXT tick's
+        # carry selection now, while this tick's q and staging are fresh.
+        if lag is not None and not carry:
+            from .sparse_engine import SPARSE_REFRESH_TICKS as _SRT
+
+            if self.ticks_since_refresh >= _SRT - 1:
+                lag.prepare(g.sf, rows)
         if chains:
             ctx.verify(reqs, chains, logits, g.hidden)
         else:

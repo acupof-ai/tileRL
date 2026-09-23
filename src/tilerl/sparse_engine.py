@@ -608,11 +608,35 @@ class SparseForward:
         self._dphys: dict[int, Tensor] = {}
         self._dchosen: dict[int, Tensor] = {}
         self._dnsel: dict[int, Tensor] = {}
+        # Set on the persistent sf when THIS replay is a lag-1 refresh tick, so
+        # finalize runs the eager-style pin reconcile the captured path skips.
+        # The per-group override buffers themselves are allocated in the
+        # reuse block below (_ov_phys_t / _ov_chosen_t / _ov_nsel_t, and the
+        # shared per-row _ov_use_t); arm_override() fills them per refresh.
+        self.refresh_tick = False
+        # PROBE-ONLY #805 v2: when True, each replay copies its real post-rope
+        # q into a per-group sink (_q_prev) so the NEXT tick's lag-1 refresh
+        # selects over all candidates with that q. Flipped by the runtime only
+        # when TILERL_SPARSE_V2 is on, so normal runs add no per-tick copy.
+        self.lag_enabled = False
+        self._q_prev: dict[int, Tensor] = {}
         if self.reuse:
             # STAGING stores the captured region reads (never the tracker dicts):
             # s_l2p [B,C] resident phys/-1; s_bounds one gathered candidate bound
             # plane per (row, source group) -> flat [B*n_src,C,Hkv,2,D].
             self.s_l2p = torch.full((self.b, cmax), -1, dtype=torch.long, device=dev)
+            # v2 lag-1 override staging per GROUP (fixed [B,k] physical/logical
+            # and [B] nsel) plus one shared per-row use flag. Defaults
+            # (use=False, zeros) leave every normal graph tick on its own
+            # resident-only selection; arm_override() fills them per refresh.
+            ksel = self.tracker.k_pages
+            self._ov_phys_t = [torch.zeros(self.b, ksel, dtype=torch.long, device=dev)
+                               for _ in range(self.n_groups)]
+            self._ov_chosen_t = [torch.zeros(self.b, ksel, dtype=torch.long, device=dev)
+                                 for _ in range(self.n_groups)]
+            self._ov_nsel_t = [torch.zeros(self.b, dtype=torch.long, device=dev)
+                               for _ in range(self.n_groups)]
+            self._ov_use_t = torch.zeros(self.b, dtype=torch.bool, device=dev)
             if self.tracker.scorer == "bounds":
                 n_src, hkv, dim = (len(self.tracker.src_planes), self.tracker.hkv, self.tracker.dim)
                 self.s_bounds = [
@@ -632,6 +656,12 @@ class SparseForward:
         self.rows = rows
         dev = self.device
         self._dphys, self._dnsel, self._dchosen = {}, {}, {}
+        # v2 lag-1: an armed override is one tick only. Disarm by default;
+        # arm_override() re-enables it on the refresh replay after fill().
+        self.refresh_tick = False
+        self._ov_use_t.zero_()
+        for t in self._ov_nsel_t:
+            t.zero_()
         for bi, r in enumerate(rows):
             own = r["own"]
             self.page_base[bi] = own[0]
@@ -771,6 +801,13 @@ class SparseForward:
                     for bi in range(self.b)
                 ]
             )  # [B,Cmax]
+        if self.reuse and self.lag_enabled:
+            # v2 lag-1: retain this group's REAL post-rope q [B,Tq,hq,D] for
+            # the NEXT tick's all-candidate refresh select. clone() under
+            # capture allocates from graph memory and is rewritten every replay
+            # (same sink address), so the runtime clones it out on the host
+            # side after replay before issuing the background.
+            self._q_prev[g] = q.clone()
         scores = quest_scores_batched(q, bounds)  # [B,Cmax]
         member = select_members(scores, self.n_cand, self.tracker.k_pages, self.win, resident)
         positions, nsel = order_members(member, self.tracker.k_pages)  # [B,k]
@@ -799,6 +836,63 @@ class SparseForward:
         self._dnsel[g] = nsel
         self._dchosen[g] = chosen
         return phys, nsel
+
+    def select_refresh(self, q_prev: dict[int, Tensor],
+                       staging: tuple | None = None
+                       ) -> dict[int, tuple[Tensor, Tensor]]:
+        """PROBE-ONLY #805 v2: the lag-1 refresh selection. Scores the candidate
+        staging with the previous tick's REAL post-rope q over ALL candidates
+        — no residency mask (a cold page is a legitimate pick and gets
+        promoted). This is the SAME quest_scores_batched/select_members/
+        order_members primitives the captured path uses, not a reimplementation:
+        async and inline both call this, so the installation gate cannot pass on
+        a divergent copy.
+
+        ``staging`` is None for inline (read live sf staging, still valid right
+        after the 7th replay) or a ``(cand_idx, n_cand, win, s_bounds)`` tuple
+        of post-replay SNAPSHOTS for the async side stream — the carry tick's
+        fill() would otherwise overwrite the staging before the background read.
+
+        Returns {group: (chosen_logical [B,k] 0-padded, nsel [B])} on device.
+        The caller resolves/promotes the named logical pages (host side) and
+        hands the physical blocks back via arm_override()."""
+        assert self.reuse
+        if staging is None:
+            cand_idx, n_cand, win_t, s_bounds = (
+                self.cand_idx, self.n_cand, self.win, self.s_bounds)
+        else:
+            cand_idx, n_cand, win_t, s_bounds = staging
+        out: dict[int, tuple[Tensor, Tensor]] = {}
+        ksel = self.tracker.k_pages
+        for g, plane in enumerate(self.tracker.src_planes):
+            q = q_prev[g]
+            gi = self.tracker.src_index[plane]
+            bounds = torch.stack(s_bounds[gi :: self.n_groups])  # [B,C,Hkv,2,D]
+            # eligible=None -> select over every candidate, resident or cold.
+            scores = quest_scores_batched(q, bounds)
+            member = select_members(scores, n_cand, ksel, win_t, None)
+            positions, nsel = order_members(member, ksel)
+            valid = torch.arange(ksel, device=self.device)[None, :] < nsel[:, None]
+            safe_pos = positions.clamp_max(self.cmax - 1)
+            chosen = cand_idx.gather(1, safe_pos)
+            chosen = torch.where(valid, chosen, torch.zeros_like(chosen))
+            out[g] = (chosen, nsel)
+        return out
+
+    def arm_override(self, per_group: dict[int, tuple[Tensor, Tensor, Tensor]],
+                     use_rows: Tensor) -> None:
+        """PROBE-ONLY #805 v2: install one refresh tick's promoted selection into
+        the captured staging, called AFTER fill() and BEFORE replay(). per_group
+        maps group -> (phys [B,k] 0-padded, chosen_logical [B,k], nsel [B]); the
+        named pages MUST already be resident (the promote event was awaited).
+        use_rows[B] selects which rows take the override (a row that fell back
+        to eager, or a pad row, stays False and keeps its resident pick)."""
+        self.refresh_tick = True
+        self._ov_use_t.copy_(use_rows)
+        for g, (phys, chosen, nsel) in per_group.items():
+            self._ov_phys_t[g].copy_(phys)
+            self._ov_chosen_t[g].copy_(chosen)
+            self._ov_nsel_t[g].copy_(nsel)
 
     def selected_pages(self, bi: int) -> set[int]:
         """Union of this row's logical pages chosen across ALL source groups this

@@ -236,10 +236,11 @@ class SparseDecodeGraph:
         self.hidden = hid[-1] if hid else None
         self.aux = aux
 
-    def run(self, srows, chains, pad=None):
+    def run(self, srows, chains, pad=None, pre_replay=None):
         """Fill every static input and the sparse staging buffers, then replay.
         ``srows`` are the decode geometry dicts (carry ``req``); pad slots past
-        n use ``(slot, block)``."""
+        n use ``(slot, block)``. ``pre_replay(sf)`` runs after fill/staging and
+        before replay — the v2 lag-1 refresh arm point (PROBE-ONLY #805)."""
         W = self._w
         sf = self.sf
         sf.fill(srows)
@@ -260,6 +261,8 @@ class SparseDecodeGraph:
         self._sl.copy_(self._sl_h, non_blocking=True)
         self._slots.copy_(self._slots_h, non_blocking=True)
         self._sql.copy_(self._sql_h, non_blocking=True)
+        if pre_replay is not None:
+            pre_replay(sf)
         self._graph.replay()
         return self._logits
 
@@ -307,9 +310,11 @@ class CpuSparseGraph:
         self._b, self._w = B, W
         self.hidden = None
 
-    def run(self, srows, chains, pad=None):
+    def run(self, srows, chains, pad=None, pre_replay=None):
         sf = self.sf
         sf.fill(srows)
+        if pre_replay is not None:
+            pre_replay(sf)
         B, W = self._b, self._w
         ids = torch.zeros(B, W, dtype=torch.long)
         pos = torch.zeros(B, W, dtype=torch.long)
