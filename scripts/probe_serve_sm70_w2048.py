@@ -590,10 +590,19 @@ def run_worker(arm, args):
                   f"not armed — prompt too short or max_new too small?",
                   file=sys.stderr)
             return 14
-        if not smoke and args.stage == 1 and len(results["prompts"]) < N_PROMPTS_MIN:
+        if not smoke and args.stage == 1 \
+                and len(results["prompts"]) < args.min_prompts:
             print(f"INSUFFICIENT: only {len(results['prompts'])} prompts "
-                  f"(floor {N_PROMPTS_MIN})", file=sys.stderr)
+                  f"(floor --min-prompts {args.min_prompts})", file=sys.stderr)
             return 14
+        if not smoke and args.stage == 1:
+            results["verdict"] = {
+                "prompts": len(results["prompts"]),
+                "floor_min_prompts": args.min_prompts,
+                "first_replay_failures": len(results["failures"]),
+                "unattributed_eager_ticks": len(unattributed_eager)}
+            with open(out_path, "w") as f:
+                json.dump(results, f, indent=2)
     return 0
 
 
@@ -626,6 +635,9 @@ def main():
     ap.add_argument("--out-prefix", default="serve805")
     ap.add_argument("--stage", type=int, default=0, choices=[0, 1])
     ap.add_argument("--n-prompts", type=int, default=N_PROMPTS)
+    ap.add_argument("--min-prompts", type=int, default=N_PROMPTS_MIN,
+                    help="stage1 verdict floor (default 20); pass the same value "
+                         "as --n-prompts for a deliberately small window")
     ap.add_argument("--min-tokens", type=int, default=20000)
     ap.add_argument("--max-tokens", type=int, default=40000)
     ap.add_argument("--max-new-tokens", type=int, default=2048)
@@ -695,6 +707,7 @@ def main():
                "--reference-dir", args.reference_dir, "--expect-tree", args.expect_tree,
                "--out-prefix", args.out_prefix, "--stage", str(args.stage),
                "--n-prompts", str(args.n_prompts),
+               "--min-prompts", str(args.min_prompts),
                "--min-tokens", str(args.min_tokens),
                "--max-tokens", str(args.max_tokens),
                "--max-new-tokens", str(args.max_new_tokens)]
