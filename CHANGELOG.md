@@ -8,8 +8,9 @@
   after the first 1–2 ticks and valid-but-wrong in-vocab tokens appear
   (device V100 sm70 parity, d=0 sparse graph proven token-exact across all
   cmax buckets; d=1 diverges, unverified on sm90 too). `_sparse_capture_allowed`
-  keeps the sparse graph OFF on CUDA with a draft at depth>=1 (one-time
-  warning; sparse decode falls back to token-exact eager); the dense captured
+  keeps the sparse graph OFF on CUDA with a draft at depth>=1 (a warning is
+  emitted each time such an engine is built; sparse decode falls back to
+  token-exact eager); the dense captured
   graph and sparse device selection are unaffected. Scope is CUDA only: the
   CPU cell runs the CpuSparseGraph eager reference, token-exact at W=2 and
   left enabled (its W=2 token-equality gate is the oracle for the separate

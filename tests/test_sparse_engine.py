@@ -3322,3 +3322,76 @@ def test_sparse_capture_allowed_guard_a():
     assert _sparse_capture_allowed(cpu, True, 3) is True
     assert _sparse_capture_allowed(cpu, False, 0) is True
 
+
+def test_sparse_capture_guard_is_wired_into_engine():
+    """#805 guard A, Engine-level: the predicate must actually gate the running
+    engine. A CUDA-stub backend (RefBackend tensors/materialize, but device.type
+    cuda) over real donor-built CPU pools/tracker + a minimal constructor-only
+    drafter must yield a built Engine whose sparse graph is OFF at spec_depth=1
+    (with the warning) and ON at depth 0. Deleting the `and not cuda_spec_guard`
+    wiring in Engine.__init__ fails the depth-1 assertion even though the
+    predicate gate above still passes — this is what rev 5789359652 required."""
+    import warnings
+
+    from tilerl.engine import Engine
+
+    class _CudaStub(RefBackend):
+        # RefBackend supplies materialize/ops on CPU; override only the device
+        # identity the guard reads, plus the draft-path attrs _serve_draft /
+        # __init__ query (has_kernel, verify width, arch). No CUDA tensors:
+        # the kv/state pools are the donor engine's CPU pools.
+        device = torch.device("cuda")
+        arch = "sm90"
+        max_verify_width = 16
+
+        def has_kernel(self, name):
+            return False
+
+    class _FakeDrafter:
+        aux_layers = ()
+        width = 2
+        forwards = 0
+        no_quant = True
+        params: dict = {}
+        kv = None
+        cfg = None
+
+        def set_depth(self, depth):
+            self.depth = depth
+
+        def attach(self, *a, **k):
+            pass
+
+        def step(self, rows):
+            raise AssertionError("guard gate never runs a draft step")
+
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    donor = build_engine(
+        cfg=cfg, model=model, backend=RefBackend(),
+        num_blocks=16, num_slots=2, max_batch=1, max_total_tokens=1024,
+        max_num_batched_tokens=128, sparse_k=2, scorer="bounds",
+        kv_cold_bytes=1 << 20, sparse_device_select=True, decode_graph=True)
+    try:
+        parts = dict(
+            model=donor._model, kv_pool=donor._kv, state_pool=donor._states,
+            prefix_store=donor._prefix, limits=donor.limits,
+            sparse_tracker=donor._sparse.tracker, sparse_k=2,
+            sparse_device_select=True, decode_graph=True)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            e1 = Engine(backend=_CudaStub(), draft=_FakeDrafter(), spec_depth=1, **parts)
+            assert e1._sparse_graph_on is False, (
+                "CUDA + spec_depth=1 must wire the sparse graph OFF in the engine")
+            assert any("auto-disabled" in str(w.message) for w in caught), (
+                [str(w.message) for w in caught])
+
+        with warnings.catch_warnings(record=True) as caught0:
+            warnings.simplefilter("always")
+            e0 = Engine(backend=_CudaStub(), draft=None, **parts)
+            assert e0._sparse_graph_on is True, "depth 0 keeps the sparse graph on"
+            assert not any("auto-disabled" in str(w.message) for w in caught0)
+    finally:
+        donor.shutdown()
+
