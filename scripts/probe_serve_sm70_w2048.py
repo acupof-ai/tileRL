@@ -487,6 +487,29 @@ def run_worker(arm, args):
 
     print(f"[serve-probe] {arm} {tag} wrote {out_path}", flush=True)
 
+    if not smoke:
+        # Observed tick paths: decode=sparse ticks, graph=ticks that replayed.
+        # Reported for every arm; the graph arm's fraction is below 1.0 because
+        # its refresh ticks run eager. For the baseline the sharp assertion is
+        # zero graph ticks (sparse_graph_on=False makes a replay impossible) —
+        # with g=0 the fraction is exactly 1.0, so no redundant threshold. A
+        # dense zero-tick baseline (CPU tiny shape) proves nothing, device only.
+        d_tot = sum(p.get("decode_ticks", 0) for p in results["prompts"])
+        g_tot = sum(p.get("graph_ticks", 0) for p in results["prompts"])
+        frac = (d_tot - g_tot) / d_tot if d_tot else None
+        results["sparse_path_split"] = {
+            "decode_ticks": d_tot, "graph_ticks": g_tot,
+            "eager_sparse_fraction": round(frac, 4) if frac is not None else None}
+        baseline_bad = arm == "baseline" and args.stage == 1 and (
+            d_tot == 0 or g_tot != 0)
+        if baseline_bad:
+            with open(out_path, "w") as f:
+                json.dump(results, f, indent=2)
+            print(f"INSUFFICIENT: baseline sparse split {g_tot} graph / {d_tot} "
+                  f"total; production config must run eager sparse with ZERO "
+                  f"graph ticks", file=sys.stderr)
+            return 14
+
     if results["failures"]:
         for x in results["failures"][:10]:
             print("  MISMATCH " + x, file=sys.stderr)
