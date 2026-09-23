@@ -92,6 +92,31 @@ R=8 synchronous refresh on the same prompts, temp 0, same seed.
 Prompt set: the same 37.6k real wikitext prompts used in stage 1; report n
 and every per-prompt value, not just the aggregate.
 
+## Shadow v1 — go/no-go (pre-registered 2026-09-24, before the run)
+
+Env-gated (`TILERL_SPARSE_SHADOW=1`), probe branch only, default off. No
+residency side effects: after each graph tick, on a side stream, recompute the
+full bounds/quest selection from the previous tick's cached query (no
+`.tolist`) and issue representative cold H2D copies into scratch blocks carved
+out of `num_blocks`; nothing is mapped into l2p and no tick reads the scratch,
+so output is token-identical with shadow off (CPU gate asserts this).
+
+- Budget: carve the scratch reserve out of `num_blocks` (no +k; V100 has only
+  2-3 GiB free). Verdict prints carved pages and the resulting num_blocks.
+- Representative copy size: **512 pages** = 4 groups × k 128, the worst-case
+  single-refresh churn (churn window measured a median 100/128 replaced per
+  group). Deliberately an overestimate; verdict prints
+  `512 × per-page f32 bytes`.
+- Verdict (n ≥ 50 graph ticks per side, same process, alternating on/off in
+  segments as a placement control):
+  - p50 AND p90 of background select+promote device time;
+  - adjacent-graph-tick interval (the budget the background must fit);
+  - graph-tick p50 shadow OFF vs ON (segmented).
+- GO line, locked before the run:
+  1. background select+promote **p90 ≤ one graph-tick interval**, and
+  2. graph-tick p50 slowdown shadow-on vs off **≤ 5%**.
+  Both must hold; either fails → v2 (real delay) is not built.
+
 ## Device measurement order
 
 - ANSWERED by the phase window (f7a93e5c/a6b6a511, no nsys needed — nsys
