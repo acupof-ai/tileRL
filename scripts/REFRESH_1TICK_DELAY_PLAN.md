@@ -209,15 +209,27 @@ the same tick show the extra is host-side: `h2d107` tick 80 is
 graph=37`, at the same `free=3914 MiB`, `why=gpu_drain`, `d_malloc=0`, no
 stall.
 
-**Cause is the probe's segmentation, not the device.** `run_one_mode` cuts
-segments by **graph-tick ordinal**, but the `stats` block runs on every
-`step()`, so segment 0 holds ~60 steps of which ~10 are non-graph; `h2d107`
-happened to carry expensive ones in that window. Corrected denominator (OFF
-segments past the first, n=55 each): `h2d107` **46**, `off` 45, `both107` 45.
-Criterion 1 was `71.43 <= 61.77 → False`; at 46 it is more False. **All three
-gates fail under either denominator, so the v1 no-go does not depend on this
-denominator.** The fix (adopted for the v2 probe) is to cut segments by step
-index rather than by graph-tick ordinal.
+**Cause is startup non-stationarity in the first segment, not the segment's
+contents.** Segment 0 is the first ~50 graph ticks after the last prefill —
+first graph capture per bucket key, page-carve settling, allocator warmup — and
+its gaps are both inflated and higher-variance; the effect is config-dependent
+(`h2d107` worst, `both107` partially, the rest clean). The gap *structure* is
+identical across configs, which rules out the segments mixing different kinds
+of step: every config has exactly **43 gaps with nothing between the two graph
+ticks and 7 with an intervening step**, yet `h2d107`'s 43 plain gaps read
+p50 **127 ms** against `off`'s 46 ms, and its `stats` p50 is 41 ms against 3 ms.
+By the second segment every config reads 42–46 ms graph and 3 ms `stats`,
+including `h2d107` — so the carve itself costs nothing in steady state.
+
+Corrected denominator (OFF segments past the first, n=55 each): `h2d107`
+**46**, `off` 45, `both107` 45. Criterion 1 was `71.43 <= 61.77 → False`; at
+46 it is more False. **All three gates fail under either denominator, so the
+v1 no-go does not depend on this denominator.**
+
+For the v2 probe the adopted fix is to **discard the first startup segment**
+before taking cycle p50/p90, keeping segments cut at graph-tick boundaries:
+the 8-tick cycle is defined by graph ticks and the one-tick wait at the cycle's
+end is part of the design, so it belongs in the steady-state distribution.
 
 ## Device measurement order
 
