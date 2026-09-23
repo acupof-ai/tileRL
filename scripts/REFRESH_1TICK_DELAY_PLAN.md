@@ -240,6 +240,68 @@ before taking cycle p50/p90, keeping segments cut at graph-tick boundaries:
 the 8-tick cycle is defined by graph ticks and the one-tick wait at the cycle's
 end is part of the design, so it belongs in the steady-state distribution.
 
+## v2 pre-registration — gates, fixed before the v2 window (2026-09-24)
+
+Locked by the coordinator before any v2 number exists, so the gates cannot be
+set after seeing the result. v2 = real lagged-q + real selection mapping,
+background launched **once per refresh cycle** (not once per tick, which is
+what v1 measured).
+
+**The prize, from the v1 numbers.** Current cycle `7 x 45.76 + 249.3 = 569.6 ms`
+per 8 ticks (71.2 ms/tick). The 7 plain graph ticks are already 320.3 ms
+(56.2%) of it; the whole prize is the 249.3 ms eager refresh tick (43.8%).
+v2's cycle is `7 x plain + 1 x carrying tick`.
+
+1. **CYCLE, measured — the shape gate.** Measure the 8-tick cycle directly,
+   p50 and p90, **discarding the first startup segment** (v1 showed segment 0
+   is non-stationary: `h2d107` read 84 ms graph / 41 ms `stats` against 42/3
+   for every other config, settling by segment 2). Report p50/p90 on the
+   directly measured cycles only.
+   **Reconciliation is on MEANS, not a sum of percentiles** — a sum of p50s is
+   not the p50 of the sum. Compare `7 x mean(plain tick) + mean(carrying tick)`
+   against `mean(cycle)`; a gap over 5% means the segments still hold
+   non-stationary ticks and the reading is not usable.
+
+2. **THE CARRYING TICK, absolute — the primary gate.** The carrying tick's
+   **p90 <= 135.4 ms**. Absolute ms, not a slowdown ratio: with only 1 tick in
+   8 hosting background, a ratio gate would be diluted 7x into a false margin.
+   135.4 ms is the 20% tier (`7 x 45.76 + 135.4 = 455.7 ms`, a 20% cycle cut
+   against 569.6), and it implies background <= 89.6 ms on a 45.76 ms plain
+   tick.
+
+3. **`carry_fallback_frac`, per cycle — <= 0.05.** A *cycle* where the
+   background missed its one-tick deadline and the carrying tick fell back to
+   the synchronous path. Deliberately named apart from v1's
+   `bg_exceed_fraction`, which counted **per tick**; the two are different
+   quantities and must not be compared across versions.
+
+4. **QUALITY — the pre-registered gate above stands.** Noise floor 1.0
+   (measured); per-prompt agreement >= floor - 1.0pp; mean >= floor - 0.5pp;
+   **median first-divergence >= 128** generated tokens (the binding line);
+   mod8==0 clustering applies only to the delayed run, since the floor has no
+   diverged prompt to cluster.
+
+5. **RESULT — the gate that decides go.** Measured effective tok/s for the
+   same configuration the baseline used (sparse graph + draft W=2 + W2048 +
+   `sparse_min_tokens=0`), **>= 24.9 x 1.2 = 29.9 tok/s**. The 24.9 baseline is
+   committed at `scripts/v2_baseline_24p915.json` (`warm_effective_tok_s` =
+   24.915, warm window = ticks [16, end) with the close tick excluded, from
+   the `graph_w2048` stage-1 window on the same machine).
+
+   **Provenance caveat, stated because it changes how a near-miss reads.**
+   That baseline was measured on an earlier revision with a different prompt
+   set, so it is a *historical* reference, not a same-run control. The v2
+   window should re-measure the current configuration as a control **in the
+   same window and on the same prompts** and report both against the 29.9
+   line; if the control itself lands away from 24.9, the 29.9 line is the
+   wrong ruler and that must be said before the result is read, not after.
+
+**The v1 background figures are a LOWER BOUND, not the v2 budget.** v1's
+background was a synthetic load with zero side effects (no l2p writes, no
+promotions, `carved` pages untouched); v2 writes the mapping and moves real
+pages. So 23.15 / 55.60 / 68.50 ms are "at least this much", and a v2 carrying
+tick above them is expected rather than a regression.
+
 ## Device measurement order
 
 - ANSWERED by the phase window (f7a93e5c/a6b6a511, no nsys needed — nsys

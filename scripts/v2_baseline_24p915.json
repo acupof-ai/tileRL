@@ -1,0 +1,29 @@
+{
+  "arm": "graph_w2048",
+  "config": {
+    "arm": "graph_w2048",
+    "built_sparse_graph_on": true,
+    "forced_eager": false,
+    "auto_disabled_warnings": [],
+    "min_tokens": 0,
+    "draft_window": 2048
+  },
+  "throughput": {
+    "comparison": "this window's same-machine engine baseline (separate subprocess, in-engine counters); earlier-window reads are background",
+    "warm_window": "ticks [16, end), close tick excluded",
+    "warm_effective_tokens": 5957,
+    "warm_wall_ms": 239094.28,
+    "warm_effective_tok_s": 24.915,
+    "warm_step_p50_ms_graph": 45.749,
+    "warm_step_p50_ms_eager": 210.987,
+    "warm_graph_ticks": 2862,
+    "warm_eager_ticks": 408,
+    "close_ticks": 6,
+    "close_step_p50_ms": 14804.318
+  },
+  "eager_tick_attribution": {
+    "refresh": 421,
+    "prefill_boundary": 0
+  },
+  "source": "servewin-0924-003135/serve_graph_w2048.stage1.json"
+}
