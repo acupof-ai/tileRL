@@ -272,6 +272,14 @@ class SparseDecodeGraph:
             t = time.perf_counter()
         self._graph.replay()
         if tm is not None:
+            # replay() is an ASYNC enqueue; without a fence the wall span would
+            # measure only the enqueue and the GPU work would land in whichever
+            # phase next syncs. Drain inside the phase (before the mark) so
+            # p2_replay is an exclusive host wall equal to the device span;
+            # verify reads logits back on host anyway, so this costs no extra
+            # pipelining on the spec path. Timing-only gate.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             tm.mark("p2_replay", t)
         return self._logits
 

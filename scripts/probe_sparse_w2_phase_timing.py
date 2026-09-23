@@ -7,18 +7,25 @@ the env-gated ``_StepTiming`` instrument (no second product timer):
     p_rows   decode geometry + bucket/graph lookup (host)
     p0_fill  own resolve + candidate/own staging fill (host, may drain promotion H2D)
     p1_h2d   pinned staging -> static device buffers (host enqueue)
-    p2_replay  captured CUDAGraph.replay() device span (CUDA event, probe-only)
+    p2_replay  captured CUDAGraph.replay(), host wall WITH a sync fence (exclusive)
     p3_finalize  bounds store + demote/promote pin set (host)
     p4_verify  spec sample/argmax + select_step state restore (host; spec only)
     p_sample  depth-0 analogue of p4_verify (plain sample commit)
-    p5_draft  MTP draft forward for the NEXT chain (CUDA event via TILERL_DRAFT_TIMING)
+    p5_draft  MTP draft forward for the NEXT chain, host wall with a sync fence (exclusive)
 
 Closure is a GATE, not a report line: per tick
-    |host-phase sum + p2_dev + p5_dev - call_wall| / call_wall <= 5%
-where ``call_wall`` brackets ``_run_sparse_decode_graph`` in this probe. Host
-phases are wall-clock (they carry the GPU drain they block on); p2/p5 are device
-spans, so the sum CAN exceed the single-stream wall and the assert is non-vacuous.
-Failure aborts with a non-zero exit and prints the offending tick, never a table.
+    |sum(PHASE_WALL) - product 'graph' envelope| / envelope <= 5%
+Every phase is HOST WALL. p2_replay and p5_draft each call torch.cuda.synchronize()
+BEFORE their mark (only when TILERL_STEP_TIMING is on), so they are EXCLUSIVE
+device-spanning walls — replay()/draft.step() are otherwise async and the GPU
+work would leak into whichever phase next syncs. Because every phase drains its
+own async work, the per-phase sum can only be <= the graph envelope (which
+brackets run_decode_graph); the gate is non-vacuous because a missed or
+double-counted phase makes the sum fall MORE than 5% short of the envelope.
+The exclusive p2/p5 figures are serial single-occupancy times, NOT production
+shares: in serving p3_finalize host work overlaps an async replay, so a W2-W1
+p2 delta means "the graph takes longer", not necessarily a changed overlap.
+Failure aborts non-zero and prints the offending tick, never a table.
 
 Two arms run in ONE process, order A then reversed B:
     w2_graph  depth=1, sparse graph on   (the cost under question)
@@ -145,13 +152,16 @@ def _drain(engine, pid, n):
     return out
 
 
-def measure_graph_ticks(e, want=N_STEADY, max_attempts=None):
+def measure_graph_ticks(e, want=N_STEADY, max_attempts=None, require_phases=()):
     """Step one engine and collect `want` STEADY sparse-graph ticks from the
     product _StepTiming buckets. Each returned row carries every PHASE_WALL value
     (missing keys are a hard error, never silently 0), the product 'graph'
     envelope as wall, and the per-tick closure gap. Refresh/prefill/mixed ticks
     and ticks that did not run exactly one sparse graph are SKIPPED, not counted.
-    Raises ProbeFail(rc=14) if `want` steady ticks are not observed."""
+    A tick is also skipped unless every phase in `require_phases` is > 0 (the w2
+    arm requires p4_verify and p5_draft so an empty-policy plain decode can never
+    masquerade as a verify sample). Raises ProbeFail(rc=14) if `want` qualifying
+    steady ticks are not observed."""
     max_attempts = max_attempts or want * 16
     tm = e._step_timing
     if tm is None:
@@ -165,7 +175,7 @@ def measure_graph_ticks(e, want=N_STEADY, max_attempts=None):
         # cumulative totals one tick at a time.
         return {k: tm.tot.get(k, 0.0) for k in track}
 
-    rows, attempts, prev, prev_fwd = [], 0, snap(), e._decode_forwards
+    rows, attempts, skipped_req, prev, prev_fwd = [], 0, 0, snap(), e._decode_forwards
     while len(rows) < want and attempts < max_attempts:
         attempts += 1
         ran = {"v": False}
@@ -186,10 +196,22 @@ def measure_graph_ticks(e, want=N_STEADY, max_attempts=None):
             continue  # refresh / prefill / capture-declined: excluded
 
         ph = {k: d[k] for k in PHASE_WALL}  # every p_* key must exist
+        if any(ph[k] <= 0.0 for k in require_phases):
+            # Graph ran but it was not the tick shape required (e.g. policy kept
+            # no draft -> plain decode records p_sample, not p4_verify). Count it
+            # so a window that never verifies fails loudly instead of greening.
+            skipped_req += 1
+            continue
         psum = sum(ph.values())
         wall = d["graph"]
         rows.append({"phases_ms": ph, "sum_ms": psum, "wall_ms": wall,
                      "gap": abs(psum - wall) / wall})
+
+    if len(rows) < want:
+        raise ProbeFail(
+            f"only {len(rows)} qualifying steady graph ticks (<{want}) after "
+            f"{attempts} steps; {skipped_req} graph ticks lacked required phases "
+            f"{require_phases}", rc=14)
 
     if len(rows) < want:
         raise ProbeFail(f"only {len(rows)} steady sparse-graph ticks (<{want}) "
@@ -240,7 +262,8 @@ def run_arm(name, depth, graph, neg_depth0_draft=False):
     for _ in range(20):
         e.step()
 
-    rows = measure_graph_ticks(e)
+    require = ("p4_verify", "p5_draft") if has_draft else ()
+    rows = measure_graph_ticks(e, require_phases=require)
     e.shutdown()
     return {0: rows}  # one synthetic cell for the CPU precondition
 
@@ -254,32 +277,36 @@ def _tokens_for_bucket(bucket: int) -> int:
 
 def _prime_bucket_27b(e, tok, bucket, depth, gen):
     """Submit the counting prompt whose FIRST decode tick lands in `bucket` and
-    wait until decode begins (measure-and-correct, mirroring prime_counting).
-    Returns the rid. Does NOT drain decode — measure_graph_ticks owns that."""
+    wait until decode begins. Returns the rid. Does NOT drain decode —
+    measure_graph_ticks owns that.
+
+    Single-shot (no measure-and-correct retry): nfill is computed from the same
+    deterministic tokens_for_bucket geometry as the parity probe, so the observed
+    bucket is asserted, not re-aimed. A miss is an instrument/geometry failure
+    (rc14) — silently padding another prompt would leave the prior rid live and
+    contaminate the next bucket."""
     from tilerl.sparse_engine import cmax_bucket
 
     instr = tok.encode(" Count aloud from one to forty, one number per line:")
     fid = tok.encode(" z")[-1:]
     nfill = _tokens_for_bucket(bucket) - len(instr)
-    for _ in range(6):
-        ids = fid * nfill + instr
-        rid = e.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=gen, seed=0))
-        for _ in range(40000):
-            e.step()
-            row = next((r for r in e._running if r.req_id == rid), None)
-            if row is None:
-                raise ProbeFail(f"b{bucket}: row vanished before decode")
-            if row.phase == PHASE_DECODE:
-                srows = e._sparse.decode_rows([row], [1 + depth])
-                cmax = max((len(x["cand"]) for x in srows), default=0)
-                if cmax_bucket(cmax) != bucket:
-                    raise ProbeFail(
-                        f"b{bucket}: first decode tick in cmax bucket {cmax_bucket(cmax)} "
-                        f"(cmax={cmax}), expected {bucket}", rc=14)
-                return rid
-            if getattr(row, "phase", None) > PHASE_DECODE:
-                raise ProbeFail(f"b{bucket}: request DONE before decode", rc=14)
-        nfill += bucket * 16  # never reached: loop above returns on first decode
+    ids = fid * nfill + instr
+    rid = e.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=gen, seed=0))
+    for _ in range(40000):
+        e.step()
+        row = next((r for r in e._running if r.req_id == rid), None)
+        if row is None:
+            raise ProbeFail(f"b{bucket}: row vanished before decode", rc=14)
+        if row.phase == PHASE_DECODE:
+            srows = e._sparse.decode_rows([row], [1 + depth])
+            cmax = max((len(x["cand"]) for x in srows), default=0)
+            if cmax_bucket(cmax) != bucket:
+                raise ProbeFail(
+                    f"b{bucket}: first decode tick in cmax bucket {cmax_bucket(cmax)} "
+                    f"(cmax={cmax}), expected {bucket}", rc=14)
+            return rid
+        if getattr(row, "phase", None) > PHASE_DECODE:
+            raise ProbeFail(f"b{bucket}: request DONE before decode", rc=14)
     raise ProbeFail(f"b{bucket}: counting prompt never entered decode", rc=14)
 
 
@@ -319,7 +346,8 @@ def run_arm_27b(name, depth, graph, source, draft_path, neg=False):
     try:
         for bucket in CMAX_BUCKETS:
             rid = _prime_bucket_27b(e, tok, bucket, depth, gen=max(N_STEADY * 4, 240))
-            cells[bucket] = measure_graph_ticks(e, want=N_STEADY)
+            require = ("p4_verify", "p5_draft") if depth >= 1 else ()
+            cells[bucket] = measure_graph_ticks(e, want=N_STEADY, require_phases=require)
             # drain/finish this request before priming the next bucket
             for _ in range(40000):
                 if not any(r.req_id == rid for r in e._running):
@@ -388,6 +416,9 @@ def _brief_cells(cells):
             "n": s["n"], "wall_p50_ms": round(s["wall_ms"]["p50"], 3),
             "wall_p90_ms": round(s["wall_ms"]["p90"], 3),
             "gap_p90": round(s["gap"]["p90"], 4),
+            # p2_replay/p5_draft are EXCLUSIVE host walls (sync fence inside the
+            # phase); the other six are plain host wall. See module docstring.
+            "exclusive_phases": ["p2_replay", "p5_draft"],
             **{f"{ph}_p50_ms": round(s[ph]["p50"], 3) for ph in PHASE_WALL}}
     return brief
 

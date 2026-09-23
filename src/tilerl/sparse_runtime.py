@@ -879,7 +879,13 @@ class SparseRuntime:
             end = ctx.width - 1
             for r in reqs:
                 assert len(r.draft_blocks) * BLOCK_TOKENS > r.seq_len - 1 + end
+            if tm is not None:
+                pt = time.perf_counter()
             ctx.draft_step(reqs)
             if tm is not None:
+                # Same exclusive-span fence as p2_replay: the draft forward's
+                # GPU work is async, so drain inside the phase before the mark.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 tm.mark("p5_draft", pt)
         return True
