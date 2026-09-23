@@ -8,9 +8,16 @@ late) is not free. The only staleness that might be free is ONE decode tick.
 
 ## Mechanism
 
-Today's every-8-tick synchronous refresh runs eager and costs p50 ~203-211 ms
-vs ~46 ms for a captured graph tick; ~128 ms of the gap is inside the eager
-sparse `model.forward` envelope, ~157 ms total. It does three serial things:
+Measured in the phase window (revision f7a93e5c/a6b6a511, V100 sm70,
+`TILERL_REFRESH_PHASES=1`, CUDA-event spans): the every-8-tick synchronous
+refresh step p50 is **249.312 ms** (n=15) vs a captured graph tick **45.732
+ms** (n=108) — a **203.58 ms** delta. The eager sparse trunk forward
+(`eager_trunk_forward`) is **198.663 ms = 97.6%** of that delta; the same
+geometry replays in 45.732 ms, so the eager trunk runs **4.34x** its own
+graph. Non-trunk work is 50.649 ms; host blocking is only 1.76 ms/tick
+(0.87%: synchronize ~1.76, 4 `.item` + 7 `.tolist` per refresh tick;
+select_quest ~17.3 ms, promote ~24.5 ms, select_pages ~3.7 ms). The refresh
+tick does three serial things:
 
 1. eager `_select` per source group — bounds `index_select` + chunked
    `quest_scores` (device), then `select_pages` whose width is forced to host
@@ -34,12 +41,14 @@ fully resident before the next replay: a stream wait on the promote batch
 (including the per-page shared sync and mmap) is the core synchronization
 point.
 
-What it removes from the 157 ms:
-- the eager-trunk launch gap (C3) — refresh tick returns to graph replay;
-- the ~8 in-forward readback stalls (C1) — moved off the critical path;
-- inline promote/shared/mmap/evict blocking (C2) — moved off the critical
-  path, but the H2D/SSD bandwidth now contends with the graph replay, so the
-  graph tick gets slightly longer. Net gain is measured, not assumed to be 46.
+What it removes: the 198.663 ms eager-trunk penalty (the refresh tick becomes
+a graph replay). The ~50.6 ms non-trunk select/promote work is moved off the
+critical path but now runs concurrently with graph ticks and shares the H2D/
+SSD bandwidth, so graph ticks may get slightly longer — the net gain is
+measured, not assumed. This is the 1-tick design rather than a longer refresh
+interval: the phase window already answered the A'-vs-B question (the gap is
+the eager trunk, not host sync), and churn Jaccard 0.438 says staleness is
+not free.
 
 Staging: SHADOW MODE first — compute and promote in the background while the
 tick still uses the synchronous selection, changing no tokens; measure whether
@@ -85,9 +94,12 @@ and every per-prompt value, not just the aggregate.
 
 ## Device measurement order
 
-- task 2 breakdown (commit 9b5cd169, `TILERL_REFRESH_PHASES=1`) attributes the
-  128 ms without nsys (nsys 2022.4.2.1 export is broken): GPU-event spans for
-  quest/select_pages/promote/shared_promote/eager trunk, wall time for
-  synchronize/evict, raw `.item/.tolist/.cpu` counts. Decides whether the gap
-  is idle/sync-bound (A' wins) or real eager trunk GPU time (B wins).
-- then shadow mode, then the real delay, then the pre-registered gate above.
+- ANSWERED by the phase window (f7a93e5c/a6b6a511, no nsys needed — nsys
+  2022.4.2.1 export is broken): the gap is the eager sparse trunk (97.6%),
+  not host sync (0.87%). This picked the 1-tick-delay design over a longer
+  refresh interval; see Mechanism.
+- NEXT: shadow mode (env-gated, probe branch only; budget carved from
+  num_blocks). CPU gate: shadow on/off produce token-identical output.
+  Measure whether the background select+promote keeps up within one graph
+  tick and how much it lengthens graph ticks.
+- then the real delay, then the pre-registered gate above.
