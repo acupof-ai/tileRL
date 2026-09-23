@@ -137,6 +137,85 @@ def load_prompts(path, tokenizer, want_n, min_tokens, max_tokens):
 # --------------------------------------------------------------------------- #
 # engine construction — one build call; the arm differs only by its three knobs
 # --------------------------------------------------------------------------- #
+def _finalize_arm(e, arm, armed, disabled, built_graph_on):
+    """Config assertions shared by the CUDA and CPU-smoke builds."""
+    if armed:
+        if not built_graph_on or disabled:
+            raise ProbeFail(
+                f"{arm}: sparse graph not armed after build "
+                f"(on={built_graph_on}, warnings={disabled})", rc=14)
+    elif built_graph_on:
+        raise ProbeFail("baseline: _sparse_graph_on True with min_tokens=8192", rc=14)
+    # Ref arm = graph arm with every sparse tick forced eager: same runtime,
+    # same selection/fill, only the captured replay declined.
+    if arm == "ref_eager_w2048":
+        e._sparse_graph_on = False
+    config = {"arm": arm, "built_sparse_graph_on": built_graph_on,
+              "forced_eager": arm == "ref_eager_w2048",
+              "auto_disabled_warnings": disabled,
+              "min_tokens": 0 if armed else 8192,
+              "draft_window": 2048}
+    if not armed:
+        # Baseline's graph-off comes from the min_tokens term of the build
+        # expression (`... and not self._sparse_min_tokens`), NOT from the sm70
+        # spec guard — do not report this as guard evidence.
+        config["graph_off_reason"] = "sparse_min_tokens=8192 in build expression"
+    return config
+
+
+def _tiny_draft(cfg, model):
+    """One-layer DraftHead over the tiny CPU trunk (the test-suite builder)."""
+    from dataclasses import replace
+
+    from tilerl.model import build_random
+    from tilerl.spec import DraftHead
+
+    dcfg = replace(cfg, num_layers=1, full_attn_layers=(0,), fp4=False)
+    params = {k: v for k, v in build_random(dcfg, seed=3).params.items()
+              if k.startswith("layers.")}
+    import torch
+
+    gen = torch.Generator().manual_seed(3)
+    h = cfg.hidden_size
+    params["fc"] = (torch.randn(h, 2 * h, generator=gen) * 0.02).to(torch.bfloat16)
+    params["norm"] = torch.ones(h, dtype=torch.bfloat16)
+    params["pre_fc_norm_hidden"] = torch.ones(h, dtype=torch.bfloat16)
+    return DraftHead(model, params, num_layers=1, attn_window_tokens=2048)
+
+
+def build_smoke_engine(arm):
+    """CPU tiny end-to-end plumbing check: all three arms build, run a prompt,
+    and write json. Not a fidelity gate (tiny vocab, CpuSparseGraph seam) — it
+    exists to catch crash-level script bugs in the first second instead of on
+    the device. Mirrors build_arm_engine's knobs at tiny scale."""
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl.build import build_engine
+    from tilerl.config import tiny
+    from tilerl.model import build_random
+
+    be = get_backend()
+    cfg = tiny()
+    armed = arm in ("graph_w2048", "ref_eager_w2048")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model = build_random(cfg, seed=11)
+        e = build_engine(
+            cfg, model, be,
+            num_blocks=64, num_slots=4, max_batch=4, max_total_tokens=4096,
+            max_num_batched_tokens=512,
+            sparse_k=2, sparse_min_tokens=0 if armed else 8192,
+            sparse_device_select=True,
+            scorer="bounds",
+            kv_cold_bytes=1 << 30,
+            decode_graph=True, draft=_tiny_draft(cfg, model), spec_depth=1,
+        )
+        disabled = [str(w.message) for w in caught if "auto-disabled" in str(w.message)]
+    config = _finalize_arm(e, arm, armed, disabled, bool(e._sparse_graph_on))
+    config["smoke"] = True
+    return e, be, config
+
+
 def build_arm_engine(model_name, source, draft_path, arm):
     from tilerl_kernels.backend import get_backend
 
@@ -147,7 +226,7 @@ def build_arm_engine(model_name, source, draft_path, arm):
     build_mod.QWEN38_SOURCE = source
     be = get_backend()
     if be.device.type != "cuda":
-        raise ProbeFail("this probe needs CUDA", rc=14)
+        raise ProbeFail("this probe needs CUDA (use --smoke for the CPU check)", rc=14)
 
     # All three arms run W2048 (production does too); the arms differ only by
     # min_tokens (baseline 8192 vs graph/ref 0) and the ref arm's forced eager.
@@ -166,36 +245,11 @@ def build_arm_engine(model_name, source, draft_path, arm):
             kv_cold_bytes=int(os.environ.get("H2_COLD_BYTES", str(1 << 30))),
             cold_ssd_path=os.environ.get("H2_COLD_SSD", ""),
             cold_ssd_bytes=int(os.environ.get("H2_COLD_SSD_BYTES", "0")),
-            cold_shared_ssd_bytes=int(os.environ.get("H2_COLD_SHARED_SSD_BYTES", "0")),
             cold_format="f16",
             decode_graph=True, draft=draft, spec_depth=1,
         )
         disabled = [str(w.message) for w in caught if "auto-disabled" in str(w.message)]
-
-    built_graph_on = bool(e._sparse_graph_on)
-    if armed:
-        if not built_graph_on or disabled:
-            raise ProbeFail(
-                f"{arm}: sparse graph not armed after build "
-                f"(on={built_graph_on}, warnings={disabled})", rc=14)
-    elif built_graph_on:
-        raise ProbeFail("baseline: _sparse_graph_on True with min_tokens=8192", rc=14)
-
-    # Ref arm = graph arm with every sparse tick forced eager: same runtime,
-    # same selection/fill, only the captured replay declined.
-    if arm == "ref_eager_w2048":
-        e._sparse_graph_on = False
-
-    config = {"arm": arm, "built_sparse_graph_on": built_graph_on,
-              "forced_eager": arm == "ref_eager_w2048",
-              "auto_disabled_warnings": disabled,
-              "min_tokens": 0 if armed else 8192,
-              "draft_window": 2048}
-    if not armed:
-        # Baseline's graph-off comes from the min_tokens term of the build
-        # expression (`... and not self._sparse_min_tokens`), NOT from the sm70
-        # spec guard — do not report this as guard evidence.
-        config["graph_off_reason"] = "sparse_min_tokens=8192 in build expression"
+    config = _finalize_arm(e, arm, armed, disabled, bool(e._sparse_graph_on))
     return e, be, config
 
 
@@ -281,18 +335,31 @@ def run_prompt(e, ids, max_new, on_decode=None, pre_step=None):
 def run_worker(arm, args):
     os.environ.setdefault("TILERL_STEP_TIMING", "1")
     os.environ.setdefault("TILERL_STEP_TIMING_SLOW_MS", "0")
-    _assert_tree(args.expect_tree)
-    from tilerl.cli import _qwen38_tokenizer
+    smoke = bool(getattr(args, "smoke", False))
+    if not smoke:
+        _assert_tree(args.expect_tree)
 
-    e, be, config = build_arm_engine(args.model, args.source, args.draft, arm)
-    tok = _qwen38_tokenizer()
-    want = 1 if args.stage == 0 else args.n_prompts
-    prompts = load_prompts(args.prompts, tok, want, args.min_tokens, args.max_tokens)
+    if smoke:
+        e, be, config = build_smoke_engine(arm)
+        # Tiny vocab 320, max_total_tokens 4096: one deterministic ~96-token
+        # prompt is enough to drive prefill + several sparse decode captures.
+        prompts = [[7 + (i % 300) for i in range(96)]]
+        max_new = 24
+    else:
+        from tilerl.cli import _qwen38_tokenizer
+
+        e, be, config = build_arm_engine(args.model, args.source, args.draft, arm)
+        tok = _qwen38_tokenizer()
+        want = 1 if args.stage == 0 else args.n_prompts
+        prompts = load_prompts(args.prompts, tok, want,
+                               args.min_tokens, args.max_tokens)
+        max_new = args.max_new_tokens
 
     results = {"arm": arm, "config": config, "prompts": [], "failures": [],
               "instrument_errors": []}
-    out_path = f"{args.out_prefix}_{arm}.stage{args.stage}.json"
-    measure = arm in ("graph_w2048", "baseline")  # throughput arms
+    tag = "smoke" if smoke else f"stage{args.stage}"
+    out_path = f"{args.out_prefix}_{arm}.{tag}.json"
+    measure = arm in ("graph_w2048", "baseline") and not smoke
     eff_tokens = 0
     wall_ms = 0.0
     graph_walls, eager_walls = [], []
@@ -316,7 +383,7 @@ def run_worker(arm, args):
                     acc[1] += w
                     (graph_walls if tm.fwd_path == "graph" else eager_walls).append(w)
 
-            r = run_prompt(e, ids, args.max_new_tokens, on_decode, before_step)
+            r = run_prompt(e, ids, max_new, on_decode, before_step)
             if unwrap is not None:
                 unwrap()
             eff_tokens += acc[0]
@@ -418,14 +485,23 @@ def run_worker(arm, args):
 
             torch.cuda.synchronize()
 
-    print(f"[serve-probe] {arm} stage{args.stage} wrote {out_path}", flush=True)
+    print(f"[serve-probe] {arm} {tag} wrote {out_path}", flush=True)
 
     if results["failures"]:
         for x in results["failures"][:10]:
             print("  MISMATCH " + x, file=sys.stderr)
-        return 1
+        return 1  # the ONLY rc=1 path: the 09-17 gate actually went red
     if arm == "graph_w2048":
-        if not any(p.get("new_bucket_armed") for p in results["prompts"]):
+        n_captures = sum(len(p.get("first_replays", [])) for p in results["prompts"])
+        if smoke:
+            # Plumbing check: at least one sparse capture must have fired and
+            # every first replay aligned with the eager ref. The 4096
+            # sufficiency criterion is device-window-specific.
+            if n_captures == 0:
+                print("INSUFFICIENT(smoke): graph arm recorded zero sparse "
+                      "captures", file=sys.stderr)
+                return 14
+        elif not any(p.get("new_bucket_armed") for p in results["prompts"]):
             seen = sorted({b for p in results["prompts"]
                            for b in p.get("buckets_seen", [])})
             print(f"INSUFFICIENT: no first replay at bucket >= {MIN_NEW_BUCKET} "
@@ -433,7 +509,7 @@ def run_worker(arm, args):
                   f"not armed — prompt too short or max_new too small?",
                   file=sys.stderr)
             return 14
-        if args.stage == 1 and len(results["prompts"]) < N_PROMPTS_MIN:
+        if not smoke and args.stage == 1 and len(results["prompts"]) < N_PROMPTS_MIN:
             print(f"INSUFFICIENT: only {len(results['prompts'])} prompts "
                   f"(floor {N_PROMPTS_MIN})", file=sys.stderr)
             return 14
@@ -472,17 +548,32 @@ def main():
     ap.add_argument("--min-tokens", type=int, default=20000)
     ap.add_argument("--max-tokens", type=int, default=40000)
     ap.add_argument("--max-new-tokens", type=int, default=2048)
+    ap.add_argument("--smoke", action="store_true",
+                    help="CPU tiny end-to-end plumbing check (all arms, no CUDA, "
+                         "no real prompts, no tree assert); run before any window")
     args = ap.parse_args()
 
     if args.worker:
         try:
             return run_worker(args.worker, args)
         except ProbeFail as exc:
+            # Instrument/insufficiency path.
             print(f"INSUFFICIENT(rc14) [{args.worker}]: {exc}", file=sys.stderr)
             return exc.rc
+        except Exception:
+            # Any other crash (TypeError, build failure, OOM, ...) is an
+            # INSTRUMENT failure: rc14, never the rc=1 that means "09-17 gate
+            # red". The two must be separable from the exit code alone.
+            import traceback
+
+            traceback.print_exc()
+            print(f"INSTRUMENT ERROR(rc14) [{args.worker}]: uncaught exception; "
+                  f"this is not a 09-17 gate red", file=sys.stderr)
+            return 14
 
     import subprocess
 
+    tag = "smoke" if args.smoke else f"stage{args.stage}"
     args.reference_dir = args.reference_dir or "serve805_refs"
     os.makedirs(args.reference_dir, exist_ok=True)
     # ref must precede graph (graph reads its per-prompt reference files).
@@ -497,10 +588,13 @@ def main():
                "--min-tokens", str(args.min_tokens),
                "--max-tokens", str(args.max_tokens),
                "--max-new-tokens", str(args.max_new_tokens)]
-        with open(f"{args.out_prefix}_{arm}.stage{args.stage}.out", "w") as out_f, \
-                open(f"{args.out_prefix}_{arm}.stage{args.stage}.err", "w") as err_f:
+        if args.smoke:
+            cmd.append("--smoke")
+        with open(f"{args.out_prefix}_{arm}.{tag}.out", "w") as out_f, \
+                open(f"{args.out_prefix}_{arm}.{tag}.err", "w") as err_f:
             rcs[arm] = subprocess.run(cmd, stdout=out_f, stderr=err_f).returncode
     print(json.dumps(rcs, indent=2))
+    # 1 means a real 09-17 gate red; 14 means a crash or insufficiency.
     return 1 if 1 in rcs.values() else (14 if 14 in rcs.values() else 0)
 
 
