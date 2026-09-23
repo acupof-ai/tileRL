@@ -98,13 +98,24 @@ Control `tok/fwd` is the same measurement as `accept` on a W=2 cell (every tick
 has width>1), so the two columns carry identical values there; at W=1 the strict
 rate is undefined by construction and is marked `–`, not zero.
 
-☨ **Two outliers, recorded as machine jitter, not position effect.** Both sit at
-the b1024 / ORDER B combination: control-B b1024 W=1 graph **250.8** ms/tick
-where the same arm's other W=1 cells read 86.8 / 85.1 and ORDER A's same cell
-read 67.2; and patch-B b1024 W=2 eager **974.7** ms/tick against ORDER A's
-237.7. Each appears on one side only, so neither moves a verdict — but the same
-bucket/order pairing produced both, which is worth knowing before anyone quotes
-b1024 as a stable latency.
+☨ **Two cells, at the b1024 / ORDER B combination — a reproducible pairing, not
+machine jitter (corrected 2026-09-23, see below).** control-B b1024 W=1 graph
+**250.8** ms/tick where the same arm's other W=1 cells read 86.8 / 85.1 and
+ORDER A's same cell read 67.2; and patch-B b1024 W=2 eager **974.7** ms/tick
+against ORDER A's 237.7. Neither moves a verdict, but b1024 should not be quoted
+as a stable latency.
+
+**Correction.** This paragraph originally read "recorded as machine jitter, not
+position effect." That is wrong. The phase window of the same day
+(`2026-09-23-sparse-w2-phase-timing.md`) hit the same pairing again: two cells,
+both b1024, both ORDER B, in **two different arms**, with `step − graph` of
+**41.909** and **41.911 ms** — agreeing to three decimals across arms, which is a
+deterministic signature rather than jitter. That makes three windows at which the
+b1024/ORDER-B pairing misbehaves, across arms and across measurands (this window
+saw it inside the graph, the phase window outside it). Mechanism undetermined;
+tracked as an open defect in
+[errors/2026-09-23-b1024-order-b-outside-graph.md](../errors/2026-09-23-b1024-order-b-outside-graph.md)
+and in [OPEN.md](../OPEN.md).
 
 Raw artifacts: `sparse-w2-graph-keep-steps-2026-09-23/parity-patch-A-20260923-171959.json`,
 `…/parity-patch-B-20260923-171959.json`,

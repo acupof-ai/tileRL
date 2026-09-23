@@ -1,0 +1,81 @@
+{
+  "arm": "w2_graph_dw2048",
+  "tok_per_fwd": 1.978021978021978,
+  "cells": {
+    "512": {
+      "summary": {
+        "bucket": 512,
+        "n": 50,
+        "graph_envelope_p50_ms": 41.703,
+        "graph_envelope_p90_ms": 43.826,
+        "step_p50_ms": 45.133,
+        "step_p90_ms": 47.368,
+        "step_minus_graph_p50_ms": 3.344,
+        "gap_p90": 0.0009,
+        "exclusive_phases": [
+          "p2_replay",
+          "p5_draft"
+        ],
+        "p_rows_p50_ms": 0.137,
+        "p0_fill_p50_ms": 0.714,
+        "p1_h2d_p50_ms": 0.106,
+        "p2_replay_p50_ms": 28.089,
+        "p3_finalize_p50_ms": 0.046,
+        "p4_verify_p50_ms": 0.811,
+        "p_sample_p50_ms": 0.0,
+        "p5_draft_p50_ms": 11.704
+      },
+      "failures": []
+    },
+    "1024": {
+      "summary": {
+        "bucket": 1024,
+        "n": 50,
+        "graph_envelope_p50_ms": 83.368,
+        "graph_envelope_p90_ms": 93.031,
+        "step_p50_ms": 125.809,
+        "step_p90_ms": 134.756,
+        "step_minus_graph_p50_ms": 41.911,
+        "gap_p90": 0.0022,
+        "exclusive_phases": [
+          "p2_replay",
+          "p5_draft"
+        ],
+        "p_rows_p50_ms": 2.336,
+        "p0_fill_p50_ms": 5.541,
+        "p1_h2d_p50_ms": 1.075,
+        "p2_replay_p50_ms": 28.362,
+        "p3_finalize_p50_ms": 0.197,
+        "p4_verify_p50_ms": 2.86,
+        "p_sample_p50_ms": 0.0,
+        "p5_draft_p50_ms": 42.105
+      },
+      "failures": []
+    },
+    "2048": {
+      "summary": {
+        "bucket": 2048,
+        "n": 50,
+        "graph_envelope_p50_ms": 42.41,
+        "graph_envelope_p90_ms": 43.928,
+        "step_p50_ms": 46.02,
+        "step_p90_ms": 47.573,
+        "step_minus_graph_p50_ms": 3.521,
+        "gap_p90": 0.0008,
+        "exclusive_phases": [
+          "p2_replay",
+          "p5_draft"
+        ],
+        "p_rows_p50_ms": 0.489,
+        "p0_fill_p50_ms": 0.878,
+        "p1_h2d_p50_ms": 0.105,
+        "p2_replay_p50_ms": 28.238,
+        "p3_finalize_p50_ms": 0.046,
+        "p4_verify_p50_ms": 0.811,
+        "p_sample_p50_ms": 0.0,
+        "p5_draft_p50_ms": 11.745
+      },
+      "failures": []
+    }
+  }
+}
