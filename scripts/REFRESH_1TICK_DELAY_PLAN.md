@@ -94,28 +94,43 @@ and every per-prompt value, not just the aggregate.
 
 ## Shadow v1 — go/no-go (pre-registered 2026-09-24, before the run)
 
-Env-gated (`TILERL_SPARSE_SHADOW=1`), probe branch only, default off. No
-residency side effects: after each graph tick, on a side stream, recompute the
-full bounds/quest selection from the previous tick's cached query (no
-`.tolist`) and issue representative cold H2D copies into scratch blocks carved
-out of `num_blocks`; nothing is mapped into l2p and no tick reads the scratch,
-so output is token-identical with shadow off (CPU gate asserts this).
+Env-gated (`TILERL_SPARSE_SHADOW=quest|h2d|both`, `TILERL_SPARSE_SHADOW_PAGES`
+for the H2D volume), probe branch only, default off. No residency side
+effects: after each graph tick, on a side stream, run the quest compute with a
+synthetic post-rope q (same shape/SM cost, result unused) and/or issue cold H2D
+copies into scratch blocks carved out of `num_blocks` (popped off the pool's
+free list, restored on shutdown — capacity leaves via free_blocks, not the
+fixed `num_blocks`); nothing is mapped into l2p and no live tick reads the
+scratch, so output is token-identical with shadow off (CPU gate asserts it).
 
-- Budget: carve the scratch reserve out of `num_blocks` (no +k; V100 has only
-  2-3 GiB free). Verdict prints carved pages and the resulting num_blocks.
-- Representative copy size: **512 pages** = 4 groups × k 128, the worst-case
-  single-refresh churn (churn window measured a median 100/128 replaced per
-  group). Deliberately an overestimate; verdict prints
-  `512 × per-page f32 bytes`.
+- Budget: carve scratch out of `num_blocks` (no +k; V100 has only 2-3 GiB
+  free), capped at half the current free pool. Verdict prints carved pages,
+  num_blocks fixed, and free blocks before/after.
+- The real per-refresh promotion volume is measured in the SAME window by
+  delta-ing `HostKvPages.promotions` (`kv_cold_promotions`, the `.take` H2D
+  counter) on each refresh tick — `offers_pages` is EVICTIONS and churn's 400
+  is REPLACED-pages; neither is promotions, so neither sets the volume.
+  Reported per run as refresh_promotions p50/p90/max.
+- Synthetic H2D volumes run at three points: **107** (offers_pages p90,
+  proxy), **206** (observed max eviction), **512** (4×k supremum). The gate is
+  read at the point matching the measured real promotion p90; if that p90
+  falls between two points, report both adjacent points. quest is
+  informational (SM contention only; no H2D gate).
 - Verdict (n ≥ 50 graph ticks per side, same process, alternating on/off in
-  segments as a placement control):
-  - p50 AND p90 of background select+promote device time;
-  - adjacent-graph-tick interval (the budget the background must fit);
-  - graph-tick p50 shadow OFF vs ON (segmented).
-- GO line, locked before the run:
-  1. background select+promote **p90 ≤ one graph-tick interval**, and
-  2. graph-tick p50 slowdown shadow-on vs off **≤ 5%**.
-  Both must hold; either fails → v2 (real delay) is not built.
+  segments as a placement control; start-to-start intervals):
+  - background device time p50/p90/p99;
+  - the real budget denominator is graph-tick interval measured in OFF
+    segments (ON-segment intervals include the background's own wait and
+    would make the fit gate self-proving);
+  - graph-tick p50 OFF vs ON;
+  - tail: at each ON tick start, non-blocking event query of whether the
+    previous tick's background finished — fraction NOT finished.
+- GO line, locked before the run (h2d/both, at the measured-volume point):
+  1. background **p90 ≤ OFF-segment graph-tick interval p50**;
+  2. graph-tick p50 slowdown ON vs OFF **≤ 5%**;
+  3. **fraction of refreshes whose background exceeds one interval ≤ 5%**
+     (the tail: an occasional two-tick refresh is the real-delay failure).
+  All three must hold; any fails → v2 (real delay) is not built.
 
 ## Device measurement order
 

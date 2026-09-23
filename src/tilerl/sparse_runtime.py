@@ -13,6 +13,7 @@ keeps its old surface.
 
 from __future__ import annotations
 
+import os
 import time
 import warnings
 from collections.abc import Callable
@@ -121,6 +122,9 @@ class SparseRuntime:
         self.graphs: dict = {}
         self.warm_adoptions = 0
         self.ctx: SparseCtx | None = None
+        # PROBE-ONLY #805: real cold-promotion deltas per refresh tick.
+        self._refresh_promo_base = None
+        self.refresh_promotions: list[int] = []
 
     # ------------------------------------------------ tracker read proxies
     @property
@@ -305,9 +309,19 @@ class SparseRuntime:
         device_select = self.device_select and pure_decode and not do_refresh
         if do_refresh:
             self.ticks_since_refresh = 0
+            # PROBE-ONLY #805: baseline the real cold-promotion counter at the
+            # start of a refresh tick; engine reads the delta at tick end. No
+            # behavior change, env-gated.
+            if os.environ.get("TILERL_SPARSE_SHADOW"):
+                self._refresh_promo_base = self._cold_promotions(ctx)
         return SparseForward(
             tr, srows, ctx.backend.device, ctx.backend, device_select=device_select
         )
+
+    @staticmethod
+    def _cold_promotions(ctx) -> int:
+        cold = getattr(ctx.kv, "cold", None)
+        return int(getattr(cold, "promotions", 0)) if cold is not None else 0
 
     def _release_private_frame(self, ctx, tr, r, rid: int, p: int, phys: int) -> bool:
         """Release a departing page's device frame. A page whose identical bytes

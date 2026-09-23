@@ -27,12 +27,20 @@ import torch
 
 from .sparse_engine import order_members, quest_scores_batched, select_members
 
-# Worst-case pages a refresh can replace: 4 source groups x k.
-SHADOW_PAGES = 4 * 128
+# Per-TICK amortised promote rate the real 1-tick delay must sustain, from the
+# churn window: median 100 pages replaced per group per REFRESH, a refresh runs
+# every 8 ticks, over 4 source groups -> 100/8*4 = 50 pages/tick (measured
+# mean 49.8). The 512 = 4*k is a whole single refresh, i.e. 8 ticks of work;
+# it is reported as a worst-case upper bound, never the per-tick gate size.
+SHADOW_PAGES = 50
+SHADOW_PAGES_REFRESH_BURST = 4 * 128
 
 
 class SparseShadow:
-    def __init__(self, ctx, tracker, num_scratch: int = SHADOW_PAGES):
+    def __init__(self, ctx, tracker, num_scratch: int | None = None):
+        if num_scratch is None:
+            num_scratch = int(os.environ.get("TILERL_SPARSE_SHADOW_PAGES",
+                                             SHADOW_PAGES))
         self.ctx = ctx
         self.tracker = tracker
         self.device = ctx.backend.device
@@ -52,7 +60,6 @@ class SparseShadow:
         # close(). Honest capacity reduction from num_blocks (no +k).
         self.carved = 0
         self.scratch: list[int] = []
-        self.original_num_blocks = self.kv.num_blocks
         self._host_k = None
         self._host_v = None
         if self.enabled and self.do_h2d:
@@ -84,10 +91,22 @@ class SparseShadow:
         )
         return {"mode": self.mode, "enabled": self.enabled,
                 "carved_scratch_pages": self.carved,
-                "original_num_blocks": self.original_num_blocks,
-                "resulting_num_blocks": self.kv.num_blocks - self.carved,
+                # PagedKvPool.num_blocks is fixed at construction; carving pops
+                # blocks off _free, so capacity leaves via the free list, not
+                # num_blocks. Report the actual free-pool before/after.
+                "num_blocks_fixed": self.kv.num_blocks,
+                "free_blocks_before_carve":
+                    self.kv.free_blocks + self.carved,
+                "free_blocks_after_carve": self.kv.free_blocks,
+                "blocks_in_circulation": self.kv.num_blocks,
                 "scratch_page_bytes": per_page,
-                "h2d_bytes_worst_case": self.carved * per_page}
+                # The gate copies `carved` pages: the measured cold-promotion
+                # count of ONE refresh (must finish in one tick). 512 is the
+                # whole-refresh upper bound, reported for reference only.
+                "h2d_bytes_gate_window": self.carved * per_page,
+                "h2d_pages_whole_refresh_burst": SHADOW_PAGES_REFRESH_BURST,
+                "h2d_bytes_burst_512_upper_bound":
+                    SHADOW_PAGES_REFRESH_BURST * per_page}
 
     def _synthetic_q(self, plane: int, bounds) -> torch.Tensor:
         """[B=1,Tq=1,hq,D] post-rope-shaped query for one plane's bounds."""
@@ -116,13 +135,13 @@ class SparseShadow:
             self.wait_pending()
         self.bg_ms = []
 
-    def after_graph_tick(self, rows) -> None:
-        """Launch the background work after one captured graph tick. `rows`
-        are the tick's sparse rows (used only to size candidate bounds; no
-        output is consumed). On CPU it runs inline so the logic/CPU gate
-        exercises the same code."""
+    def after_graph_tick(self, rows):
+        """Launch the background work after one captured graph tick. Returns a
+        handle the caller queries at the NEXT graph tick's start to see whether
+        the background finished within one interval: a CUDA end event (queryable
+        non-blocking), or None on CPU where work runs inline (always done)."""
         if not self.enabled or not self.active_seg:
-            return
+            return None
         t0 = torch.cuda.Event(enable_timing=True) if self.cuda else None
         t1 = torch.cuda.Event(enable_timing=True) if self.cuda else None
         import time
@@ -144,8 +163,9 @@ class SparseShadow:
             t1.record(self.stream)
             self.ready_events.append(t1)
             self.bg_ms.append((t0, t1))
-        else:
-            self.bg_ms.append((time.perf_counter() - wall0) * 1000.0)
+            return t1
+        self.bg_ms.append((time.perf_counter() - wall0) * 1000.0)
+        return "inline-done"
 
     def _quest_work(self, rows) -> None:
         # Score every source plane over that row's full candidate bounds with a

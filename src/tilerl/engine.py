@@ -2172,6 +2172,16 @@ class Engine:
             # draft_step (prefix-bound). No device read.
             if sparse and sparse_offers is not None:
                 _tm.note += f" offers_pages={sum(len(p) for _, p in sparse_offers)}"
+        # PROBE-ONLY #805: real cold promotions this refresh tick (HostKvPages
+        # .take H2D count), distinct from offers_pages (evictions). Env-gated.
+        if sparse and self._sparse is not None \
+                and self._sparse._refresh_promo_base is not None:
+            delta = self._sparse._cold_promotions(self._sparse.ctx) \
+                - self._sparse._refresh_promo_base
+            self._sparse.refresh_promotions.append(delta)
+            self._sparse._refresh_promo_base = None
+            if _tm is not None:
+                _tm.note += f" cold_promotions={delta}"
 
     def _sparse_live_stats(self) -> dict:
         """Flat sparse residency counters for a hybrid engine. The memory ledger

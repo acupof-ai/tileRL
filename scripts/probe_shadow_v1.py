@@ -32,7 +32,23 @@ from probe_serve_sm70_w2048 import (
 )
 
 SEGMENT = 50  # graph ticks per off/on segment; n >= 50 per side, alternating
-MODES = ("quest", "h2d", "both")
+# quest measures SM contention (no H2D volume). h2d/both run at three synthetic
+# volumes: 107 = offers_pages p90 (proxy), 206 = observed max eviction (real
+# bound seen on device), 512 = 4*k supremum. The gate is read at the volume
+# matching the measured real promotion p90 (reported per run).
+QUEST_MODE = ("quest", None)
+H2D_VOLUMES = (107, 206, 512)
+
+
+def configs(smoke: bool):
+    if smoke:
+        # Tiny CPU pool cannot hold the device volumes; one small h2d point.
+        return [QUEST_MODE, ("h2d", 16), ("both", 16)]
+    return [QUEST_MODE] + [(m, p) for p in H2D_VOLUMES for m in ("h2d", "both")]
+
+
+def label(mode, pages):
+    return mode if pages is None else f"{mode}{pages}"
 
 
 def pct(values, q):
@@ -44,67 +60,123 @@ def pct(values, q):
 
 
 def run_one_mode(arm_mode, e, ids, max_new):
-    """Run one prompt; collect graph tick wall off/on and on-tick background."""
+    """One prompt, alternating OFF/ON graph-tick segments.
+
+    Timing (start-to-start, not the wall of a tick that may itself wait on the
+    background):
+      - graph tick wall per segment (off/on p50,p90) for the slowdown gate;
+      - interval_off: real graph->graph start gaps in OFF segments, the honest
+        budget denominator (ON-segment gaps include background wait by design);
+      - bg_over_1_interval: at each ON graph tick start, query whether the
+        PREVIOUS tick's background end event is already complete. Fraction NOT
+        complete = refreshes that would miss a one-tick deadline (tail gate).
+    """
     sh = e._sparse_shadow
     sh.set_active(False)
-    sh.reset_timing()
 
     rid = e.submit(list(ids), _sampling(max_new))
     tm = e._step_timing
-    seg = {"state": "off", "n": 0}
-    off_w, on_w = [], []
-    intervals = []
-    last_graph_t = None
+    seg_state = "off"
+    seg_n = 0
+    off_w, on_w, intervals_off = [], [], []
+    bg_complete = 0
+    bg_missed = 0
+    last_bg_event = None
+    pending_had_bg = False
+    prev_start = None
     import time
 
     for _ in range(200000):
-        live = any(r.req_id == rid for r in e._running)
+        live_row = next((x for x in e._running if x.req_id == rid), None)
+        live = live_row is not None
         f0 = e._decode_forwards
-        t0 = time.perf_counter()
+        t_start = time.perf_counter()
+        if prev_start is not None:
+            gap = (t_start - prev_start) * 1000.0
         e.step()
-        wall = (time.perf_counter() - t0) * 1000.0
         df = e._decode_forwards - f0
         alive = any(r.req_id == rid for r in e._running)
-        if live and df and tm is not None and tm.fwd_sparse \
-                and tm.fwd_path == "graph":
-            if last_graph_t is not None:
-                intervals.append(wall)  # tick wall as the conservative interval
-            last_graph_t = wall
-            (on_w if seg["state"] == "on" else off_w).append(wall)
-            seg["n"] += 1
-            if seg["n"] >= SEGMENT:
-                seg["state"] = "on" if seg["state"] == "off" else "off"
-                seg["n"] = 0
-                sh.set_active(seg["state"] == "on")
-                sh.reset_timing()
+        is_graph = (live and df and tm is not None and tm.fwd_sparse
+                    and tm.fwd_path == "graph")
+        if is_graph:
+            wall = (time.perf_counter() - t_start) * 1000.0
+            if prev_start is not None and seg_state == "off":
+                intervals_off.append(gap)
+            (on_w if seg_state == "on" else off_w).append(wall)
+            # Tail gate: did the previous ON tick's background finish before
+            # this tick started? (non-blocking event query, no wait).
+            if seg_state == "on" and pending_had_bg:
+                done = True
+                if last_bg_event not in (None, "inline-done"):
+                    done = bool(last_bg_event.query())
+                if done:
+                    bg_complete += 1
+                else:
+                    bg_missed += 1
+            seg_n += 1
+            if seg_n >= SEGMENT:
+                if seg_state == "on":
+                    sh.wait_pending()  # don't leak bg across the boundary
+                seg_state = "on" if seg_state == "off" else "off"
+                seg_n = 0
+                sh.set_active(seg_state == "on")
+            # Launch this tick's background AFTER recording the segment; the
+            # event is checked at the next graph tick start. live_row is the
+            # pre-step request (still present for a decode tick).
+            if seg_state == "on":
+                rows = e._sparse.decode_rows([live_row], [1])
+                last_bg_event = sh.after_graph_tick(rows)
+                pending_had_bg = last_bg_event is not None
+            else:
+                last_bg_event, pending_had_bg = None, False
+            prev_start = t_start
         if not alive:
             break
 
     bg = sh.background_ms() if sh is not None else []
     info = sh.info() if sh is not None else {}
-    return {"mode": arm_mode, "n_graph_off": len(off_w), "n_graph_on": len(on_w),
+    promo = list(getattr(e._sparse, "refresh_promotions", []))
+    bg_total = bg_complete + bg_missed
+    return {"mode": arm_mode, "h2d_pages": info.get("carved_scratch_pages"),
+            "n_graph_off": len(off_w), "n_graph_on": len(on_w),
             "graph_p50_off": pct(off_w, 50), "graph_p90_off": pct(off_w, 90),
             "graph_p50_on": pct(on_w, 50), "graph_p90_on": pct(on_w, 90),
-            "interval_p50": pct(intervals, 50),
-            "interval_p90": pct(intervals, 90),
-            "bg_p50": pct(bg, 50), "bg_p90": pct(bg, 90), "n_bg": len(bg),
+            "interval_off_p50": pct(intervals_off, 50),
+            "interval_off_p90": pct(intervals_off, 90),
+            "bg_p50": pct(bg, 50), "bg_p90": pct(bg, 90),
+            "bg_p99": pct(bg, 99), "n_bg": len(bg),
+            "bg_finished_within_1_interval": bg_complete,
+            "bg_exceeded_1_interval": bg_missed,
+            "bg_exceed_fraction": round(bg_missed / bg_total, 4)
+                if bg_total else None,
+            # Real per-refresh cold-promotion distribution observed this run
+            # (HostKvPages.take deltas); the h2d gate is read at its p90.
+            "refresh_promotions_n": len(promo),
+            "refresh_promotions_p50": pct(promo, 50),
+            "refresh_promotions_p90": pct(promo, 90),
+            "refresh_promotions_max": max(promo) if promo else None,
             "shadow": info}
 
 
 def verdict_for(rep):
     g_off, g_on = rep["graph_p50_off"], rep["graph_p50_on"]
-    bg90, interval50 = rep["bg_p90"], rep["interval_p50"]
-    if None in (g_off, g_on, bg90, interval50) or rep["n_bg"] == 0:
+    bg90, interval_off50 = rep["bg_p90"], rep["interval_off_p50"]
+    exceed = rep["bg_exceed_fraction"]
+    if None in (g_off, g_on, bg90, interval_off50, exceed):
         return 14, "insufficient timing samples"
     slow = g_on / g_off if g_off else float("inf")
-    fits = bg90 <= interval50
+    fits = bg90 <= interval_off50
     slow_ok = slow <= 1.05
+    tail_ok = exceed <= 0.05
     rep["graph_p50_slowdown_ratio"] = round(slow, 4)
-    rep["go_bg_p90_le_interval_p50"] = fits
+    rep["go_bg_p90_le_interval_off_p50"] = fits
     rep["go_slowdown_le_1p05"] = slow_ok
-    return (0 if (fits and slow_ok) else 14), (
-        f"bg_p90 {bg90} <= interval_p50 {interval50}: {fits}; "
-        f"graph p50 slowdown x{slow:.4f} <=1.05: {slow_ok}")
+    rep["go_tail_exceed_fraction_le_0p05"] = tail_ok
+    go = fits and slow_ok and tail_ok
+    return (0 if go else 14), (
+        f"bg_p90 {bg90} <= interval_off_p50 {interval_off50}: {fits}; "
+        f"graph p50 slowdown x{slow:.4f} <=1.05: {slow_ok}; "
+        f"bg exceed-1-interval fraction {exceed} <=0.05: {tail_ok}")
 
 
 def main():
@@ -125,15 +197,17 @@ def main():
     if args.smoke:
         reps = []
         ids = [7 + (i % 300) for i in range(400)]
-        for mode in MODES:
+        for mode, pages in configs(True):
             os.environ["TILERL_SPARSE_SHADOW"] = mode
+            if pages is not None:
+                os.environ["TILERL_SPARSE_SHADOW_PAGES"] = str(pages)
             e, _be, _cfg = build_smoke_engine("graph_w2048")
-            rep = run_one_mode(mode, e, ids, 80)
+            rep = run_one_mode(label(mode, pages), e, ids, 80)
             e.shutdown()
             reps.append(rep)
         with open(args.out, "w") as f:
             json.dump(reps, f, indent=2)
-        print(f"[smoke] wrote {args.out} modes={len(reps)}", flush=True)
+        print(f"[smoke] wrote {args.out} configs={len(reps)}", flush=True)
         return 0
 
     import subprocess
@@ -152,21 +226,33 @@ def main():
     tok = _qwen38_tokenizer()
     prompts = load_prompts(args.prompts, tok, 1, 20000, 40000)
     reps, worst = [], 0
-    for mode in MODES:
+    for mode, pages in configs(False):
         os.environ["TILERL_SPARSE_SHADOW"] = mode
+        if pages is not None:
+            os.environ["TILERL_SPARSE_SHADOW_PAGES"] = str(pages)
+        else:
+            os.environ.pop("TILERL_SPARSE_SHADOW_PAGES", None)
         e, _be, _cfg = build_arm_engine(args.model, args.source, args.draft,
                                         "graph_w2048")
         try:
-            rep = run_one_mode(mode, e, prompts[0], args.max_new_tokens)
+            rep = run_one_mode(label(mode, pages), e, prompts[0],
+                               args.max_new_tokens)
         finally:
             e.shutdown()
             torch.cuda.synchronize()
-        rc, note = verdict_for(rep)
-        rep["verdict_rc"] = rc
-        rep["verdict"] = note
-        worst = max(worst, rc)
+        # quest has no H2D volume: report SM contention/slowdown only, no
+        # fits/tail verdict. h2d/both carry the three pre-registered gates.
+        if mode == "quest":
+            rep["verdict_rc"] = 0
+            rep["verdict"] = "informational (quest SM contention; no H2D gate)"
+        else:
+            rc, note = verdict_for(rep)
+            rep["verdict_rc"] = rc
+            rep["verdict"] = note
+            worst = max(worst, rc)
         reps.append(rep)
-        print(f"[{mode}] rc={rc} {note}", flush=True)
+        print(f"[{rep['mode']}] rc={rep['verdict_rc']} {rep['verdict']}",
+              flush=True)
     with open(args.out, "w") as f:
         json.dump(reps, f, indent=2)
     print(f"wrote {args.out}; worst rc {worst}", flush=True)
