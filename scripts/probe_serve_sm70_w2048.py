@@ -4,8 +4,11 @@
 Three arms, each its own subprocess (one 27B model per process; two in a
 process OOM the 32G card):
 
-  baseline        production: sparse_min_tokens=8192 (32k is sparse, but the
-                  captured sparse tick is gated off by min_tokens), draft W=0.
+  baseline        production, verbatim: depth 1 + draft window W2048 (today's
+                  run_serve_prod.sh ships --draft-attn-window-tokens 2048) +
+                  sparse_min_tokens=8192, which gates the captured sparse tick
+                  off. The graph/ref arms change ONLY the guard + min_tokens;
+                  the window is present on both sides and cancels in the diff.
   ref_eager_w2048 probe tree: sparse_min_tokens=0 + W2048 + d1, built with the
                   sparse decode graph ARMED then forced eager after build
                   (graph_on=False). Identical to the graph arm down to the
@@ -17,7 +20,8 @@ by sparse_min_tokens 8192 vs 0, which changes the PREFILL sparse routing, so
 baseline can legitimately commit different tokens and is not a correctness
 reference. (Draft W does NOT change which tokens greedy commits — speculation is
 lossless under greedy verify, only how many are accepted per forward — so W is
-not the reason.)
+not the reason. W is also identical across all three arms anyway: production
+already runs W2048.)
 
 Answers on REAL long prompts at ~32k with the production cold tier:
   1. CORRECTNESS — errors/2026-09-17 gate. A sparse decode graph lazily captured
@@ -145,16 +149,18 @@ def build_arm_engine(model_name, source, draft_path, arm):
     if be.device.type != "cuda":
         raise ProbeFail("this probe needs CUDA", rc=14)
 
-    w2048 = arm in ("graph_w2048", "ref_eager_w2048")
+    # All three arms run W2048 (production does too); the arms differ only by
+    # min_tokens (baseline 8192 vs graph/ref 0) and the ref arm's forced eager.
+    armed = arm in ("graph_w2048", "ref_eager_w2048")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         cfg, model = build_model(model_name, seed=0, fuse_projections=True)
-        draft = load_draft(model, draft_path, attn_window_tokens=2048 if w2048 else 0)
+        draft = load_draft(model, draft_path, attn_window_tokens=2048)
         e = build_engine(
             cfg, model, be,
             num_slots=4, max_batch=4, max_total_tokens=131072,
             max_num_batched_tokens=512,
-            sparse_k=128, sparse_min_tokens=0 if w2048 else 8192,
+            sparse_k=128, sparse_min_tokens=0 if armed else 8192,
             sparse_device_select=True,
             scorer="bounds",
             kv_cold_bytes=int(os.environ.get("H2_COLD_BYTES", str(1 << 30))),
@@ -167,7 +173,7 @@ def build_arm_engine(model_name, source, draft_path, arm):
         disabled = [str(w.message) for w in caught if "auto-disabled" in str(w.message)]
 
     built_graph_on = bool(e._sparse_graph_on)
-    if w2048:
+    if armed:
         if not built_graph_on or disabled:
             raise ProbeFail(
                 f"{arm}: sparse graph not armed after build "
@@ -183,9 +189,9 @@ def build_arm_engine(model_name, source, draft_path, arm):
     config = {"arm": arm, "built_sparse_graph_on": built_graph_on,
               "forced_eager": arm == "ref_eager_w2048",
               "auto_disabled_warnings": disabled,
-              "min_tokens": 0 if w2048 else 8192,
-              "draft_window": 2048 if w2048 else 0}
-    if not w2048:
+              "min_tokens": 0 if armed else 8192,
+              "draft_window": 2048}
+    if not armed:
         # Baseline's graph-off comes from the min_tokens term of the build
         # expression (`... and not self._sparse_min_tokens`), NOT from the sm70
         # spec guard — do not report this as guard evidence.
