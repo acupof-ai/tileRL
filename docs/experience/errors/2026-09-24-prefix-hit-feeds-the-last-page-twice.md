@@ -1,6 +1,7 @@
 # A full-page prefix hit feeds the last page to the GDN state twice — V100 sm70 / CPU tiny, 2026-09-24
 
-> Status: open — the PR that writes the restored snapshot back removes this line.
+> Status: FIXED 2026-09-24 by #824 (`260ee7a3`). The restored snapshot is written
+> back after the re-forward has produced the logits. OPEN.md row removed.
 
 ## What happens
 
