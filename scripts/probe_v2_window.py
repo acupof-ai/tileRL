@@ -157,6 +157,45 @@ def run_worker(tag, lag, args):
         print(f"tree {sha} != {args.expect_tree[:8]}", file=sys.stderr)
         return 14
 
+    # Geometry (device arm only; smoke keeps the tiny defaults). Same probe-only
+    # patch point as the R×W sweep worker: sparse_engine imported WINDOW_PAGES
+    # BY VALUE and imports SPARSE_REFRESH_TICKS inside its functions, so set the
+    # module attrs BEFORE the engine/graph modules use them. The draft read
+    # window stays 2048 (build_arm_engine); W here is the sparse own-window.
+    cap_state = None
+    if not smoke:
+        from tilerl import sparse_engine, sparse_index
+
+        pages = args.window_tokens // sparse_index.BLOCK_TOKENS
+        sparse_index.WINDOW_TOKENS = args.window_tokens
+        sparse_index.WINDOW_PAGES = pages
+        sparse_engine.WINDOW_PAGES = pages
+        sparse_engine.SPARSE_REFRESH_TICKS = args.refresh
+        print(f"GEOMETRY window_tokens={args.window_tokens} pages={pages} "
+              f"R={args.refresh}", flush=True)
+        # Startup hard assertion for the v2 capture-order defect: the prior
+        # device run baked the graph BEFORE sf.lag_enabled was set, so the
+        # q-clone/override merge were absent and every carry silently fell back
+        # eager. Wrap the capture entry: a graph captured for the async arm with
+        # sf.lag_enabled falsy is an instrument error, not a measured no-go.
+        if lag == "async":
+            import tilerl.sparse_runtime as srt
+
+            _raw_make = srt.make_sparse_graph
+            cap_state = {"captures": 0, "bad": 0}
+
+            def _make_checked(*a, **kw):
+                sf = a[5] if len(a) > 5 else kw.get("sf")
+                if not getattr(sf, "lag_enabled", False):
+                    cap_state["bad"] += 1
+                    raise RuntimeError(
+                        "capture-order violation: sf.lag_enabled is False at "
+                        "make_sparse_graph (q-clone/merge absent from graph)")
+                cap_state["captures"] += 1
+                return _raw_make(*a, **kw)
+
+            srt.make_sparse_graph = _make_checked
+
     if smoke:
         from probe_serve_sm70_w2048 import build_smoke_engine
 
@@ -327,6 +366,10 @@ def run_worker(tag, lag, args):
         "b1_decode_ticks": _b1_state["ticks"],
         "b1_max_concurrent_rows": _b1_state["max_rows"],
         "b1_violations": _b1_state["violations"],
+        "capture_order_checked": (cap_state or {"captures": 0})["captures"],
+        "capture_order_violations": (cap_state or {"bad": 0})["bad"],
+        "window_tokens": None if smoke else args.window_tokens,
+        "refresh_ticks_R": None if smoke else args.refresh,
     }
     with open(f"{args.out_prefix}_{tag}.json", "w") as f:
         json.dump(rep, f, indent=2)
@@ -425,9 +468,9 @@ def _tf_analyze(arm_logits_dir, n_prompts, tag_a, tag_b):
     }
 
 
-def quality(v2_seqs, ctl_seqs):
+def quality(v2_seqs, ctl_seqs, mod=REFRESH_MOD):
     """Legacy free-running paired comparison (kept for the end-to-end aux)."""
-    agree, first_divs, mod8 = [], [], {}
+    agree, first_divs, modn = [], [], {}
     per_prompt = []
     for i, (v, c) in enumerate(zip(v2_seqs, ctl_seqs)):
         if len(v) != len(c):
@@ -438,7 +481,7 @@ def quality(v2_seqs, ctl_seqs):
         agree.append(ag)
         if fd is not None:
             first_divs.append(fd)
-            mod8[fd % REFRESH_MOD] = mod8.get(fd % REFRESH_MOD, 0) + 1
+            modn[fd % mod] = modn.get(fd % mod, 0) + 1
         per_prompt.append({"i": i, "agreement": round(ag, 5),
                            "first_divergence": fd})
     return {
@@ -448,7 +491,7 @@ def quality(v2_seqs, ctl_seqs):
         "median_first_divergence": statistics.median(first_divs)
             if first_divs else None,
         "n_diverged_prompts": len(first_divs),
-        "divergence_mod8": dict(sorted(mod8.items())),
+        "divergence_mod_R": dict(sorted(modn.items())),
     }
 
 
@@ -471,6 +514,12 @@ def main():
                     help="CPU tiny-model plumbing run (1 prompt; absolute timing "
                          "gates are not meaningful, but the 3-subprocess driver, "
                          "floor and quality comparison are exercised)")
+    ap.add_argument("--window-tokens", type=int, default=128, choices=[128, 1024],
+                    help="sparse own-window in tokens (the R×W sweep's W; the "
+                         "draft read window stays W2048)")
+    ap.add_argument("--refresh", type=int, default=8, choices=[8, 16, 32],
+                    help="decode ticks between refreshes (R); v2 carries the "
+                            "refresh tick")
     args = ap.parse_args()
 
     if args.worker_tag:
@@ -507,7 +556,9 @@ def main():
                "--min-tokens", str(args.min_tokens),
                "--max-tokens", str(args.max_tokens),
                "--out-prefix", args.out_prefix,
-               "--per-prompt-dir", args.per_prompt_dir]
+               "--per-prompt-dir", args.per_prompt_dir,
+               "--window-tokens", str(args.window_tokens),
+               "--refresh", str(args.refresh)]
         if args.smoke:
             cmd.append("--smoke")
         with open(f"{args.out_prefix}_{tag}.out", "w") as out_f, \
@@ -598,7 +649,7 @@ def main():
         problems14.append(
             "v2 teacher-forced coverage broken (subset assertion risk): "
             + str([(p["i"], p["missing_positions"]) for p in bad]))
-    q = quality(sv, sa)
+    q = quality(sv, sa, mod=args.refresh)
     verdict["freerun_quality_aux"] = q if q["ok"] else q
     if not q["ok"]:
         problems14.append(q["reason"])
@@ -625,6 +676,12 @@ def main():
                 f"{_arm.get('tag')}: {_arm['b1_violations']} B>1 graph decode "
                 f"ticks (max {_arm.get('b1_max_concurrent_rows')} rows); this "
                 "window is B=1-only (94(a))")
+    if V.get("capture_order_violations"):
+        problems14.append(
+            "v2 capture-order gate: a sparse graph was captured with "
+            "sf.lag_enabled falsy; q-clone/override merge absent from the "
+            "baked graph, so every carry would be a silent eager no-op (the "
+            "prior device-run defect)")
 
     # Timing/result gates (measured; failures are rc1, not rc14).
     ratio = round(V["aggregate_eff_tok_s"] / ctl_eff, 4) if ctl_eff else None
