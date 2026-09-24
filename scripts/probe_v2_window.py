@@ -140,6 +140,90 @@ def structural_report(samples, pin_ceiling):
     }
 
 
+def _free_run_pass(e, prompts, args, struct_samples):
+    """Genuine free-run leg for the async arm (the anchored leg changes the
+    token stream and so its speed/acceptance are not comparable to an unforced
+    baseline). Same warm-window caliber [16,end), close tick dropped. Returns
+    the metrics 94 asked for: warm eff tok/s, graph/eager tick p50, eager
+    fraction, effective tokens/tick, spec acceptance (overall + in/post)."""
+    pcyc = pcarry = pplain = []
+    all_graph_w, all_eager_w = [], []
+    agg_tok = agg_wall = 0
+    d_acc = d_dft = d_in_a = d_in_d = d_post_a = d_post_d = 0
+    lag = "async"
+    per_prompt = []
+    for pi, ids in enumerate(prompts):
+        e._sparse.ticks_since_refresh = 0  # #821: phase 0 per prompt
+        c0 = (e._spec_accepted, e._spec_drafted, e._spec_acc_in,
+              e._spec_dft_in, e._spec_acc_post, e._spec_dft_post)
+        ticks, acc = [], [0, 0]
+
+        def on_decode(idx, wall, tm, df, da, is_close, refresh_after,
+                      phase_pre, acc=acc, ticks=ticks, pi=pi):
+            warm = idx >= WARMUP_DECODE and not is_close
+            if warm:
+                acc[0] += df + da
+                acc[1] += wall
+            ticks.append({"wall": wall, "path": tm.fwd_path,
+                          "refresh_after": refresh_after, "warm": warm})
+            if (lag == "async" and warm and refresh_after == 0
+                    and tm.fwd_path == "graph"):
+                rt = e._sparse
+                pool = rt.ctx.kv
+                live_rows = [x for x in e._running]
+                live_row = live_rows[0] if len(live_rows) == 1 else None
+                if live_row is not None \
+                        and live_row.req_id in rt.tracker.resident:
+                    struct_samples.append({
+                        "prompt": pi, "decode_idx": idx, "leg": "free",
+                        "resident_frames":
+                            len(rt.tracker.resident[live_row.req_id]),
+                        "blocks": len(live_row.blocks),
+                        "free_blocks": pool.free_blocks,
+                        "reserve": len(rt._lag_obj.reserve)})
+
+        r = run_prompt(e, ids, args.max_new_tokens, on_decode)
+        c1 = (e._spec_accepted, e._spec_drafted, e._spec_acc_in,
+              e._spec_dft_in, e._spec_acc_post, e._spec_dft_post)
+        warm = [t for t in ticks if t["warm"]]
+        all_graph_w += [t["wall"] for t in warm if t["path"] == "graph"]
+        all_eager_w += [t["wall"] for t in warm if t["path"] != "graph"]
+        cyc, carry, plain, ncyc, neager, trail = steady_distributions(warm)
+        pcyc, pcarry, pplain = pcyc + cyc, pcarry + carry, pplain + plain
+        agg_tok += acc[0]
+        agg_wall += acc[1]
+        d_acc += c1[0] - c0[0]
+        d_dft += c1[1] - c0[1]
+        d_in_a += c1[2] - c0[2]
+        d_in_d += c1[3] - c0[3]
+        d_post_a += c1[4] - c0[4]
+        d_post_d += c1[5] - c0[5]
+        per_prompt.append({"i": pi, "n_out": len(r["output"]),
+                           "warm_eff_tokens": acc[0],
+                           "warm_eff_tok_s": round(acc[0] / (acc[1] / 1000.0), 4)
+                               if acc[1] else None})
+    n_warm = len(all_graph_w) + len(all_eager_w)
+    lagc = getattr(e._sparse, "_lag_obj", None)
+    return {
+        "warm_eff_tok_s": round(agg_tok / (agg_wall / 1000.0), 4) if agg_wall else None,
+        "graph_tick_ms_p50": pct(all_graph_w, 50),
+        "eager_tick_ms_p50": pct(all_eager_w, 50),
+        "carry_ms_p50": pct(pcarry, 50), "carry_ms_p90": pct(pcarry, 90),
+        "plain_ms_mean": round(statistics.fmean(pplain), 4) if pplain else None,
+        "eager_tick_frac": round(len(all_eager_w) / n_warm, 4) if n_warm else None,
+        "warm_ticks": n_warm,
+        "tokens_per_tick": round(agg_tok / n_warm, 4) if n_warm else None,
+        "accept_rate": round(d_acc / d_dft, 4) if d_dft else None,
+        "spec_accepted": d_acc, "spec_drafted": d_dft,
+        "accept_in": round(d_in_a / d_in_d, 4) if d_in_d else None,
+        "accept_post": round(d_post_a / d_post_d, 4) if d_post_d else None,
+        "steady_cycles": len(pcyc),
+        "lag_carry": lagc.carry_cycles if lagc else None,
+        "lag_fallback": lagc.fallback_cycles if lagc else None,
+        "per_prompt": per_prompt,
+    }
+
+
 def run_worker(tag, lag, args):
     smoke = bool(getattr(args, "smoke", False))
     if lag == "async":
@@ -205,10 +289,11 @@ def run_worker(tag, lag, args):
         from tilerl.cli import _qwen38_tokenizer
 
         tok = _qwen38_tokenizer()
-        prompts = load_prompts(args.prompts, tok, N_PROMPTS,
+        prompts = load_prompts(args.prompts, tok, args.n_prompts,
                                args.min_tokens, args.max_tokens)
-        if len(prompts) < N_PROMPTS:
-            print(f"only {len(prompts)} prompts (< {N_PROMPTS})", file=sys.stderr)
+        if len(prompts) < args.n_prompts:
+            print(f"only {len(prompts)} prompts (< {args.n_prompts})",
+                  file=sys.stderr)
             return 14
         e, _be, config = build_arm_engine(args.model, args.source, args.draft,
                                           "graph_w2048")
@@ -231,9 +316,54 @@ def run_worker(tag, lag, args):
         return _raw_rdg(reqs, chains)
 
     _rt0.run_decode_graph = _b1_checked_rdg
+
+    if getattr(args, "ab_free", False):
+        # Stacked-combo A/B speed read: two pure free runs (A v2 off, B v2 on),
+        # no teacher forcing — the anchored leg changes acceptance, so speed must
+        # be free. A/B run in separate processes via the shell orchestrator.
+        # Allowed under --smoke so the free-run metric path has CPU coverage;
+        # device geometry is skipped there.
+        samples = []
+        rep = _free_run_pass(e, prompts, args, samples)
+        lagc = getattr(e._sparse, "_lag_obj", None)
+        from tilerl.memory import sparse_hot_pages_per_slot
+        tr = e._sparse.tracker
+        pin_ceiling = sparse_hot_pages_per_slot(
+            tr.cfg, tr.k_pages, e.limits.max_num_batched_tokens)
+        rep.update({
+            "tag": tag, "lag": lag, "tree": sha,
+            "config": config, "n_prompts": len(prompts),
+            "window_tokens": args.window_tokens, "refresh_ticks_R": args.refresh,
+            "draft_true_q_width": bool(
+                __import__("tilerl.spec", fromlist=["_DRAFT_TRUE_Q_WIDTH"])
+                ._DRAFT_TRUE_Q_WIDTH),
+            "graph_carry_observed": (rep.get("lag_carry") or 0) > 0,
+            "capture_order_checked": (cap_state or {"captures": 0})["captures"],
+            "capture_order_violations": (cap_state or {"bad": 0})["bad"],
+            "b1_violations": _b1_state["violations"],
+            "residency_structural": structural_report(samples, pin_ceiling),
+        })
+        try:
+            e.shutdown()
+        finally:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        with open(f"{args.out_prefix}_{tag}.json", "w") as f:
+            json.dump(rep, f, indent=2)
+        print(f"[{tag}] FREE warm_tok/s={rep['warm_eff_tok_s']} "
+              f"graph_p50={rep['graph_tick_ms_p50']} "
+              f"eager_p50={rep['eager_tick_ms_p50']} "
+              f"eager_frac={rep['eager_tick_frac']} "
+              f"tok/tick={rep['tokens_per_tick']} accept={rep['accept_rate']} "
+              f"carry={rep['lag_carry']} fb={rep['lag_fallback']}", flush=True)
+        return 0
+
     rows = []
     pcyc = pcarry = pplain = []
     struct_samples = []
+    all_graph_w, all_eager_w = [], []
+    t_acc = t_dft = t_in_a = t_in_d = t_post_a = t_post_d = 0
     # Teacher-forcing. controlA runs free and RECORDS its own logits (its greedy
     # output is the anchor). v2 and controlB load controlA's per-prompt output
     # and teacher-force that stream, recording their logits on the same tokens.
@@ -241,7 +371,7 @@ def run_worker(tag, lag, args):
     recorder = None
     if not record_only:
         anchors = {}
-        for pi in range(N_PROMPTS if not smoke else 1):
+        for pi in range(args.n_prompts if not smoke else 1):
             ap = os.path.join(args.per_prompt_dir, f"controlA_{pi:03d}.json")
             anchors[pi] = _load_json(ap)["output"]
     try:
@@ -253,6 +383,9 @@ def run_worker(tag, lag, args):
             anc = None if record_only else {0: anchors[pi]}
             recorder = TeacherForceRecorder(e, anc).install()
             ticks, acc = [], [0, 0.0]
+            _c0 = (e._spec_accepted, e._spec_drafted, e._decode_forwards,
+                   getattr(e, "_spec_acc_in", 0), getattr(e, "_spec_dft_in", 0),
+                   getattr(e, "_spec_acc_post", 0), getattr(e, "_spec_dft_post", 0))
 
             def on_decode(idx, wall, tm, df, da, is_close, refresh_after,
                           phase_pre, acc=acc, ticks=ticks, pi=pi):
@@ -260,6 +393,8 @@ def run_worker(tag, lag, args):
                 if warm:
                     acc[0] += df + da
                     acc[1] += wall
+                    (all_graph_w if tm.fwd_path == "graph"
+                     else all_eager_w).append(wall)
                 ticks.append({"wall": wall, "path": tm.fwd_path,
                               "refresh_after": refresh_after, "warm": warm})
                 # Structural gate sample at every steady cycle boundary: the
@@ -283,6 +418,14 @@ def run_worker(tag, lag, args):
                         })
 
             r = run_prompt(e, ids, args.max_new_tokens, on_decode)
+            c1 = (e._spec_accepted, e._spec_drafted, e._spec_acc_in,
+                  e._spec_dft_in, e._spec_acc_post, e._spec_dft_post)
+            t_acc += c1[0] - _c0[0]
+            t_dft += c1[1] - _c0[1]
+            t_in_a += c1[2] - _c0[2]
+            t_in_d += c1[3] - _c0[3]
+            t_post_a += c1[4] - _c0[4]
+            t_post_d += c1[5] - _c0[5]
             # Dump teacher-forced logits (top1 + full f32 logits per recorded
             # chain slot) for the driver's quality gate, then detach.
             tf_rows = recorder.rows.get(0, [])
@@ -468,6 +611,16 @@ def _tf_analyze(arm_logits_dir, n_prompts, tag_a, tag_b):
     }
 
 
+def _speed_row(j):
+    """The free-run read 94 asked for."""
+    return {k: j.get(k) for k in (
+        "warm_eff_tok_s", "graph_tick_ms_p50", "eager_tick_ms_p50",
+        "eager_tick_frac", "tokens_per_tick", "accept_rate",
+        "accept_in", "accept_post", "spec_accepted", "spec_drafted",
+        "graph_carry_observed", "lag_carry", "lag_fallback",
+        "carry_ms_p50", "carry_ms_p90", "steady_cycles", "warm_ticks")}
+
+
 def quality(v2_seqs, ctl_seqs, mod=REFRESH_MOD):
     """Legacy free-running paired comparison (kept for the end-to-end aux)."""
     agree, first_divs, modn = [], [], {}
@@ -520,6 +673,15 @@ def main():
     ap.add_argument("--refresh", type=int, default=8, choices=[8, 16, 32],
                     help="decode ticks between refreshes (R); v2 carries the "
                             "refresh tick")
+    ap.add_argument("--n-prompts", type=int, default=N_PROMPTS)
+    ap.add_argument("--ab-free", action="store_true",
+                    help="stacked-combo speed read: pure free runs only, no "
+                         "teacher-forcing/floor/quality gates (two processes A "
+                         "off / B async driven by the shell orchestrator)")
+    ap.add_argument("--quality-only", action="store_true",
+                    help="follow-up read: rc gates floor + teacher-forced "
+                         "quality + instrument gates; speed ratio/carry timing "
+                         "are reported, not gated")
     args = ap.parse_args()
 
     if args.worker_tag:
@@ -538,10 +700,11 @@ def main():
     if not args.smoke and not args.prompts:
         print("--prompts required (serve805_prompts.jsonl)", file=sys.stderr)
         return 14
-    n_prompts = 1 if args.smoke else N_PROMPTS
+    n_prompts = 1 if args.smoke else args.n_prompts
     args.per_prompt_dir = args.per_prompt_dir or f"{args.out_prefix}_pp"
     os.makedirs(args.per_prompt_dir, exist_ok=True)
-    runs = [("controlA", "off"), ("v2", "async"), ("controlB", "off")]
+    runs = ([("A", "off"), ("B", "async")] if args.ab_free
+            else [("controlA", "off"), ("v2", "async"), ("controlB", "off")])
     rcs = {}
     for tag, lag in runs:
         out_json = f"{args.out_prefix}_{tag}.json"
@@ -558,7 +721,10 @@ def main():
                "--out-prefix", args.out_prefix,
                "--per-prompt-dir", args.per_prompt_dir,
                "--window-tokens", str(args.window_tokens),
-               "--refresh", str(args.refresh)]
+               "--refresh", str(args.refresh),
+               "--n-prompts", str(args.n_prompts)]
+        if args.ab_free:
+            cmd.append("--ab-free")
         if args.smoke:
             cmd.append("--smoke")
         with open(f"{args.out_prefix}_{tag}.out", "w") as out_f, \
@@ -576,6 +742,38 @@ def main():
     def _load(p):
         with open(p) as f:
             return json.load(f)
+
+    if args.ab_free:
+        # Stacked-combo A/B free-run verdict. No teacher forcing, so the only
+        # instrument gates are: v2 actually carried (capture order), B=1 held,
+        # residency structural. Speed/acceptance are measured reads, not gates.
+        A = _load(f"{args.out_prefix}_A.json")
+        B = _load(f"{args.out_prefix}_B.json")
+        problems = []
+        if not B.get("graph_carry_observed"):
+            problems.append("B ran ZERO graph carries (silent eager / capture order)")
+        if B.get("capture_order_violations"):
+            problems.append("B capture-order violations")
+        if A.get("b1_violations") or B.get("b1_violations"):
+            problems.append("B>1 ticks in an A/B B=1-only read")
+        if A.get("residency_structural", {}).get("violated") or \
+                B.get("residency_structural", {}).get("violated"):
+            problems.append("residency structural violation")
+        ratio = (B["warm_eff_tok_s"] / A["warm_eff_tok_s"]) \
+            if A.get("warm_eff_tok_s") else None
+        verdict = {
+            "geometry": {"window_tokens": A["window_tokens"],
+                         "refresh_R": A["refresh_ticks_R"],
+                         "draft_true_q_width": A["draft_true_q_width"]},
+            "A_v2off": _speed_row(A), "B_v2on": _speed_row(B),
+            "B_over_A_speed_ratio": round(ratio, 4) if ratio else None,
+            "B_ge_40_triggers_quality_followup": bool(
+                B.get("warm_eff_tok_s") is not None and B["warm_eff_tok_s"] >= 40),
+            "instrument_ok": not problems, "problems": problems}
+        with open(f"{args.out_prefix}_verdict.json", "w") as f:
+            json.dump(verdict, f, indent=2)
+        print(json.dumps(verdict, indent=2))
+        return 14 if problems else 0
 
     A = _load(f"{args.out_prefix}_controlA.json")
     V = _load(f"{args.out_prefix}_v2.json")
@@ -685,6 +883,16 @@ def main():
 
     # Timing/result gates (measured; failures are rc1, not rc14).
     ratio = round(V["aggregate_eff_tok_s"] / ctl_eff, 4) if ctl_eff else None
+    verdict["instrument_problems"] = problems14
+    if problems14:
+        # Instrument gates (floor, coverage, placement, graph-carry observed,
+        # B==1, capture order, residency structural, counter consistency): any
+        # failure invalidates the whole window regardless of the speed gates.
+        with open(f"{args.out_prefix}_verdict.json", "w") as f:
+            json.dump(verdict, f, indent=2)
+        for p in problems14:
+            print("INSTRUMENT FAIL(rc14): " + p, file=sys.stderr)
+        return 14
     gates1 = {
         "eff_ratio_v2_over_control": ratio,
         "go_ratio_ge_1p20": ratio is not None and ratio >= GO_RATIO,
@@ -742,6 +950,14 @@ def main():
         # (few cycles). Require only that all three subprocesses produced
         # jsons (rc already enforced) and the two controls are token-identical.
         return 0 if floor_ok else 1
+    if args.quality_only:
+        # Follow-up after the speed read: instrument gates + floor + binding
+        # teacher-forced quality only; speed ratio/carry timing are reported.
+        quality_go = floor_ok and gates1["tf_top1_mean_ge_0p99"]
+        verdict["QUALITY_GO"] = bool(quality_go)
+        with open(f"{args.out_prefix}_verdict.json", "w") as f:
+            json.dump(verdict, f, indent=2)
+        return 0 if quality_go else 1
     return 0 if verdict["GO"] else 1
 
 
