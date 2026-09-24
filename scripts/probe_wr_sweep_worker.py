@@ -81,14 +81,19 @@ def run_one_prompt(e, rid, tag_decline) -> tuple[list[int], dict]:
     eager_ms: list[float] = []
     wall0 = None
     out = None
+    cuda = torch.cuda.is_available()
     for _ in range(200000):
         tag_decline["v"] = False
-        t0 = torch.cuda.Event(enable_timing=True)
-        t1 = torch.cuda.Event(enable_timing=True)
-        t0.record()
+        if cuda:
+            t0 = torch.cuda.Event(enable_timing=True)
+            t1 = torch.cuda.Event(enable_timing=True)
+            t0.record()
+        else:
+            w0 = time.perf_counter()
         e.step()
-        t1.record()
-        torch.cuda.synchronize()
+        if cuda:
+            t1.record()
+            torch.cuda.synchronize()
         row = next((r for r in e._running if r.req_id == rid), None)
         if row is not None and row.phase == 2:
             if not decoding:
@@ -103,8 +108,11 @@ def run_one_prompt(e, rid, tag_decline) -> tuple[list[int], dict]:
                 wall0 = time.perf_counter()
                 f0 = e._decode_forwards
                 acc0 = e._spec_accepted
-            (eager_ms if tag_decline["v"] else graph_ms).append(t0.elapsed_time(t1))
-        e.poll()
+            ms = (t0.elapsed_time(t1) if cuda
+                  else (time.perf_counter() - w0) * 1000.0)
+            (eager_ms if tag_decline["v"] else graph_ms).append(ms)
+        # take() pops _finished; do NOT also poll() — poll clears the finished
+        # dict, so a following take() would never see the completed request.
         out = e.take(rid)
         if out is not None:
             break
