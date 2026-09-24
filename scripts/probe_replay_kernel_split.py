@@ -85,6 +85,15 @@ def main() -> int:
         cold_ssd_path=args.cold_ssd, cold_ssd_bytes=8 << 30, cold_format="f16",
         decode_graph=True, draft=draft, spec_depth=1,
     )
+    import tilerl
+    print(f"TILERL_FILE {tilerl.__file__}", flush=True)
+    print(f"SPARSE_GRAPH_ON {e._sparse_graph_on}", flush=True)
+    # #818 guard A: depth1+draft sparse graph must be armed; without it the
+    # captured replay under measurement is eager.
+    if not e._sparse_graph_on:
+        print("FATAL sparse graph forced eager (guard A/#818 not in this tree)",
+              file=sys.stderr)
+        return 14
     tok = _qwen38_tokenizer()
     rid = e.submit(ids_for_bucket(tok, args.bucket),
                    SamplingParams(temperature=0.0, max_new_tokens=4096, seed=0))

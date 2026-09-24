@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 
 
@@ -104,6 +105,16 @@ def main() -> int:
         cold_ssd_path=args.cold_ssd, cold_ssd_bytes=8 << 30, cold_format="f16",
         decode_graph=True, draft=draft, spec_depth=1,
     )
+    import tilerl
+    print(f"TILERL_FILE {tilerl.__file__}", flush=True)
+    print(f"SPARSE_GRAPH_ON {e._sparse_graph_on}", flush=True)
+    # #818 guard A: with depth1 + draft the sparse decode graph must be armed;
+    # R>1 measured without it measures eager, not the sweep arm. R=1 declines by
+    # design so it does not need the graph.
+    if args.refresh > 1 and not e._sparse_graph_on:
+        print("FATAL sparse graph forced eager (guard A/#818 not in this tree)",
+              file=sys.stderr)
+        return 14
     tok = _qwen38_tokenizer()
     prompts = load_prompts(args.prompts, tok, args.n_prompts)
 
@@ -124,6 +135,30 @@ def main() -> int:
     type(e._sparse).run_decode_graph = spy_rdg
     pp_dir = f"{args.out_prefix}_pp"
     os.makedirs(pp_dir, exist_ok=True)
+    pages = args.window_tokens // 16
+
+    def write_meta(per_prompt, ok=None):
+        # Rewritten after every prompt: an interrupted arm keeps the speed
+        # records and outputs of the prompts it finished.
+        declines_ok = (
+            all(d == args.refresh - 1 for d in declines) if args.refresh > 1
+            else bool(declines) and all(d == 0 for d in declines)
+        )
+        key_own_ws = sorted({k[3] for k in e._sparse.graphs})
+        keys_ok = key_own_ws == [] if args.refresh == 1 else pages + 1 in key_own_ws
+        gate = (keys_ok and declines_ok) if ok is None else ok
+        summary = {
+            "window_tokens": args.window_tokens, "window_pages": pages,
+            "refresh_ticks": args.refresh, "graph_key_own_w": pages + 1,
+            "observed_graph_key_own_ws": key_own_ws,
+            "n_captured_graphs": len(e._sparse.graphs),
+            "declines_seen": len(declines),
+            "decline_counter_values": sorted(set(declines))[:8],
+            "structural_gate_ok": bool(gate),
+            "prompts": per_prompt,
+        }
+        with open(f"{args.out_prefix}.json", "w") as f:
+            json.dump(summary, f, indent=2)
 
     per_prompt = []
     for idx, ids in enumerate(prompts):
@@ -172,36 +207,21 @@ def main() -> int:
         print(f"[{args.window_tokens}/R{args.refresh}] prompt {idx} done "
               f"{len(out)} tok, eff {per_prompt[-1]['eff_tok_s']} tok/s",
               flush=True)
+        write_meta(per_prompt)
 
-    # Structural gate, read off the runtime itself — not recomputed constants:
-    # 1. captured graph keys carry own_w = window_pages + 1 (W=2 verify width);
-    # 2. R=1 declines every attempt, so it must have captured ZERO graphs;
-    # 3. R>1 refresh declines fired at counter R-1 (every R graph ticks).
-    pages = args.window_tokens // 16
     key_own_ws = sorted({k[3] for k in e._sparse.graphs})
-    keys_ok = (key_own_ws == [] if args.refresh == 1 else key_own_ws == [pages + 1])
-    expected_decline_at = args.refresh - 1
+    keys_ok = key_own_ws == [] if args.refresh == 1 else key_own_ws == [pages + 1]
     declines_ok = (
-        all(d == expected_decline_at for d in declines) if args.refresh > 1
-        else len(declines) > 0 and all(d == 0 for d in declines)
+        all(d == args.refresh - 1 for d in declines) if args.refresh > 1
+        else bool(declines) and all(d == 0 for d in declines)
     )
-    own_w = pages + 1
-    summary = {
-        "window_tokens": args.window_tokens, "window_pages": pages,
-        "refresh_ticks": args.refresh, "graph_key_own_w": own_w,
-        "observed_graph_key_own_ws": key_own_ws,
+    write_meta(per_prompt, ok=keys_ok and declines_ok)
+    print("STRUCTURAL " + json.dumps({
+        "window_pages": pages, "refresh_ticks": args.refresh,
+        "graph_key_own_w": pages + 1, "observed_graph_key_own_ws": key_own_ws,
         "n_captured_graphs": len(e._sparse.graphs),
         "declines_seen": len(declines),
-        "decline_counter_values": sorted(set(declines))[:8],
-        "structural_gate_ok": bool(keys_ok and declines_ok),
-        "prompts": per_prompt,
-    }
-    with open(f"{args.out_prefix}.json", "w") as f:
-        json.dump(summary, f, indent=2)
-    print("STRUCTURAL " + json.dumps({k: summary[k] for k in (
-        "window_pages", "refresh_ticks", "graph_key_own_w",
-        "observed_graph_key_own_ws", "n_captured_graphs",
-        "declines_seen", "structural_gate_ok")}), flush=True)
+        "structural_gate_ok": keys_ok and declines_ok}), flush=True)
     if not (keys_ok and declines_ok):
         return 1
     e.shutdown()

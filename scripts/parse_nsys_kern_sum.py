@@ -86,6 +86,10 @@ def main() -> int:
                     help="weight-bytes/bandwidth roofline, printed for reference")
     ap.add_argument("--ticks", type=int, default=0,
                     help="captured tick count: normalize totals to ms/tick")
+    ap.add_argument("--min-per-tick", type=int, default=0,
+                    help="rc14 if total kernel instances per tick is below this "
+                         "(graph-trace positive control: node tracing must expand "
+                         "a 64-layer replay to several hundred kernels per tick)")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -108,9 +112,13 @@ def main() -> int:
         agg[c]["ms"] = round(agg[c]["ms"], 3)
         agg[c]["share"] = round(agg[c]["ms"] / total_ms, 4)
     raw.sort(key=lambda r: -r["ms"])
+    total_instances = sum(a["count"] for a in agg.values())
+    per_tick_n = total_instances / args.ticks if args.ticks else 0
     result = {"total_kernel_ms": round(total_ms, 3),
               "memcpy_ms": round(mem_ms, 3),
               "ticks": args.ticks,
+              "kernel_instances": total_instances,
+              "instances_per_tick": round(per_tick_n, 1),
               "roofline_ms": args.roof_ms, "classes": agg, "top40": raw[:40]}
     if args.out:
         with open(args.out, "w") as f:
@@ -118,11 +126,18 @@ def main() -> int:
     per = f" over {args.ticks} ticks = {total_ms / args.ticks:.2f} ms/tick" if args.ticks else ""
     print(f"total kernel time {total_ms:.2f} ms{per}"
           + (f" (roofline {args.roof_ms:.2f} ms)" if args.roof_ms else "")
-          + (f"; memcpy {mem_ms:.2f} ms" if mem_ms else ""))
+          + (f"; memcpy {mem_ms:.2f} ms" if mem_ms else "")
+          + f"; {total_instances} kernel instances"
+          + (f" = {per_tick_n:.0f}/tick" if args.ticks else ""))
     for c in CLASSES:
         a = agg[c]
         tail = f" ({a['ms'] / args.ticks:.2f}/tick)" if args.ticks else ""
         print(f"{c:>10}: {a['ms']:>9.2f} ms {a['share']*100:>6.2f}%  x{a['count']}{tail}")
+    if args.min_per_tick and per_tick_n < args.min_per_tick:
+        print(f"FATAL only {per_tick_n:.0f} kernels/tick < {args.min_per_tick}: "
+              "cuda graph node tracing not active (kernels collapsed into graph entry)",
+              file=sys.stderr)
+        return 14
     return 0
 
 

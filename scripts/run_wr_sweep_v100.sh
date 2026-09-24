@@ -36,17 +36,46 @@ if [ -n "$SP" ]; then
 fi
 nvidia-smi --query-gpu=memory.used --format=csv,noheader
 
-for W in 128 1024; do
-  for R in 1 8 16 32; do
-    TAG=arm_W${W}_R${R}
-    echo "===== ARM $TAG $(date +%T) ====="
-    $PY -u scripts/probe_wr_sweep_worker.py \
-      --window-tokens "$W" --refresh "$R" \
-      --prompts "$HOME/serve805_prompts.jsonl" --n-prompts 6 \
-      --out-prefix "$OUT/$TAG" > "$OUT/$TAG.out" 2> "$OUT/$TAG.err"
-    echo "$TAG EXIT=$?"
-  done
+# R=1 (the quality reference) first per window, then 16/32/8; W128 whole
+# window before W1024. Each arm's report lands as it finishes, so a window
+# interrupted midway keeps every completed arm.
+ORDER=(128:1 128:16 128:32 128:8 1024:1 1024:16 1024:32 1024:8)
+for WR in "${ORDER[@]}"; do
+  W=${WR%%:*}; R=${WR##*:}
+  TAG=arm_W${W}_R${R}
+  echo "===== ARM $TAG $(date +%T) ====="
+  $PY -u scripts/probe_wr_sweep_worker.py \
+    --window-tokens "$W" --refresh "$R" \
+    --prompts "$HOME/serve805_prompts.jsonl" --n-prompts 6 \
+    --out-prefix "$OUT/$TAG" > "$OUT/$TAG.out" 2> "$OUT/$TAG.err"
+  echo "$TAG EXIT=$?"
 done
 
 $PY scripts/wr_sweep_report.py --dir "$OUT" --out "$OUT/wr_sweep.json" | tee "$OUT/summary.txt"
-echo "SWEEP END $(date +%T) dir=$OUT; card left without a serve"
+
+echo "SWEEP END $(date +%T) dir=$OUT"
+# When chained with the replay-split window (item 2 then item 1), restore once,
+# AFTER both: SKIP_SERVE_RESTORE=1 hands the stopped card straight to the next
+# window.
+if [ "${SKIP_SERVE_RESTORE:-0}" = "1" ]; then
+  echo "SKIP_SERVE_RESTORE set; card left stopped for the next window"
+  exit 0
+fi
+# Do not leave the test card idle: start the latest-main service. After a
+# validated fixmisc cutover run_serve_prod.sh IS the cutover config; if the
+# cutover is not validated yet, the handover note sets START_SERVE_CMD to an
+# explicit serve with --sparse-min-tokens 8192.
+START_SERVE_CMD=${START_SERVE_CMD:-"bash $HOME/run_serve_prod.sh"}
+nohup bash -c "$START_SERVE_CMD" > "$OUT/restore_serve.log" 2>&1 < /dev/null &
+for _ in $(seq 1 90); do
+  H=$(curl -s -m 3 http://127.0.0.1:8000/health 2>/dev/null)
+  echo "$H" | grep -q '"status":"ok"' && { echo HEALTH_OK; break; }
+  sleep 5
+done
+echo "$H" | head -c 400
+echo
+curl -s -m 60 -X POST http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"qwen38-27b","messages":[{"role":"user","content":"reply with the single word ok"}],"temperature":0,"max_tokens":4,"enable_thinking":false}' \
+  | python3 -c "import sys,json;print('CHAT200',json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null \
+  || echo "CHAT failed — check restore_serve.log"
+echo "RESTORE PID=$(pgrep -f 'cli serve' | head -1)"
