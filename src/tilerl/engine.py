@@ -1464,7 +1464,7 @@ class Engine:
                 # from, so start it here. `ticks_since_refresh` is otherwise
                 # engine-wide and survives requests, which makes a fresh request's
                 # eager-refresh ticks -- and so its tokens -- depend on the traffic
-                # before it. errors/2026-09-24-slot-output-cycle.md.
+                # before it. errors/2026-09-24-refresh-phase-inherited-across-requests.md.
                 # ponytail: cadence is batch-global, not per-request, at B>1; bind
                 # per rid if B>1 staleness parity matters.
                 self._sparse.ticks_since_refresh = 0

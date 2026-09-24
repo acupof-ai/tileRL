@@ -5,7 +5,7 @@ construction (``sparse_runtime.py:120``), advanced every decode tick, and reset
 only when a refresh itself fires (``:307``). Nothing reset it at admission, so a
 new request's eager-refresh ticks -- and therefore its served tokens -- depended
 on the traffic that ran before it. Confirmed against the device:
-``errors/2026-09-24-slot-output-cycle.md``.
+``errors/2026-09-24-refresh-phase-inherited-across-requests.md``.
 
 Gate: the phase after a new call's FIRST decode tick is 1 (reset to 0 at
 admission, then one increment), whatever phase the predecessor left behind. A
