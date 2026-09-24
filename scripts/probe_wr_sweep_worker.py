@@ -420,8 +420,21 @@ def main() -> int:
         kept = rec.accepted_positions(idx)
         anchor = tf_anchors[idx]
         if len(kept) != len(anchor):
-            print(f"FATAL prompt {idx}: {len(kept)} committed records != "
-                  f"{len(anchor)} anchor tokens", file=sys.stderr)
+            # Diagnose the off-by-one: dump gen_idx/out_len/committed for the
+            # tail records and every accepted record whose gen_idx is outside
+            # the anchor range (a sampled-but-not-appended EOS/length edge).
+            rows_idx = rec.rows[idx]
+            edge = [{"gen_idx": r["gen_idx"], "out_len_before": r["out_len_before"],
+                     "accepted": r.get("accepted"), "committed": r["committed"],
+                     "verify_slot": r.get("verify_slot")}
+                    for r in rows_idx
+                    if r.get("accepted") and r["gen_idx"] >= len(anchor)]
+            tail = [{"gen_idx": r["gen_idx"], "out_len_before": r["out_len_before"],
+                     "accepted": r.get("accepted"), "committed": r["committed"]}
+                    for r in rows_idx[-6:]]
+            print(f"FATAL prompt {idx}: {len(kept)} committed != {len(anchor)} anchor; "
+                  f"total_records={len(rows_idx)} edge={edge} tail={tail}",
+                  file=sys.stderr)
             return 1
         if out != anchor:
             print(f"FATAL prompt {idx}: forced output != anchor (instrument defect)",
