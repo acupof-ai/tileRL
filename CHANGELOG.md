@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-09-25
+- **reject verdict (sparse, #805)** — the v2 lag-1 async carry (snapshot +
+  cold-page promotion moved to a CUDA side stream one tick early, probe branch
+  `probe/805-v2`) is **rejected at W1024/R32 on V100 sm70 and not merged**:
+  v2-on warm decode is **23.18 vs 37.80 tok/s v2-off (ratio 0.613)**, and a
+  successful carry takes p50 257 / p90 **1056 ms** against a ~40 ms graph tick —
+  one refresh promotes ~212 private cold pages (8 of 17 carries also hit the
+  200-frame reserve cap, `reserve 200 < picks 212`), so the transfer cannot hide
+  behind a tick and serialises at commit; eager refresh at R32 is only 3.2% of
+  ticks. Two carry-failure defects were found and fixed on the card on the
+  branch: shared-prefix picks were never promoted (no `share_take` class), and
+  pages resident nowhere got no frame (missing `resolve()`'s fresh-block else
+  parity; after diag showed selected pages with resident -1, 0/17 → 9 armed
+  carries). Same entry records **conflicting #827 readings on one tree
+  (`5a0c54cc`)**: the production streaming path measures a fixed prefix hit —
+  **38.78 tok/s**, TTFT **242.2 → 3.1 s** (prefill forwards 75 → 1), accept
+  0.4923 both runs, byte-identical 304-char output; fixmisc's `hitref` test
+  harness on the same tree measures the opposite — **18.16 tok/s**,
+  first_diff **1**, identical to pre-fix. The paths differ in builder, request
+  shape and `max_total_tokens` draft-pool limit; fixmisc is discriminating.
+  Until then #827 is **not** recorded as confirmed fixed.
+  — [errors/2026-09-24-v2-async-carry-rejected-w1024-r32.md](docs/experience/errors/2026-09-24-v2-async-carry-rejected-w1024-r32.md)
+
 ## 2026-09-24
 - **verdict (sparse, #805)** — ⑤'s exact-identity gate is **unreachable at temp0**
   on this stack: the cutover window's arms put the first divergent token inside
