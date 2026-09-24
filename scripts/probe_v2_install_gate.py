@@ -185,9 +185,24 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip", default="",
                     help="comma list of scenario groups to skip "
-                         "(clean|b2|tf); default runs all")
+                         "(clean|b2|tf|shared); default runs all")
     args = ap.parse_args()
     skip = set(x for x in args.skip.split(",") if x)
+
+    # Shared-prefix carry regression: a prefix-adopting follower's early pages
+    # resolve through the shared tier, not the private cold tier; the lag job
+    # must promote them and arm the carry. Independent script, real engine.
+    if "shared" not in skip:
+        gate = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "probe_v2_shared_carry_gate.py")
+        src = subprocess.run([sys.executable, "-u", gate],
+                             capture_output=True, text=True)
+        if src.returncode != 0:
+            print(src.stdout[-1000:])
+            print(src.stderr[-2000:], file=sys.stderr)
+            print("RED: shared-prefix carry gate failed", file=sys.stderr)
+            return 1
+        print(src.stdout.strip().splitlines()[-1])
     rcs = {}
     inline = async_ = corrupt = None
     b2guard = b2noguard = tfclean = tfbuggy = None

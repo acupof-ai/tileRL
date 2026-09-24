@@ -132,9 +132,17 @@ class LagController:
                 sf.s_l2p.clone())
         q = {g: t.clone() for g, t in q_prev.items()}
         cold_pages = [set(rw["req"].cold_pages) for rw in srows]
+        # Shared-prefix pages (#796) resolve through tracker.shared ->
+        # share_take/shared_promote, NOT the private cold tier. Snapshot the
+        # page->content-key map so the side stream classifies a picked shared
+        # page correctly; without this a prefix-adopting row's early pages
+        # (e.g. logical page 0) read as "unsupported" and every carry fell
+        # back eager.
+        shared_maps = [dict(self.rt.tracker.shared.get(rw["req_id"], {}))
+                       for rw in srows]
         rids = tuple(rw["req_id"] for rw in srows)
         self._job_rids = rids
-        job = (sf, q, snap, rids, cold_pages)
+        job = (sf, q, snap, rids, cold_pages, shared_maps)
         if self.mode == "inline" or sf.device.type != "cuda":
             self._result = self._run_job(job)
         else:
@@ -171,7 +179,7 @@ class LagController:
 
     # ------------------------------------------------------------- the job
     def _run_job(self, job):
-        sf, q, snap, rids, cold_pages = job
+        sf, q, snap, rids, cold_pages, shared_maps = job
         cand_idx, n_cand, win_t, s_bounds, s_l2p = snap
         # sel: {group: (chosen_logical positional-padded, nsel)}.
         sel = sf.select_refresh(q, (cand_idx, n_cand, win_t, s_bounds))
@@ -187,7 +195,12 @@ class LagController:
         # Valid chosen pages are positions [:nsel]; padding is positional, so a
         # real logical page 0 in a valid slot is preserved (never filter ==0).
         picks: dict[int, list[int]] = {bi: [] for bi in range(len(rids))}
-        cold_need: list[tuple] = []
+        # Each non-resident pick is one of: a PRIVATE cold page (blob keyed
+        # (rid,page), take()) or a SHARED prefix page (content key in
+        # shared_maps, share_take() read-only). Both H2D into a reserve frame;
+        # they differ only in blob acquisition and post-commit bookkeeping.
+        cold_need: list[tuple] = []     # (rid, page) -> private cold
+        shared_need: list[tuple] = []   # (rid, page, content_key)
         for _g, (chosen_t, nsel_t) in sel.items():
             cc = chosen_t.tolist()
             nn = [int(x) for x in nsel_t.tolist()]
@@ -195,26 +208,40 @@ class LagController:
                 for p in cc[bi][: nn[bi]]:
                     if p not in picks[bi]:
                         picks[bi].append(p)
-                    key = (rids[bi], p)
                     rp = resident_of[bi].get(p, -1)
                     if rp is not None and rp >= 0:
                         continue
-                    if (p not in cold_pages[bi] or pool.cold is None
-                            or key not in pool.cold):
-                        return {"fallback": f"unsupported/missing page {p} rid {rids[bi]}"}
-                    cold_need.append(key)
-        # de-dup cold_need preserving order
+                    key = (rids[bi], p)
+                    if p in cold_pages[bi] and pool.cold is not None \
+                            and key in pool.cold:
+                        cold_need.append(key)
+                    elif p in shared_maps[bi] and pool.cold is not None:
+                        shared_need.append((rids[bi], p, shared_maps[bi][p]))
+                    else:
+                        return {"fallback":
+                                f"unsupported/missing page {p} rid {rids[bi]}"}
+        # de-dup preserving order
         seen = set()
         cold_need = [k for k in cold_need if not (k in seen or seen.add(k))]
-        if len(cold_need) > len(self.reserve):
+        seen = set()
+        shared_need = [k for k in shared_need
+                       if not (k[:2] in seen or seen.add(k[:2]))]
+        n_promote = len(cold_need) + len(shared_need)
+        if n_promote > len(self.reserve):
             return {"fallback":
-                    f"reserve {len(self.reserve)} < cold picks {len(cold_need)}"}
+                    f"reserve {len(self.reserve)} < picks {n_promote} "
+                    f"(cold {len(cold_need)} shared {len(shared_need)})"}
 
         page_phys: dict[tuple, int] = {}
         blobs = []
+        # promoted entries: (key, blk, blob, is_shared, content_key|None).
         promoted: list[tuple] = []
+        # Content keys pinned for the async H2D window AND kept after commit so
+        # a capacity LRU cannot delete a blob this row may re-resolve. The same
+        # pin the eager resolve path takes; unpinned in drop()/rollback.
+        pinned_keys: list[int] = []
         try:
-            # Phase 2: take + reserve alloc + side-stream H2D.
+            # Phase 2: take/share + reserve alloc + side-stream H2D.
             for key in cold_need:
                 blob = pool.cold.take(key)
                 if blob is None:
@@ -222,7 +249,26 @@ class LagController:
                 blk = self.reserve.pop()
                 pool.refcount[blk] = 1
                 self._h2d(pool, blk, blob)
-                promoted.append((key, blk, blob))
+                promoted.append((key, blk, blob, False, None))
+                blobs.append(blob)
+                page_phys[key] = blk
+            for rid, p, content_key in shared_need:
+                blob = pool.cold.share_take(content_key) if pool.cold else None
+                if blob is None:
+                    # The shared label outlived its index entry: resolve() turns
+                    # this into a fresh never-written block, which a lag carry
+                    # cannot populate (it only has the shared blob). Fall back to
+                    # the eager refresh, which allocates the fresh block.
+                    return {"fallback":
+                            f"shared label aged out page {p} rid {rid}"}
+                if content_key not in pinned_keys \
+                        and pool.cold.pin_if_present(content_key):
+                    pinned_keys.append(content_key)
+                blk = self.reserve.pop()
+                pool.refcount[blk] = 1
+                self._h2d(pool, blk, blob)
+                key = (rid, p)
+                promoted.append((key, blk, blob, True, content_key))
                 blobs.append(blob)
                 page_phys[key] = blk
             for bi in range(len(rids)):
@@ -251,10 +297,14 @@ class LagController:
             if self.stream is not None:
                 self.stream.synchronize()
             self._rollback_promotes(pool, promoted)
+            for ck in pinned_keys:
+                pool.cold.unpin(ck)
             return {"fallback": f"promote failed: {ex}"}
         return {"picks": picks, "groups": groups,
                 "page_phys": page_phys, "blobs": blobs,
-                "promoted": promoted}
+                "promoted": promoted, "pinned_keys": pinned_keys,
+                "shared_pages": {rid: [p for (_r, p, c) in shared_need
+                                        if _r == rid] for rid in rids}}
 
     def _h2d(self, pool, blk, blob) -> None:
         on_side = self.stream is not None
@@ -271,8 +321,13 @@ class LagController:
                    if (t := blob.get(name)) is not None)
 
     def _rollback_promotes(self, pool, promoted) -> None:
-        for key, blk, blob in reversed(promoted):
-            pool.cold.hold(key, blob, self._blob_nbytes(blob))
+        for entry in reversed(promoted):
+            key, blk, blob, is_shared, _content_key = entry
+            if not is_shared:
+                # Private blob re-homed into its (rid,page) host slot. A shared
+                # blob is a read-only reference owned by the prefix index; it
+                # just drops here (its pin, if any, is released separately).
+                pool.cold.hold(key, blob, self._blob_nbytes(blob))
             if pool.refcount[blk] > 0:
                 pool.refcount[blk] = 0
             self.reserve.append(blk)
@@ -326,10 +381,20 @@ class LagController:
                 if self.stream is not None:
                     self.stream.synchronize()
                 self._rollback_promotes(self._kv(), promoted)
+                for ck in (res.get("pinned_keys") or []):
+                    self._kv().cold.unpin(ck)
             self._reset()
             return False
         rt = self.rt
         dev = sf.device
+        # Adopt the shared-content pins the job took: register them on the
+        # tracker's per-rid pin set so drop() releases them once, the same
+        # ownership the eager resolve path establishes. B==1 (enforce_b1).
+        if res.get("pinned_keys"):
+            pins_by_rid = rt.tracker.request_pins
+            for rid in rids_now:
+                if res.get("shared_pages", {}).get(rid):
+                    pins_by_rid.setdefault(rid, set()).update(res["pinned_keys"])
         use = torch.zeros(sf.b, dtype=torch.bool, device=dev)
         for bi, rw in enumerate(srows):
             if bi not in res["picks"]:
