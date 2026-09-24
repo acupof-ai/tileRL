@@ -44,9 +44,15 @@ for WR in "${ORDER[@]}"; do
   W=${WR%%:*}; R=${WR##*:}
   TAG=arm_W${W}_R${R}
   echo "===== ARM $TAG $(date +%T) ====="
+  ANCHOR_ARGS=()
+  if [ "$R" != "1" ]; then
+    # Anchor = this window's R=1 free run, which completed first.
+    ANCHOR_ARGS=(--anchor-dir "$OUT/arm_W${W}_R1_pp")
+  fi
   $PY -u scripts/probe_wr_sweep_worker.py \
     --window-tokens "$W" --refresh "$R" \
     --prompts "$HOME/serve805_prompts.jsonl" --n-prompts 6 \
+    "${ANCHOR_ARGS[@]}" \
     --out-prefix "$OUT/$TAG" > "$OUT/$TAG.out" 2> "$OUT/$TAG.err"
   echo "$TAG EXIT=$?"
 done
