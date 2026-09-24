@@ -93,6 +93,13 @@ def run_one_prompt(e, rid, tag_decline) -> tuple[list[int], dict]:
         if row is not None and row.phase == 2:
             if not decoding:
                 decoding = True
+                # P0 control: every prompt must enter decode at refresh phase 0
+                # (the worker zeroed ticks_since_refresh before submit). On the
+                # unpatched tree a new request inherits the prior request's
+                # phase, contaminating per-prompt comparisons.
+                ph = e._sparse.ticks_since_refresh
+                print(f"PHASE_AT_FIRST_DECODE rid={rid} phase={ph}", flush=True)
+                assert ph == 0, f"refresh phase {ph} != 0 at first decode"
                 wall0 = time.perf_counter()
                 f0 = e._decode_forwards
                 acc0 = e._spec_accepted
@@ -126,10 +133,12 @@ def neg_anchor_run(e, prompts, args, decline_flag) -> int:
 
     red = False
     for ids in prompts:
+        e._sparse.ticks_since_refresh = 0
         rid0 = e.submit(list(ids), SamplingParams(
             temperature=0.0, max_new_tokens=args.neg_tokens, seed=0))
         base, _ = run_one_prompt(e, rid0, decline_flag)
         shifted = {0: base[args.neg_anchor_offset:]}
+        e._sparse.ticks_since_refresh = 0
         rec = TeacherForceRecorder(e, anchors=shifted, record_full_logits=False).install()
         rid1 = e.submit(list(ids), SamplingParams(
             temperature=0.0, max_new_tokens=args.neg_tokens, seed=0))
@@ -155,6 +164,7 @@ def floor_kl_check(e, ids, n_tok: int, decline_flag) -> float:
     max symmetric KL seen."""
     from tilerl.engine import SamplingParams
 
+    e._sparse.ticks_since_refresh = 0
     rec0 = TeacherForceRecorder(e, anchors=None, record_full_logits=True).install()
     rid0 = e.submit(list(ids), SamplingParams(
         temperature=0.0, max_new_tokens=n_tok, seed=0))
@@ -162,6 +172,7 @@ def floor_kl_check(e, ids, n_tok: int, decline_flag) -> float:
     free_kept = rec0.accepted_positions(0)
     rec0.uninstall()
 
+    e._sparse.ticks_since_refresh = 0
     rec1 = TeacherForceRecorder(e, anchors={0: base}, record_full_logits=True).install()
     rid1 = e.submit(list(ids), SamplingParams(
         temperature=0.0, max_new_tokens=n_tok, seed=0))
@@ -186,7 +197,9 @@ def main() -> int:
     ap.add_argument("--refresh", type=int, required=True, choices=[1, 8, 16, 32])
     ap.add_argument("--prompts", default=os.path.expanduser("~/serve805_prompts.jsonl"))
     ap.add_argument("--n-prompts", type=int, default=6)
-    ap.add_argument("--max-new-tokens", type=int, default=1024)
+    ap.add_argument("--max-new-tokens", type=int, default=512)
+    ap.add_argument("--free-only", action="store_true",
+                    help="skip the teacher-forced leg (speed-only control arm)")
     ap.add_argument("--source", default=os.environ.get("TILERL_QWEN38_SOURCE", ""))
     ap.add_argument("--draft", default="/home/chenkailun.c/mmlu-assets/model_mtp.safetensors")
     ap.add_argument("--cold-ssd", default="/home/chenkailun.c/sparse_cold_128k.bin")
@@ -303,6 +316,9 @@ def main() -> int:
             print(f"FATAL floor KL {floor_kl:.2e} > 1e-4", file=sys.stderr)
             return 1
     for idx, ids in enumerate(prompts):
+        # P0: zero the engine-wide refresh phase before each admission so a new
+        # prompt never inherits the previous request's phase (probe-only).
+        e._sparse.ticks_since_refresh = 0
         rid = e.submit(list(ids), SamplingParams(
             temperature=0.0, max_new_tokens=args.max_new_tokens, seed=0))
         out, st = run_one_prompt(e, rid, decline_flag)
@@ -315,6 +331,15 @@ def main() -> int:
         write_meta(free_stats)
         print(f"[W{args.window_tokens}/R{args.refresh}] free prompt {idx} "
               f"{len(out)} tok, eff {st['eff_tok_s']} tok/s", flush=True)
+
+    if args.free_only:
+        write_meta(free_stats)
+        print("STRUCTURAL " + json.dumps({
+            "window_pages": pages, "refresh_ticks": args.refresh,
+            "n_captured_graphs": len(e._sparse.graphs),
+            "declines_seen": len(declines), "free_only": True}), flush=True)
+        e.shutdown()
+        return 0
 
     # ---- teacher-forced run. The TF output is forced to the anchor, so
     # out==anchor by construction; the measured quantity is the trunk's top1
@@ -338,6 +363,7 @@ def main() -> int:
     tf_agreement = []
     rec = TeacherForceRecorder(e, anchors=tf_anchors, record_full_logits=True).install()
     for idx, ids in enumerate(prompts):
+        e._sparse.ticks_since_refresh = 0
         rid = e.submit(list(ids), SamplingParams(
             temperature=0.0, max_new_tokens=args.max_new_tokens, seed=0))
         out, _ = run_one_prompt(e, rid, decline_flag)

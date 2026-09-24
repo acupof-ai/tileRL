@@ -53,26 +53,46 @@ if [ "$NEGRC" != "0" ]; then
 fi
 echo "NEG CONTROL red as required"
 
-# R=1 (the quality reference) first per window, then 16/32/8; W128 whole
-# window before W1024. Each arm's report lands as it finishes, so a window
-# interrupted midway keeps every completed arm.
-ORDER=(128:1 128:16 128:32 128:8 1024:1 1024:16 1024:32 1024:8)
-for WR in "${ORDER[@]}"; do
-  W=${WR%%:*}; R=${WR##*:}
-  TAG=arm_W${W}_R${R}
+# Shortened 6-arm order: W128 {R1 anchor, R8 free-only speed control, R16,
+# R32}, then W1024 {R1 anchor, R32}. 512 tokens × 6 prompts. If W128 R16's
+# TF top1 fails the >=0.99 gate, R32 is skipped and we go straight to W1024.
+run_arm() {
+  local W=$1 R=$2 FREE=${3:-0}
+  local TAG=arm_W${W}_R${R}
   echo "===== ARM $TAG $(date +%T) ====="
-  ANCHOR_ARGS=()
-  if [ "$R" != "1" ]; then
-    # Anchor = this window's R=1 free run, which completed first.
-    ANCHOR_ARGS=(--anchor-dir "$OUT/arm_W${W}_R1_pp")
+  local args=(--window-tokens "$W" --refresh "$R"
+    --prompts "$HOME/serve805_prompts.jsonl" --n-prompts 6
+    --max-new-tokens 512 --out-prefix "$OUT/$TAG")
+  if [ "$FREE" = "1" ]; then
+    args+=(--free-only)
+  elif [ "$R" != "1" ]; then
+    # Quality arm: teacher-force this window's R=1 free run.
+    args+=(--anchor-dir "$OUT/arm_W${W}_R1_pp")
   fi
-  $PY -u scripts/probe_wr_sweep_worker.py \
-    --window-tokens "$W" --refresh "$R" \
-    --prompts "$HOME/serve805_prompts.jsonl" --n-prompts 6 \
-    "${ANCHOR_ARGS[@]}" \
-    --out-prefix "$OUT/$TAG" > "$OUT/$TAG.out" 2> "$OUT/$TAG.err"
+  $PY -u scripts/probe_wr_sweep_worker.py "${args[@]}" \
+    > "$OUT/$TAG.out" 2> "$OUT/$TAG.err"
   echo "$TAG EXIT=$?"
-done
+}
+
+run_arm 128 1
+run_arm 128 8 1
+run_arm 128 16
+# Skip W128 R32 if R16's mean TF top1 agreement is below 0.99.
+if $PY - "$OUT" <<'PY'
+import glob, json, sys
+ag = [json.load(open(f))["top1_agreement_vs_anchor"]
+      for f in sorted(glob.glob(f"{sys.argv[1]}/arm_W128_R16_tf/tf_*.json"))]
+mean = sum(ag) / len(ag) if ag else 0.0
+print(f"W128 R16 mean top1={mean:.4f} -> {'RUN R32' if mean >= 0.99 else 'SKIP R32'}")
+sys.exit(0 if mean >= 0.99 else 3)
+PY
+then
+  run_arm 128 32
+else
+  echo "W128 R16 failed top1 gate; skipping W128 R32"
+fi
+run_arm 1024 1
+run_arm 1024 32
 
 $PY scripts/wr_sweep_report.py --dir "$OUT" --out "$OUT/wr_sweep.json" | tee "$OUT/summary.txt"
 
