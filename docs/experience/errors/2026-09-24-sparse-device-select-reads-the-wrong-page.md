@@ -1,6 +1,7 @@
 # Sparse device-select attends the wrong page when candidates have holes — V100 sm70 / CPU tiny, 2026-09-24
 
-> Status: open — the PR that gathers by candidate position removes this line.
+> Status: FIXED 2026-09-24 by #824 (`260ee7a3`). The gather uses the candidate
+> position. OPEN.md row removed.
 
 ## What happens
 
