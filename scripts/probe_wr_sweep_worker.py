@@ -148,6 +148,38 @@ def neg_anchor_run(e, prompts, args, decline_flag) -> int:
     return 0 if red else 1
 
 
+def floor_kl_check(e, ids, n_tok: int, decline_flag) -> float:
+    """R=1 floor: two decodes over the IDENTICAL prefix — one record-only free
+    run, one teacher-forced with the free output — must agree as distributions,
+    symmetric per-position KL <= 1e-4 (perf1's cutover floor line). Returns the
+    max symmetric KL seen."""
+    from tilerl.engine import SamplingParams
+
+    rec0 = TeacherForceRecorder(e, anchors=None, record_full_logits=True).install()
+    rid0 = e.submit(list(ids), SamplingParams(
+        temperature=0.0, max_new_tokens=n_tok, seed=0))
+    base, _ = run_one_prompt(e, rid0, decline_flag)
+    free_kept = rec0.accepted_positions(0)
+    rec0.uninstall()
+
+    rec1 = TeacherForceRecorder(e, anchors={0: base}, record_full_logits=True).install()
+    rid1 = e.submit(list(ids), SamplingParams(
+        temperature=0.0, max_new_tokens=n_tok, seed=0))
+    out, _ = run_one_prompt(e, rid1, decline_flag)
+    tf_kept = rec1.accepted_positions(0)
+    rec1.uninstall()
+    if out != base:
+        raise SystemExit("floor KL: TF output diverged from its free anchor")
+    from probe_teacher_force import kl_from_logits
+    worst = 0.0
+    for a, b in zip(free_kept, tf_kept):
+        ka = kl_from_logits(a["logits"], b["logits"])
+        kb = kl_from_logits(b["logits"], a["logits"])
+        worst = max(worst, ka, kb)
+    print(f"FLOOR_KL n={len(tf_kept)} max_symmetric_kl={worst:.2e}", flush=True)
+    return worst
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--window-tokens", type=int, required=True, choices=[128, 1024])
@@ -168,6 +200,7 @@ def main() -> int:
                          "positions; the leg must FAIL 'forced output != anchor'")
     ap.add_argument("--neg-prompts", type=int, default=1)
     ap.add_argument("--neg-tokens", type=int, default=64)
+    ap.add_argument("--floor-kl-tokens", type=int, default=128)
     args = ap.parse_args()
 
     pages = patch_geometry(args.window_tokens, args.refresh)
@@ -252,6 +285,7 @@ def main() -> int:
             "decline_counter_values": sorted(set(declines))[:8],
             "structural_gate_ok": bool(structural if gate is None else gate and structural),
             "self_anchor_gate_ok": gate,
+            "floor_kl_max": floor_kl,
             "prompts": per_prompt,
         }
         with open(f"{args.out_prefix}.json", "w") as f:
@@ -259,6 +293,15 @@ def main() -> int:
 
     free_stats = []
     anchors: dict[int, list[int]] = {}
+    floor_kl = None
+    if args.refresh == 1:
+        # cutover floor: free-run logits vs self-TF logits on the same prefix,
+        # before the 1024-token legs, so a broken instrument fails early.
+        floor_kl = floor_kl_check(
+            e, prompts[0], args.floor_kl_tokens, decline_flag)
+        if floor_kl > 1e-4:
+            print(f"FATAL floor KL {floor_kl:.2e} > 1e-4", file=sys.stderr)
+            return 1
     for idx, ids in enumerate(prompts):
         rid = e.submit(list(ids), SamplingParams(
             temperature=0.0, max_new_tokens=args.max_new_tokens, seed=0))
