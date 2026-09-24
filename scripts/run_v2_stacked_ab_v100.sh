@@ -53,11 +53,19 @@ fi
 nvidia-smi --query-gpu=memory.used --format=csv,noheader
 
 echo "===== STACKED A/B W1024/R32 narrow-q tree=$TREE $(date +%T) ====="
+SNAP_ARGS=()
+if [ "${USE_SNAPSHOT:-1}" = 1 ] && [ -d "${SNAP_ROOT:-$HOME/prefill-snap}/p0" ]; then
+  SNAP_ARGS=(--snap-root "${SNAP_ROOT:-$HOME/prefill-snap}")
+  echo "using prefill snapshots from ${SNAP_ROOT:-$HOME/prefill-snap} (skips prefill)"
+else
+  echo "no usable snapshot (USE_SNAPSHOT=$USE_SNAPSHOT); running full prefill"
+fi
 $PY -u scripts/probe_v2_window.py --ab-free \
   --model qwen38-27b --source "$TILERL_QWEN38_SOURCE" --draft "$DRAFT" \
   --prompts "$PROMPTS" --expect-tree "$TREE" \
   --window-tokens 1024 --refresh 32 --n-prompts 2 \
   --max-new-tokens 512 --min-tokens 20000 --max-tokens 40000 \
+  "${SNAP_ARGS[@]}" \
   --out-prefix "$OUT/ab" --per-prompt-dir "$OUT/ab_pp" \
   > "$OUT/ab.out" 2> "$OUT/ab.err"
 RC=$?

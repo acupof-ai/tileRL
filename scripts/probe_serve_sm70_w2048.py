@@ -322,7 +322,7 @@ def install_capture_recorder(e):
     return events, before_step, unwrap
 
 
-def run_prompt(e, ids, max_new, on_decode=None, pre_step=None):
+def run_prompt(e, ids, max_new, on_decode=None, pre_step=None, pre_submit=None):
     """Submit one temp-0 prompt, drain to done. For every sparse decode tick
     while the rid is live calls
       on_decode(idx, wall_ms, tm, d_forwards, d_accepted, is_close,
@@ -334,6 +334,10 @@ def run_prompt(e, ids, max_new, on_decode=None, pre_step=None):
     periodic refresh, which runs eager), and phase_pre is the tick's prefill
     row count (>0 marks a prefill/mixed boundary, also eager). Returns
     {output, decode_ticks, graph_ticks, close_ticks}."""
+    if pre_submit is not None:
+        # e.g. load a cross-process prefill snapshot so submit hits the
+        # prefix-adoption path instead of recomputing prefill.
+        pre_submit(ids)
     rid = e.submit(list(ids), _sampling(max_new))
     tm = e._step_timing
     idx = graph_ticks = close_ticks = 0

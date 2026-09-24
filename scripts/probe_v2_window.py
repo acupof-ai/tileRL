@@ -188,7 +188,19 @@ def _free_run_pass(e, prompts, args, struct_samples):
                         "free_blocks": pool.free_blocks,
                         "reserve": len(rt._lag_obj.reserve)})
 
-        r = run_prompt(e, ids, args.max_new_tokens, on_decode)
+        _pre_submit = None
+        if getattr(args, "snap_root", ""):
+            # Skip the long prefill: install impl's cross-process snapshot for
+            # this prompt, then submit onto the prefix-adoption path.
+            from prefill_snapshot import load as _snap_load
+            _sd = os.path.join(args.snap_root, f"p{pi}")
+            _mk = os.path.realpath(args.source) if args.source else ""
+
+            def _pre_submit(_ids, _sd=_sd, _mk=_mk):
+                _snap_load(e, _sd, list(_ids), model_key=_mk)
+
+        r = run_prompt(e, ids, args.max_new_tokens, on_decode,
+                       pre_submit=_pre_submit)
         c1 = (e._spec_accepted, e._spec_drafted, e._spec_acc_in,
               e._spec_dft_in, e._spec_acc_post, e._spec_dft_post)
         warm = [t for t in ticks if t["warm"]]
@@ -450,7 +462,19 @@ def run_worker(tag, lag, args):
                             "reserve": len(rt._lag_obj.reserve),
                         })
 
-            r = run_prompt(e, ids, args.max_new_tokens, on_decode)
+            _pre_submit = None
+            if getattr(args, "snap_root", ""):
+                # Skip the long prefill: install impl's cross-process snapshot
+                # for this prompt, then submit onto the prefix-adoption path.
+                from prefill_snapshot import load as _snap_load
+                _sd = os.path.join(args.snap_root, f"p{pi}")
+                _mk = os.path.realpath(args.source) if args.source else ""
+
+                def _pre_submit(_ids, _sd=_sd, _mk=_mk):
+                    _snap_load(e, _sd, list(_ids), model_key=_mk)
+
+            r = run_prompt(e, ids, args.max_new_tokens, on_decode,
+                           pre_submit=_pre_submit)
             c1 = (e._spec_accepted, e._spec_drafted, e._spec_acc_in,
                   e._spec_dft_in, e._spec_acc_post, e._spec_dft_post)
             t_acc += c1[0] - _c0[0]
@@ -715,6 +739,10 @@ def main():
                     help="follow-up read: rc gates floor + teacher-forced "
                          "quality + instrument gates; speed ratio/carry timing "
                          "are reported, not gated")
+    ap.add_argument("--snap-root", default="",
+                    help="dir with p0/p1 cross-process prefill snapshots "
+                         "(probe_prefill_snapshot_run snapshot mode); when set, "
+                         "each prompt loads its snapshot and skips prefill")
     args = ap.parse_args()
 
     if args.worker_tag:
@@ -758,6 +786,8 @@ def main():
                "--n-prompts", str(args.n_prompts)]
         if args.ab_free:
             cmd.append("--ab-free")
+        if args.snap_root:
+            cmd += ["--snap-root", args.snap_root]
         if args.smoke:
             cmd.append("--smoke")
         with open(f"{args.out_prefix}_{tag}.out", "w") as out_f, \
