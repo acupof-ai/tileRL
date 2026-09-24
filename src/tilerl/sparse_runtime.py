@@ -107,6 +107,18 @@ def retier(pool, keep, running, waiting) -> tuple[int, int]:
     return cold.demotions - d0, cold.promotions - p0
 
 
+def _captured_skips_pin_reconcile(sf) -> bool:
+    """Whether finalize skips the eager-style pin/drop reconcile for a tick.
+    An ordinary captured CUDA tick skips it (evict-on-promote handles growth);
+    a v2 lag-1 carry (sf.refresh_tick) is a captured replay that CHANGED the
+    hot set, so it must reconcile even though it is device_select+CUDA.
+    Extracted as a function so the CPU gate can force the CUDA branch and prove
+    the refresh_tick exception actually reaches reconcile."""
+    return (getattr(sf, "device_select", False)
+            and sf.device.type == "cuda"
+            and not getattr(sf, "refresh_tick", False))
+
+
 class SparseRuntime:
     """The sparse half of one Engine. State the Engine used to hold lives here:
     refresh counter, per-bucket captured sparse graphs, the graph-on flag, the
@@ -714,10 +726,12 @@ class SparseRuntime:
                         (sp.states[r.state_slot].clone(), sp.window_snapshot(r.state_slot)),
                         boundary_h,
                     )
-                if getattr(sf, "device_select", False) and sf.device.type == "cuda":
-                    # Captured tick: skip the device→host pin readback here;
-                    # evict_victim prunes on promotion and the eager refresh tick
-                    # reconciles the pin set and publishes drops.
+                if _captured_skips_pin_reconcile(sf):
+                    # Ordinary captured tick: skip the device→host pin readback;
+                    # evict_victim prunes on promotion and the lag-1 carry /
+                    # eager refresh tick reconciles the pin set and publishes
+                    # drops. A v2 carry (refresh_tick) is a captured replay that
+                    # CHANGED the hot set, so it MUST fall through to reconcile.
                     continue
                 kept = sf.selected_pages(bi)
                 dropped = [p for p in live if p not in kept]

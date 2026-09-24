@@ -871,6 +871,14 @@ class SparseForward:
         The caller resolves/promotes the named logical pages (host side) and
         hands the physical blocks back via arm_override()."""
         assert self.reuse
+        # A refresh pick can be up to k_pages wide, so the fixed [B,k_pages]
+        # override buffers and the cmax-width gather must have room. A smaller
+        # cmax cannot happen for a steady decode tick (candidates only grow),
+        # but fail loudly rather than broadcast-mismatch inside capture.
+        if self.cmax < self.tracker.k_pages:
+            raise RuntimeError(
+                f"lag-1 refresh cmax {self.cmax} < k_pages "
+                f"{self.tracker.k_pages}; override staging cannot hold the pick")
         if staging is None:
             cand_idx, n_cand, win_t, s_bounds = (
                 self.cand_idx, self.n_cand, self.win, self.s_bounds)

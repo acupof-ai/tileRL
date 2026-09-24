@@ -199,20 +199,21 @@ class LagController:
         # Phase 2: take + alloc-reserve + H2D (all sources validated above).
         page_phys: dict[tuple, int] = {}
         blobs = []
-        for (rid, p) in cold_need:
-            bi = next(i for i, r in enumerate(rids) if r == rid)
-            key = (rid, p)
-            blob = pool.cold.take(key)
-            if blob is None:
-                # Took nothing yet for this key; previously-taken blobs this job
-                # are simply held (commit absent this cycle => caller must
-                # release). Defensive: pre-validation makes this unreachable.
-                return {"fallback": f"take vanished {key}"}
-            blk = self.reserve.pop()
-            pool.refcount[blk] = 1  # own the frame; it is off the free list
-            self._h2d(pool, blk, blob)
-            blobs.append(blob)
-            page_phys[key] = blk
+        promoted: list[tuple] = []  # (key, blk, blob) already taken/H2D'd
+        try:
+            for key in cold_need:
+                blob = pool.cold.take(key)
+                if blob is None:  # unreachable after phase-1; defensive
+                    raise RuntimeError(f"take vanished {key}")
+                blk = self.reserve.pop()
+                pool.refcount[blk] = 1  # own the frame; off the free list
+                self._h2d(pool, blk, blob)
+                promoted.append((key, blk, blob))
+                blobs.append(blob)
+                page_phys[key] = blk
+        except Exception as ex:
+            self._rollback_promotes(pool, promoted)
+            return {"fallback": f"promote failed: {ex}"}
         for bi in range(len(rids)):
             for p in picks[bi]:
                 key = (rids[bi], p)
@@ -232,6 +233,22 @@ class LagController:
             groups[g] = (phys_t, chosen_t.clone(), nsel_t.clone())
         return {"picks": picks, "groups": groups,
                 "page_phys": page_phys, "blobs": blobs}
+
+    @staticmethod
+    def _blob_nbytes(blob) -> int:
+        return sum(t.numel() * t.element_size()
+                   for name in ("k", "v", "ks", "vs")
+                   if (t := blob.get(name)) is not None)
+
+    def _rollback_promotes(self, pool, promoted) -> None:
+        """Undo phase-2 promotes on a fallback: re-home each taken blob on the
+        cold store so the eager refresh that follows can still resolve the
+        page, and return its frame to the worker reserve (LIFO)."""
+        for key, blk, blob in reversed(promoted):
+            pool.cold.hold(key, blob, self._blob_nbytes(blob))
+            if pool.refcount[blk] > 0:
+                pool.refcount[blk] = 0
+            self.reserve.append(blk)
 
     def _h2d(self, pool, blk, blob) -> None:
         on_side = self.stream is not None

@@ -99,6 +99,36 @@ def first_div(a, b):
     return next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
 
 
+def structural_report(samples, pin_ceiling):
+    """Residency structural gate. A missing demote reconcile (the dead-flag
+    bug) shows up as resident frames exceeding the pin ceiling and/or free
+    blocks draining monotonically across steady carry cycles. Returns samples
+    summary + violated=False when healthy."""
+    if not samples:
+        return {"sampled_cycles": 0, "violated": False,
+                "note": "no steady carry samples (control or no carries)"}
+    max_res = max(s["resident_frames"] for s in samples)
+    max_blocks = max(s["blocks"] for s in samples)
+    first_free = samples[0]["free_blocks"]
+    last_free = samples[-1]["free_blocks"]
+    # monotonic non-increasing free over the whole window = leak (normal
+    # promotion/demote makes free oscillate).
+    frees = [s["free_blocks"] for s in samples]
+    monotonic_drain = all(b <= a for a, b in zip(frees, frees[1:])) \
+        and frees[-1] < frees[0]
+    over_ceiling = max_res > pin_ceiling
+    return {
+        "sampled_cycles": len(samples),
+        "pin_ceiling": pin_ceiling,
+        "max_resident_frames": max_res,
+        "max_blocks": max_blocks,
+        "free_first": first_free, "free_last": last_free,
+        "free_monotonic_drain": monotonic_drain,
+        "over_pin_ceiling": over_ceiling,
+        "violated": bool(over_ceiling or monotonic_drain),
+    }
+
+
 def run_worker(tag, lag, args):
     smoke = bool(getattr(args, "smoke", False))
     if lag == "async":
@@ -134,18 +164,38 @@ def run_worker(tag, lag, args):
                                           "graph_w2048")
     rows = []
     pcyc = pcarry = pplain = []
+    struct_samples = []
     try:
         for pi, ids in enumerate(prompts):
             ticks, acc = [], [0, 0.0]
 
             def on_decode(idx, wall, tm, df, da, is_close, refresh_after,
-                          phase_pre, acc=acc, ticks=ticks):
+                          phase_pre, acc=acc, ticks=ticks, pi=pi):
                 warm = idx >= WARMUP_DECODE and not is_close
                 if warm:
                     acc[0] += df + da
                     acc[1] += wall
                 ticks.append({"wall": wall, "path": tm.fwd_path,
                               "refresh_after": refresh_after, "warm": warm})
+                # Structural gate sample at every steady cycle boundary: the
+                # demote reconcile must keep the request's resident union at the
+                # pin ceiling and must not leak frames (free/reserve drain).
+                if (lag == "async" and warm and refresh_after == 0
+                        and tm.fwd_path == "graph"):
+                    rt = e._sparse
+                    pool = rt.ctx.kv
+                    live_rows = [x for x in e._running]
+                    live_row = live_rows[0] if len(live_rows) == 1 else None
+                    if live_row is not None \
+                            and live_row.req_id in rt.tracker.resident:
+                        lrid = live_row.req_id
+                        struct_samples.append({
+                            "prompt": pi, "decode_idx": idx,
+                            "resident_frames": len(rt.tracker.resident[lrid]),
+                            "blocks": len(live_row.blocks),
+                            "free_blocks": pool.free_blocks,
+                            "reserve": len(rt._lag_obj.reserve),
+                        })
 
             r = run_prompt(e, ids, args.max_new_tokens, on_decode)
             warm = [t for t in ticks if t["warm"]]
@@ -165,6 +215,13 @@ def run_worker(tag, lag, args):
         lag_carry = lag_fb = None
         if lagc is not None:
             lag_carry, lag_fb = lagc.carry_cycles, lagc.fallback_cycles
+        # Canonical per-slot hot ceiling build_engine sizes the pool for:
+        # n_groups*k + WINDOW + chunk pages. Use it (not a hand formula) so the
+        # structural gate matches the actual allocation on every model shape.
+        from tilerl.memory import sparse_hot_pages_per_slot
+        tr = e._sparse.tracker
+        pin_ceiling = sparse_hot_pages_per_slot(
+            tr.cfg, tr.k_pages, e.limits.max_num_batched_tokens)
     finally:
         e.shutdown()
         import torch
@@ -177,6 +234,12 @@ def run_worker(tag, lag, args):
     agg_eff = round(toks / (wall / 1000.0), 4) if wall else None
     n_cycles = len(pcyc)
     n_eager = sum(r["eager_carry_cycles"] for r in rows)
+    # In a single-request steady pure-decode window every eager refresh tick is
+    # exactly a lag fallback: the controller's own count MUST equal the harness
+    # count (path!=graph at refresh_after==0). A mismatch means the two counters
+    # measure different things / a carry fell back uncounted -> rc14, not a
+    # performance result. The first (startup-discarded) interval is excluded.
+    fb_consistent = (lag_fb is None) or (lag_fb == n_eager)
     recon = None
     if pcyc and pcarry and pplain:
         lhs = 7 * statistics.fmean(pplain) + statistics.fmean(pcarry)
@@ -190,12 +253,15 @@ def run_worker(tag, lag, args):
         "eager_carry_cycles": n_eager,
         "carry_fallback_frac": round(n_eager / n_cycles, 4) if n_cycles else None,
         "lag_controller_carry": lag_carry, "lag_controller_fallback": lag_fb,
+        "fallback_counter_consistent": fb_consistent,
         "cycle_ms_p50": pct(pcyc, 50), "cycle_ms_p90": pct(pcyc, 90),
         "cycle_ms_mean": round(statistics.fmean(pcyc), 4) if pcyc else None,
         "carry_ms_p50": pct(pcarry, 50), "carry_ms_p90": pct(pcarry, 90),
         "carry_ms_mean": round(statistics.fmean(pcarry), 4) if pcarry else None,
         "plain_ms_mean": round(statistics.fmean(pplain), 4) if pplain else None,
         "cycle_reconcile_rel_gap": recon,
+        "residency_structural": structural_report(struct_samples, pin_ceiling),
+        "structural_samples": struct_samples,
     }
     with open(f"{args.out_prefix}_{tag}.json", "w") as f:
         json.dump(rep, f, indent=2)
@@ -340,6 +406,18 @@ def main():
     verdict["quality_vs_controlA"] = q if q["ok"] else q
     if not q["ok"]:
         problems14.append(q["reason"])
+    if V.get("fallback_counter_consistent") is False:
+        problems14.append(
+            f"lag controller fallback {V.get('lag_controller_fallback')} != "
+            f"harness eager-carry {V.get('eager_carry_cycles')} (counter "
+            f"mismatch; a carry fell back uncounted or counters diverged)")
+    s = V.get("residency_structural", {})
+    if s.get("violated"):
+        problems14.append(
+            f"residency structural gate violated: max_resident "
+            f"{s.get('max_resident_frames')} vs ceiling {s.get('pin_ceiling')}, "
+            f"free {s.get('free_first')}->{s.get('free_last')} monotonic_drain="
+            f"{s.get('free_monotonic_drain')} (demote reconcile leaking frames)")
 
     # Timing/result gates (measured; failures are rc1, not rc14).
     ratio = round(V["aggregate_eff_tok_s"] / ctl_eff, 4) if ctl_eff else None

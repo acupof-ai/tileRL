@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace as _S
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 N_NEW = 160
@@ -78,7 +79,8 @@ def run_worker(mode, kind):
     if rc != 0 or not os.path.exists(out):
         print(f"{mode}/{kind}: worker rc={rc}, no json -> rc14", file=sys.stderr)
         return 14, None
-    return 0, json.load(open(out))
+    with open(out) as jf:
+        return 0, json.load(jf)
 
 
 def main():
@@ -121,12 +123,53 @@ def main():
     if fd_corrupt is None:
         problems.append("one wrong committed phys page did NOT change output "
                         "(override is inert / merge does not reach attention)")
+
+    # CUDA-branch reconcile predicate. On CPU the device.type=="cuda" clause is
+    # always False, which hid rev's dead refresh_tick flag. Force a CUDA-like
+    # sf and assert: an ordinary captured tick skips reconcile, a carry does
+    # not. Negative control: a predicate missing the refresh_tick exception
+    # wrongly skips the carry — the exact bug — and this check catches it.
+    from tilerl.sparse_runtime import _captured_skips_pin_reconcile as pred
+
+    cuda_sf = _S(device_select=True, device=_S(type="cuda"))
+    cuda_carry = _S(device_select=True, refresh_tick=True,
+                    device=_S(type="cuda"))
+    skips_normal = pred(cuda_sf)
+    skips_carry = pred(cuda_carry)
+    cpu_carry = _S(device_select=True, refresh_tick=True,
+                   device=_S(type="cpu"))
+    skips_cpu = pred(cpu_carry)
+    skips_cpu = pred(cpu_carry)
+    # Negative control of THIS check: the buggy predicate (the pre-fix code,
+    # which ignored refresh_tick) returns True for a carry, proving the
+    # skips_carry assertion below would have fired on the real blocker.
+    buggy_skips_carry = (getattr(cuda_carry, "device_select", False)
+                         and cuda_carry.device.type == "cuda")
+    if not buggy_skips_carry:
+        problems.append("reconcile negative control broken: the pre-fix "
+                        "predicate should skip the carry (so the gate can "
+                        "distinguish it)")
+    if not skips_normal:
+        problems.append("reconcile predicate: ordinary captured CUDA tick "
+                        "must skip pin reconcile")
+    if skips_carry:
+        problems.append("reconcile predicate: a v2 carry (refresh_tick) must "
+                        "NOT skip pin reconcile — this is rev's dead-flag blocker")
+    if skips_cpu:
+        problems.append("reconcile predicate: CPU must never skip reconcile")
+
+    _coldval = async_.get("cold_promos")
+
     verdict = {
         "inline_vs_async_first_div": fd_same,
         "corrupt_one_phys_page_first_div": fd_corrupt,
         "inline_carry": inline["carry"], "async_carry": async_["carry"],
         "fallback_cycles": [inline["fb"], async_["fb"], corrupt["fb"]],
-        "async_cold_promotions": async_.get("cold_promos"),
+        "async_cold_promotions": _coldval,
+        "reconcile_predicate": {
+            "ordinary_cuda_captured_skips": bool(skips_normal),
+            "v2_carry_skips": bool(skips_carry),
+            "cpu_skips": bool(skips_cpu)},
         "n_tokens": len(inline["output"]),
     }
     with open(os.path.join(OUTDIR, "verdict.json"), "w") as f:
