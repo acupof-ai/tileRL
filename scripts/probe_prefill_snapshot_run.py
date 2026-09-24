@@ -75,7 +75,7 @@ def _zero(e):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", required=True, choices=["snapshot", "baseline", "snaprun"])
+    ap.add_argument("--mode", required=True, choices=["snapshot", "baseline", "snaprun", "hitref"])
     ap.add_argument("--prompts", default=os.path.expanduser("~/serve805_prompts.jsonl"))
     ap.add_argument("--n-prompts", type=int, default=2)
     ap.add_argument("--decode-tokens", type=int, default=512)
@@ -122,11 +122,37 @@ def main() -> int:
             t0 = time.perf_counter()
             snap_load(e, snap_dir, ids, model_key=model_key)
             load_ms = round((time.perf_counter() - t0) * 1000, 1)
-        _zero(e)
-        rid = e.submit(
-            list(ids), SamplingParams(temperature=0.0, max_new_tokens=args.decode_tokens, seed=0)
-        )
-        out, st = run_one_prompt(e, rid, flag)
+
+        def decode_once():
+            _zero(e)
+            r = e.submit(
+                list(ids),
+                SamplingParams(temperature=0.0, max_new_tokens=args.decode_tokens, seed=0),
+            )
+            return run_one_prompt(e, r, flag)
+
+        if args.mode == "hitref":
+            # Discriminator, no snapshot: a full-prefill MISS run publishes the
+            # warm prompt entry, then a second submit of the SAME prompt adopts
+            # it through the real cross-request path. B-vs-H isolates whether
+            # warm-adopt-with-draft is itself bit-exact, independent of dump/load.
+            bout, bst = decode_once()
+            hout, hst = decode_once()
+            n = min(len(bout), len(hout))
+            fd = next((k for k in range(n) if bout[k] != hout[k]), None)
+            with open(f"{args.out}.p{idx}.base.json", "w") as f:
+                json.dump({"output": [int(x) for x in bout]}, f)
+            with open(f"{args.out}.p{idx}.hit.json", "w") as f:
+                json.dump({"output": [int(x) for x in hout]}, f)
+            print(
+                f"hitref p{idx}: base_warm {bst['warm_tok_s']} hit_warm "
+                f"{hst['warm_tok_s']} first_diff={fd} "
+                f"identical={bout == hout}",
+                flush=True,
+            )
+            continue
+
+        out, st = decode_once()
         st["idx"] = idx
         st["snapshot_load_ms"] = load_ms
         rows.append(st)
