@@ -1,6 +1,16 @@
 # Changelog
 
 ## 2026-09-24
+- **verdict (sparse, #805)** — ⑤'s exact-identity gate is **unreachable at temp0**
+  on this stack: the cutover window's arms put the first divergent token inside
+  the same two candidates, 0.03–0.41 logits apart, against a cross-config spread
+  of 0.23–0.60 — a near-tie argmax flip, not a kernel error, and the two
+  non-graph arms flip on the same pair. Cutover correctness therefore moves to
+  the teacher-forced `top1 ≥ 0.99` gate. Consequence recorded with it: the
+  09-17 first-replay "6/6 MATCH" is also an exact-equality gate at temp0 and so
+  is **not** bit-identity. V100 was switched to `min0` on 2026-09-24 by ckl's
+  decision after this result.
+  — [wins/2026-09-24-near-tie-flip.md](docs/experience/wins/2026-09-24-near-tie-flip.md)
 - **default flip (sparse, #805)** — the speculated sparse captured decode graph
   is armed on **sm70 only**. `_sparse_capture_allowed` (guard A) kept it off on
   every CUDA arch at `spec_depth>=1` because the width-2 captured verify
