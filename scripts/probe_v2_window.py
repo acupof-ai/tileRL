@@ -56,6 +56,12 @@ FALLBACK_FRAC_MAX = 0.05
 CYCLE_RECONCILE_MAX = 0.05
 DIV_MIN = 128
 PLACEMENT_MAX = 0.05
+# Teacher-forced floor KL is compared with a tolerance, not float ==0: two
+# separate device processes/engines on the same geometry are token-identical
+# (top1 discrete, still required ==1.0) but need not be bit-identical in f32
+# logits (W>1 vs W=1 tiles are explicitly not bit-exact off the CPU reference).
+FLOOR_KL_EPS = 1e-4
+TF_TOP1_MIN = 0.99
 HIST_24P9 = 24.915
 N_PROMPTS = 6
 REFRESH_MOD = 8  # SPARSE_REFRESH_TICKS (carry/refresh every 8 sparse ticks)
@@ -363,7 +369,20 @@ def _tf_analyze(arm_logits_dir, n_prompts, tag_a, tag_b):
             kls_ba += kl_from_logits(lb, la)
         m = len(gids)
         ag = same / m if m else 0.0
+        # Coverage: the compared set must be (almost) every generated position.
+        # The only allowed misses are the gen0 boundary (its logit can be the
+        # prefill's first token rather than a decode) and a single tail position
+        # (last committed gen_idx can equal n_out and is filtered g<n_out);
+        # interior holes would mean the accepted-position sets drifted and the
+        # top1 ratio was being computed on a silently chosen subset.
+        union = set(ma) | set(mb)
+        missing = sorted(union - set(gids))
+        interior_missing = [g for g in missing if 0 < g < n]
         per.append({"i": pi, "positions_compared": m, "n_output": n,
+                    "missing_positions": missing,
+                    "interior_missing": interior_missing,
+                    "coverage_ok": (len(interior_missing) == 0
+                                    and n - m <= 1),
                     "top1_agreement": round(ag, 5),
                     "kl_ab_mean": round(kls_ab / m, 6) if m else None,
                     "kl_ba_mean": round(kls_ba / m, 6) if m else None})
@@ -372,6 +391,7 @@ def _tf_analyze(arm_logits_dir, n_prompts, tag_a, tag_b):
         all_margins.extend(margins)
     return {
         "ok": True, "per_prompt": per,
+        "coverage_ok": all(p["coverage_ok"] for p in per),
         "min_top1_agreement": round(min(p["top1_agreement"] for p in per), 5)
             if per else None,
         "mean_top1_agreement": round(statistics.fmean(
@@ -505,16 +525,28 @@ def main():
     verdict["floor_controlB_vs_controlA"] = {
         k: floor[k] for k in ("min_top1_agreement", "mean_top1_agreement",
                              "mean_kl_ab", "mean_kl_ba",
-                             "n_disagree_positions")}
-    floor_ok = (floor["min_top1_agreement"] == 1.0
-                and (floor["mean_kl_ab"] or 0.0) == 0.0
-                and (floor["mean_kl_ba"] or 0.0) == 0.0)
-    verdict["floor_top1_eq_1_and_kl0"] = floor_ok
+                             "n_disagree_positions", "coverage_ok",
+                             "per_prompt")}
+    # top1 discrete -> strict 1.0; KL f32 across separate processes -> tolerance.
+    # Coverage must hold so the agreement is over (almost) every position, not a
+    # silently chosen subset.
+    floor_ok = (floor.get("coverage_ok")
+                and floor["min_top1_agreement"] == 1.0
+                and (floor["mean_kl_ab"] or 0.0) <= FLOOR_KL_EPS
+                and (floor["mean_kl_ba"] or 0.0) <= FLOOR_KL_EPS)
+    verdict["floor_top1_eq_1_kl_le_eps"] = floor_ok
+    verdict["floor_kl_eps"] = FLOOR_KL_EPS
+    if not floor.get("coverage_ok"):
+        bad = [p for p in floor["per_prompt"] if not p["coverage_ok"]]
+        problems14.append(
+            f"teacher-forced floor coverage broken (interior missing or >1 "
+            f"uncompared): {[(p['i'], p['missing_positions']) for p in bad]}")
     if not floor_ok:
         problems14.append(
             f"teacher-forced floor violated: controlB vs controlA "
             f"min_top1={floor['min_top1_agreement']} "
-            f"kl_ab={floor['mean_kl_ab']} kl_ba={floor['mean_kl_ba']}")
+            f"kl_ab={floor['mean_kl_ab']} kl_ba={floor['mean_kl_ba']} "
+            f"(eps {FLOOR_KL_EPS})")
 
     # Free-running token identity of the two controls (aux end-to-end read; not
     # a hard instrument gate now that the teacher-forced floor is binding).
@@ -537,7 +569,13 @@ def main():
     verdict["teacher_forced_quality"] = {
         k: tfq[k] for k in ("min_top1_agreement", "mean_top1_agreement",
                            "mean_kl_ab", "mean_kl_ba",
-                           "n_disagree_positions", "margins")}
+                           "n_disagree_positions", "coverage_ok",
+                           "per_prompt", "margins")}
+    if not tfq.get("coverage_ok"):
+        bad = [p for p in tfq["per_prompt"] if not p["coverage_ok"]]
+        problems14.append(
+            "v2 teacher-forced coverage broken (subset assertion risk): "
+            + str([(p["i"], p["missing_positions"]) for p in bad]))
     q = quality(sv, sa)
     verdict["freerun_quality_aux"] = q if q["ok"] else q
     if not q["ok"]:
@@ -581,8 +619,10 @@ def main():
         "tf_mean_kl_ab": tfq.get("mean_kl_ab"),
         "tf_mean_kl_ba": tfq.get("mean_kl_ba"),
         "tf_n_disagree_positions": tfq.get("n_disagree_positions"),
-        "tf_top1_mean_ge_0p99": tfq.get("mean_top1_agreement") is not None
-            and tfq["mean_top1_agreement"] >= 0.99,
+        "tf_coverage_ok": tfq.get("coverage_ok"),
+        "tf_top1_mean_ge_0p99": (tfq.get("coverage_ok") is True
+            and tfq.get("mean_top1_agreement") is not None
+            and tfq["mean_top1_agreement"] >= TF_TOP1_MIN),
     }
     verdict["v2"] = {k: V[k] for k in (
         "aggregate_eff_tok_s", "steady_cycles", "graph_carry_cycles",
