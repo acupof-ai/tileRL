@@ -1671,6 +1671,12 @@ class Engine:
         if t is not None:
             t.join(timeout)
         self._thread = None
+        # PROBE-ONLY #805 v2: join the lag worker, release held blobs and
+        # return the carved reserve blocks before the pool goes away.
+        if self._sparse is not None:
+            lag = self._sparse._lag()
+            if lag is not None:
+                lag.close()
         if self._sparse is not None and self._sparse.prefix is not None:
             self._sparse.prefix.clear()  # release shared prefix blobs to the cold tier
 

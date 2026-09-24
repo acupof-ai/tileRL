@@ -867,7 +867,10 @@ class SparseForward:
         of post-replay SNAPSHOTS for the async side stream — the carry tick's
         fill() would otherwise overwrite the staging before the background read.
 
-        Returns {group: (chosen_logical [B,k] 0-padded, nsel [B])} on device.
+        Returns {group: (chosen_logical [B,k] 0-padded by POSITION, nsel [B])}
+        on device. Padding is the tail positions >= nsel, NOT a sentinel value:
+        logical page 0 is a real early-context page and may legitimately appear
+        in a valid slot, so callers must index [:nsel], never filter value!=0.
         The caller resolves/promotes the named logical pages (host side) and
         hands the physical blocks back via arm_override()."""
         assert self.reuse

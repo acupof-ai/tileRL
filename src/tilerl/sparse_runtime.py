@@ -849,6 +849,12 @@ class SparseRuntime:
                 cmax_cap=key[2],
                 own_w_cap=own_w,
             )
+            # v2: lag_enabled MUST be set BEFORE make_sparse_graph captures.
+            # The q-clone and the branchless override merge are graph nodes; if
+            # flipped after capture they are absent from the baked graph and v2
+            # silently never carries on CUDA (every carry falls back eager).
+            if lag is not None:
+                sf.lag_enabled = True
             g, ctx.graph_capture.pool, err = make_sparse_graph(
                 ctx.model,
                 ctx.backend,
@@ -868,19 +874,26 @@ class SparseRuntime:
                 self.graph_on = False
                 return False
             self.graphs[key] = g
-        if lag is not None:
-            g.sf.lag_enabled = True
         # v2 carry tick. Commit the prepared job's residency BEFORE g.run()
         # (which calls fill(), whose own-page resolve must see the picks as
         # reserved). commit() joins the worker/event; a background that overruns
-        # one interval makes this tick WAIT. A job that is absent or named an
-        # unsupported page falls back to the normal eager refresh, counted once.
+        # one interval makes this tick WAIT. A job that is absent, names an
+        # unsupported page, or fails must fall through to the NORMAL eager
+        # refresh. Do NOT touch the counter here: build_rows() below then sees
+        # counter==R-1, sets do_refresh itself and runs the real all-candidate
+        # eager refresh (resetting to 0). Resetting here would make that eager
+        # tick a resident-only tick and silently skip the cold promotion the
+        # fallback promised. The fallback cycle is counted inside commit().
         pre_replay = None
-        if carry:
-            if not lag.is_ready() or not lag.commit(g.sf, rows):
-                self.ticks_since_refresh = 0
-                return False
+        if carry and lag.is_ready() and lag.commit(g.sf, rows):
             pre_replay = lag.arm_callback
+            self._carry_armed = True
+        else:
+            self._carry_armed = False
+            if carry:
+                # Fall through to eager refresh with the cadence counter left at
+                # R-1 so build_rows treats THIS tick as the periodic refresh.
+                return False
         logits = g.run(
             rows,
             chains or [(r.output[-1],) for r in reqs],
