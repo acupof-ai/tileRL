@@ -29,7 +29,8 @@ DRAFT=${DRAFT:-$HOME/mmlu-assets/model_mtp.safetensors}
 SSD=${SSD:-$HOME/sparse_cold_128k.bin}
 PROMPTS=${PROMPTS:-$HOME/serve805_prompts.jsonl}
 export H2_COLD_BYTES=1073741824 H2_COLD_SSD="$SSD" H2_COLD_SSD_BYTES=8589934592
-TREE=$(git rev-parse --short=8 HEAD)
+TREE=$(git rev-parse --short=8 HEAD 2>/dev/null || cat .synced_commit)
+TREE=${TREE:0:8}
 
 # Free the card if a prior window left a service up.
 SP=$(pgrep -f "cli serve" | head -1)

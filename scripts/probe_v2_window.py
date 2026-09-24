@@ -237,6 +237,13 @@ def run_worker(tag, lag, args):
 
     sha = subprocess.run(["git", "rev-parse", "--short=8", "HEAD"],
                          capture_output=True, text=True).stdout.strip()
+    if not sha:
+        # Deployed (rsync/tar) trees carry .synced_commit instead of .git.
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sc = os.path.join(root, ".synced_commit")
+        if os.path.exists(sc):
+            with open(sc) as cf:
+                sha = cf.read().strip()[:8]
     if args.expect_tree and sha != args.expect_tree[:8]:
         print(f"tree {sha} != {args.expect_tree[:8]}", file=sys.stderr)
         return 14
