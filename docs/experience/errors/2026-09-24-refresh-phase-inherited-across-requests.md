@@ -140,6 +140,28 @@ the `slot=1` allocation comes from a different (2-slot) pool created before the
 serving pool. At `--slots 1` the warmup/capture pool and the serving pool appear
 to land in the same slot; that is the leading explanation and it is unverified.
 
+## What is measured about the geometry
+
+`build_engine` sizes the pool as `num_slots + pad`, where `pad` is 1 when the
+decode graph is on (the replay's padding row owns a slot). Read on the CPU tiny
+model, `num_slots` per request against the number of free slots at build:
+
+| `--slots` | graph off | graph on |
+|---|---|---|
+| 1 | pool 1, free 1 | pool 2, free 1 |
+| 2 | pool 2, free 2 | pool 3, free 2 |
+| 4 | pool 4, free 4 | pool 5, free 4 |
+
+So at `--slots 1` with the graph on the pool holds 2 slots and exactly **one**
+is usable by a request — the padding row is the other one. Which slot index the
+request and the padding row land on is not fixed by this table, and the trace
+above is the only evidence on that.
+
+What this does **not** establish: that the padding row and the serving request
+collide, or that any collision is what produces the repeated token. The CPU tiny
+model did not reproduce the degeneracy, so the mechanism is still open and named
+as such.
+
 ## Why it matters
 
 `--slots 1` is a legitimate-looking configuration that silently produces garbage
