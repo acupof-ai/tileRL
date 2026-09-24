@@ -432,7 +432,11 @@ def main() -> int:
         if missing:
             print(f"FATAL anchor dir lacks prompts {sorted(missing)}", file=sys.stderr)
             return 14
-    self_gate = True
+    # TF-vs-anchor agreement is RECORD ONLY, never a pass/fail: even R=1's own
+    # free run differs ~3% at near-tie positions when replayed as a forced
+    # trajectory (a different code path, not noise). The binding quality gate is
+    # TF(R) top1 vs TF(R=1) top1, computed post-hoc by wr_sweep_report.py. The
+    # only hard gate is the floor KL (same trajectory twice), already passed.
     tf_agreement = []
     rec = TeacherForceRecorder(e, anchors=tf_anchors, record_full_logits=True).install()
     for idx, ids in enumerate(prompts):
@@ -449,8 +453,6 @@ def main() -> int:
         top1s = [r["top1"] for r in kept]
         agree = sum(t == a for t, a in zip(top1s, anchor)) / len(anchor)
         tf_agreement.append(round(agree, 6))
-        if args.refresh == 1 and agree != 1.0:
-            self_gate = False
         torch.save(
             {"top1": torch.tensor(top1s, dtype=torch.long),
              "logits": torch.stack([r["logits"] for r in kept]),
@@ -460,20 +462,17 @@ def main() -> int:
             json.dump({"output": [int(x) for x in out], "n_positions": len(kept),
                        "top1_agreement_vs_anchor": round(agree, 6)}, f)
         print(f"[W{args.window_tokens}/R{args.refresh}] tf prompt {idx} "
-              f"top1-vs-anchor {agree:.4f}", flush=True)
+              f"top1-vs-anchor {agree:.4f} (record only)", flush=True)
     rec.uninstall()
 
     for st in free_stats:
-        st["tf_top1_agreement"] = tf_agreement[st["idx"]]
-    write_meta(free_stats, gate=self_gate)
+        st["tf_top1_agreement_vs_anchor"] = tf_agreement[st["idx"]]
+    write_meta(free_stats)
     print("STRUCTURAL " + json.dumps({
         "window_pages": pages, "refresh_ticks": args.refresh,
         "n_captured_graphs": len(e._sparse.graphs),
         "declines_seen": len(declines),
-        "tf_top1_agreement": tf_agreement,
-        "self_anchor_gate_ok": self_gate}), flush=True)
-    if not self_gate:
-        return 1
+        "tf_top1_agreement_vs_anchor": tf_agreement}), flush=True)
     e.shutdown()
     return 0
 

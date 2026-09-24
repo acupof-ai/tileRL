@@ -71,6 +71,9 @@ def main() -> int:
             eager_fracs = [p["eager_refresh_ticks"]
                            / max(p["graph_ticks"] + p["eager_refresh_ticks"], 1)
                            for p in speed]
+            # TF-vs-anchor for THIS arm (record only, near-tie flips expected).
+            arm_anchor_agree = [p.get("tf_top1_agreement_vs_anchor") for p in speed]
+            arm_anchor_agree = [x for x in arm_anchor_agree if x is not None]
             row = {
                 "window": w, "R": r,
                 "mean_eff_tok_s": round(statistics.mean(p["eff_tok_s"] for p in speed), 3),
@@ -89,13 +92,14 @@ def main() -> int:
                 "eager_tick_ms_p50": round(
                     statistics.median(p["eager_tick_ms_p50"] for p in speed
                                       if p["eager_refresh_ticks"]), 3),
-                "self_anchor_gate_ok": meta.get("self_anchor_gate_ok"),
+                "top1_vs_anchor": round(statistics.mean(arm_anchor_agree), 6)
+                    if arm_anchor_agree else None,
+                "floor_kl_max": meta.get("floor_kl_max"),
             }
-            if r == 1:
-                if not meta.get("self_anchor_gate_ok"):
-                    print(f"FATAL {tag} R=1 self-anchor gate not ok", file=sys.stderr)
-                    return 1
-            else:
+            if r != 1:
+                # BINDING gate: this arm's TF top1 vs the same-window R=1 TF
+                # top1 (both forced onto the identical anchor). TF-vs-anchor is
+                # not a gate — R=1 itself only reaches ~0.97 there.
                 ref_dir = f"{args.dir}/arm_W{w}_R1_tf"
                 arm_dir = f"{args.dir}/{tag}_tf"
                 agree_all, agree_first, kl_ab, kl_ba, margins = [], [], [], [], []
@@ -149,20 +153,25 @@ def main() -> int:
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"gate": GATE, "arms": rows}, f, indent=2)
-    print(f"{'W':>5} {'R':>3} {'effTok/s':>8} {'warmTok/s':>9} {'eagerFr':>7} "
-          f"{'g50ms':>6} {'e50ms':>6} "
-          f"{'agree':>6} {'first16':>7} {'gate':>5} {'nDiv':>5} {'KLmed+/-':>10}")
+    print(f"{'W':>5} {'R':>3} {'warmTok/s':>9} {'eagerFr':>7} {'g50ms':>6} {'e50ms':>6} "
+          f"{'R1vAnc':>7} {'RvAnc':>7} {'RvR1':>7} {'1st16':>6} {'gate':>5} "
+          f"{'nDiv':>5} {'KLmed+/-':>10}")
+    # R1's own TF-vs-anchor value, shown beside each arm's for the same window.
+    r1_vs_anchor = {(r["window"]): r.get("top1_vs_anchor")
+                    for r in rows if r.get("R") == 1}
     for r in rows:
         if r.get("missing"):
             print(f"{r['window']:>5} {r['R']:>3}  (missing)")
             continue
         klm = r.get("kl_a_b")
         kls = f"{klm['median']:.4f}/{r['kl_b_a']['median']:.4f}" if klm else "-"
-        print(f"{r['window']:>5} {r['R']:>3} {r['mean_eff_tok_s']:>8} "
-              f"{r['warm_eff_tok_s']:>9} {r['eager_tick_frac']:>7.3f} "
+        print(f"{r['window']:>5} {r['R']:>3} {r['warm_eff_tok_s']:>9} "
+              f"{r['eager_tick_frac']:>7.3f} "
               f"{str(r['graph_tick_ms_p50']):>6} {str(r['eager_tick_ms_p50']):>6} "
-              f"{str(r.get('top1_agreement', '-')):>6} "
-              f"{str(r.get('top1_agreement_first16', '-')):>7} "
+              f"{str(r1_vs_anchor.get(r['window'], '-')):>7} "
+              f"{str(r.get('top1_vs_anchor', '-')):>7} "
+              f"{str(r.get('top1_agreement', '-')):>7} "
+              f"{str(r.get('top1_agreement_first16', '-')):>6} "
               f"{str(r.get('gate_ok', 'ref')):>5} {str(r.get('n_disagreements', '-')):>5} "
               f"{kls:>10}")
     return 0

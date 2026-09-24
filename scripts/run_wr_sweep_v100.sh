@@ -80,25 +80,9 @@ run_arm() {
   echo "$TAG EXIT=$?"
 }
 
-w128_r32() {
-  # Run W128 R32 only if R16 cleared the >=0.99 TF top1 gate.
-  if $PY - "$OUT" <<'PY'
-import glob, json, sys
-ag = [json.load(open(f))["top1_agreement_vs_anchor"]
-      for f in sorted(glob.glob(f"{sys.argv[1]}/arm_W128_R16_tf/tf_*.json"))]
-mean = sum(ag) / len(ag) if ag else 0.0
-print(f"W128 R16 mean top1={mean:.4f} -> {'RUN R32' if mean >= 0.99 else 'SKIP R32'}")
-sys.exit(0 if mean >= 0.99 else 3)
-PY
-  then
-    run_arm 128 32
-  else
-    echo "W128 R16 failed top1 gate; skipping W128 R32"
-  fi
-}
-
-# (W:R:free) sequence; resume via START_AT.
-SEQ=(128:1:0 128:8:1 1024:1:0 1024:32:0 128:16:0 __W128_R32_GATE__)
+# (W:R:free) sequence; resume via START_AT. R32 always runs — the R16 vs R1
+# TF top1 gate is computed in the final report, not used to skip arms.
+SEQ=(128:1:0 128:8:1 1024:1:0 1024:32:0 128:16:0 128:32:0)
 started=0
 for step in "${SEQ[@]}"; do
   if [ "$started" = "0" ]; then
@@ -106,12 +90,8 @@ for step in "${SEQ[@]}"; do
     [ -z "$START_AT" ] && started=1
     [ "$started" = "0" ] && continue
   fi
-  if [ "$step" = "__W128_R32_GATE__" ]; then
-    w128_r32
-  else
-    W=${step%%:*}; rest=${step#*:}; R=${rest%%:*}; F=${rest##*:}
-    run_arm "$W" "$R" "$F"
-  fi
+  W=${step%%:*}; rest=${step#*:}; R=${rest%%:*}; F=${rest##*:}
+  run_arm "$W" "$R" "$F"
 done
 
 $PY scripts/wr_sweep_report.py --dir "$OUT" --out "$OUT/wr_sweep.json" | tee "$OUT/summary.txt"
