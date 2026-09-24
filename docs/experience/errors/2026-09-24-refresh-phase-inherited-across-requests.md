@@ -1,6 +1,6 @@
 # temp-0 greedy output depends on the traffic before the request — V100 sm70, 2026-09-24
 
-> Status: open — the PR that resets `ticks_since_refresh` at admission removes this line.
+> Status: open — finding 1 is fixed by #821; finding 2 is not.
 
 Two separate defects, found while diagnosing an unrelated crash in the `#805`
 production cutover (V100 switched to `min0` on 2026-09-24). The crash turned out
@@ -16,7 +16,9 @@ why the first observation could not be classified after the fact).
 
 # 1. A new request inherits the previous requests' sparse refresh phase
 
-> Status: open
+> Status: fixed by #821 — but this entry stays open for finding 2, which the same
+> PR does not touch. The OPEN.md row tracks finding 2 and is removed only when
+> that is fixed, not when this one is.
 
 ## What happens
 
