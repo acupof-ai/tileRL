@@ -80,9 +80,15 @@ def main() -> int:
                 "graph_tick_ms_mean": round(
                     statistics.mean(p["graph_tick_ms_mean"] for p in speed
                                      if p["graph_ticks"]), 3),
+                "graph_tick_ms_p50": round(
+                    statistics.median(p["graph_tick_ms_p50"] for p in speed
+                                      if p["graph_ticks"]), 3),
                 "eager_tick_ms_mean": round(
                     statistics.mean(p["eager_tick_ms_mean"] for p in speed
                                      if p["eager_refresh_ticks"]), 3),
+                "eager_tick_ms_p50": round(
+                    statistics.median(p["eager_tick_ms_p50"] for p in speed
+                                      if p["eager_refresh_ticks"]), 3),
                 "self_anchor_gate_ok": meta.get("self_anchor_gate_ok"),
             }
             if r == 1:
@@ -144,7 +150,7 @@ def main() -> int:
         with open(args.out, "w") as f:
             json.dump({"gate": GATE, "arms": rows}, f, indent=2)
     print(f"{'W':>5} {'R':>3} {'effTok/s':>8} {'warmTok/s':>9} {'eagerFr':>7} "
-          f"{'graph ms':>8} {'eager ms':>8} "
+          f"{'g50ms':>6} {'e50ms':>6} "
           f"{'agree':>6} {'first16':>7} {'gate':>5} {'nDiv':>5} {'KLmed+/-':>10}")
     for r in rows:
         if r.get("missing"):
@@ -154,7 +160,7 @@ def main() -> int:
         kls = f"{klm['median']:.4f}/{r['kl_b_a']['median']:.4f}" if klm else "-"
         print(f"{r['window']:>5} {r['R']:>3} {r['mean_eff_tok_s']:>8} "
               f"{r['warm_eff_tok_s']:>9} {r['eager_tick_frac']:>7.3f} "
-              f"{str(r['graph_tick_ms_mean']):>8} {str(r['eager_tick_ms_mean']):>8} "
+              f"{str(r['graph_tick_ms_p50']):>6} {str(r['eager_tick_ms_p50']):>6} "
               f"{str(r.get('top1_agreement', '-')):>6} "
               f"{str(r.get('top1_agreement_first16', '-')):>7} "
               f"{str(r.get('gate_ok', 'ref')):>5} {str(r.get('n_disagreements', '-')):>5} "

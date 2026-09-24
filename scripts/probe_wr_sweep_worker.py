@@ -141,12 +141,21 @@ def run_one_prompt(e, rid, tag_decline) -> tuple[list[int], dict]:
 
     graph_ms = [t[0] for t in ticks if not t[1]]
     eager_ms = [t[0] for t in ticks if t[1]]
+
+    def p50(xs):
+        if not xs:
+            return 0.0
+        xs = sorted(xs)
+        return xs[min(len(xs) - 1, int(round(0.5 * (len(xs) - 1))))]
+
     warm, warm_tok, warm_n = warm_eff(ticks)
     return out, {
         "generated": len(out),
         "graph_ticks": len(graph_ms), "eager_refresh_ticks": len(eager_ms),
         "graph_tick_ms_mean": round(sum(graph_ms) / max(len(graph_ms), 1), 3),
+        "graph_tick_ms_p50": round(p50(graph_ms), 3),
         "eager_tick_ms_mean": round(sum(eager_ms) / max(len(eager_ms), 1), 3),
+        "eager_tick_ms_p50": round(p50(eager_ms), 3),
         "wall_s": round(wall, 3),
         "decode_forwards": fwd, "spec_accepted": accepted,
         "eff_tok_s": round((fwd + accepted) / wall, 3),
