@@ -115,6 +115,24 @@ stop_server() {
 }
 trap 'stop_server; exit 143' TERM INT
 
+restore_and_exit() {
+  local rc=$1
+  stop_server
+  if [ "${SKIP_SERVE_RESTORE:-0}" = 1 ]; then
+    echo "SKIP_SERVE_RESTORE set; card left stopped"; exit "$rc"
+  fi
+  local RESTORE_CMD=${START_SERVE_CMD:-"bash $HOME/run_serve_prod.sh"}
+  nohup bash -c "$RESTORE_CMD" > "$OUT/restore_serve.log" 2>&1 < /dev/null &
+  local H=
+  for _ in $(seq 1 90); do
+    H=$(curl -s -m 3 http://127.0.0.1:8000/health 2>/dev/null)
+    echo "$H" | grep -q '"status":"ok"' && { echo RESTORE_HEALTH_OK; break; }
+    sleep 5
+  done
+  echo "$H" | head -c 400; echo
+  exit "$rc"
+}
+
 run_client() { # tag prompt_idx_or_all
   local tag=$1 idx=$2
   if [ "$idx" = all ]; then
@@ -169,9 +187,11 @@ PYEOF
 }
 
 # OLD first, then ThinkingCap
-run_model old "$PROD_LAUNCHER" || exit 14
-run_model thinkingcap "$TC_LAUNCHER" || exit 14
+run_model old "$PROD_LAUNCHER" || restore_and_exit 14
+run_model thinkingcap "$TC_LAUNCHER" || restore_and_exit 14
 
 $PY scripts/tc_validate_client.py --compare "$OUT/old.json" "$OUT/thinkingcap.json" \
   | tee "$OUT/acceptance_gate.json"
+GATE_RC=${PIPESTATUS[0]}
 echo "VALIDATION END $(date +%T) dir=$OUT fresh_per_prompt=$FRESH"
+restore_and_exit "$GATE_RC"

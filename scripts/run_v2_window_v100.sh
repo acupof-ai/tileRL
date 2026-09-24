@@ -80,3 +80,19 @@ for t in W1024_R32 W128_R8; do
   [ -f "$OUT/${t}_verdict.json" ] && echo "== $t ==" && \
     python3 -c "import json;d=json.load(open('$OUT/${t}_verdict.json'));print(json.dumps({k:d.get(k) for k in ('GO','v2','floor_top1_eq_1_kl_le_eps')},indent=1)[:800])"
 done
+
+# Queue rule: hand the card back to the latest-main production service and
+# verify /health 200 before exiting. SKIP_SERVE_RESTORE=1 hands the stopped
+# card straight to the next queued probe instead.
+if [ "${SKIP_SERVE_RESTORE:-0}" = 1 ]; then
+  echo "SKIP_SERVE_RESTORE set; card left stopped for the next queue item"
+  exit 0
+fi
+RESTORE_CMD=${START_SERVE_CMD:-"bash $HOME/run_serve_prod.sh"}
+nohup bash -c "$RESTORE_CMD" > "$OUT/restore_serve.log" 2>&1 < /dev/null &
+for _ in $(seq 1 90); do
+  H=$(curl -s -m 3 http://127.0.0.1:8000/health 2>/dev/null)
+  echo "$H" | grep -q '"status":"ok"' && { echo RESTORE_HEALTH_OK; break; }
+  sleep 5
+done
+echo "$H" | head -c 400; echo
