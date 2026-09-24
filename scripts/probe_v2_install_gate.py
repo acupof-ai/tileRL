@@ -47,6 +47,7 @@ if kind == "corrupt":
             t[0, 0] = 140  # one wrong committed phys page for row0/group0
     SparseForward.arm_override = _corrupt
 e, _be, _cfg = build_smoke_engine("graph_w2048")
+_promo0 = int(e._sparse.ctx.kv.cold.promotions)
 rid = e.submit([7 + (i % 300) for i in range(400)], _sampling({N_NEW}))
 lag = e._sparse._lag()
 for _ in range(200000):
@@ -54,7 +55,8 @@ for _ in range(200000):
     if not any(r.req_id == rid for r in e._running):
         break
 out = e.poll().get(rid, [])
-json.dump({{"output": out, "carry": lag.carry_cycles, "fb": lag.fallback_cycles}},
+json.dump({{"output": out, "carry": lag.carry_cycles, "fb": lag.fallback_cycles,
+            "cold_promos": int(e._sparse.ctx.kv.cold.promotions) - _promo0}},
           open(outpath, "w"))
 print(mode, kind, len(out), lag.carry_cycles, lag.fallback_cycles)
 e.shutdown()
@@ -106,6 +108,12 @@ def main():
         problems.append(
             f"carry/fb inline={inline['carry']}/{inline['fb']} "
             f"async={async_['carry']}/{async_['fb']} (need carry>0, fb=0)")
+    # The async worker must ACTUALLY drive cold take/reserve/H2D; if every pick
+    # were already resident the whole promote path would be untested.
+    if async_.get("cold_promos", 0) <= 0:
+        problems.append(
+            f"async cold_promos={async_.get('cold_promos')} — the worker never "
+            f"took/promoted a cold page, so the reserve/H2D path is untested")
     fd_same = _first_div(inline["output"], async_["output"])
     if fd_same is not None:
         problems.append(f"inline vs async first divergence at {fd_same} (must be identical)")
@@ -118,6 +126,7 @@ def main():
         "corrupt_one_phys_page_first_div": fd_corrupt,
         "inline_carry": inline["carry"], "async_carry": async_["carry"],
         "fallback_cycles": [inline["fb"], async_["fb"], corrupt["fb"]],
+        "async_cold_promotions": async_.get("cold_promos"),
         "n_tokens": len(inline["output"]),
     }
     with open(os.path.join(OUTDIR, "verdict.json"), "w") as f:

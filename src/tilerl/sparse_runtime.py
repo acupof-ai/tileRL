@@ -854,20 +854,19 @@ class SparseRuntime:
                 self.graph_on = False
                 return False
             self.graphs[key] = g
-            self.graphs[key] = g
         if lag is not None:
             g.sf.lag_enabled = True
-        # v2 carry tick: if the previous plain tick prepared no selection
-        # (first interval / reservation short / timed out), fall back to the
-        # normal eager refresh for THIS cycle and count it.
+        # v2 carry tick. Commit the prepared job's residency BEFORE g.run()
+        # (which calls fill(), whose own-page resolve must see the picks as
+        # reserved). commit() joins the worker/event; a background that overruns
+        # one interval makes this tick WAIT. A job that is absent or named an
+        # unsupported page falls back to the normal eager refresh, counted once.
         pre_replay = None
         if carry:
-            if lag.is_ready():
-                pre_replay = lag.arm_callback
-            else:
-                lag.fallback_cycles += 1
+            if not lag.is_ready() or not lag.commit(g.sf, rows):
                 self.ticks_since_refresh = 0
                 return False
+            pre_replay = lag.arm_callback
         logits = g.run(
             rows,
             chains or [(r.output[-1],) for r in reqs],
