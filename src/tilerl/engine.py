@@ -608,6 +608,13 @@ class _Req:
     #: here and written back in `_finish_prefills`, so the logits come from the
     #: re-forward and the state does not. errors/2026-09-24-prefix-hit-feeds-the-last-page-twice.md
     resend_restore: Any = None
+    #: The entry's stored boundary hidden. The draft reads it one position back, and a
+    #: re-forward recomputes that position from the re-run page instead of reading it,
+    #: so the draft would condition on a different last token than the trunk committed
+    #: to. Held here and put back where the trunk resumes.
+    #: errors/2026-09-24-draft-hit-conditions-on-the-wrong-hidden.md
+    resend_hidden: Any = None
+    resend_from: int = 0
     #: A request failed mid-flight (e.g. cold spill): release its frames without
     #: trying to publish a prefix snapshot whose cold blobs may already be gone.
     failed: bool = False
@@ -1539,6 +1546,10 @@ class Engine:
                         self._states.states[slot].clone(),
                         self._states.window_snapshot(slot) if snap_windows is not None else None,
                     )
+                    if entry.get("hidden") is not None:
+                        req.resend_hidden = entry["hidden"].to(
+                            self._states.states.device).reshape(1, 1, -1)
+                        req.resend_from = matched - 1
                 if self._draft is not None:
                     self._sparse.warm_draft(req, entry, matched)
                 self._prefix_hits += 1
@@ -2328,6 +2339,10 @@ class Engine:
                 self._states.states[pf.state_slot].copy_(states)
                 if window is not None:
                     self._states.window_restore(pf.state_slot, window)
+                if pf.resend_hidden is not None:
+                    pf.hidden = pf.resend_hidden
+                    pf.hidden_from = pf.resend_from
+                    pf.hidden_prev = None
                 pf.resend_restore = None
         self._sample_commit(done)
         for pf, _, _ in done:
