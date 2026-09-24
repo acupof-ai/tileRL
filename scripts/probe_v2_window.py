@@ -251,6 +251,7 @@ def _free_run_pass(e, prompts, args, struct_samples):
         "lag_fallback": lagc.fallback_cycles if lagc else None,
         "lag_fallback_reasons": getattr(lagc, "fallback_reasons", None),
         "lag_last_fallback_reason": getattr(lagc, "last_fallback_reason", None),
+        "lag_last_fallback_diag": getattr(lagc, "last_fallback_diag", None),
         "per_prompt": per_prompt,
     }
 

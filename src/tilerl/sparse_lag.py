@@ -86,6 +86,7 @@ class LagController:
         # new geometry is otherwise invisible (the string was discarded).
         self.fallback_reasons: dict[str, int] = {}
         self.last_fallback_reason = None
+        self.last_fallback_diag = None
 
     # ------------------------------------------------------------ cadence
     def is_carry(self) -> bool:
@@ -218,8 +219,28 @@ class LagController:
                     elif p in shared_maps[bi] and pool.cold is not None:
                         shared_need.append((rids[bi], p, shared_maps[bi][p]))
                     else:
+                        # PROBE DIAGNOSTIC: classify why a selected early page
+                        # cannot be promoted. One-time dump into the instance.
+                        diag = {
+                            "page": p, "rid": rids[bi],
+                            "in_cold_pages": p in cold_pages[bi],
+                            "in_shared": p in shared_maps[bi],
+                            "in_resident_snap": p in resident_of[bi],
+                            "private_key_in_cold": key in pool.cold,
+                            "cold_pages_n": len(cold_pages[bi]),
+                            "shared_n": len(shared_maps[bi]),
+                            "cold_tier_keys_sample":
+                                (p in cold_pages[bi]) and (key in pool.cold),
+                            "cold_minmax":
+                                (min(cold_pages[bi]), max(cold_pages[bi]))
+                                if cold_pages[bi] else None,
+                            "shared_minmax":
+                                (min(shared_maps[bi]), max(shared_maps[bi]))
+                                if shared_maps[bi] else None,
+                        }
                         return {"fallback":
-                                f"unsupported/missing page {p} rid {rids[bi]}"}
+                                f"unsupported/missing page {p} rid {rids[bi]}",
+                                "diag": diag}
         # de-dup preserving order
         seen = set()
         cold_need = [k for k in cold_need if not (k in seen or seen.add(k))]
@@ -371,6 +392,8 @@ class LagController:
             key = reason.split(":")[0].split()[0]
             self.fallback_reasons[key] = self.fallback_reasons.get(key, 0) + 1
             self.last_fallback_reason = reason
+            if isinstance(res, dict) and res.get("diag"):
+                self.last_fallback_diag = res["diag"]
             # Stale request set, failed job, or B>1 guard: eager fallback. Any
             # promoted frames in a fallback dict were rolled back in the job.
             self.fallback_cycles += 1
