@@ -289,6 +289,9 @@ class _StepTiming:
         "alloc_conf",
         "phase_dec",
         "phase_pre",
+        # PROBE-ONLY #805: whole-step GPU ms recorded by run_prompt so the
+        # device window reports the same CUDA-event caliber as the R×W sweep.
+        "probe_step_gpu_ms",
     )
 
     def __init__(self, engine=None) -> None:
