@@ -62,11 +62,30 @@ def parse(text: str) -> list[tuple[str, int, int]]:
     return rows
 
 
+def mem_op_ms(text: str) -> float:
+    """Total H2D/D2H copy time from the memory-operations summary. Captured
+    graph staging copies land here, not in the kernel table."""
+    sec = text.split("CUDA Memory Operation Summary", 1)
+    if len(sec) < 2:
+        sec = text.split("cuda_gpu_mem_time_sum", 1)
+    if len(sec) < 2:
+        return 0.0
+    total = 0
+    body = sec[1].split("\n\n", 1)[0]
+    for ln in body.splitlines():
+        m = re.match(r"\s*[\d.]+\s+([\d,]+)\s+(\d+)", ln)
+        if m:
+            total += int(m.group(1).replace(",", ""))
+    return total / 1e6
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("nsys_log")
     ap.add_argument("--roof-ms", type=float, default=0.0,
                     help="weight-bytes/bandwidth roofline, printed for reference")
+    ap.add_argument("--ticks", type=int, default=0,
+                    help="captured tick count: normalize totals to ms/tick")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -84,20 +103,26 @@ def main() -> int:
         agg[c]["ms"] += ns / 1e6
         raw.append({"name": name, "class": c, "instances": inst, "ms": round(ns / 1e6, 4)})
     total_ms = sum(a["ms"] for a in agg.values())
+    mem_ms = mem_op_ms(text)
     for c in CLASSES:
         agg[c]["ms"] = round(agg[c]["ms"], 3)
         agg[c]["share"] = round(agg[c]["ms"] / total_ms, 4)
     raw.sort(key=lambda r: -r["ms"])
-    result = {"total_kernel_ms": round(total_ms, 3), "roofline_ms": args.roof_ms,
-              "classes": agg, "top40": raw[:40]}
+    result = {"total_kernel_ms": round(total_ms, 3),
+              "memcpy_ms": round(mem_ms, 3),
+              "ticks": args.ticks,
+              "roofline_ms": args.roof_ms, "classes": agg, "top40": raw[:40]}
     if args.out:
         with open(args.out, "w") as f:
             json.dump(result, f, indent=2)
-    print(f"total kernel time {total_ms:.2f} ms"
-          + (f" (roofline {args.roof_ms:.2f} ms)" if args.roof_ms else ""))
+    per = f" over {args.ticks} ticks = {total_ms / args.ticks:.2f} ms/tick" if args.ticks else ""
+    print(f"total kernel time {total_ms:.2f} ms{per}"
+          + (f" (roofline {args.roof_ms:.2f} ms)" if args.roof_ms else "")
+          + (f"; memcpy {mem_ms:.2f} ms" if mem_ms else ""))
     for c in CLASSES:
         a = agg[c]
-        print(f"{c:>10}: {a['ms']:>9.2f} ms {a['share']*100:>6.2f}%  x{a['count']}")
+        tail = f" ({a['ms'] / args.ticks:.2f}/tick)" if args.ticks else ""
+        print(f"{c:>10}: {a['ms']:>9.2f} ms {a['share']*100:>6.2f}%  x{a['count']}{tail}")
     return 0
 
 
