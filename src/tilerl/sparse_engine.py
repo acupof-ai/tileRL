@@ -66,6 +66,24 @@ def apply_refresh_ticks(ticks: int | None = None) -> int:
     return SPARSE_REFRESH_TICKS
 
 
+def apply_window_pages(tokens: int | None = None) -> int:
+    """Set the local window on BOTH modules; returns the page count.
+
+    Here rather than in ``sparse_index`` because this module imported
+    ``WINDOW_PAGES`` by value at load, so it holds its own copy — and the write
+    to a lower layer may not come from that layer (``test_layering`` pins the
+    direction). ``build_engine`` calls this one function instead of patching two
+    modules from outside.
+    """
+    import tilerl.sparse_index as si
+
+    pages = si.apply_window_tokens(tokens)
+    if tokens is not None:
+        global WINDOW_PAGES
+        WINDOW_PAGES = pages
+    return pages
+
+
 def resolve_refresh_ticks(explicit: int | None = None) -> int | None:
     """An explicit value (the serve flag) wins; else
     TILERL_SPARSE_REFRESH_TICKS; else None = leave the module default."""

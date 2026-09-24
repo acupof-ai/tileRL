@@ -71,7 +71,9 @@ def apply_window_tokens(tokens: int | None = None) -> int:
     it. ``None`` (the default) leaves the module values alone, so an untouched
     process is byte-identical to the pre-flag build.
 
-    ``sparse_engine`` imported ``WINDOW_PAGES`` BY VALUE, so it is written too.
+    ``sparse_engine`` imported ``WINDOW_PAGES`` BY VALUE, so it keeps its own copy
+    and must be written too — but this module is BELOW it in the layering, so the
+    write belongs to the caller: see ``sparse_engine.apply_window_pages``.
     """
     global WINDOW_TOKENS, WINDOW_PAGES
     if tokens is None:
@@ -83,9 +85,6 @@ def apply_window_tokens(tokens: int | None = None) -> int:
         )
     WINDOW_TOKENS = int(tokens)
     WINDOW_PAGES = WINDOW_TOKENS // BLOCK_TOKENS
-    from . import sparse_engine
-
-    sparse_engine.WINDOW_PAGES = WINDOW_PAGES
     return WINDOW_PAGES
 
 

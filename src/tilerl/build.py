@@ -259,10 +259,14 @@ def build_engine(
     # the pool ledger (memory.sparse_pool_num_blocks), the tick's own width and
     # the captured graph key all read ONE value. None = leave the defaults, which
     # is what keeps an unflagged process byte-identical.
-    from .sparse_engine import apply_refresh_ticks, resolve_refresh_ticks
-    from .sparse_index import apply_window_tokens, resolve_window_tokens
+    from .sparse_engine import (
+        apply_refresh_ticks,
+        apply_window_pages,
+        resolve_refresh_ticks,
+    )
+    from .sparse_index import resolve_window_tokens
 
-    apply_window_tokens(resolve_window_tokens(sparse_window_tokens))
+    apply_window_pages(resolve_window_tokens(sparse_window_tokens))
     apply_refresh_ticks(resolve_refresh_ticks(sparse_refresh_ticks))
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
     from .sparse_engine import SparseTracker
