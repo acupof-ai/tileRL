@@ -33,34 +33,75 @@ import urllib.request
 
 
 def main() -> None:
-    host, port, prompt, maxtok = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+    argv = [a for a in sys.argv[1:] if a != "--ttft"]
+    want_ttft = "--ttft" in sys.argv
+    host, port, prompt, maxtok = argv[0], int(argv[1]), argv[2], int(argv[3])
     base = f"http://{host}:{port}"
 
     def health() -> dict:
         with urllib.request.urlopen(f"{base}/health", timeout=30) as r:
             return json.load(r)["stats"]
 
-    body = json.dumps({"model": "qwen38-27b", "temperature": 0, "max_tokens": maxtok,
-                       "messages": [{"role": "user", "content": prompt}]}).encode()
-    req = urllib.request.Request(f"{base}/v1/chat/completions", data=body,
+    body = {"model": "qwen38-27b", "temperature": 0, "max_tokens": maxtok,
+            "messages": [{"role": "user", "content": prompt}]}
+    if want_ttft:
+        # The server streams on `stream: true` (SSE). Only then is the first
+        # content chunk's timestamp observable on the client: on the non-stream
+        # route nothing arrives until the whole reply is finished, so TTFT is not
+        # measurable there at all.
+        body["stream"] = True
+    req = urllib.request.Request(f"{base}/v1/chat/completions",
+                                data=json.dumps(body).encode(),
                                 headers={"Content-Type": "application/json"})
 
     s0 = health()
     t0 = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=1800) as r:
-        # strict=False: the reply carries raw newlines inside the JSON string, which
-        # json.loads rejects by default -- and the failure looks like a server bug.
-        out = json.loads(r.read().decode(), strict=False)
-    wall = (time.perf_counter() - t0) * 1000
+    ttft = None
+    if want_ttft:
+        n_stream = 0
+        prompt_tokens = None
+        head = ""
+        with urllib.request.urlopen(req, timeout=1800) as r:
+            for raw in r:
+                line = raw.decode().strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    ch = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if ch.get("usage"):
+                    prompt_tokens = ch["usage"].get("prompt_tokens")
+                for c in ch.get("choices", []):
+                    piece = (c.get("delta") or {}).get("content")
+                    if piece:
+                        if ttft is None:
+                            ttft = (time.perf_counter() - t0) * 1000
+                        n_stream += 1
+                        if len(head) < 60:
+                            head += piece
+        wall = (time.perf_counter() - t0) * 1000
+        n = n_stream
+        ptoks = prompt_tokens
+    else:
+        with urllib.request.urlopen(req, timeout=1800) as r:
+            # strict=False: the reply carries raw newlines inside the JSON string, which
+            # json.loads rejects by default -- and the failure looks like a server bug.
+            out = json.loads(r.read().decode(), strict=False)
+        wall = (time.perf_counter() - t0) * 1000
+        n = out["usage"]["completion_tokens"]
+        ptoks = out["usage"]["prompt_tokens"]
     s1 = health()
 
     d = {k: s1[k] - s0[k] for k in
          ("decode_forwards", "prefill_forwards", "mixed_forwards", "spec_drafted",
           "spec_accepted", "tokens_generated")}
     fwd = max(d["decode_forwards"], 1)
-    n = out["usage"]["completion_tokens"]
 
-    print(f"prompt_tokens    {out['usage']['prompt_tokens']}")
+    print(f"prompt_tokens    {ptoks}")
     print(f"completion       {n}")
     print(f"decode_forwards  {d['decode_forwards']}")
     print(f"prefill_forwards {d['prefill_forwards']}")
@@ -70,6 +111,15 @@ def main() -> None:
     print(f"acceptance       {d['spec_accepted'] / max(d['spec_drafted'], 1):.3f}")
     print(f"wall_ms          {wall:.0f}   (prefill + decode + HTTP + tokenize)")
     print(f"end_to_end_tok_s {1000 * n / wall:.1f}")
+    if ttft is not None:
+        # TTFT is tokenize + queue + prefill + the FIRST decode tick, not prefill
+        # alone, so the figure below charges that tick to decode and is a lower
+        # bound on the decode rate. Say so rather than presenting it as exact.
+        dec = wall - ttft
+        print(f"ttft_ms          {ttft:.0f}   (tokenize+queue+prefill+first tick)")
+        print(f"decode_window_ms {dec:.0f}")
+        print(f"decode_only_tok_s {1000 * n / dec:.1f}   "
+              f"(lower bound: TTFT carries the first tick too)")
     # Everything outside a decode forward is lumped as overhead rather than split:
     # this instrument cannot see inside it, and naming a split it cannot measure is
     # how the three errors above happened.
