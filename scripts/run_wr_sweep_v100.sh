@@ -39,6 +39,8 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader
 # Negative control first: R=1 self-feed with a one-position-shifted anchor must
 # fail the committed-output identity. The worker exits 0 only when the red is
 # observed; a non-zero exit aborts before any arm burns card time.
+# Skipped on a START_AT resume (the negative control already passed).
+if [ -z "${START_AT:-}" ]; then
 echo "===== NEG CONTROL (shifted anchor must diverge) $(date +%T) ====="
 $PY -u scripts/probe_wr_sweep_worker.py \
   --window-tokens 128 --refresh 1 \
@@ -52,6 +54,9 @@ if [ "$NEGRC" != "0" ]; then
   exit 92
 fi
 echo "NEG CONTROL red as required"
+else
+echo "RESUME at $START_AT; skipping negative control"
+fi
 
 # 6-arm order, reprioritized 2026-09-24: W128 R1 anchor, W128 R8 free-only
 # speed control, then the PRIMARY proposal W1024 {R1 anchor, R32}, then the
