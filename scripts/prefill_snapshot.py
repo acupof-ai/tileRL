@@ -57,8 +57,7 @@ def config_fingerprint(e, model_key: str) -> dict:
         "scorer": str(e._sparse.tracker.scorer),
         "sparse_min_tokens": int(e._sparse_min_tokens),
         "window_pages": int(sparse_index.WINDOW_PAGES),
-        "draft_attn_window_tokens": (
-            None if draft is None else int(draft.attn_window_tokens)),
+        "draft_attn_window_tokens": (None if draft is None else int(draft.attn_window_tokens)),
         "model_key": str(model_key),
     }
 
@@ -83,16 +82,27 @@ def dump(e, tokens, out_dir: str, model_key: str = "") -> str:
         if blob is None:
             raise RuntimeError(f"page {p}: content key {key} has no shared blob")
         path = os.path.join(out_dir, f"page_{key}.pt")
-        torch.save({k: v.detach().cpu().clone() for k, v in blob.items()
-                    if torch.is_tensor(v)}, path)
-        pages.append({"page": p, "key": int(key),
-                      "fields": sorted(k for k, v in blob.items() if torch.is_tensor(v))})
+        torch.save(
+            {k: v.detach().cpu().clone() for k, v in blob.items() if torch.is_tensor(v)}, path
+        )
+        pages.append(
+            {
+                "page": p,
+                "key": int(key),
+                "fields": sorted(k for k, v in blob.items() if torch.is_tensor(v)),
+            }
+        )
     states, window = entry["state"]
-    torch.save({"states": states.detach().cpu().clone(),
-                "window": None if window is None else window.detach().cpu().clone(),
-                "hidden": (None if entry.get("hidden") is None
-                           else entry["hidden"].detach().cpu().clone())},
-               os.path.join(out_dir, "state.pt"))
+    torch.save(
+        {
+            "states": states.detach().cpu().clone(),
+            "window": None if window is None else window.detach().cpu().clone(),
+            "hidden": (
+                None if entry.get("hidden") is None else entry["hidden"].detach().cpu().clone()
+            ),
+        },
+        os.path.join(out_dir, "state.pt"),
+    )
     meta = {
         "n_tokens": len(entry["tokens"]),
         "tokens": [int(t) for t in entry["tokens"]],
@@ -126,19 +136,24 @@ def load(e, snap_dir: str, tokens, model_key: str = "") -> dict:
     keys = []
     for rec in meta["pages"]:
         key = rec["key"]
-        blob = torch.load(os.path.join(snap_dir, f"page_{key}.pt"),
-                          map_location="cpu", weights_only=True)
+        blob = torch.load(
+            os.path.join(snap_dir, f"page_{key}.pt"), map_location="cpu", weights_only=True
+        )
         if set(blob) != set(rec["fields"]):
-            raise ValueError(f"page {key}: blob fields {sorted(blob)} != manifest "
-                             f"{rec['fields']}")
+            raise ValueError(f"page {key}: blob fields {sorted(blob)} != manifest {rec['fields']}")
         nbytes = sum(t.numel() * t.element_size() for t in blob.values())
         cold.share_hold(key, blob, nbytes)  # one entry ref, exactly like a frozen copy
         keys.append(key)
-    sd = torch.load(os.path.join(snap_dir, "state.pt"),
-                    map_location="cpu", weights_only=True)
+    sd = torch.load(os.path.join(snap_dir, "state.pt"), map_location="cpu", weights_only=True)
     state = (sd["states"], sd["window"])
-    entry = {"eid": sp.prefix._next_id, "tokens": tuple(toks), "keys": keys,
-             "state": state, "hash": meta["entry_hash"], "hidden": sd["hidden"]}
+    entry = {
+        "eid": sp.prefix._next_id,
+        "tokens": tuple(toks),
+        "keys": keys,
+        "state": state,
+        "hash": meta["entry_hash"],
+        "hidden": sd["hidden"],
+    }
     sp.prefix._next_id += 1
     sp.prefix._entries.setdefault(entry["hash"], []).append(entry)
     sp.prefix._by_id[entry["eid"]] = entry
@@ -157,10 +172,19 @@ def _build():
     from tilerl.testing import RefBackend
 
     return build_engine(
-        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
-        num_blocks=4096, num_slots=4, max_batch=1, max_total_tokens=65536,
-        max_num_batched_tokens=2048, sparse_k=128, scorer="bounds",
-        kv_cold_bytes=1 << 30, decode_graph=True)
+        cfg=tiny(),
+        model=build_random(tiny(), seed=11),
+        backend=RefBackend(),
+        num_blocks=4096,
+        num_slots=4,
+        max_batch=1,
+        max_total_tokens=65536,
+        max_num_batched_tokens=2048,
+        sparse_k=128,
+        scorer="bounds",
+        kv_cold_bytes=1 << 30,
+        decode_graph=True,
+    )
 
 
 def _drive(e, prompt, n_new, cap_logits: dict, matched: dict | None = None):
@@ -224,7 +248,8 @@ def _selfcheck() -> None:
         hit.shutdown()
         hit_first = next(iter(hit_lg.values()))
         assert hit_matched["v"] == pages * BLOCK_TOKENS, (
-            f"restored snapshot adopted {hit_matched['v']}, expected full prefix")
+            f"restored snapshot adopted {hit_matched['v']}, expected full prefix"
+        )
         assert hit_out == ref_out, "snapshot temp0 outputs differ from full prefill"
         assert torch.equal(hit_first, ref_first), "first-tick logits differ from full prefill"
 
@@ -245,7 +270,8 @@ def _selfcheck() -> None:
         tam_out = _drive(tam, prompt, n_new, tam_lg)
         tam.shutdown()
         assert (next(iter(tam_lg.values())) != ref_first).any() and tam_out != ref_out, (
-            "tampered page was NOT read (vacuous negative): logits and outputs unchanged")
+            "tampered page was NOT read (vacuous negative): logits and outputs unchanged"
+        )
 
         # negative 2: fingerprint mismatch -> load refuses, no silent recompute
         wcfg = os.path.join(root, "wrongcfg")
@@ -265,8 +291,10 @@ def _selfcheck() -> None:
         finally:
             w.shutdown()
         assert refused, "a changed sparse_k config was accepted (fingerprint not enforced)"
-        print("PREFILL-SNAPSHOT GATE OK: outputs+first-logits identical; "
-              "tamper and fingerprint negatives both red")
+        print(
+            "PREFILL-SNAPSHOT GATE OK: outputs+first-logits identical; "
+            "tamper and fingerprint negatives both red"
+        )
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
