@@ -603,6 +603,11 @@ class _Req:
     #: exact snapshot at the deepest aligned prefill chunk end inside the ragged tail
     #: window; inserted at completion. See `_finish_prefills`.
     pending_prefix: tuple[int, Any] | None = None
+    #: Full-page-aligned prefix HIT: the adopted entry's GDN snapshot is the state
+    #: AFTER the last page, and the re-forward below consumes that page again. Held
+    #: here and written back in `_finish_prefills`, so the logits come from the
+    #: re-forward and the state does not. errors/2026-09-24-prefix-hit-feeds-the-last-page-twice.md
+    resend_restore: Any = None
     #: A request failed mid-flight (e.g. cold spill): release its frames without
     #: trying to publish a prefix snapshot whose cold blobs may already be gone.
     failed: bool = False
@@ -1525,6 +1530,15 @@ class Engine:
                 self._states.states[slot].copy_(snap_states)
                 if snap_windows is not None:
                     self._states.window_restore(slot, snap_windows)
+                if req.prefill_from != matched:
+                    # The re-forward above consumes the last page a second time: the
+                    # snapshot is already the state AT matched, so the row would start
+                    # decoding from 16 tokens it never saw. Keep the exact state and
+                    # write it back after the re-forward has produced the logits.
+                    req.resend_restore = (
+                        self._states.states[slot].clone(),
+                        self._states.window_snapshot(slot) if snap_windows is not None else None,
+                    )
                 if self._draft is not None:
                     self._sparse.warm_draft(req, entry, matched)
                 self._prefix_hits += 1
@@ -2305,6 +2319,16 @@ class Engine:
                     )
         if not done:
             return
+        for pf, _, _ in done:
+            if pf.resend_restore is not None:
+                # Undo the re-forward's double-feed BEFORE anything reads the state
+                # or publishes from it: the row decodes from the exact adopted
+                # snapshot, which is the state at `matched`.
+                states, window = pf.resend_restore
+                self._states.states[pf.state_slot].copy_(states)
+                if window is not None:
+                    self._states.window_restore(pf.state_slot, window)
+                pf.resend_restore = None
         self._sample_commit(done)
         for pf, _, _ in done:
             # The state slot still covers exactly the prompt, so the snapshot is exact.

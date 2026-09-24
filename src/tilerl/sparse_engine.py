@@ -779,7 +779,14 @@ class SparseForward:
         chosen = self.cand_idx.gather(1, safe_pos)  # logical pages [B,k]
         chosen = torch.where(valid, chosen, torch.zeros_like(chosen))
         if self.reuse:
-            phys = self.s_l2p.gather(1, chosen)  # [B,k], -1 masked next
+            # `positions` is already the CANDIDATE POSITION of each pick, and
+            # `s_l2p` is indexed by candidate position (fill() writes
+            # `s_l2p[bi, :nc] = l2p[cand]`), so gather with it directly. Gathering
+            # with `chosen` reads the slot of `cand[chosen]`: identical while
+            # `cand == range(n)`, off by one per hole otherwise, and a wrong page
+            # is silently attended rather than raising.
+            # errors/2026-09-24-sparse-device-select-reads-the-wrong-page.md
+            phys = self.s_l2p.gather(1, safe_pos)  # [B,k], -1 masked next
         else:
             phys = torch.stack(
                 [

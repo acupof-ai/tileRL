@@ -3434,3 +3434,117 @@ def test_sparse_capture_guard_is_wired_into_engine():
     finally:
         donor.shutdown()
 
+
+
+def test_full_prefix_hit_does_not_re_feed_the_snapshotted_tokens():
+    """A full-page prefix HIT restores a GDN snapshot taken AFTER the last page,
+    then re-forwards that page to produce first-token logits. The snapshot is
+    exact, so re-forwarding feeds those 16 tokens a second time and moves the
+    state the follower decodes from.
+
+    Measured before the fix: the restored state is bit-identical to a prefix-MISS
+    engine's (`(a) == oracle exactly: True` in the entry), and the re-forward then
+    moves it by 26.875 against max|state| 28.125 — a 0.956 relative error, against
+    the chunk-rounding bound of 1.2e-2 the same path is otherwise held to. The
+    emitted FIRST token was unchanged, which is why
+    test_sparse_nodraft_full_prefix_resend_re_forwards_the_last_page stayed green.
+    """
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
+    params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=0)
+    assert len(prompt) % BLOCK_TOKENS == 0
+
+    def first_decode_state(e, rid):
+        for _ in range(400):
+            e.step()
+            r = next((x for x in e._running if x.req_id == rid), None)
+            if r is not None and r.decoding:
+                return e._states.states[r.state_slot].clone(), r
+        raise AssertionError("row never reached decode")
+
+    # Prefix-MISS oracle: a fresh engine has nothing published to adopt.
+    miss = _sparse_engine(2, draft=False)
+    oracle, r_miss = first_decode_state(miss, miss.submit(prompt, params))
+    assert r_miss.sparse_matched == 0, "the oracle arm must be a miss"
+    miss.shutdown()
+
+    sp = _sparse_engine(2, draft=False)
+    r1 = sp.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    for _ in range(3000):
+        sp.step()
+        done = sp.poll()
+        if r1 in done and len(done[r1]) >= 200:
+            break
+    assert sp._sparse.prefix.lookup(prompt) is not None, "nothing got published"
+
+    hit_state, r_hit = first_decode_state(sp, sp.submit(prompt, params))
+    sp.shutdown()
+
+    assert r_hit.sparse_matched == len(prompt), (
+        f"the arm did not take the full-hit branch: matched={r_hit.sparse_matched}")
+    delta = (hit_state - oracle).abs().max().item()
+    scale = oracle.abs().max().item()
+    assert delta / scale <= 1.2e-2, (
+        f"full-prefix hit moved the GDN state {delta:.6f} against max|state| "
+        f"{scale:.6f} ({delta / scale:.4f} relative); the restored snapshot is "
+        "exact, so the re-forwarded page was consumed twice")
+
+
+def test_device_select_maps_chosen_pages_through_their_candidate_position():
+    """`s_l2p` is indexed by CANDIDATE POSITION — fill() writes
+    `s_l2p[bi, :nc] = l2p[cand]` — but `_select_device` gathered it with the
+    logical page number. The two agree only while `cand == range(n)`, which holds
+    while every earlier page has bounds. It does not hold once one does not:
+    `cand` is built by a filtered range, so a hole shifts every later page by one
+    and a WRONG physical page is attended silently (the hit is not -1, so the
+    resident mask does not catch it either).
+
+    Measured on this gate before the fix: with bounds cleared on logical page 3,
+    the code returned phys 167 for logical page 4 where the correct block is 168,
+    and 166 for 5 where it is 167.
+    """
+    cfg = tiny()
+    e = _device_engine(8, max_new=6)
+    prompt = np.arange(7, 7 + 12 * BLOCK_TOKENS, dtype=np.int64)
+    rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=6, seed=0))
+    try:
+        for _ in range(600):
+            e.step()
+            r = next((x for x in e._running if x.req_id == rid), None)
+            if r is not None and r.decoding and e._sparse_graphs:
+                break
+        assert e._sparse_graphs, "no sparse graph captured, the seam is unreachable"
+
+        tr = e._sparse.tracker
+        # Punch one hole at the FIRST logical page. Position matters: the
+        # divergence is invisible unless a page the selection actually PICKS sits
+        # past the hole, and with k=2 the picks here are the first two candidate
+        # positions. A hole at 2 or later was measured to produce identical
+        # readings in both index spaces, i.e. a vacuous arm.
+        v = tr.bounds_valid_host.get(rid)
+        assert v is not None and bool(v[0]), "the arm needs a valid page 0 to clear"
+        tr.bounds_valid[rid][0] = False
+        tr.bounds_valid_host[rid][0] = 0
+
+        g = next(iter(e._sparse_graphs.values())).sf
+        rows = e._sparse_decode_rows([r], [1])
+        cand = list(rows[0]["cand"])
+        holes = [i for i in range(len(cand)) if cand[i] != i]
+        assert holes, f"no hole formed, the gate is vacuous: cand={cand[:20]}"
+
+        g.fill(rows)
+        g._select_device(0, torch.randn(1, 1, cfg.num_attention_heads, cfg.head_dim))
+
+        l2p = tr.l2p_t[rid]
+        got = g._dphys[0][0].tolist()
+        chosen = g._dchosen[0][0].tolist()
+        nsel = int(g._dnsel[0])
+        # phys[j] is the block of chosen[j] for the valid prefix and the pad 0 past
+        # it. Derive from the CHOSEN pages, not from the first candidates: those are
+        # different lists and comparing against the wrong one reports a mismatch
+        # that is the assertion's own bug.
+        want = [int(l2p[c]) if j < nsel else 0 for j, c in enumerate(chosen)]
+        assert got == want, (
+            f"device select mapped pages through the wrong index space: "
+            f"phys {got} for chosen {chosen}, correct {want}")
+    finally:
+        e.shutdown()
