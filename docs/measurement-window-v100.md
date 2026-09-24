@@ -103,10 +103,18 @@ decode ticks are scored.
 | d1 vs d3 | **not in the sweep probe** | `probe_draft_window_sweep.py` hardcodes `spec_depth=1` and has no `--depth`; the launcher hardcodes `--depth 1`. A depth arm is a **separate launcher env change** (or `scripts/ab_draft_depth.py`, which exists for the depth question specifically) |
 | true-Q on/off | boot env `TILERL_DRAFT_TRUE_Q_WIDTH` | import-time, so two boots |
 | cap reclaim over time | `probe_headroom_coldtail.py reclaim-sample` | passive sampler; drives no requests |
+| W×R over many prompts, one arm per process | `probe_wr_sweep_worker.py` + `wr_sweep_report.py` | the cross-process half of the sweep: each arm is a fresh engine, so a W that mutates import-time state is not carried between arms. `probe_wr_sweep_worker.py` drives one arm and writes its rows; `wr_sweep_report.py` reads a directory of them into the comparison table. Run both by hand on the box (see the worked invocation in the sparse-WR entry) |
 
 The W×acceptance sweep is paired: the same prompts run in every W arm within a
 length, so a between-W difference cannot be a between-passage difference. Keep
 that property — re-drawing prompts per arm voids the comparison.
+
+Two harnesses implement it and the choice is about process boundary, not
+features: `probe_draft_window_sweep.py` sweeps W **in-process** (one engine, W
+mutated live) and is the cheaper one when nothing about W is import-time;
+`probe_wr_sweep_worker.py` + `wr_sweep_report.py` give each arm **its own
+process**, which is what a W that has to be set before the engine builds
+requires. Both keep the pairing rule above.
 
 ## 4. Reading a tick
 

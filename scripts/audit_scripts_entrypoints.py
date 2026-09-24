@@ -79,6 +79,12 @@ MANUAL_KEEP: dict[str, str] = {
                                        "counts and SSE usage is not repeated on "
                                        "message_start/message_delta. Manual, no CPU "
                                        "twin, --self-check covers the evaluator.",
+    "probe_prefill_snapshot_run": "PROBE-ONLY #298892: ops runs by hand on the "
+                                  "V100 to time prefill-snapshot load against a "
+                                  "full prefill (three modes across separate "
+                                  "processes; the process boundary is the point). "
+                                  "Card only, no CPU twin, needs a real snapshot "
+                                  "root. Sibling of prefill_snapshot.py.",
     "probe_sse_cold_first_event": "ui runs by hand in a V100 serve window: times "
                                   "the cold-prefill silence before the first SSE "
                                   "frame on /v1/messages|responses and reports any "
