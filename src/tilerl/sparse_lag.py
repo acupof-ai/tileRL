@@ -76,6 +76,11 @@ class LagController:
         self._held_event = None
         self.carry_cycles = 0
         self.fallback_cycles = 0
+        # B>1 carries are refused: the captured width-2 sparse-graph verify
+        # path has an unresolved CUDA illegal-access. Flip only from the CPU
+        # negative-control gate to prove this guard is what blocks arming.
+        self.enforce_b1 = True
+        self.b1_guard_fallbacks = 0
 
     # ------------------------------------------------------------ cadence
     def is_carry(self) -> bool:
@@ -110,6 +115,12 @@ class LagController:
         q_prev = getattr(sf, "_q_prev", None)
         if not q_prev:
             return  # no captured q yet: first carry falls back
+        if self.enforce_b1 and len(srows) != 1:
+            # Common B>1 case: never snapshot, top up, take, or start a thread.
+            # The sentinel makes is_ready() true so the runtime still reaches
+            # commit(), which counts the guard refusal and runs eager refresh.
+            self._result = {"b1_guard": True}
+            return
         self._topup_reserve()
         snap = (sf.cand_idx.clone(), sf.n_cand.clone(), sf.win.clone(),
                 ([b.clone() for b in sf.s_bounds] if sf.s_bounds else None),
@@ -237,7 +248,8 @@ class LagController:
             self._rollback_promotes(pool, promoted)
             return {"fallback": f"promote failed: {ex}"}
         return {"picks": picks, "groups": groups,
-                "page_phys": page_phys, "blobs": blobs}
+                "page_phys": page_phys, "blobs": blobs,
+                "promoted": promoted}
 
     def _h2d(self, pool, blk, blob) -> None:
         on_side = self.stream is not None
@@ -273,13 +285,29 @@ class LagController:
             torch.cuda.current_stream(sf.device).wait_event(self._end_event)
         res = self._result
         rids_now = tuple(rw["req_id"] for rw in srows)
+        # B>1 is unverified for the captured width-2 sparse-graph verify path
+        # (a production CUDA illegal-access is under investigation there). v2
+        # rides that exact path, so never ARM a graph carry with >1 active row:
+        # fall through to the normal eager refresh and count it. This makes any
+        # v2 GO statement B=1-scoped until B>1 is settled.
         bad = (self._error is not None or not isinstance(res, dict)
                or "groups" not in res
                or self._job_rids != rids_now)
         if bad:
-            # Stale request set or failed job: eager fallback. Any promoted
-            # frames in a fallback dict were already rolled back in the job.
+            if isinstance(res, dict) and res.get("b1_guard"):
+                # prepare() refused a B>1 carry before taking anything; no
+                # frames can be held, but count it distinctly.
+                self.b1_guard_fallbacks += 1
+            # Stale request set, failed job, or B>1 guard: eager fallback. Any
+            # promoted frames in a fallback dict were rolled back in the job.
             self.fallback_cycles += 1
+            # A completed job refused for a changed request set still owns its
+            # taken blobs and reserve frames; re-home them before eager refresh.
+            promoted = res.get("promoted") if isinstance(res, dict) else None
+            if promoted:
+                if self.stream is not None:
+                    self.stream.synchronize()
+                self._rollback_promotes(self._kv(), promoted)
             self._reset()
             return False
         rt = self.rt

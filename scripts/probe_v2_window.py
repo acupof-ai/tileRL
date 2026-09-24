@@ -173,6 +173,25 @@ def run_worker(tag, lag, args):
             return 14
         e, _be, config = build_arm_engine(args.model, args.source, args.draft,
                                           "graph_w2048")
+    # 94(a) hard assertion: this window is B=1-scoped while the B>1 sparse-graph
+    # verify CUDA illegal-access is open. Every graph decode tick must enter
+    # with exactly one active row; a second concurrent request invalidates the
+    # verdict and is an instrument error (rc14), not a measured no-go.
+    _rt0 = e._sparse
+    _raw_rdg = _rt0.run_decode_graph
+    _b1_state = {"violations": 0, "max_rows": 0, "ticks": 0}
+
+    def _b1_checked_rdg(reqs, chains=None):
+        n = len(reqs)
+        _b1_state["ticks"] += 1
+        _b1_state["max_rows"] = max(_b1_state["max_rows"], n)
+        if n != 1:
+            _b1_state["violations"] += 1
+            raise RuntimeError(
+                f"B>1 graph decode tick: {n} active rows (B=1-only window)")
+        return _raw_rdg(reqs, chains)
+
+    _rt0.run_decode_graph = _b1_checked_rdg
     rows = []
     pcyc = pcarry = pplain = []
     struct_samples = []
@@ -305,6 +324,9 @@ def run_worker(tag, lag, args):
         "cycle_reconcile_rel_gap": recon,
         "residency_structural": structural_report(struct_samples, pin_ceiling),
         "structural_samples": struct_samples,
+        "b1_decode_ticks": _b1_state["ticks"],
+        "b1_max_concurrent_rows": _b1_state["max_rows"],
+        "b1_violations": _b1_state["violations"],
     }
     with open(f"{args.out_prefix}_{tag}.json", "w") as f:
         json.dump(rep, f, indent=2)
@@ -597,6 +619,12 @@ def main():
             "v2 graph-carry gate: ZERO carries observed with fwd_path==graph "
             f"(graph_carry_cycles={V.get('graph_carry_cycles')}); v2 is "
             "silently running every refresh as eager (capture/q-clone order)")
+    for _arm in (A, V, B):
+        if _arm.get("b1_violations"):
+            problems14.append(
+                f"{_arm.get('tag')}: {_arm['b1_violations']} B>1 graph decode "
+                f"ticks (max {_arm.get('b1_max_concurrent_rows')} rows); this "
+                "window is B=1-only (94(a))")
 
     # Timing/result gates (measured; failures are rc1, not rc14).
     ratio = round(V["aggregate_eff_tok_s"] / ctl_eff, 4) if ctl_eff else None

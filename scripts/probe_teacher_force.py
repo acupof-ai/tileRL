@@ -63,6 +63,8 @@ class TeacherForceRecorder:
         # list of (record, chain_next_token_or_None). _verify marks acceptance.
         self._pending = {}
         self._orig_verify = None
+        self._ctx = None
+        self._orig_ctx_verify = None
         self._orig_sample_batch = None
         # map an id(_Req)->request index for the rows _sample_batch sees
         self._rid_to_idx = {}
@@ -121,10 +123,9 @@ class TeacherForceRecorder:
         def _patched_verify(rows, chains, logits, hidden):
             rec_self = self
             orig = rec_self._orig_verify
-            # mark all pending rows rejected first, then accept per n_ok below
-            for rr in rec_self._pending.values():
-                for row in rr:
-                    row["accepted"] = False
+            # orig() reassigns rec_self._pending with THIS verify's sampled
+            # rows; do not pre-mark the previous pending — it may be a plain
+            # tick's committed row that would then stay accepted=False.
             orig(rows, chains, logits, hidden)
             # After the real verify, derive n_ok per row from the anchor-forced
             # output the same way production does, using recorded gen_idx and
@@ -140,12 +141,27 @@ class TeacherForceRecorder:
                 n_ok = 0
                 while n_ok < len(got) - 1 and got[n_ok] == chain[n_ok + 1]:
                     n_ok += 1
-                for j in range(n_ok + 1):
-                    if j < len(plist):
-                        plist[j]["accepted"] = True
+                for j, row in enumerate(plist):
+                    # The draft token this slot was compared against, so a gate
+                    # can independently verify accept/reject correctness.
+                    if j + 1 < len(chain):
+                        row["chain_next"] = int(chain[j + 1])
+                        row["verify_slot"] = j
+                    row["accepted"] = j <= n_ok
             rec_self._pending = {}
 
         e._verify = _patched_verify
+        self._patched_verify = _patched_verify
+
+        # SparseCtx captured self._verify as a BOUND METHOD at engine build
+        # (engine.py SparseCtx(verify=self._verify)); graph verify ticks call
+        # ctx.verify, which still points at the unpatched method. Patch the ctx
+        # slot too, or graph-path rejected draft slots stay accepted=True.
+        ctx = getattr(getattr(e, "_sparse", None), "ctx", None)
+        if ctx is not None and hasattr(ctx, "verify"):
+            self._ctx = ctx
+            self._orig_ctx_verify = ctx.verify
+            object.__setattr__(ctx, "verify", _patched_verify)
         return self
 
     def bind_request(self, idx: int, req) -> None:
@@ -186,6 +202,10 @@ class TeacherForceRecorder:
         if self._orig_verify is not None:
             self.e._verify = self._orig_verify
             self._orig_verify = None
+        if self._ctx is not None and self._orig_ctx_verify is not None:
+            object.__setattr__(self._ctx, "verify", self._orig_ctx_verify)
+            self._orig_ctx_verify = None
+            self._ctx = None
         self._pending = {}
 
 
