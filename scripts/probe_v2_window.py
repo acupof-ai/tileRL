@@ -446,6 +446,7 @@ def main():
     verdict["v2"] = {k: V[k] for k in (
         "aggregate_eff_tok_s", "steady_cycles", "eager_carry_cycles",
         "carry_fallback_frac", "lag_controller_carry", "lag_controller_fallback",
+        "fallback_counter_consistent", "residency_structural",
         "cycle_ms_p50", "cycle_ms_p90", "carry_ms_p50", "carry_ms_p90",
         "cycle_reconcile_rel_gap")}
     verdict["gates"] = gates1
