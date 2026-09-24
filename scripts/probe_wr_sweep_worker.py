@@ -166,36 +166,46 @@ def neg_anchor_run(e, prompts, args, decline_flag) -> int:
 
 
 def floor_kl_check(e, ids, n_tok: int, decline_flag) -> float:
-    """R=1 floor: two decodes over the IDENTICAL prefix — one record-only free
-    run, one teacher-forced with the free output — must agree as distributions,
-    symmetric per-position KL <= 1e-4 (perf1's cutover floor line). Returns the
-    max symmetric KL seen."""
+    """R=1 floor: the SAME forced trajectory run twice must produce the same
+    per-position logits (perf1's cutover noise floor, symmetric KL <= 1e-4).
+
+    A record-only free run cannot be the reference: under verification its
+    draft-acceptance (n_ok, GDN state adoption) follows the real draws, while a
+    teacher-forced run follows the anchor tokens, so even with identical final
+    tokens their committed-position logits are not aligned 1:1. Instead: one
+    short free run makes the anchor, then TWO teacher-forced runs over that
+    identical anchor; only those two are compared. Returns the max symmetric
+    KL seen."""
     from tilerl.engine import SamplingParams
 
     e._sparse.ticks_since_refresh = 0
-    rec0 = TeacherForceRecorder(e, anchors=None, record_full_logits=True).install()
     rid0 = e.submit(list(ids), SamplingParams(
         temperature=0.0, max_new_tokens=n_tok, seed=0))
     base, _ = run_one_prompt(e, rid0, decline_flag)
-    free_kept = rec0.accepted_positions(0)
-    rec0.uninstall()
 
-    e._sparse.ticks_since_refresh = 0
-    rec1 = TeacherForceRecorder(e, anchors={0: base}, record_full_logits=True).install()
-    rid1 = e.submit(list(ids), SamplingParams(
-        temperature=0.0, max_new_tokens=n_tok, seed=0))
-    out, _ = run_one_prompt(e, rid1, decline_flag)
-    tf_kept = rec1.accepted_positions(0)
-    rec1.uninstall()
-    if out != base:
-        raise SystemExit("floor KL: TF output diverged from its free anchor")
+    kept_runs = []
+    for _ in range(2):
+        e._sparse.ticks_since_refresh = 0
+        rec = TeacherForceRecorder(e, anchors={0: base}, record_full_logits=True).install()
+        rid = e.submit(list(ids), SamplingParams(
+            temperature=0.0, max_new_tokens=n_tok, seed=0))
+        out, _ = run_one_prompt(e, rid, decline_flag)
+        kept = rec.accepted_positions(0)
+        rec.uninstall()
+        if out != base:
+            raise SystemExit("floor KL: TF output diverged from its anchor")
+        kept_runs.append(kept)
+
     from probe_teacher_force import kl_from_logits
+    k0, k1 = kept_runs
+    if len(k0) != len(k1):
+        raise SystemExit(f"floor KL: run length {len(k0)} != {len(k1)}")
     worst = 0.0
-    for a, b in zip(free_kept, tf_kept):
-        ka = kl_from_logits(a["logits"], b["logits"])
-        kb = kl_from_logits(b["logits"], a["logits"])
-        worst = max(worst, ka, kb)
-    print(f"FLOOR_KL n={len(tf_kept)} max_symmetric_kl={worst:.2e}", flush=True)
+    for a, b in zip(k0, k1):
+        worst = max(worst,
+                    kl_from_logits(a["logits"], b["logits"]),
+                    kl_from_logits(b["logits"], a["logits"]))
+    print(f"FLOOR_KL n={len(k1)} max_symmetric_kl={worst:.2e}", flush=True)
     return worst
 
 
