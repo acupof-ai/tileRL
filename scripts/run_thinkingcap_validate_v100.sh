@@ -25,7 +25,9 @@ PY=$HOME/venv70/bin/python
 PROMPTS=${PROMPTS:-$HOME/serve805_prompts.jsonl}
 URL=http://127.0.0.1:8000
 PORT=8000
-PROD_LAUNCHER=$HOME/run_serve_82e3_min0.sh
+# ~/run_serve_prod.sh is a symlink 94 repoints at the current production
+# launcher (plain cp follows it, so the copy is always latest-main config).
+PROD_LAUNCHER=$HOME/run_serve_prod.sh
 TC_SRC=$HOME/models/ThinkingCap-Qwen3.8-27B-NVFP4
 TC_DRAFT=$TC_SRC/model-base-aux.safetensors
 TC_LAUNCHER=$OUT/run_serve_thinkingcap_min0.sh
@@ -79,7 +81,7 @@ kill_existing() {
     sleep 3
     [ -n "$la" ] && kill "$la" 2>/dev/null
   fi
-  pkill -f "run_serve_82e3_min0|run_serve_thinkingcap_min0" 2>/dev/null
+  pkill -f "run_serve_prod.sh|run_serve_thinkingcap_min0" 2>/dev/null
   for _ in $(seq 1 40); do
     M=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
     [ "${M:-0}" -lt 1000 ] && break
