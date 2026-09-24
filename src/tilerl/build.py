@@ -227,6 +227,15 @@ def build_engine(
     #: Hybrid sparse-prefill chunk cap in tokens; 0 uses the 192 default (~1 s on
     #: the V100 sparse prefill rate). Ignored when sparse_min_tokens is 0.
     sparse_prefill_tokens: int = 0,
+    #: Sparse local window in tokens (always attended, excluded from indexer
+    #: scoring). None = TILERL_SPARSE_WINDOW_TOKENS env, else the module default
+    #: (128 = 8 pages). Applied process-wide at this boundary; changing it moves
+    #: the pool ledger, the tick width and the captured graph key together.
+    sparse_window_tokens: int | None = None,
+    #: Decode ticks between eager full-candidate refreshes; 0/None = the
+    #: TILERL_SPARSE_REFRESH_TICKS env, else 8. Larger trades <=R-tick selection
+    #: staleness for more captured ticks.
+    sparse_refresh_ticks: int | None = None,
     spec_depth: int | None = None,
     decode: Any = None,
     #: Cap on live (running + waiting) requests submit will accept. build_engine
@@ -246,6 +255,15 @@ def build_engine(
     ``num_blocks`` 0 fits the KV pool to free memory, capped at ``max_blocks``."""
     if backend.device.type == "cuda":
         card_guard()
+    # Sparse window + refresh interval are process-wide geometry, applied here so
+    # the pool ledger (memory.sparse_pool_num_blocks), the tick's own width and
+    # the captured graph key all read ONE value. None = leave the defaults, which
+    # is what keeps an unflagged process byte-identical.
+    from .sparse_engine import apply_refresh_ticks, resolve_refresh_ticks
+    from .sparse_index import apply_window_tokens, resolve_window_tokens
+
+    apply_window_tokens(resolve_window_tokens(sparse_window_tokens))
+    apply_refresh_ticks(resolve_refresh_ticks(sparse_refresh_ticks))
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
     from .sparse_engine import SparseTracker
 
@@ -573,6 +591,8 @@ def build_serving_engine(
     decode_graph=None,
     sparse_min_tokens=0,
     sparse_prefill_tokens=0,
+    sparse_window_tokens=None,
+    sparse_refresh_ticks=None,
     device_reserve_mib=0,
     device_headroom_mib=0,
 ):
@@ -627,6 +647,8 @@ def build_serving_engine(
     kw["decode_graph"] = decode_graph
     kw["sparse_min_tokens"] = sparse_min_tokens
     kw["sparse_prefill_tokens"] = sparse_prefill_tokens
+    kw["sparse_window_tokens"] = sparse_window_tokens
+    kw["sparse_refresh_ticks"] = sparse_refresh_ticks
     if device_reserve_mib:
         kw["device_reserve_bytes"] = int(device_reserve_mib) * 1024 * 1024
     if device_headroom_mib:

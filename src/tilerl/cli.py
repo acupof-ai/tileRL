@@ -163,6 +163,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            decode_graph=getattr(args, "decode_graph", None),
                            sparse_min_tokens=getattr(args, "sparse_min_tokens", 0),
                            sparse_prefill_tokens=getattr(args, "sparse_prefill_tokens", 0),
+                           sparse_window_tokens=getattr(args, "sparse_window_tokens", None),
+                           sparse_refresh_ticks=getattr(args, "sparse_refresh_ticks", None),
                            device_reserve_mib=getattr(args, "device_reserve_mib", 0),
                            device_headroom_mib=getattr(args, "device_headroom_mib", 0))
     except Exception as build_exc:
@@ -553,6 +555,19 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="hybrid (--sparse-min-tokens): cap one sparse prefill tick "
                               "to N tokens so it stays ~1 s and dense waits are bounded "
                               "(default 192 ~= 1 s on the V100 sparse prefill rate)")
+    p_serve.add_argument("--sparse-window-tokens", type=int, default=None, metavar="N",
+                         help="sparse local window in tokens: always attended and "
+                              "excluded from indexer scoring. Omitted: "
+                              "TILERL_SPARSE_WINDOW_TOKENS env, else 128 (8 pages). "
+                              "Must be a whole number of 16-token blocks. Applied "
+                              "process-wide at build, so it moves the page pool, the "
+                              "tick width and the captured graph key together")
+    p_serve.add_argument("--sparse-refresh-ticks", type=int, default=None, metavar="R",
+                         help="decode ticks between eager full-candidate refreshes. "
+                              "Omitted: TILERL_SPARSE_REFRESH_TICKS env, else 8. R=1 "
+                              "refreshes every tick (token-equal to eager sparse); "
+                              "larger R trades up to R ticks of selection staleness "
+                              "for more captured ticks")
     p_serve.add_argument("--scorer", choices=["index", "bounds"], default="bounds",
                          help="sparse-KV page scorer: training-free Quest page bounds "
                               "(default) or the learned V4.1 indexer keys")

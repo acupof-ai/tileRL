@@ -55,9 +55,56 @@ INDEX_HEAD_DIM = 128
 #: Number of index SOURCE layers over the 16 full-attention layers: one source
 #: per group of four, selection reused by the group's other three.
 INDEX_SOURCE_LAYERS = 4
-#: Local window always attended: 128 tokens = 8 pages.
+#: Local window always attended: 128 tokens = 8 pages. Serve/build_engine may
+#: override this per process (``apply_window_tokens``); the module value is the
+#: default every consumer reads.
 WINDOW_TOKENS = 128
 WINDOW_PAGES = WINDOW_TOKENS // BLOCK_TOKENS
+
+
+def apply_window_tokens(tokens: int | None = None) -> int:
+    """Override the local window for this process; returns the page count.
+
+    One apply point, called by ``build_engine`` before it sizes any pool, so the
+    derived consumers — the pool ledger in ``memory``, the sparse tick geometry
+    and the captured graph key — all read one value instead of each recomputing
+    it. ``None`` (the default) leaves the module values alone, so an untouched
+    process is byte-identical to the pre-flag build.
+
+    ``sparse_engine`` imported ``WINDOW_PAGES`` BY VALUE, so it is written too.
+    """
+    global WINDOW_TOKENS, WINDOW_PAGES
+    if tokens is None:
+        return WINDOW_PAGES
+    if tokens % BLOCK_TOKENS:
+        raise ValueError(
+            f"sparse window {tokens} tokens is not a whole number of "
+            f"{BLOCK_TOKENS}-token blocks"
+        )
+    WINDOW_TOKENS = int(tokens)
+    WINDOW_PAGES = WINDOW_TOKENS // BLOCK_TOKENS
+    from . import sparse_engine
+
+    sparse_engine.WINDOW_PAGES = WINDOW_PAGES
+    return WINDOW_PAGES
+
+
+def resolve_window_tokens(explicit: int | None = None) -> int | None:
+    """Resolve the sparse local window once, at the build boundary.
+
+    An explicit caller value (the serve flag) wins; otherwise the
+    TILERL_SPARSE_WINDOW_TOKENS env; otherwise None, meaning "leave the module
+    default". Returning None rather than the default is deliberate: an untouched
+    process then never runs the override at all, so the default path cannot
+    drift from the pre-flag build.
+    """
+    import os
+
+    if explicit is not None:
+        return int(explicit)
+    raw = os.environ.get("TILERL_SPARSE_WINDOW_TOKENS")
+    return None if raw in (None, "") else int(raw)
+
 #: Default selected hot pages per row for serve/build_engine. 0 = sparse OFF
 #: (dense engine); sparse is opt-in via --sparse-k N. Reverted from 128 on
 #: 2026-09-13: the sm90 sparse path is discontinuous even with spec off — 65's

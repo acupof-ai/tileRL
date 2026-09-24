@@ -50,6 +50,34 @@ _SCORE_PAGE_CHUNK = 64
 SPARSE_REFRESH_TICKS = 8
 
 
+def apply_refresh_ticks(ticks: int | None = None) -> int:
+    """Override decode ticks per eager refresh for this process.
+
+    ``sparse_runtime`` re-imports this name inside each function that reads it,
+    so one assignment here reaches every comparison site. ``None`` (the default)
+    leaves the module value alone.
+    """
+    global SPARSE_REFRESH_TICKS
+    if ticks is None:
+        return SPARSE_REFRESH_TICKS
+    if ticks < 1:
+        raise ValueError(f"sparse refresh interval {ticks}: want >= 1")
+    SPARSE_REFRESH_TICKS = int(ticks)
+    return SPARSE_REFRESH_TICKS
+
+
+def resolve_refresh_ticks(explicit: int | None = None) -> int | None:
+    """An explicit value (the serve flag) wins; else
+    TILERL_SPARSE_REFRESH_TICKS; else None = leave the module default."""
+    import os
+
+    if explicit is not None:
+        return int(explicit)
+    raw = os.environ.get("TILERL_SPARSE_REFRESH_TICKS")
+    return None if raw in (None, "") else int(raw)
+
+
+
 
 
 def page_bounds_one(k_page: Tensor) -> Tensor:
