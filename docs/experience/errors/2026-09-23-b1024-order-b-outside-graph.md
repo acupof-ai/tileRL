@@ -97,3 +97,32 @@ load-bearing:
 Recorded because an unexplained ~9.9 s sparse graph tick is worth knowing about,
 not because it corroborates anything. One sample, no mechanism, no fix. A third
 distinct measurement on this path would be worth its own entry.
+
+### A second, independent data point (2026-09-24)
+
+The shadow-v1 go/no-go window (`probe/805-serve-sm70` @ `0195bcce`, V100 sm70,
+`graph_w2048`, `TILERL_SPARSE_SHADOW=quest`, one real 37.6k wikitext prompt,
+dir `shadowwin-0924-051849`) hit the same shape on its last tick before the
+window aborted on an unrelated CUDA OOM:
+
+| tick | step ms | graph ms | `step − graph` ms | ssd_mmap ms | note |
+|---:|---:|---:|---:|---:|---|
+| 730 (last of run) | 10303 | — | — | 8365 | `path=eager`; `release_cold_forget=10109`, `pub_cold_transfer=8069`, `pub_share_hold=404`, `pub_draft_clone=333`, `pub_bounds_d2h=295`, `sample=10110`, `model=167` |
+
+Same order of magnitude (10.3 s vs 9.9 s), the same segments dominating, and the
+same position — the run's **last** tick, on the request's departure-release
+path — and again at the tail of a long prompt. Every other tick in that run was
+42–46 ms (graph) / ~190–200 ms (eager refresh), and the two runs differ in
+branch, env, and failure context, so the two are independent draws.
+
+**One difference, stated because it matters:** the first sample was a `path=graph`
+tick and this one is `path=eager` (`draft_step=0`, `sample=10110`). So the two do
+not share a path; what they share is the storage traffic and the tail position.
+
+**Still no conclusion.** Two samples on one machine, at the same position, is
+not a mechanism: the tail path is where a request's cold pages are forgotten
+(`release_cold_forget`) and where a spill file's final writes land, so a
+storage-tier stall there may be ordinary end-of-request work rather than a
+defect. What would discriminate is the same measurement on a prompt that ends
+while pages are still hot, and a run long enough to show whether non-tail ticks
+ever do this. Not claimed here.
