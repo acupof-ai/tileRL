@@ -164,6 +164,29 @@ def run_one_prompt(e, rid, tag_decline) -> tuple[list[int], dict]:
     }
 
 
+def aligned_positions(rec, idx: int, anchor_len: int) -> list[dict]:
+    """accepted_positions aligned 1:1 to the generated window [0, anchor_len).
+
+    The recorder counts every sample, including the one taken on the plain
+    greedy tick AFTER the last verify chain pushed output to anchor_len-1: that
+    tick's gen_idx (the engine's spec-accumulated index) equals anchor_len and
+    it is the first token OUTSIDE the requested window. It carries
+    verify_slot=None (plain path). Drop exactly such tail edge records; any
+    other accepted record outside the window, or a gap inside, is fatal.
+    """
+    kept = rec.accepted_positions(idx)
+    inside = [r for r in kept if r["gen_idx"] < anchor_len]
+    edge = [r for r in kept if r["gen_idx"] >= anchor_len]
+    bad = [r for r in edge if r.get("verify_slot") is not None]
+    gen = sorted(r["gen_idx"] for r in inside)
+    if bad or gen != list(range(anchor_len)):
+        raise SystemExit(
+            f"TF alignment defect: {len(kept)} accepted, {len(edge)} edge "
+            f"(non-plain edge={len(bad)}), inside gen_idx contiguous="
+            f"{gen == list(range(anchor_len))}")
+    return inside
+
+
 def neg_anchor_run(e, prompts, args, decline_flag) -> int:
     """Red control: R=1 self-feed with the anchor shifted. The leg must FAIL
     the committed-output identity ('forced output != anchor'). Exits 0 only if
@@ -222,7 +245,7 @@ def floor_kl_check(e, ids, n_tok: int, decline_flag) -> float:
         rid = e.submit(list(ids), SamplingParams(
             temperature=0.0, max_new_tokens=n_tok, seed=0))
         out, _ = run_one_prompt(e, rid, decline_flag)
-        kept = rec.accepted_positions(0)
+        kept = aligned_positions(rec, 0, len(base))
         rec.uninstall()
         if out != base:
             raise SystemExit("floor KL: TF output diverged from its anchor")
@@ -417,25 +440,8 @@ def main() -> int:
         rid = e.submit(list(ids), SamplingParams(
             temperature=0.0, max_new_tokens=args.max_new_tokens, seed=0))
         out, _ = run_one_prompt(e, rid, decline_flag)
-        kept = rec.accepted_positions(idx)
         anchor = tf_anchors[idx]
-        if len(kept) != len(anchor):
-            # Diagnose the off-by-one: dump gen_idx/out_len/committed for the
-            # tail records and every accepted record whose gen_idx is outside
-            # the anchor range (a sampled-but-not-appended EOS/length edge).
-            rows_idx = rec.rows[idx]
-            edge = [{"gen_idx": r["gen_idx"], "out_len_before": r["out_len_before"],
-                     "accepted": r.get("accepted"), "committed": r["committed"],
-                     "verify_slot": r.get("verify_slot")}
-                    for r in rows_idx
-                    if r.get("accepted") and r["gen_idx"] >= len(anchor)]
-            tail = [{"gen_idx": r["gen_idx"], "out_len_before": r["out_len_before"],
-                     "accepted": r.get("accepted"), "committed": r["committed"]}
-                    for r in rows_idx[-6:]]
-            print(f"FATAL prompt {idx}: {len(kept)} committed != {len(anchor)} anchor; "
-                  f"total_records={len(rows_idx)} edge={edge} tail={tail}",
-                  file=sys.stderr)
-            return 1
+        kept = aligned_positions(rec, idx, len(anchor))
         if out != anchor:
             print(f"FATAL prompt {idx}: forced output != anchor (instrument defect)",
                   file=sys.stderr)
