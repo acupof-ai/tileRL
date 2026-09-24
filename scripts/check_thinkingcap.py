@@ -101,7 +101,8 @@ def main(tc: str, base: str) -> int:
         "model.language_model.layers.4.linear_attn.in_proj_qkv",
     ]
     fails = []
-    for stem in qstems:
+    neg_checked = False
+    for si, stem in enumerate(qstems):
         w = open_tensor(tcd, wm, stem + ".weight_packed")
         ws = open_tensor(tcd, wm, stem + ".weight_scale")
         gs = open_tensor(tcd, wm, stem + ".weight_global_scale")
@@ -117,6 +118,18 @@ def main(tc: str, base: str) -> int:
         print(f"{tag:>18}: cos={cos:.4f} normr={nr:.4f} max|w|={float(dq.abs().max()):.3f}")
         if not (cos >= COS_MIN and NR_LO <= nr <= NR_HI):
             fails.append((tag, cos, nr))
+        # Negative control on the first layer: flipping global_divide (multiply
+        # by gs instead of dividing) must push normr out of the gate band.
+        if si == 0:
+            wrong = dequant_nvfp4(w, ws, gs, global_divide=False).float()
+            _, nr_wrong = metrics(wrong, bf)
+            neg_checked = not (NR_LO <= nr_wrong <= NR_HI)
+            print(f"{tag:>18}: NEG global_divide flipped normr={nr_wrong:.4e} "
+                  f"(must be outside [{NR_LO},{NR_HI}])")
+
+    if not neg_checked:
+        print("FAILURES: negative control did not go red")
+        return 1
 
     # --- MTP: aux bf16 vs base mtp bf16, direct (no dequant) ---
     aux = sorted(k for k in wm if wm[k] == "model-base-aux.safetensors")
