@@ -50,6 +50,52 @@ _SCORE_PAGE_CHUNK = 64
 SPARSE_REFRESH_TICKS = 8
 
 
+def apply_refresh_ticks(ticks: int | None = None) -> int:
+    """Override decode ticks per eager refresh for this process.
+
+    ``sparse_runtime`` re-imports this name inside each function that reads it,
+    so one assignment here reaches every comparison site. ``None`` (the default)
+    leaves the module value alone.
+    """
+    global SPARSE_REFRESH_TICKS
+    if ticks is None:
+        return SPARSE_REFRESH_TICKS
+    if ticks < 1:
+        raise ValueError(f"sparse refresh interval {ticks}: want >= 1")
+    SPARSE_REFRESH_TICKS = int(ticks)
+    return SPARSE_REFRESH_TICKS
+
+
+def apply_window_pages(tokens: int | None = None) -> int:
+    """Set the local window on BOTH modules; returns the page count.
+
+    Here rather than in ``sparse_index`` because this module imported
+    ``WINDOW_PAGES`` by value at load, so it holds its own copy — and the write
+    to a lower layer may not come from that layer (``test_layering`` pins the
+    direction). ``build_engine`` calls this one function instead of patching two
+    modules from outside.
+    """
+    import tilerl.sparse_index as si
+
+    pages = si.apply_window_tokens(tokens)
+    if tokens is not None:
+        global WINDOW_PAGES
+        WINDOW_PAGES = pages
+    return pages
+
+
+def resolve_refresh_ticks(explicit: int | None = None) -> int | None:
+    """An explicit value (the serve flag) wins; else
+    TILERL_SPARSE_REFRESH_TICKS; else None = leave the module default."""
+    import os
+
+    if explicit is not None:
+        return int(explicit)
+    raw = os.environ.get("TILERL_SPARSE_REFRESH_TICKS")
+    return None if raw in (None, "") else int(raw)
+
+
+
 
 
 def page_bounds_one(k_page: Tensor) -> Tensor:
