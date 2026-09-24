@@ -117,18 +117,35 @@ def run_one_prompt(e, rid, tag_decline) -> tuple[list[int], dict]:
     }
 
 
-def accepted_records(recs: list[dict]) -> list[dict]:
-    """Keep one record per committed generated position. A verify tick records
-    every chain slot; a rejected draft slot's gen_idx equals a position the
-    NEXT tick commits, so per gen_idx keep the smallest chain slot
-    (gen_idx - out_len_before) — that is the accepted slot."""
-    best: dict[int, dict] = {}
-    for r in recs:
-        slot = r["gen_idx"] - r["out_len_before"]
-        cur = best.get(r["gen_idx"])
-        if cur is None or slot < cur["gen_idx"] - cur["out_len_before"]:
-            best[r["gen_idx"]] = r
-    return [best[k] for k in sorted(best)]
+def neg_anchor_run(e, prompts, args, decline_flag) -> int:
+    """Red control: R=1 self-feed with the anchor shifted. The leg must FAIL
+    the committed-output identity ('forced output != anchor'). Exits 0 only if
+    the red is observed; 1 if the instrument accepts the shifted anchor (a
+    vacuous gate)."""
+    from tilerl.engine import SamplingParams
+
+    red = False
+    for ids in prompts:
+        rid0 = e.submit(list(ids), SamplingParams(
+            temperature=0.0, max_new_tokens=args.neg_tokens, seed=0))
+        base, _ = run_one_prompt(e, rid0, decline_flag)
+        shifted = {0: base[args.neg_anchor_offset:]}
+        rec = TeacherForceRecorder(e, anchors=shifted, record_full_logits=False).install()
+        rid1 = e.submit(list(ids), SamplingParams(
+            temperature=0.0, max_new_tokens=args.neg_tokens, seed=0))
+        out, _ = run_one_prompt(e, rid1, decline_flag)
+        rec.uninstall()
+        if out != shifted[0]:
+            red = True
+            print(f"NEG-OK prompt: forced output {len(out)} != shifted anchor "
+                  f"{len(shifted[0])}; p0 committed={out[0] if out else None} "
+                  f"anchor0={shifted[0][0]}", flush=True)
+        else:
+            print("NEG-BAD prompt: shifted anchor accepted byte-identically",
+                  file=sys.stderr)
+    e.shutdown()
+    print(f"NEG_CONTROL red_observed={red}", flush=True)
+    return 0 if red else 1
 
 
 def main() -> int:
@@ -146,6 +163,11 @@ def main() -> int:
                     help="dir with ref_NNN.json anchors. R=1 self-feeds its own "
                          "free run (the byte-identical control); every other R "
                          "teacher-forces its W-group R=1 free run")
+    ap.add_argument("--neg-anchor-offset", type=int, default=0,
+                    help="negative control, R=1 only: shift the self anchor by N "
+                         "positions; the leg must FAIL 'forced output != anchor'")
+    ap.add_argument("--neg-prompts", type=int, default=1)
+    ap.add_argument("--neg-tokens", type=int, default=64)
     args = ap.parse_args()
 
     pages = patch_geometry(args.window_tokens, args.refresh)
@@ -202,6 +224,11 @@ def main() -> int:
         return ok
 
     type(e._sparse).run_decode_graph = spy_rdg
+
+    # ---- negative control (R=1): self-feed with the anchor shifted. Must fail
+    # with "forced output != anchor".
+    if args.neg_anchor_offset:
+        return neg_anchor_run(e, prompts[: args.neg_prompts], args, decline_flag)
 
     pp_dir = f"{args.out_prefix}_pp"
     tf_dir = f"{args.out_prefix}_tf"
@@ -271,7 +298,7 @@ def main() -> int:
         rid = e.submit(list(ids), SamplingParams(
             temperature=0.0, max_new_tokens=args.max_new_tokens, seed=0))
         out, _ = run_one_prompt(e, rid, decline_flag)
-        kept = accepted_records(rec.rows[idx])
+        kept = rec.accepted_positions(idx)
         anchor = tf_anchors[idx]
         if len(kept) != len(anchor):
             print(f"FATAL prompt {idx}: {len(kept)} committed records != "

@@ -36,6 +36,23 @@ if [ -n "$SP" ]; then
 fi
 nvidia-smi --query-gpu=memory.used --format=csv,noheader
 
+# Negative control first: R=1 self-feed with a one-position-shifted anchor must
+# fail the committed-output identity. The worker exits 0 only when the red is
+# observed; a non-zero exit aborts before any arm burns card time.
+echo "===== NEG CONTROL (shifted anchor must diverge) $(date +%T) ====="
+$PY -u scripts/probe_wr_sweep_worker.py \
+  --window-tokens 128 --refresh 1 \
+  --prompts "$HOME/serve805_prompts.jsonl" --n-prompts 1 \
+  --neg-anchor-offset 1 --neg-tokens 64 \
+  --out-prefix "$OUT/neg_shift" > "$OUT/neg_shift.out" 2> "$OUT/neg_shift.err"
+NEGRC=$?
+grep -q "NEG-OK" "$OUT/neg_shift.out" || NEGRC=1
+if [ "$NEGRC" != "0" ]; then
+  echo "FATAL negative control did not go red (rc=$NEGRC); aborting" >&2
+  exit 92
+fi
+echo "NEG CONTROL red as required"
+
 # R=1 (the quality reference) first per window, then 16/32/8; W128 whole
 # window before W1024. Each arm's report lands as it finishes, so a window
 # interrupted midway keeps every completed arm.
