@@ -82,6 +82,11 @@ def run_one_prompt(e, rid, tag_decline) -> tuple[list[int], dict]:
     wall0 = None
     out = None
     cuda = torch.cuda.is_available()
+    # Per decode tick: (wall_ms, is_eager_refresh, committed_tokens). The token
+    # delta lets the warm window reproduce the production 24.915 definition
+    # exactly (ticks [16, end), last tail tick dropped, no prefill).
+    ticks: list[tuple[float, bool, int]] = []
+    prev_len = 0
     for _ in range(200000):
         tag_decline["v"] = False
         if cuda:
@@ -110,7 +115,9 @@ def run_one_prompt(e, rid, tag_decline) -> tuple[list[int], dict]:
                 acc0 = e._spec_accepted
             ms = (t0.elapsed_time(t1) if cuda
                   else (time.perf_counter() - w0) * 1000.0)
-            (eager_ms if tag_decline["v"] else graph_ms).append(ms)
+            nout = len(row.output)
+            ticks.append((ms, bool(tag_decline["v"]), max(0, nout - prev_len)))
+            prev_len = nout
         # take() pops _finished; do NOT also poll() — poll clears the finished
         # dict, so a following take() would never see the completed request.
         out = e.take(rid)
@@ -121,6 +128,20 @@ def run_one_prompt(e, rid, tag_decline) -> tuple[list[int], dict]:
     wall = time.perf_counter() - wall0
     fwd = e._decode_forwards - f0
     accepted = e._spec_accepted - acc0
+
+    def warm_eff(ticks_list) -> tuple[float, int, int]:
+        # Production definition: decode ticks [16, end), the final tail tick
+        # dropped (its output is the EOS/finish edge), no prefill.
+        win = ticks_list[16:-1] if len(ticks_list) > 17 else ticks_list[16:]
+        if not win:
+            return 0.0, 0, 0
+        wms = sum(t[0] for t in win) / 1000.0
+        toks = sum(t[2] for t in win)
+        return (toks / wms if wms else 0.0), toks, len(win)
+
+    graph_ms = [t[0] for t in ticks if not t[1]]
+    eager_ms = [t[0] for t in ticks if t[1]]
+    warm, warm_tok, warm_n = warm_eff(ticks)
     return out, {
         "generated": len(out),
         "graph_ticks": len(graph_ms), "eager_refresh_ticks": len(eager_ms),
@@ -129,6 +150,8 @@ def run_one_prompt(e, rid, tag_decline) -> tuple[list[int], dict]:
         "wall_s": round(wall, 3),
         "decode_forwards": fwd, "spec_accepted": accepted,
         "eff_tok_s": round((fwd + accepted) / wall, 3),
+        "warm_tok_s": round(warm, 3),
+        "warm_ticks": warm_n, "warm_tokens": warm_tok,
     }
 
 

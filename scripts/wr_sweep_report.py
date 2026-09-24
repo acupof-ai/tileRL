@@ -68,10 +68,15 @@ def main() -> int:
                 print(f"FATAL {tag} structural gate not ok", file=sys.stderr)
                 return 1
             speed = meta["prompts"]
+            eager_fracs = [p["eager_refresh_ticks"]
+                           / max(p["graph_ticks"] + p["eager_refresh_ticks"], 1)
+                           for p in speed]
             row = {
                 "window": w, "R": r,
                 "mean_eff_tok_s": round(statistics.mean(p["eff_tok_s"] for p in speed), 3),
+                "warm_eff_tok_s": round(statistics.mean(p["warm_tok_s"] for p in speed), 3),
                 "mean_wall_s": round(statistics.mean(p["wall_s"] for p in speed), 2),
+                "eager_tick_frac": round(statistics.mean(eager_fracs), 4),
                 "graph_tick_ms_mean": round(
                     statistics.mean(p["graph_tick_ms_mean"] for p in speed
                                      if p["graph_ticks"]), 3),
@@ -138,7 +143,8 @@ def main() -> int:
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"gate": GATE, "arms": rows}, f, indent=2)
-    print(f"{'W':>5} {'R':>3} {'effTok/s':>8} {'graph ms':>8} {'eager ms':>8} "
+    print(f"{'W':>5} {'R':>3} {'effTok/s':>8} {'warmTok/s':>9} {'eagerFr':>7} "
+          f"{'graph ms':>8} {'eager ms':>8} "
           f"{'agree':>6} {'first16':>7} {'gate':>5} {'nDiv':>5} {'KLmed+/-':>10}")
     for r in rows:
         if r.get("missing"):
@@ -147,6 +153,7 @@ def main() -> int:
         klm = r.get("kl_a_b")
         kls = f"{klm['median']:.4f}/{r['kl_b_a']['median']:.4f}" if klm else "-"
         print(f"{r['window']:>5} {r['R']:>3} {r['mean_eff_tok_s']:>8} "
+              f"{r['warm_eff_tok_s']:>9} {r['eager_tick_frac']:>7.3f} "
               f"{str(r['graph_tick_ms_mean']):>8} {str(r['eager_tick_ms_mean']):>8} "
               f"{str(r.get('top1_agreement', '-')):>6} "
               f"{str(r.get('top1_agreement_first16', '-')):>7} "
