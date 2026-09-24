@@ -15,6 +15,7 @@ chunked sparse prefill. Two gates the design names:
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from tilerl.build import build_engine
@@ -2229,6 +2230,14 @@ def test_sparse_warm_follower_with_an_exact_page_aligned_prompt_matches_cold():
     assert got == cold_got, f"zero-tail warm {got} != cold {cold_got}"
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "precondition rebuilt needed: the adopted-prefix re-leave this asserts was reached "
+    "only via the draft-hit trajectory of the bug fixed in "
+    "errors/2026-09-24-draft-hit-conditions-on-the-wrong-hidden.md — the follower "
+    "generated different tokens, selected different pages, and that is what dropped "
+    "them. With the fix the trajectory equals a miss, and a miss never demotes. "
+    "strict=True so rebuilding the fixture turns this into XPASS and forces the "
+    "marker off. Tracked in OPEN.md: rebuild the adopted-prefix demote fixture."))
 def test_an_adopted_prefix_redemotes_with_zero_device_bytes():
     """#783: a follower promotes an adopted prefix into PRIVATE device blocks, and
     those blocks leave its hot union as decode advances. The identical bytes are
@@ -2351,6 +2360,12 @@ def test_an_adopted_prefix_redemotes_with_zero_device_bytes():
     assert got[:8] == want, f"dedup follower {got[:8]} != miss {want}"
     assert not adopted_demoted, f"adopted pages paid a D2H demote: {adopted_demoted}"
     assert not lifted, "dup republish reached the private->shared lift instead of ref-only"
+    # The precondition, stated rather than assumed: the exit this asserts can only
+    # happen if an adopted page actually LEFT the resident union. Without this the
+    # test passes vacuously when the trajectory never drops one.
+    assert adopted_demoted or dup_refs, (
+        "precondition not met: no adopted prefix page left the resident union, so the "
+        "share_ref republish path below was never reachable")
     assert dup_refs, "the re-publish never took the zero-byte share_ref path"
     assert not leftover, f"early refs never handed to a closed frontier: {leftover}"
 
@@ -3548,3 +3563,106 @@ def test_device_select_maps_chosen_pages_through_their_candidate_position():
             f"phys {got} for chosen {chosen}, correct {want}")
     finally:
         e.shutdown()
+def test_draft_hit_conditions_on_the_stored_boundary_hidden():
+    """A draft-bearing sparse prefix HIT must condition its first tail draft on
+    the SAME trunk hidden a full prefill would: the one at position `matched-1`.
+
+    The hit path restores the entry's snapshot (taken AT matched) and re-forwards
+    the last page to get first-token logits, so the row's newest hidden is the
+    RE-FORWARD's recomputation — a different vector (measured 0.996 of its own
+    scale) because that forward starts from the state at `matched` rather than
+    from the state at `matched - BLOCK_TOKENS` the publisher used. The draft
+    reads the hidden at `matched-1`, so it must read the STORED one, which is
+    bit-identical to the publisher's.
+
+    Before the fix the follower emitted different tokens from generated index 12
+    on; the divergence needs a draft AND a hit together (draft-off: hit == miss;
+    draft-on, miss vs miss: identical).
+    """
+    N = 24 * BLOCK_TOKENS
+    prompt = (np.arange(N, dtype=np.int64) % 300) + 7
+    params = SamplingParams(temperature=0.0, max_new_tokens=24, seed=0)
+
+    def first_decode_hidden(e, rid):
+        for _ in range(6000):
+            e.step()
+            r = next((x for x in e._running if x.req_id == rid), None)
+            if r is not None and r.decoding:
+                return r
+        raise AssertionError("row never reached decode")
+
+    def drive(e, rid, want):
+        for _ in range(6000):
+            e.step()
+            d = e.poll()
+            if rid in d and len(d[rid]) >= want:
+                return d[rid][:want]
+        raise AssertionError(f"row produced < {want} tokens")
+
+    miss = _sparse_engine(2, draft=True)
+    r = first_decode_hidden(miss, miss.submit(prompt, params))
+    oracle = r.hidden[0, -1, :].clone()
+    miss.shutdown()
+
+    sp = _sparse_engine(2, draft=True)
+    r1 = sp.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    drive(sp, r1, 200)
+    entry = sp._sparse.prefix.lookup(prompt)
+    assert entry is not None, "nothing published to adopt"
+    stored = entry["hidden"].reshape(-1)
+    assert bool((stored.cpu() == oracle.cpu()).all()), (
+        "the entry's stored boundary hidden is not the prefill's — the oracle "
+        "assumption of this gate is gone")
+
+    rh = first_decode_hidden(sp, sp.submit(prompt, params))
+    assert rh.sparse_matched == len(prompt), (
+        f"the arm did not take the full-hit branch: matched={rh.sparse_matched}")
+    h, base = rh.hidden, rh.hidden_from
+    if rh.hidden_prev is not None:
+        h, base = torch.cat([rh.hidden_prev, rh.hidden], dim=1), base - 1
+    off = (len(prompt) - 1) - base
+    got = h[0, off, :].cpu()
+    sp.shutdown()
+
+    delta = (got - oracle.cpu()).abs().max().item()
+    scale = oracle.abs().max().item()
+    assert delta / scale <= 1e-6, (
+        f"the hit's draft conditions on a hidden differing from the prefill's by "
+        f"{delta:.6e} (relative {delta / scale:.6e}); it must read the stored "
+        "boundary hidden, not the re-forward's recomputation")
+
+
+def test_draft_hit_tokens_equal_a_full_prefill():
+    """The observable consequence: a draft-bearing full-prefix HIT must emit the
+    same tokens as a prefix-MISS engine on the identical prompt.
+
+    Draft-off already passes this (the trunk path is correct — measured), so the
+    arm under test is the draft.
+    """
+    N = 24 * BLOCK_TOKENS
+    prompt = (np.arange(N, dtype=np.int64) % 300) + 7
+    params = SamplingParams(temperature=0.0, max_new_tokens=24, seed=0)
+
+    def drive(e, rid, want):
+        for _ in range(6000):
+            e.step()
+            d = e.poll()
+            if rid in d and len(d[rid]) >= want:
+                return d[rid][:want]
+        raise AssertionError(f"row produced < {want} tokens")
+
+    miss = _sparse_engine(2, draft=True)
+    t_miss = drive(miss, miss.submit(prompt, params), 24)
+    miss.shutdown()
+
+    sp = _sparse_engine(2, draft=True)
+    r1 = sp.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
+    drive(sp, r1, 200)
+    assert sp._sparse.prefix.lookup(prompt) is not None, "nothing published"
+    t_hit = drive(sp, sp.submit(prompt, params), 24)
+    sp.shutdown()
+
+    first = next((i for i, (a, b) in enumerate(zip(t_miss, t_hit)) if a != b), None)
+    assert t_miss == t_hit, (
+        f"draft-bearing full-prefix hit diverged from the miss at generated index "
+        f"{first}: {t_miss[:16]} vs {t_hit[:16]}")
