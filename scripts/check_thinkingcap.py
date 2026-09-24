@@ -50,11 +50,21 @@ def index(d: Path) -> dict:
 
 
 def metrics(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float]:
+    # f64 chunked accumulation: a single f32 reduction over ~9e7 elements
+    # pushes dot/(nx*ny) off [-1,1] by ~2% even when a == b (observed 1.017).
+    import math
     a, b = a.float().flatten(), b.float().flatten()
     n = min(a.numel(), b.numel())
     a, b = a[:n], b[:n]
-    cos = float(torch.dot(a, b) / (a.norm() * b.norm() + 1e-30))
-    nr = float(a.norm() / (b.norm() + 1e-30))
+    num = sa = sb = 0.0
+    for i in range(0, n, 1 << 20):
+        ca = a[i:i + (1 << 20)].double()
+        cb = b[i:i + (1 << 20)].double()
+        num += float((ca * cb).sum())
+        sa += float((ca * ca).sum())
+        sb += float((cb * cb).sum())
+    cos = num / (math.sqrt(sa * sb) + 1e-30)
+    nr = math.sqrt(sa / (sb + 1e-30))
     return cos, nr
 
 
