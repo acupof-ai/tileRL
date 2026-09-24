@@ -832,6 +832,20 @@ class SparseForward:
                 ]
             )  # [B,k], always >= 0
         phys = torch.where(valid, phys, torch.zeros_like(phys))
+        if self.reuse:
+            # v2 lag-1 merge. Always runs for the persistent (captured) sf;
+            # `reuse` is constant per captured object so the guard is capture
+            # safe, and on a normal tick the use flag is all-False making every
+            # where a no-op. arm_override() fills the promoted lagged selection
+            # per carry tick; one fixed shape, branchless.
+            ar = torch.arange(k, device=self.device)[None, :]
+            ovalid = ar < self._ov_nsel_t[g][:, None]
+            take = self._ov_use_t[:, None] & ovalid
+            phys = torch.where(take, self._ov_phys_t[g], phys)
+            chosen = torch.where(take, self._ov_chosen_t[g], chosen)
+            nsel = torch.where(self._ov_use_t, self._ov_nsel_t[g], nsel)
+            valid = ar < nsel[:, None]
+            phys = torch.where(valid, phys, torch.zeros_like(phys))
         self._dphys[g] = phys
         self._dnsel[g] = nsel
         self._dchosen[g] = chosen
