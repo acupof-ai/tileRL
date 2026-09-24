@@ -343,7 +343,22 @@ def run_prompt(e, ids, max_new, on_decode=None, pre_step=None):
             pre_step(rid)
         f0, a0 = e._decode_forwards, e._spec_accepted
         t0 = time.perf_counter()
+        # Whole-step GPU time via CUDA events, the same caliber the R×W sweep
+        # worker uses (it brackets e.step()); hung on tm so callbacks read it
+        # without a signature change. Wall clock stays available as `wall`.
+        import torch as _torch
+
+        _on_cuda = _torch.cuda.is_available()
+        if _on_cuda:
+            _eg0, _eg1 = _torch.cuda.Event(enable_timing=True), \
+                         _torch.cuda.Event(enable_timing=True)
+            _eg0.record()
         e.step()
+        if _on_cuda:
+            _eg1.record()
+            _torch.cuda.synchronize()
+            if tm is not None:
+                tm.probe_step_gpu_ms = _eg0.elapsed_time(_eg1)
         wall = (time.perf_counter() - t0) * 1000.0
         alive = any(r.req_id == rid for r in e._running)
         df, da = e._decode_forwards - f0, e._spec_accepted - a0

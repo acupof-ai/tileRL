@@ -148,7 +148,9 @@ def _free_run_pass(e, prompts, args, struct_samples):
     fraction, effective tokens/tick, spec acceptance (overall + in/post)."""
     pcyc = pcarry = pplain = []
     all_graph_w, all_eager_w = [], []
-    agg_tok = agg_wall = 0
+    # GPU-event ms (comparable to the R×W sweep), alongside wall-clock ms.
+    g_graph_w, g_eager_w = [], []
+    agg_tok = agg_wall = agg_gpu = 0
     d_acc = d_dft = d_in_a = d_in_d = d_post_a = d_post_d = 0
     lag = "async"
     per_prompt = []
@@ -156,15 +158,19 @@ def _free_run_pass(e, prompts, args, struct_samples):
         e._sparse.ticks_since_refresh = 0  # #821: phase 0 per prompt
         c0 = (e._spec_accepted, e._spec_drafted, e._spec_acc_in,
               e._spec_dft_in, e._spec_acc_post, e._spec_dft_post)
-        ticks, acc = [], [0, 0]
+        ticks, acc = [], [0, 0, 0.0]
 
         def on_decode(idx, wall, tm, df, da, is_close, refresh_after,
                       phase_pre, acc=acc, ticks=ticks, pi=pi):
+            gpu_ms = getattr(tm, "probe_step_gpu_ms", None)
+            gpu_ms = wall if gpu_ms is None else gpu_ms
             warm = idx >= WARMUP_DECODE and not is_close
             if warm:
                 acc[0] += df + da
                 acc[1] += wall
-            ticks.append({"wall": wall, "path": tm.fwd_path,
+                acc[2] += gpu_ms
+            ticks.append({"wall": wall, "gpu_ms": gpu_ms,
+                          "path": tm.fwd_path,
                           "refresh_after": refresh_after, "warm": warm})
             if (lag == "async" and warm and refresh_after == 0
                     and tm.fwd_path == "graph"):
@@ -188,10 +194,13 @@ def _free_run_pass(e, prompts, args, struct_samples):
         warm = [t for t in ticks if t["warm"]]
         all_graph_w += [t["wall"] for t in warm if t["path"] == "graph"]
         all_eager_w += [t["wall"] for t in warm if t["path"] != "graph"]
+        g_graph_w += [t["gpu_ms"] for t in warm if t["path"] == "graph"]
+        g_eager_w += [t["gpu_ms"] for t in warm if t["path"] != "graph"]
         cyc, carry, plain, ncyc, neager, trail = steady_distributions(warm)
         pcyc, pcarry, pplain = pcyc + cyc, pcarry + carry, pplain + plain
         agg_tok += acc[0]
         agg_wall += acc[1]
+        agg_gpu += acc[2]
         d_acc += c1[0] - c0[0]
         d_dft += c1[1] - c0[1]
         d_in_a += c1[2] - c0[2]
@@ -200,14 +209,22 @@ def _free_run_pass(e, prompts, args, struct_samples):
         d_post_d += c1[5] - c0[5]
         per_prompt.append({"i": pi, "n_out": len(r["output"]),
                            "warm_eff_tokens": acc[0],
-                           "warm_eff_tok_s": round(acc[0] / (acc[1] / 1000.0), 4)
+                           # GPU-event tok/s: the caliber comparable to impl's
+                           # sweep warm_tok_s; wall-clock reported separately.
+                           "warm_tok_s": round(acc[0] / (acc[2] / 1000.0), 4)
+                               if acc[2] else None,
+                           "warm_wall_tok_s": round(acc[0] / (acc[1] / 1000.0), 4)
                                if acc[1] else None})
     n_warm = len(all_graph_w) + len(all_eager_w)
     lagc = getattr(e._sparse, "_lag_obj", None)
     return {
-        "warm_eff_tok_s": round(agg_tok / (agg_wall / 1000.0), 4) if agg_wall else None,
-        "graph_tick_ms_p50": pct(all_graph_w, 50),
-        "eager_tick_ms_p50": pct(all_eager_w, 50),
+        # Primary speed: GPU-event caliber (matches the R×W sweep / 39.0 ref).
+        "warm_eff_tok_s": round(agg_tok / (agg_gpu / 1000.0), 4) if agg_gpu else None,
+        "warm_wall_tok_s": round(agg_tok / (agg_wall / 1000.0), 4) if agg_wall else None,
+        "graph_tick_ms_p50": pct(g_graph_w, 50),
+        "eager_tick_ms_p50": pct(g_eager_w, 50),
+        "graph_wall_ms_p50": pct(all_graph_w, 50),
+        "eager_wall_ms_p50": pct(all_eager_w, 50),
         "carry_ms_p50": pct(pcarry, 50), "carry_ms_p90": pct(pcarry, 90),
         "plain_ms_mean": round(statistics.fmean(pplain), 4) if pplain else None,
         "eager_tick_frac": round(len(all_eager_w) / n_warm, 4) if n_warm else None,
