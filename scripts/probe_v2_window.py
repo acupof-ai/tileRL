@@ -241,44 +241,33 @@ def run_worker(tag, lag, args):
         print(f"tree {sha} != {args.expect_tree[:8]}", file=sys.stderr)
         return 14
 
-    # Geometry (device arm only; smoke keeps the tiny defaults). Same probe-only
-    # patch point as the R×W sweep worker: sparse_engine imported WINDOW_PAGES
-    # BY VALUE and imports SPARSE_REFRESH_TICKS inside its functions, so set the
-    # module attrs BEFORE the engine/graph modules use them. The draft read
-    # window stays 2048 (build_arm_engine); W here is the sparse own-window.
+    # Geometry is the production process-wide build path (sparse own-window and
+    # refresh interval, same as the serve --sparse-window/--sparse-refresh
+    # flags); it is passed into build_arm_engine -> build_engine, NOT monkey-
+    # patched. The draft read window stays 2048.
     cap_state = None
-    if not smoke:
-        from tilerl import sparse_engine, sparse_index
-
-        pages = args.window_tokens // sparse_index.BLOCK_TOKENS
-        sparse_index.WINDOW_TOKENS = args.window_tokens
-        sparse_index.WINDOW_PAGES = pages
-        sparse_engine.WINDOW_PAGES = pages
-        sparse_engine.SPARSE_REFRESH_TICKS = args.refresh
-        print(f"GEOMETRY window_tokens={args.window_tokens} pages={pages} "
-              f"R={args.refresh}", flush=True)
+    if not smoke and lag == "async":
         # Startup hard assertion for the v2 capture-order defect: the prior
         # device run baked the graph BEFORE sf.lag_enabled was set, so the
         # q-clone/override merge were absent and every carry silently fell back
         # eager. Wrap the capture entry: a graph captured for the async arm with
         # sf.lag_enabled falsy is an instrument error, not a measured no-go.
-        if lag == "async":
-            import tilerl.sparse_runtime as srt
+        import tilerl.sparse_runtime as srt
 
-            _raw_make = srt.make_sparse_graph
-            cap_state = {"captures": 0, "bad": 0}
+        _raw_make = srt.make_sparse_graph
+        cap_state = {"captures": 0, "bad": 0}
 
-            def _make_checked(*a, **kw):
-                sf = a[5] if len(a) > 5 else kw.get("sf")
-                if not getattr(sf, "lag_enabled", False):
-                    cap_state["bad"] += 1
-                    raise RuntimeError(
-                        "capture-order violation: sf.lag_enabled is False at "
-                        "make_sparse_graph (q-clone/merge absent from graph)")
-                cap_state["captures"] += 1
-                return _raw_make(*a, **kw)
+        def _make_checked(*a, **kw):
+            sf = a[5] if len(a) > 5 else kw.get("sf")
+            if not getattr(sf, "lag_enabled", False):
+                cap_state["bad"] += 1
+                raise RuntimeError(
+                    "capture-order violation: sf.lag_enabled is False at "
+                    "make_sparse_graph (q-clone/merge absent from graph)")
+            cap_state["captures"] += 1
+            return _raw_make(*a, **kw)
 
-            srt.make_sparse_graph = _make_checked
+        srt.make_sparse_graph = _make_checked
 
     if smoke:
         from probe_serve_sm70_w2048 import build_smoke_engine
@@ -295,8 +284,26 @@ def run_worker(tag, lag, args):
             print(f"only {len(prompts)} prompts (< {args.n_prompts})",
                   file=sys.stderr)
             return 14
-        e, _be, config = build_arm_engine(args.model, args.source, args.draft,
-                                          "graph_w2048")
+        e, _be, config = build_arm_engine(
+            args.model, args.source, args.draft, "graph_w2048",
+            window_tokens=args.window_tokens, refresh_ticks=args.refresh)
+        # Geometry actually applied at build (the process-wide constants the
+        # captured graph key/pool use), not just passed: W pages in both modules
+        # and R — a mismatch here silently measures the wrong configuration.
+        from tilerl import sparse_engine as _se
+        from tilerl import sparse_index as _si
+
+        _want_pages = args.window_tokens // _si.BLOCK_TOKENS
+        if _want_pages != _si.WINDOW_PAGES or _want_pages != _se.WINDOW_PAGES:
+            print(f"window geometry not applied: {_si.WINDOW_PAGES}/"
+                  f"{_se.WINDOW_PAGES} != {_want_pages}", file=sys.stderr)
+            return 14
+        if args.refresh != _se.SPARSE_REFRESH_TICKS:
+            print(f"refresh R not applied: {_se.SPARSE_REFRESH_TICKS} != "
+                  f"{args.refresh}", file=sys.stderr)
+            return 14
+        print(f"GEOMETRY ok window_tokens={args.window_tokens} "
+              f"pages={_want_pages} R={args.refresh}", flush=True)
     # 94(a) hard assertion: this window is B=1-scoped while the B>1 sparse-graph
     # verify CUDA illegal-access is open. Every graph decode tick must enter
     # with exactly one active row; a second concurrent request invalidates the

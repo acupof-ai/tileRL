@@ -234,7 +234,8 @@ def build_smoke_engine(arm):
     return e, be, config
 
 
-def build_arm_engine(model_name, source, draft_path, arm):
+def build_arm_engine(model_name, source, draft_path, arm,
+                     window_tokens=2048, refresh_ticks=None):
     from tilerl_kernels.backend import get_backend
 
     from tilerl import build as build_mod
@@ -246,8 +247,9 @@ def build_arm_engine(model_name, source, draft_path, arm):
     if be.device.type != "cuda":
         raise ProbeFail("this probe needs CUDA (use --smoke for the CPU check)", rc=14)
 
-    # All three arms run W2048 (production does too); the arms differ only by
-    # min_tokens (baseline 8192 vs graph/ref 0) and the ref arm's forced eager.
+    # Default draft read window W2048; sparse own-window/refresh follow the
+    # caller (the R×W sweep and stacked read pass 1024/32 via build kwargs —
+    # the same process-wide path the production serve flags use).
     armed = arm in ("graph_w2048", "ref_eager_w2048")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -260,6 +262,8 @@ def build_arm_engine(model_name, source, draft_path, arm):
             sparse_k=128, sparse_min_tokens=0 if armed else 8192,
             sparse_device_select=True,
             scorer="bounds",
+            sparse_window_tokens=window_tokens,
+            sparse_refresh_ticks=refresh_ticks,
             kv_cold_bytes=int(os.environ.get("H2_COLD_BYTES", str(1 << 30))),
             cold_ssd_path=os.environ.get("H2_COLD_SSD", ""),
             cold_ssd_bytes=int(os.environ.get("H2_COLD_SSD_BYTES", "0")),
