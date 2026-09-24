@@ -67,7 +67,20 @@ def parse(path):
 
     out, cur_pre, cur_n, started = [], 0, 0, False
     leading_decode = 0
+    mixed = 0
     for tick, total, dec, pre in rows:
+        if dec >= 1 and pre >= 1:
+            # A tick carrying BOTH decode and prefill rows. The segmentation below
+            # cannot place it: it is neither "a prefill tick" nor "a decode tick
+            # closing a run", so its wall lands in neither bucket and the prompt
+            # split is ambiguous. Measured 0 on the 37.6k floor run, but a
+            # different prompt mix (a short prompt admitted while a long one
+            # decodes) can produce them, and silently under-counting prefill is
+            # exactly the failure this parser exists to avoid. Counted, and the
+            # caller turns a nonzero count into rc14 rather than reporting numbers
+            # that quietly omit these ticks.
+            mixed += 1
+            continue
         if dec == 0 and pre >= 1:
             cur_pre += total
             cur_n += 1
@@ -93,6 +106,7 @@ def parse(path):
     return {"file": path, "ticks_parsed": len(rows),
             "step_timing_lines_skipped": skipped,
             "leading_decode_ticks_dropped": leading_decode,
+            "mixed_ticks": mixed,
             "prompts": out}
 
 
@@ -152,6 +166,12 @@ def main():
     runs = [parse(p) for p in args.logs]
     rc = 0
     for r in runs:
+        if r["mixed_ticks"]:
+            print(f"INSUFFICIENT: {r['file']} has {r['mixed_ticks']} tick(s) with "
+                  f"dec>=1 AND pre>=1; the prefill/decode split is ambiguous there "
+                  f"and the per-prompt walls below omit them. Not a reading.",
+                  file=sys.stderr)
+            rc = 14
         if r["leading_decode_ticks_dropped"]:
             print(f"WARNING: {r['file']} starts mid-stream "
                   f"({r['leading_decode_ticks_dropped']} leading decode ticks); "

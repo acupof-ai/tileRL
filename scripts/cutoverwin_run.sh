@@ -113,6 +113,7 @@ cd "$T"
 echo "===== STAGE 1 THREE ARMS $(date +%T) ====="
 echo "# this window is a correctness gate (full-sequence comparison, n=$N), not"
 echo "# a speed statistic; the floor of 20 applies to speed estimation."
+PROBE_RC=0
 $HOME/venv70/bin/python -u "$PROBE" \
   --model qwen38-27b --source "$HOME/models/Qwen3.8-27B-NVFP4" \
   --draft "$HOME/mmlu-assets/model_mtp.safetensors" \
@@ -122,34 +123,83 @@ $HOME/venv70/bin/python -u "$PROBE" \
   --min-tokens 4096 --max-tokens 37600 --max-new-tokens 1024 \
   --arms baseline,ref_eager_w2048,graph_w2048 \
   > "$D/probe.out" 2> "$D/probe.err"
-echo "PROBE EXIT=$?"
+PROBE_RC=$?
+echo "PROBE EXIT=$PROBE_RC"
 cat "$D/probe.out"
 
 # ---------- ⑤ verdict + ④ short-prompt text sanity --------------------------
+# Every step below is a GATE: each writes rc into GATE_RC and is checked before
+# START SERVICE. Nothing here may be an `|| echo`, which reports a failure and
+# carries on -- that is how a crashed correctness run reaches the service start.
+GATE_RC=0
 python3 - "$D" "$N" <<'PY'
 import json, os, sys
 d, n = sys.argv[1], int(sys.argv[2])
-g = json.load(open(f"{d}/cut_graph_w2048.stage1.json"))
-r = json.load(open(f"{d}/cut_ref_eager_w2048.stage1.json"))
-b = json.load(open(f"{d}/cut_baseline.stage1.json"))
+bad = []
+def load(name):
+    p = f"{d}/cut_{name}.stage1.json"
+    if not os.path.exists(p):
+        bad.append(f"MISSING json {p}")
+        return None
+    try:
+        return json.load(open(p))
+    except Exception as exc:
+        bad.append(f"UNREADABLE json {p}: {exc}")
+        return None
+
+g, r, b = load("graph_w2048"), load("ref_eager_w2048"), load("baseline")
 print("=== ⑤ FULL-SEQUENCE (graph vs forced-eager ref), per prompt")
-for p in g["prompts"]:
-    print(f"  prompt {p['i']}: {p.get('fullseq')!r} "
-          f"n_out={p['n_out']} decode_ticks={p['decode_ticks']} "
-          f"graph_ticks={p['graph_ticks']} close={p['close_ticks']}")
-print("  failures:", len(g["failures"]))
-for f in g["failures"][:10]:
-    print("   MISMATCH", f)
-print("  unattributed_eager:", len(g.get("unattributed_eager_ticks", [])))
+if g:
+    for p in g["prompts"]:
+        print(f"  prompt {p['i']}: {p.get('fullseq')!r} "
+              f"n_out={p['n_out']} decode_ticks={p['decode_ticks']} "
+              f"graph_ticks={p['graph_ticks']} close={p['close_ticks']}")
+        # ⑤ is the cutover decision: a prompt with no verdict, or with a
+        # divergence the probe did not mark as a failure, is not a pass.
+        if p.get("fullseq") is None:
+            bad.append(f"prompt {p['i']}: fullseq verdict absent")
+    if len(g["prompts"]) != n:
+        bad.append(f"graph arm has {len(g['prompts'])} prompts, expected {n}")
+    print("  failures:", len(g["failures"]))
+    for f in g["failures"][:10]:
+        print("   MISMATCH", f)
+    if g["failures"]:
+        bad.append(f"{len(g['failures'])} full-sequence mismatch(es)")
+    n_un = len(g.get("unattributed_eager_ticks", []))
+    print("  unattributed_eager:", n_un)
+    if n_un:
+        bad.append(f"{n_un} unattributed eager tick(s)")
 print("=== arms: baseline is the ONLY min8192 arm")
 for name, j in (("baseline", b), ("ref_eager_w2048", r), ("graph_w2048", g)):
+    if not j:
+        continue
     t = j.get("throughput") or {}
     print(f"  {name}: min_tokens={j['config']['min_tokens']} "
           f"graph_on={j['config']['built_sparse_graph_on']} "
           f"eff_tok_s={t.get('warm_effective_tok_s')} "
           f"p50_graph={t.get('warm_step_p50_ms_graph')} "
           f"p50_eager={t.get('warm_step_p50_ms_eager')}")
+    if len(j["prompts"]) != n:
+        bad.append(f"{name} arm has {len(j['prompts'])} prompts, expected {n}")
+    if not t:
+        bad.append(f"{name} arm wrote no throughput block")
+# The config claim the whole window rests on: exactly one min8192 arm.
+if r and r["config"]["min_tokens"] != 0:
+    bad.append(f"ref arm min_tokens={r['config']['min_tokens']}, expected 0")
+if g and g["config"]["built_sparse_graph_on"] is not True:
+    bad.append("graph arm build did not arm the sparse graph")
+if b and b["config"]["built_sparse_graph_on"] is not False:
+    bad.append("baseline build armed the sparse graph (expected off at 8192)")
+if b and b["config"]["min_tokens"] != 8192:
+    bad.append(f"baseline min_tokens={b['config']['min_tokens']}, expected 8192")
+
+print("=== ⑤ GATE:", "GREEN" if not bad else "RED")
+for x in bad:
+    print("   RED:", x)
+sys.exit(0 if not bad else 1)
 PY
+[ $? -ne 0 ] && GATE_RC=1
+echo "GATE_RC after ⑤+configs = $GATE_RC"
 
 echo "=== ④ short/mid prompt text (first 120 chars, from the graph arm) ==="
 $HOME/venv70/bin/python - "$D" "$N" <<'PY'
@@ -175,9 +225,27 @@ for m in man:
 PY
 
 echo "=== ④ prefill tick wall, baseline(min8192) vs ref_eager_w2048(min0) ==="
+PF_RC=0
 python3 "$D/parse_prefill_ticks.py" \
   "$D/cut_baseline.stage1.err" "$D/cut_ref_eager_w2048.stage1.err" \
-  --json "$D/prefill_ticks.json" || echo "PREFILL PARSE rc=$?"
+  --expect-prompts "$N" \
+  --json "$D/prefill_ticks.json" || PF_RC=$?
+echo "PREFILL PARSE EXIT=$PF_RC"
+[ "$PF_RC" -ne 0 ] && GATE_RC=1
+
+# ---------- the gate: nothing starts the service unless ⑤ and ④ are green ----
+if [ "$PROBE_RC" -ne 0 ]; then
+  echo "=== GATE RED: probe exit $PROBE_RC (1 = measured red, 14 = insufficiency)"
+  echo "=== ⑤ rc from the probe subprocesses is reported above; the service is NOT started."
+  echo "=== to fall back: re-add --sparse-min-tokens 8192 to the SAME tree's launcher."
+  exit 1
+fi
+if [ "$GATE_RC" -ne 0 ]; then
+  echo "=== GATE RED: the ⑤/prefill checks above reported a failure."
+  echo "=== the service is NOT started. Fall back with --sparse-min-tokens 8192 on $T."
+  exit 1
+fi
+echo "=== GATE GREEN: ⑤ full-sequence + configs + prefill-parser all clean; starting the service"
 
 # ---------- start the $M service (min0) -------------------------------------
 sed -e "s|--sparse-min-tokens 8192 ||" \
