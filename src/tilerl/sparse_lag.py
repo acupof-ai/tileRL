@@ -81,6 +81,11 @@ class LagController:
         # negative-control gate to prove this guard is what blocks arming.
         self.enforce_b1 = True
         self.b1_guard_fallbacks = 0
+        # PROBE-ONLY diagnostics: why each eager fallback happened. Counts the
+        # classified reasons and keeps the last message; a 17/17 fallback on a
+        # new geometry is otherwise invisible (the string was discarded).
+        self.fallback_reasons: dict[str, int] = {}
+        self.last_fallback_reason = None
 
     # ------------------------------------------------------------ cadence
     def is_carry(self) -> bool:
@@ -298,6 +303,19 @@ class LagController:
                 # prepare() refused a B>1 carry before taking anything; no
                 # frames can be held, but count it distinctly.
                 self.b1_guard_fallbacks += 1
+                reason = "b1_guard"
+            elif self._error is not None:
+                reason = f"exception: {type(self._error).__name__}: {self._error}"
+            elif not isinstance(res, dict) or "groups" not in res:
+                reason = (res.get("fallback", "job-without-groups")
+                          if isinstance(res, dict) else f"non-dict {type(res).__name__}")
+            elif self._job_rids != rids_now:
+                reason = "stale_rids"
+            else:
+                reason = "unknown"
+            key = reason.split(":")[0].split()[0]
+            self.fallback_reasons[key] = self.fallback_reasons.get(key, 0) + 1
+            self.last_fallback_reason = reason
             # Stale request set, failed job, or B>1 guard: eager fallback. Any
             # promoted frames in a fallback dict were rolled back in the job.
             self.fallback_cycles += 1
