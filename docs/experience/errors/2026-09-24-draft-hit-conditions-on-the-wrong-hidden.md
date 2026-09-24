@@ -165,15 +165,23 @@ the trunk attends different pages from the first decode tick. That is why the
 divergence survives turning the draft off, and why it is config-dependent: the
 CPU cell (k=2) does not diverge in either arm.
 
-**The shape of the divergence argues against calling it benign.** Over 512
-generated tokens, p0 differs in **508** and p1 in **493**, with **no
-re-convergence** (the last differing index is 511 in both; the drift grows
-monotonically rather than flipping near ties). Two approximations of the same
-context can legitimately disagree, and equal speed on both arms (30.6/30.3 and
-36.7/37.9 tok/s) is consistent with a difference that costs nothing — but a
-508-of-512 disagreement is a different context being conditioned on, not a
-near-tie resolved the other way. **Recorded as design behavior per coordinator
-ruling** (94, 2026-09-25) with that magnitude on the record.
+**The shape of the divergence agrees with that reading.** Over 512 generated
+tokens, p0 differs in **508** and p1 in **493**, with **no re-convergence** (the
+last differing index is 511 in both; the drift grows monotonically rather than
+flipping near ties).
+
+The decisive evidence for "different input, not a near-tie flipping" is
+**upstream of the first sampling decision, not the 508/512**: the resident sets
+already differ at the first decode tick (359 vs 396, candidates 2336 vs 2349,
+chosen sets differing in all four groups), which is *before* anything is sampled
+from either arm. A near-tie flip is a sampling-time event; this is a different
+attention input from the first step. The 508/512 is corroboration of how far the
+two streams end up apart, not the proof — the proof is that the divergence is
+present before a token is drawn. (Credited to rev-ec, who corrected my weaker
+framing of this in review.)
+
+**Recorded as design behavior per coordinator ruling** (94, 2026-09-25), with
+the magnitude on the record rather than argued away.
 
 **Optional fix, not attempted:** force the hit arm's first decode tick to be a
 refresh tick (promote the full candidate set before selecting), which should
