@@ -47,12 +47,22 @@ import torch
 
 class TeacherForceRecorder:
     def __init__(self, engine, anchors, record_full_logits: bool = True):
-        # anchors: {request_index: [anchor token per generated position]}
+        # anchors: {request_index: [anchor token per generated position]}.
+        # Pass None to RECORD ONLY (the free-running control): logits are
+        # captured and no token is forced; its own greedy output is the anchor.
         self.e = engine
-        self.anchors = {int(k): list(v) for k, v in anchors.items()}
+        self.anchors = None if anchors is None else \
+            {int(k): list(v) for k, v in anchors.items()}
         self.record_full_logits = record_full_logits
         # per request: list of recorded position rows, in commit order
-        self.rows = {int(k): [] for k in self.anchors}
+        if anchors is None:
+            self.rows = {}
+        else:
+            self.rows = {int(k): [] for k in self.anchors}
+        # pending records from the most recent _sample_batch, keyed by id(req):
+        # list of (record, chain_next_token_or_None). _verify marks acceptance.
+        self._pending = {}
+        self._orig_verify = None
         self._orig_sample_batch = None
         # map an id(_Req)->request index for the rows _sample_batch sees
         self._rid_to_idx = {}
@@ -65,26 +75,77 @@ class TeacherForceRecorder:
         rec = self
 
         def _patched_sample_batch(rows):
-            # rows: list of (req, logits[seq,*], generated_index). Run the real
-            # sampler (draft acceptance / RNG / restrict all unchanged) then
-            # overwrite each draw with the anchor token for that position.
+            # Record logits for every request first (record-only control arm
+            # creates its bucket on demand), then force the anchor token only
+            # when an anchor stream is supplied.
             orig_toks = rec._orig_sample_batch(rows)
             out = list(orig_toks)
+            # ensure buckets for record-only mode
+            if rec.anchors is None:
+                for _r, _l, _g in rows:
+                    rec._idx_for(_r)
+            # group this batch's rows per request for verify acceptance marking
+            batch_by_req = {}
             for slot, (r, lg, gen_idx) in enumerate(rows):
                 idx = rec._idx_for(r)
                 if idx is None:
                     continue
-                anc = rec.anchors[idx]
-                if 0 <= gen_idx < len(anc):
-                    out[slot] = int(anc[gen_idx])
-                rec._record(idx, r, lg, gen_idx,
-                            drawn=int(orig_toks[slot]),
-                            anchor=int(anc[gen_idx]) if gen_idx < len(anc)
-                            else None,
-                            committed=int(out[slot]))
+                anc = rec.anchors[idx] if rec.anchors is not None else None
+                forced = None
+                if anc is not None and 0 <= gen_idx < len(anc):
+                    forced = int(anc[gen_idx])
+                    out[slot] = forced
+                row = {"gen_idx": int(gen_idx),
+                       "out_len_before": len(r.output),
+                       "top1": int(lg.argmax().item()) if lg.numel() else None,
+                       "drawn": int(orig_toks[slot]),
+                       "anchor": (int(anc[gen_idx])
+                                  if anc is not None and gen_idx < len(anc)
+                                  else None),
+                       "committed": int(out[slot]),
+                       "accepted": True}  # plain path: one slot, accepted
+                if self.record_full_logits:
+                    row["logits"] = lg.detach().to("cpu", dtype=torch.float32).clone()
+                self.rows[idx].append(row)
+                batch_by_req.setdefault(id(r), []).append(row)
+            rec._pending = batch_by_req
             return out
 
         e._sample_batch = _patched_sample_batch
+
+        # Wrap verify so rejected verify-chain slots are marked accepted=False.
+        # n_ok is exactly the production rule: got[n_ok] == chains[n_ok+1], with
+        # got the (anchor-forced) sampled tokens; committed slots are 0..n_ok.
+        self._orig_verify = e._verify
+
+        def _patched_verify(rows, chains, logits, hidden):
+            rec_self = self
+            orig = rec_self._orig_verify
+            # mark all pending rows rejected first, then accept per n_ok below
+            for rr in rec_self._pending.values():
+                for row in rr:
+                    row["accepted"] = False
+            orig(rows, chains, logits, hidden)
+            # After the real verify, derive n_ok per row from the anchor-forced
+            # output the same way production does, using recorded gen_idx and
+            # the draft chains. Accepted = positions that advanced output.
+            for i, r in enumerate(rows):
+                plist = rec_self._pending.get(id(r))
+                if not plist:
+                    continue
+                chain = chains[i]
+                # produced chain tokens are rows whose gen_idx is in-chain;
+                # production accepted leading run against chain[j+1].
+                got = [row["committed"] for row in plist]
+                n_ok = 0
+                while n_ok < len(got) - 1 and got[n_ok] == chain[n_ok + 1]:
+                    n_ok += 1
+                for j in range(n_ok + 1):
+                    if j < len(plist):
+                        plist[j]["accepted"] = True
+            rec_self._pending = {}
+
+        e._verify = _patched_verify
         return self
 
     def bind_request(self, idx: int, req) -> None:
@@ -97,50 +158,35 @@ class TeacherForceRecorder:
         rid = id(req)
         idx = self._rid_to_idx.get(rid)
         if idx is None:
-            # Auto-assign by first encounter, up to the number of anchors. Safe
-            # for the one-prompt-at-a-time probes sharing this instrument.
+            # Auto-assign by first encounter. When anchors are supplied, only
+            # assign within their range (explicit bind otherwise); record-only
+            # mode assigns an unbounded index per new request.
             used = set(self._rid_to_idx.values())
-            free = [i for i in range(len(self.anchors)) if i not in used]
-            if free:
-                idx = free[0]
+            if self.anchors is None:
+                idx = len(used)
+            else:
+                free = [i for i in range(len(self.anchors)) if i not in used]
+                idx = free[0] if free else None
+            if idx is not None:
                 self._rid_to_idx[rid] = idx
+                self.rows.setdefault(idx, [])
         return idx
 
-    # ------------------------------------------------------------ recording
-    def _record(self, idx, req, logits, gen_idx, drawn, anchor, committed):
-        # gen_idx is the position within THIS chain (0..W-1). Verify records
-        # every chain slot; accepted-vs-rejected filtering is done by the
-        # consumer using the committed prefix (positions that advance output).
-        lg = logits.detach()
-        rec = {
-            "gen_idx": int(gen_idx),
-            "out_len_before": len(req.output),
-            "top1": int(lg.argmax().item()) if lg.numel() else None,
-            "drawn": drawn, "anchor": anchor, "committed": committed,
-        }
-        if self.record_full_logits:
-            rec["logits"] = lg.detach().to("cpu", dtype=torch.float32).clone()
-        self.rows[idx].append(rec)
+    # ------------------------------------------------------------ export
+    def accepted_positions(self, idx: int) -> list[dict]:
+        """Records that actually advanced the output (verify accepted slots
+        got[0..n_ok] plus every plain-greedy slot), one per generated position.
+        The _verify wrapper sets accepted=False on rejected draft slots."""
+        return [r for r in self.rows.get(idx, []) if r.get("accepted", True)]
 
     def uninstall(self):
         if self._orig_sample_batch is not None:
             self.e._sample_batch = self._orig_sample_batch
             self._orig_sample_batch = None
-
-    # ------------------------------------------------------------ export
-    def accepted_positions(self, idx: int) -> list[dict]:
-        """The records that actually advanced the output, in generated order.
-
-        A verify tick hands _commit got[:n_ok+1]; the rejected tail slot's
-        record has gen_idx beyond what the request grew by. Rebuild from the
-        request's output length is not available post-hoc, so the recorder
-        marks acceptance by replay: walk records and keep one per distinct
-        committed output position. The plain path has one record per position
-        (all kept)."""
-        out = []
-        for rec in self.rows[idx]:
-            out.append(rec)
-        return out
+        if self._orig_verify is not None:
+            self.e._verify = self._orig_verify
+            self._orig_verify = None
+        self._pending = {}
 
 
 # --------------------------------------------------------------------------- #

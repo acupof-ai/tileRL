@@ -61,6 +61,11 @@ N_PROMPTS = 6
 REFRESH_MOD = 8  # SPARSE_REFRESH_TICKS (carry/refresh every 8 sparse ticks)
 
 
+def _load_json(p):
+    with open(p) as f:
+        return json.load(f)
+
+
 def pct(values, q):
     if not values:
         return None
@@ -165,8 +170,24 @@ def run_worker(tag, lag, args):
     rows = []
     pcyc = pcarry = pplain = []
     struct_samples = []
+    # Teacher-forcing. controlA runs free and RECORDS its own logits (its greedy
+    # output is the anchor). v2 and controlB load controlA's per-prompt output
+    # and teacher-force that stream, recording their logits on the same tokens.
+    record_only = (tag == "controlA")
+    recorder = None
+    if not record_only:
+        anchors = {}
+        for pi in range(N_PROMPTS if not smoke else 1):
+            ap = os.path.join(args.per_prompt_dir, f"controlA_{pi:03d}.json")
+            anchors[pi] = _load_json(ap)["output"]
     try:
         for pi, ids in enumerate(prompts):
+            # Install the recorder on the engine before each prompt's submit so
+            # verify/sample are intercepted from the first step; auto-bind maps
+            # this single request to index 0. Wrap submit to bind deterministically.
+            from probe_teacher_force import TeacherForceRecorder
+            anc = None if record_only else {0: anchors[pi]}
+            recorder = TeacherForceRecorder(e, anc).install()
             ticks, acc = [], [0, 0.0]
 
             def on_decode(idx, wall, tm, df, da, is_close, refresh_after,
@@ -198,6 +219,20 @@ def run_worker(tag, lag, args):
                         })
 
             r = run_prompt(e, ids, args.max_new_tokens, on_decode)
+            # Dump teacher-forced logits (top1 + full f32 logits per recorded
+            # chain slot) for the driver's quality gate, then detach.
+            tf_rows = recorder.rows.get(0, [])
+            with open(os.path.join(args.per_prompt_dir,
+                                   f"{tag}_{pi:03d}.logits.json"), "w") as lf:
+                json.dump({"output": r["output"],
+                           "records": [{"top1": x["top1"],
+                                        "committed": x["committed"],
+                                        "gen_idx": x["gen_idx"],
+                                        "accepted": x.get("accepted", True),
+                                        "logits": x["logits"].tolist()
+                                                  if "logits" in x else None}
+                                       for x in tf_rows]}, lf)
+            recorder.uninstall()
             warm = [t for t in ticks if t["warm"]]
             cyc, carry, plain, ncyc, neager, trail = steady_distributions(warm)
             pcyc, pcarry, pplain = pcyc + cyc, pcarry + carry, pplain + plain
@@ -234,11 +269,11 @@ def run_worker(tag, lag, args):
     agg_eff = round(toks / (wall / 1000.0), 4) if wall else None
     n_cycles = len(pcyc)
     n_eager = sum(r["eager_carry_cycles"] for r in rows)
-    # In a single-request steady pure-decode window every eager refresh tick is
-    # exactly a lag fallback: the controller's own count MUST equal the harness
-    # count (path!=graph at refresh_after==0). A mismatch means the two counters
-    # measure different things / a carry fell back uncounted -> rc14, not a
-    # performance result. The first (startup-discarded) interval is excluded.
+    n_graph_carry = n_cycles - n_eager  # carries observed with path=="graph"
+    # rev gate A: on the DEVICE v2 must actually run graph carries (sf armed),
+    # not silently fall back to eager every cycle (the capture-order bug). On a
+    # real run this must be > 0. (CPU smoke is exempt: path shapes differ.)
+    graph_carry_seen = n_graph_carry > 0
     fb_consistent = (lag_fb is None) or (lag_fb == n_eager)
     recon = None
     if pcyc and pcarry and pplain:
@@ -250,6 +285,8 @@ def run_worker(tag, lag, args):
         "n_prompts": len(rows), "prompts": rows,
         "aggregate_eff_tok_s": agg_eff,
         "steady_cycles": n_cycles,
+        "graph_carry_cycles": n_graph_carry,
+        "graph_carry_observed": graph_carry_seen,
         "eager_carry_cycles": n_eager,
         "carry_fallback_frac": round(n_eager / n_cycles, 4) if n_cycles else None,
         "lag_controller_carry": lag_carry, "lag_controller_fallback": lag_fb,
@@ -270,8 +307,84 @@ def run_worker(tag, lag, args):
     return 0
 
 
+def _accepted_records(recs, n_out):
+    """One trunk-logit record per COMMITTED generated position. The recorder
+    marks verify-chain rejected slots accepted=False; keep accepted rows and
+    dedup by gen_idx (first record per position)."""
+    by_pos = {}
+    for x in recs:
+        if not x.get("accepted", True) or x.get("logits") is None:
+            continue
+        g = x["gen_idx"]
+        if g < 0 or g >= n_out or g in by_pos:
+            continue
+        by_pos[g] = x
+    return [by_pos[g] for g in sorted(by_pos)]
+
+
+def _tf_analyze(arm_logits_dir, n_prompts, tag_a, tag_b):
+    """Teacher-forced distribution comparison of two arms over the SAME anchor
+    positions. Returns per-prompt and aggregate top1 agreement, symmetric mean
+    KL, and both-arm margins at disagreeing positions. Uses probe_teacher_force
+    kl helpers (torch)."""
+    import torch
+    from probe_teacher_force import kl_from_logits
+
+    per = []
+    all_kl_ab, all_kl_ba, all_margins = [], [], []
+    for pi in range(n_prompts):
+        da = _load_json(os.path.join(arm_logits_dir, f"{tag_a}_{pi:03d}.logits.json"))
+        db = _load_json(os.path.join(arm_logits_dir, f"{tag_b}_{pi:03d}.logits.json"))
+        n = min(len(da["output"]), len(db["output"]))
+        ra = _accepted_records(da["records"], len(da["output"]))
+        rb = _accepted_records(db["records"], len(db["output"]))
+        # align by gen_idx intersection
+        ma = {x["gen_idx"]: x for x in ra}
+        mb = {x["gen_idx"]: x for x in rb}
+        gids = sorted(set(ma) & set(mb))
+        same = kls_ab = kls_ba = 0
+        margins = []
+        for g in gids:
+            xa, xb = ma[g], mb[g]
+            la = torch.tensor(xa["logits"], dtype=torch.float32)
+            lb = torch.tensor(xb["logits"], dtype=torch.float32)
+            if xa["top1"] == xb["top1"]:
+                same += 1
+            else:
+                ta = la.topk(2)
+                tb = lb.topk(2)
+                margins.append({
+                    "pos": g,
+                    "a_top1": int(ta.indices[0]),
+                    "a_top1_minus_top2": round(float(ta.values[0] - ta.values[1]), 5),
+                    "b_top1": int(tb.indices[0]),
+                    "b_top1_minus_top2": round(float(tb.values[0] - tb.values[1]), 5)})
+            kls_ab += kl_from_logits(la, lb)
+            kls_ba += kl_from_logits(lb, la)
+        m = len(gids)
+        ag = same / m if m else 0.0
+        per.append({"i": pi, "positions_compared": m, "n_output": n,
+                    "top1_agreement": round(ag, 5),
+                    "kl_ab_mean": round(kls_ab / m, 6) if m else None,
+                    "kl_ba_mean": round(kls_ba / m, 6) if m else None})
+        all_kl_ab.append(kls_ab / m if m else 0.0)
+        all_kl_ba.append(kls_ba / m if m else 0.0)
+        all_margins.extend(margins)
+    return {
+        "ok": True, "per_prompt": per,
+        "min_top1_agreement": round(min(p["top1_agreement"] for p in per), 5)
+            if per else None,
+        "mean_top1_agreement": round(statistics.fmean(
+            [p["top1_agreement"] for p in per]), 5) if per else None,
+        "mean_kl_ab": round(statistics.fmean(all_kl_ab), 6) if all_kl_ab else None,
+        "mean_kl_ba": round(statistics.fmean(all_kl_ba), 6) if all_kl_ba else None,
+        "n_disagree_positions": len(all_margins),
+        "margins": all_margins,
+    }
+
+
 def quality(v2_seqs, ctl_seqs):
-    """Paired per-prompt comparison. Returns a verdict dict."""
+    """Legacy free-running paired comparison (kept for the end-to-end aux)."""
     agree, first_divs, mod8 = [], [], {}
     per_prompt = []
     for i, (v, c) in enumerate(zip(v2_seqs, ctl_seqs)):
@@ -384,12 +497,29 @@ def main():
 
     verdict = {}
     problems14 = []
-    # Floor: the two controls must be token-identical (measured floor 1.0).
-    floor_fd = [first_div(a, b) for a, b in zip(sa, sb)]
-    floor_ok = all(d is None for d in floor_fd)
-    verdict["controls_token_identical"] = floor_ok
+    # Floor (teacher-forced distribution): controlB is force-fed controlA's
+    # stream, so on the same anchor tokens its trunk logits must match
+    # controlA's: top1 = 1.0 and KL ~ 0. Anything else invalidates the window.
+    floor = _tf_analyze(args.per_prompt_dir, n_prompts,
+                        "controlA", "controlB")
+    verdict["floor_controlB_vs_controlA"] = {
+        k: floor[k] for k in ("min_top1_agreement", "mean_top1_agreement",
+                             "mean_kl_ab", "mean_kl_ba",
+                             "n_disagree_positions")}
+    floor_ok = (floor["min_top1_agreement"] == 1.0
+                and (floor["mean_kl_ab"] or 0.0) == 0.0
+                and (floor["mean_kl_ba"] or 0.0) == 0.0)
+    verdict["floor_top1_eq_1_and_kl0"] = floor_ok
     if not floor_ok:
-        problems14.append(f"controls diverged: {floor_fd} (floor not 1.0)")
+        problems14.append(
+            f"teacher-forced floor violated: controlB vs controlA "
+            f"min_top1={floor['min_top1_agreement']} "
+            f"kl_ab={floor['mean_kl_ab']} kl_ba={floor['mean_kl_ba']}")
+
+    # Free-running token identity of the two controls (aux end-to-end read; not
+    # a hard instrument gate now that the teacher-forced floor is binding).
+    verdict["controls_freerun_first_div"] = \
+        [first_div(a, b) for a, b in zip(sa, sb)]
 
     # Placement: aggregate eff of the two controls within 5%.
     ea, eb = A["aggregate_eff_tok_s"], B["aggregate_eff_tok_s"]
@@ -402,8 +532,14 @@ def main():
     if place is None or place > PLACEMENT_MAX:
         problems14.append(f"control placement gap {place} > {PLACEMENT_MAX}")
 
+    # Binding quality: v2 teacher-forced on the controlA anchor vs controlA.
+    tfq = _tf_analyze(args.per_prompt_dir, n_prompts, "controlA", "v2")
+    verdict["teacher_forced_quality"] = {
+        k: tfq[k] for k in ("min_top1_agreement", "mean_top1_agreement",
+                           "mean_kl_ab", "mean_kl_ba",
+                           "n_disagree_positions", "margins")}
     q = quality(sv, sa)
-    verdict["quality_vs_controlA"] = q if q["ok"] else q
+    verdict["freerun_quality_aux"] = q if q["ok"] else q
     if not q["ok"]:
         problems14.append(q["reason"])
     if V.get("fallback_counter_consistent") is False:
@@ -418,6 +554,11 @@ def main():
             f"{s.get('max_resident_frames')} vs ceiling {s.get('pin_ceiling')}, "
             f"free {s.get('free_first')}->{s.get('free_last')} monotonic_drain="
             f"{s.get('free_monotonic_drain')} (demote reconcile leaking frames)")
+    if not args.smoke and not V.get("graph_carry_observed"):
+        problems14.append(
+            "v2 graph-carry gate: ZERO carries observed with fwd_path==graph "
+            f"(graph_carry_cycles={V.get('graph_carry_cycles')}); v2 is "
+            "silently running every refresh as eager (capture/q-clone order)")
 
     # Timing/result gates (measured; failures are rc1, not rc14).
     ratio = round(V["aggregate_eff_tok_s"] / ctl_eff, 4) if ctl_eff else None
@@ -433,18 +574,19 @@ def main():
         "cycle_reconcile_rel_gap": V["cycle_reconcile_rel_gap"],
         "cycle_reconcile_le_0p05": (V["cycle_reconcile_rel_gap"] is not None
                                     and V["cycle_reconcile_rel_gap"] <= CYCLE_RECONCILE_MAX),
-        "quality_mean_agreement": q.get("mean_agreement") if q["ok"] else None,
-        "quality_min_agreement": q.get("min_agreement") if q["ok"] else None,
-        "quality_mean_ge_0p995": q["ok"] and q["mean_agreement"] is not None
-            and q["mean_agreement"] >= 0.995,
-        "quality_each_ge_0p99": q["ok"] and q["min_agreement"] is not None
-            and q["min_agreement"] >= 0.99,
-        "quality_median_first_div": q.get("median_first_divergence") if q["ok"] else None,
-        "quality_median_div_ge_128": (not q["ok"]) or q["median_first_divergence"] is None
-            or q["median_first_divergence"] >= DIV_MIN,
+        # Teacher-forced quality: top1 agreement is the BINDING gate (>=0.99
+        # per 94); KL is report-only this round; margins describe near-ties.
+        "tf_mean_top1_agreement": tfq.get("mean_top1_agreement"),
+        "tf_min_top1_agreement": tfq.get("min_top1_agreement"),
+        "tf_mean_kl_ab": tfq.get("mean_kl_ab"),
+        "tf_mean_kl_ba": tfq.get("mean_kl_ba"),
+        "tf_n_disagree_positions": tfq.get("n_disagree_positions"),
+        "tf_top1_mean_ge_0p99": tfq.get("mean_top1_agreement") is not None
+            and tfq["mean_top1_agreement"] >= 0.99,
     }
     verdict["v2"] = {k: V[k] for k in (
-        "aggregate_eff_tok_s", "steady_cycles", "eager_carry_cycles",
+        "aggregate_eff_tok_s", "steady_cycles", "graph_carry_cycles",
+        "graph_carry_observed", "eager_carry_cycles",
         "carry_fallback_frac", "lag_controller_carry", "lag_controller_fallback",
         "fallback_counter_consistent", "residency_structural",
         "cycle_ms_p50", "cycle_ms_p90", "carry_ms_p50", "carry_ms_p90",
@@ -459,16 +601,16 @@ def main():
               gates1["carry_p90_le_135p4"],
               gates1["carry_fallback_le_0p05"],
               gates1["cycle_reconcile_le_0p05"],
-              gates1["quality_mean_ge_0p995"],
-              gates1["quality_each_ge_0p99"],
-              gates1["quality_median_div_ge_128"]))
+              gates1["tf_top1_mean_ge_0p99"]))
     verdict["GO"] = bool(go)
     with open(f"{args.out_prefix}_verdict.json", "w") as f:
         json.dump(verdict, f, indent=2)
     print(json.dumps(rcs, indent=2))
     print(json.dumps({"ratio": ratio, "carry_p90": V["carry_ms_p90"],
                       "fallback": V["carry_fallback_frac"],
-                      "quality": gates1["quality_median_first_div"],
+                      "graph_carries": V.get("graph_carry_cycles"),
+                      "tf_top1": gates1["tf_mean_top1_agreement"],
+                      "tf_kl": gates1["tf_mean_kl_ab"],
                       "GO": verdict["GO"]}, indent=2))
     if args.smoke:
         # Plumbing run: the measured gates are not meaningful on the tiny model

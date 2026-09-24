@@ -157,7 +157,7 @@ class LagController:
     def _run_job(self, job):
         sf, q, snap, rids, cold_pages = job
         cand_idx, n_cand, win_t, s_bounds, s_l2p = snap
-        # chosen_plus: logical page id +1 (0 stays pad so real page 0 survives).
+        # sel: {group: (chosen_logical positional-padded, nsel)}.
         sel = sf.select_refresh(q, (cand_idx, n_cand, win_t, s_bounds))
         B, dev = sf.b, sf.device
         pool = self._kv()
