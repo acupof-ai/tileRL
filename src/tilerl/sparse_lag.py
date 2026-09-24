@@ -197,11 +197,15 @@ class LagController:
         # real logical page 0 in a valid slot is preserved (never filter ==0).
         picks: dict[int, list[int]] = {bi: [] for bi in range(len(rids))}
         # Each non-resident pick is one of: a PRIVATE cold page (blob keyed
-        # (rid,page), take()) or a SHARED prefix page (content key in
-        # shared_maps, share_take() read-only). Both H2D into a reserve frame;
-        # they differ only in blob acquisition and post-commit bookkeeping.
+        # (rid,page), take()), a SHARED prefix page (content key in
+        # shared_maps, share_take() read-only), or a FRESH page that is a valid
+        # candidate (has bounds) but currently holds KV nowhere — resolve()'s
+        # final branch allocates a zero block for it, so the lag job allocates
+        # a zeroed reserve frame too (no H2D). The first two H2D a blob; the
+        # third only reserves the frame.
         cold_need: list[tuple] = []     # (rid, page) -> private cold
         shared_need: list[tuple] = []   # (rid, page, content_key)
+        fresh_need: list[tuple] = []    # (rid, page) -> zeroed frame
         for _g, (chosen_t, nsel_t) in sel.items():
             cc = chosen_t.tolist()
             nn = [int(x) for x in nsel_t.tolist()]
@@ -219,39 +223,25 @@ class LagController:
                     elif p in shared_maps[bi] and pool.cold is not None:
                         shared_need.append((rids[bi], p, shared_maps[bi][p]))
                     else:
-                        # PROBE DIAGNOSTIC: classify why a selected early page
-                        # cannot be promoted. One-time dump into the instance.
-                        diag = {
-                            "page": p, "rid": rids[bi],
-                            "in_cold_pages": p in cold_pages[bi],
-                            "in_shared": p in shared_maps[bi],
-                            "in_resident_snap": p in resident_of[bi],
-                            "private_key_in_cold": key in pool.cold,
-                            "cold_pages_n": len(cold_pages[bi]),
-                            "shared_n": len(shared_maps[bi]),
-                            "cold_tier_keys_sample":
-                                (p in cold_pages[bi]) and (key in pool.cold),
-                            "cold_minmax":
-                                (min(cold_pages[bi]), max(cold_pages[bi]))
-                                if cold_pages[bi] else None,
-                            "shared_minmax":
-                                (min(shared_maps[bi]), max(shared_maps[bi]))
-                                if shared_maps[bi] else None,
-                        }
-                        return {"fallback":
-                                f"unsupported/missing page {p} rid {rids[bi]}",
-                                "diag": diag}
+                        # Same as resolve()'s else: a candidate page resident
+                        # nowhere (never-written / boundary). Allocate a fresh
+                        # frame; its KV is whatever the frame holds, exactly the
+                        # semantics the eager refresh would serve.
+                        fresh_need.append(key)
         # de-dup preserving order
         seen = set()
         cold_need = [k for k in cold_need if not (k in seen or seen.add(k))]
         seen = set()
         shared_need = [k for k in shared_need
                        if not (k[:2] in seen or seen.add(k[:2]))]
-        n_promote = len(cold_need) + len(shared_need)
+        seen = set()
+        fresh_need = [k for k in fresh_need if not (k in seen or seen.add(k))]
+        n_promote = len(cold_need) + len(shared_need) + len(fresh_need)
         if n_promote > len(self.reserve):
             return {"fallback":
                     f"reserve {len(self.reserve)} < picks {n_promote} "
-                    f"(cold {len(cold_need)} shared {len(shared_need)})"}
+                    f"(cold {len(cold_need)} shared {len(shared_need)} "
+                    f"fresh {len(fresh_need)})"}
 
         page_phys: dict[tuple, int] = {}
         blobs = []
@@ -291,6 +281,14 @@ class LagController:
                 key = (rid, p)
                 promoted.append((key, blk, blob, True, content_key))
                 blobs.append(blob)
+                page_phys[key] = blk
+            for key in fresh_need:
+                # resolve()'s else branch: a candidate page resident nowhere.
+                # Allocate a fresh reserve frame with no H2D; promoted tuple
+                # carries blob=None so rollback knows not to re-home it.
+                blk = self.reserve.pop()
+                pool.refcount[blk] = 1
+                promoted.append((key, blk, None, False, None))
                 page_phys[key] = blk
             for bi in range(len(rids)):
                 for p in picks[bi]:
@@ -344,10 +342,10 @@ class LagController:
     def _rollback_promotes(self, pool, promoted) -> None:
         for entry in reversed(promoted):
             key, blk, blob, is_shared, _content_key = entry
-            if not is_shared:
+            if blob is not None and not is_shared:
                 # Private blob re-homed into its (rid,page) host slot. A shared
-                # blob is a read-only reference owned by the prefix index; it
-                # just drops here (its pin, if any, is released separately).
+                # blob is a read-only reference owned by the prefix index; a
+                # fresh frame (blob=None) never had bytes — both just drop.
                 pool.cold.hold(key, blob, self._blob_nbytes(blob))
             if pool.refcount[blk] > 0:
                 pool.refcount[blk] = 0
