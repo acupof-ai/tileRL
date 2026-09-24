@@ -11,6 +11,24 @@
   is **not** bit-identity. V100 was switched to `min0` on 2026-09-24 by ckl's
   decision after this result.
   — [wins/2026-09-24-near-tie-flip.md](docs/experience/wins/2026-09-24-near-tie-flip.md)
+- **fix (sparse, correctness)** — **a temp-0 greedy request's tokens depended on the
+  traffic before it.** `SparseRuntime.ticks_since_refresh` is engine-wide: 0 once at
+  construction (`sparse_runtime.py:120`), advanced every decode tick, reset only when a
+  refresh fires (`:307`) — never at admission. A sparse decode tick is eager every
+  `SPARSE_REFRESH_TICKS` (8) ticks, so which tick that is depended on the previous
+  requests' decode-tick count. Measured V100 sm70 min0, eight identical 32k requests:
+  entry phases **3, 6, 0, 0, 0, 0, 0, 0** against **three distinct output classes
+  one-to-one in order** (879 / 401 / 286 chars, last five byte-identical); a second run of
+  the same shape gave a **period-4 cycle** instead, predicted by the same rule
+  `8/gcd(8, T mod 8)` before it ran. The slot is **not** the cause — a runtime trace shows
+  every later request on slot 3 while the output still cycled with period 4. Fix: reset at
+  admission when no other decode row is in flight (cadence stays batch-global at B>1, noted
+  in the code). Gate `tests/test_sparse_refresh_phase.py`: the predecessor must leave a
+  non-zero phase or the assertion cannot discriminate, and the negative control reads
+  **6** (inherited 5 + 1). Rate effect `pending-remote` — the reset moves *which* ticks are
+  eager, not how many, so zero is the expected reading.
+  [errors/2026-09-24-refresh-phase-inherited-across-requests.md](docs/experience/errors/2026-09-24-refresh-phase-inherited-across-requests.md)
+  [wins/2026-09-24-refresh-phase-reset-bench.md](docs/experience/wins/2026-09-24-refresh-phase-reset-bench.md)
 - **default flip (sparse, #805)** — the speculated sparse captured decode graph
   is armed on **sm70 only**. `_sparse_capture_allowed` (guard A) kept it off on
   every CUDA arch at `spec_depth>=1` because the width-2 captured verify
