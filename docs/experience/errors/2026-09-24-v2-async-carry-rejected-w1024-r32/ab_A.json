@@ -1,0 +1,65 @@
+{
+  "warm_eff_tok_s": 37.8,
+  "warm_wall_tok_s": 37.748,
+  "graph_tick_ms_p50": 40.5693,
+  "eager_tick_ms_p50": 230.2654,
+  "graph_wall_ms_p50": 40.6234,
+  "eager_wall_ms_p50": 230.3287,
+  "carry_ms_p50": 226.686,
+  "carry_ms_p90": 254.6528,
+  "plain_ms_mean": 40.9217,
+  "eager_tick_frac": 0.0317,
+  "warm_ticks": 537,
+  "tokens_per_tick": 1.7952,
+  "accept_rate": 0.7898,
+  "spec_accepted": 451,
+  "spec_drafted": 571,
+  "accept_in": 0.7898,
+  "accept_post": null,
+  "steady_cycles": 13,
+  "lag_carry": null,
+  "lag_fallback": null,
+  "lag_fallback_reasons": null,
+  "lag_last_fallback_reason": null,
+  "lag_last_fallback_diag": null,
+  "per_prompt": [
+    {
+      "i": 0,
+      "n_out": 512,
+      "warm_eff_tokens": 483,
+      "warm_tok_s": 36.5758,
+      "warm_wall_tok_s": 36.5242
+    },
+    {
+      "i": 1,
+      "n_out": 512,
+      "warm_eff_tokens": 481,
+      "warm_tok_s": 39.1146,
+      "warm_wall_tok_s": 39.0624
+    }
+  ],
+  "tag": "A",
+  "lag": "off",
+  "tree": "366f5c7c",
+  "config": {
+    "arm": "graph_w2048",
+    "built_sparse_graph_on": true,
+    "forced_eager": false,
+    "auto_disabled_warnings": [],
+    "min_tokens": 0,
+    "draft_window": 2048
+  },
+  "n_prompts": 2,
+  "window_tokens": 1024,
+  "refresh_ticks_R": 32,
+  "draft_true_q_width": true,
+  "graph_carry_observed": false,
+  "capture_order_checked": 0,
+  "capture_order_violations": 0,
+  "b1_violations": 0,
+  "residency_structural": {
+    "sampled_cycles": 0,
+    "violated": false,
+    "note": "no steady carry samples (control or no carries)"
+  }
+}

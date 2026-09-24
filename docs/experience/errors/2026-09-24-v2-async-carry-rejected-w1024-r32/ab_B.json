@@ -1,0 +1,73 @@
+{
+  "warm_eff_tok_s": 23.1847,
+  "warm_wall_tok_s": 23.1355,
+  "graph_tick_ms_p50": 40.9033,
+  "eager_tick_ms_p50": 270.0104,
+  "graph_wall_ms_p50": 40.9704,
+  "eager_wall_ms_p50": 270.1079,
+  "carry_ms_p50": 256.9729,
+  "carry_ms_p90": 1055.9109,
+  "plain_ms_mean": 55.5836,
+  "eager_tick_frac": 0.0146,
+  "warm_ticks": 547,
+  "tokens_per_tick": 1.766,
+  "accept_rate": 0.7625,
+  "spec_accepted": 443,
+  "spec_drafted": 581,
+  "accept_in": 0.7625,
+  "accept_post": null,
+  "steady_cycles": 13,
+  "lag_carry": 9,
+  "lag_fallback": 8,
+  "lag_fallback_reasons": {
+    "reserve": 8
+  },
+  "lag_last_fallback_reason": "reserve 200 < picks 212 (cold 212 shared 0 fresh 0)",
+  "lag_last_fallback_diag": null,
+  "per_prompt": [
+    {
+      "i": 0,
+      "n_out": 512,
+      "warm_eff_tokens": 484,
+      "warm_tok_s": 20.4104,
+      "warm_wall_tok_s": 20.3673
+    },
+    {
+      "i": 1,
+      "n_out": 512,
+      "warm_eff_tokens": 482,
+      "warm_tok_s": 26.8495,
+      "warm_wall_tok_s": 26.792
+    }
+  ],
+  "tag": "B",
+  "lag": "async",
+  "tree": "366f5c7c",
+  "config": {
+    "arm": "graph_w2048",
+    "built_sparse_graph_on": true,
+    "forced_eager": false,
+    "auto_disabled_warnings": [],
+    "min_tokens": 0,
+    "draft_window": 2048
+  },
+  "n_prompts": 2,
+  "window_tokens": 1024,
+  "refresh_ticks_R": 32,
+  "draft_true_q_width": true,
+  "graph_carry_observed": true,
+  "capture_order_checked": 1,
+  "capture_order_violations": 0,
+  "b1_violations": 0,
+  "residency_structural": {
+    "sampled_cycles": 9,
+    "pin_ceiling": 609,
+    "max_resident_frames": 65,
+    "max_blocks": 65,
+    "free_first": 2324,
+    "free_last": 2338,
+    "free_monotonic_drain": false,
+    "over_pin_ceiling": false,
+    "violated": false
+  }
+}
