@@ -17,8 +17,7 @@ from safetensors.torch import save_file
 from tilerl_kernels import reference
 
 from tilerl.config import tiny
-from tilerl.model import (
-    _param_key_for, build_random, fp4_param_keys, load_hf, param_specs, save_hf)
+from tilerl.model import _param_key_for, build_random, fp4_param_keys, load_hf, param_specs, save_hf
 
 #: param suffix -> HF suffix (reverse of model._LAYER_SUFFIXES)
 _SIMPLE = {
@@ -725,8 +724,9 @@ def _native_expected(expected_packed):
 
 
 def test_pack_fp4_bounded_is_bit_identical_and_respects_budget(monkeypatch):
-    from tilerl.model import _PACK_BYTES_PER_WEIGHT, _pack_fp4_bounded
     from tilerl_kernels.reference import pack_fp4 as pf4
+
+    from tilerl.model import _PACK_BYTES_PER_WEIGHT, _pack_fp4_bounded
 
     gen = torch.Generator().manual_seed(3)
     w = torch.randn(257, 128, generator=gen).to(torch.bfloat16)
@@ -756,8 +756,9 @@ def test_load_hf_packs_bf16_linears_under_a_tiny_budget(tmp_path, monkeypatch):
     """End-to-end V100 failure: bf16 lm_head (248320x5120 there) packed whole
     needs ~41 GiB of temporaries. With a tiny per-chunk budget load still
     succeeds and yields the SAME served bytes as one whole pack."""
-    from tilerl.model import _native_fp4  # noqa: F401
     from tilerl_kernels.reference import pack_fp4, renorm_fp4_scale
+
+    from tilerl.model import _native_fp4  # noqa: F401
 
     cfg = tiny()
     model = build_random(cfg, seed=7)
