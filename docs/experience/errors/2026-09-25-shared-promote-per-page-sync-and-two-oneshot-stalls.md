@@ -1,12 +1,11 @@
 # Three distinct 2-6 s decode stalls after the 8 GB cold tier removed SSD reads — 2026-09-25
 
-> Status: one of the three is a code defect with a fix (shared_promote
-> per-page sync, pending PR); the other two are the CUDA allocator and
-> request-finish teardown, measured and left. After `--kv-cold-bytes` 1 GB →
-> 8 GB every `ssd_mmap` tick was 0, but 3 decode ticks still crossed 2 s and
-> the second of three identical 37.6k requests had eight 1.5–1.9 s refresh
-> ticks. They are three different mechanisms; lumping them as "cold tier"
-> would fix none.
+> Status: the code defect is fixed (#832) and device-verified 2026-09-25; the
+> other two are the CUDA allocator and request-finish teardown, measured and
+> left (rows in OPEN.md). After `--kv-cold-bytes` 1 GB → 8 GB every `ssd_mmap`
+> tick was 0, but 3 decode ticks still crossed 2 s and the second of three
+> identical 37.6k requests had eight 1.5–1.9 s refresh ticks. They are three
+> different mechanisms; lumping them as "cold tier" would fix none.
 
 Data: V100 sm70, ThinkingCap 27B, W1024/R32/q1/d1, three back-to-back
 streamed runs of serve805 prompt 0 (37.6k → 512 tokens), `TILERL_STEP_TIMING=1`
@@ -79,3 +78,27 @@ For a repeat-prompt workload the dominant cost is **class A** (8 ticks ×
 throughout), the phase fields (`graph` vs `model` vs `pub_*`/
 `release_cold_forget`), and matched `offers_pages` across runs with divergent
 `model` ms.
+
+## Device verification of #832 (2026-09-25)
+
+Same service/geometry, fix deployed to a separate tree, one miss followed by
+three identical 37.6k hits (1108 decode ticks, `ssd_mmap` still 0). The first
+hit's eight refresh ticks, matched one-for-one to the baseline positions
+(same offers_pages 45–270):
+
+| offers_pages | baseline total | fixed total | baseline model | fixed model |
+|---:|---:|---:|---:|---:|
+| 123 | 1740 | 216 | 1513 | 189 |
+| 78 | 1623 | 202 | 1520 | 187 |
+| 120 | 1583 | 197 | 1472 | 182 |
+| 45 | 327 | 190 | 304 | 176 |
+| 198 | 1852 | 223 | 1722 | 206 |
+| 270 | 1770 | 213 | 1634 | 195 |
+| 143 | 1847 | 219 | 1725 | 203 |
+| 186 | 1770 | 215 | 1635 | 192 |
+
+First-hit refresh **p50 1755 → 214 ms, max 1852 → 223 ms** — the hit is now
+as fast as a miss or a warm repeat. The only >2 s decode tick left was the
+class-C request-finish publish (tick 352, 2578 ms; one per unique prompt);
+class B did not recur in this window. Hit decode tok/s 39.0 on the fixed
+first hit vs 12.0 baseline; acceptance unchanged 0.8484 across all four runs.
