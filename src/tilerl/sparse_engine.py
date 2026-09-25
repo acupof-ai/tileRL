@@ -613,6 +613,17 @@ class SparseForward:
             # s_l2p [B,C] resident phys/-1; s_bounds one gathered candidate bound
             # plane per (row, source group) -> flat [B*n_src,C,Hkv,2,D].
             self.s_l2p = torch.full((self.b, cmax), -1, dtype=torch.long, device=dev)
+            # Persistent per-group select OUTPUTS, allocated OUTSIDE capture,
+            # matching s_l2p above. The old per-group dict cached tensors lazily
+            # allocated DURING the first captured forward: graph-private storage
+            # that on replay read back as garbage (observed only after a mixed
+            # eager tick changed the graph's allocation history), sending nsel
+            # out of range in table.scatter_ (device-side assert). Outputs a
+            # recorded replay must read live in stable, pre-capture storage.
+            kg = min(self.tracker.k_pages, cmax)
+            self.s_nsel = torch.zeros(self.n_groups, self.b, dtype=torch.long, device=dev)
+            self.s_phys = torch.zeros(self.n_groups, self.b, kg, dtype=torch.long, device=dev)
+            self.s_chosen = torch.zeros(self.n_groups, self.b, kg, dtype=torch.long, device=dev)
             if self.tracker.scorer == "bounds":
                 n_src, hkv, dim = (len(self.tracker.src_planes), self.tracker.hkv, self.tracker.dim)
                 self.s_bounds = [
@@ -795,6 +806,14 @@ class SparseForward:
                 ]
             )  # [B,k], always >= 0
         phys = torch.where(valid, phys, torch.zeros_like(phys))
+        if self.reuse:
+            # Write into the persistent, OUTSIDE-capture staging so the recorded
+            # scatter/gather downstream bakes a stable address instead of a
+            # graph-private intermediate's.
+            self.s_phys[g].copy_(phys)
+            self.s_nsel[g].copy_(nsel)
+            self.s_chosen[g].copy_(chosen)
+            phys, nsel, chosen = self.s_phys[g], self.s_nsel[g], self.s_chosen[g]
         self._dphys[g] = phys
         self._dnsel[g] = nsel
         self._dchosen[g] = chosen
