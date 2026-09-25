@@ -17,7 +17,8 @@ from safetensors.torch import save_file
 from tilerl_kernels import reference
 
 from tilerl.config import tiny
-from tilerl.model import build_random, fp4_param_keys, load_hf, param_specs, save_hf
+from tilerl.model import (
+    _param_key_for, build_random, fp4_param_keys, load_hf, param_specs, save_hf)
 
 #: param suffix -> HF suffix (reverse of model._LAYER_SUFFIXES)
 _SIMPLE = {
@@ -661,3 +662,128 @@ def test_mlx_affine_load(tmp_path):
     assert set(loaded.params) == set(param_specs(cfg))
     for key, exp in expected.items():
         assert torch.equal(loaded.params[key], exp), f"param {key} dequant mismatch"
+
+
+def test_nvfp4_sibling_scale_in_another_shard_loads(tmp_path, monkeypatch):
+    """ThinkingCap-NVFP4 split ONE packed triple across files: up_proj's scalar
+    weight_global_scale was in shard 1 while its weight_packed + weight_scale
+    were in shard 2. The old loader read siblings only from the packed tensor's
+    shard and died with KeyError; the index must now route the fetch."""
+    cfg = replace(_WIDE_CFG, fp4=True)
+    model = build_random(_WIDE_CFG, seed=7)
+    gen = torch.Generator().manual_seed(11)
+    tensors, expected_packed = {}, {}
+    split_stem = "model.language_model.layers.0.mlp.up_proj."
+    for key, t in model.params.items():
+        hf = _hf_name(key)
+        if key.endswith((".gate_proj", ".up_proj", ".down_proj")):
+            n, k = t.shape
+            packed = torch.randint(0, 256, (n, k // 2), generator=gen, dtype=torch.uint8)
+            scale = (torch.rand(n, k // 16, generator=gen) * 0.1 + 0.05).to(torch.float8_e4m3fn)
+            gscale = torch.rand(1, generator=gen) * 1000 + 100
+            stem = hf.removesuffix(".weight")
+            tensors[stem + ".weight_packed"] = packed
+            tensors[stem + ".weight_scale"] = scale
+            tensors[stem + ".weight_global_scale"] = gscale
+            pkey = _param_key_for(hf)
+            assert pkey is not None
+            expected_packed[pkey] = (packed, scale, gscale)
+        else:
+            tensors[hf] = t
+    split_gs = split_stem + "weight_global_scale"
+    assert split_gs in tensors
+    shard2 = {split_gs: tensors.pop(split_gs)}
+    f1, f2 = "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"
+    save_file(tensors, str(tmp_path / f1))
+    save_file(shard2, str(tmp_path / f2))
+    weight_map = {name: f1 for name in tensors} | {split_gs: f2}
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": weight_map}))
+    _write_config(tmp_path, cfg, "qwen3_6", nested=True, **_NVFP4)
+
+    loaded = load_hf(cfg, str(tmp_path), keep_master=True)
+    exp_wq, exp_scale, exp_oscale = _native_expected(expected_packed)
+    got_key = _param_key_for(split_stem.removesuffix(".") + ".weight")
+    assert got_key == "layers.0.up_proj"
+    assert torch.equal(loaded.params[got_key + ".wq"], exp_wq)
+    assert torch.equal(loaded.params[got_key + ".oscale"], exp_oscale)
+    assert torch.equal(loaded.params[got_key + ".scale"], exp_scale)
+
+    # Negative control: a sibling the index does not route still fails loudly
+    # instead of silently loading a partial weight.
+    weight_map.pop(split_gs)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": weight_map}))
+    with pytest.raises(KeyError):
+        load_hf(cfg, str(tmp_path))
+
+
+def _native_expected(expected_packed):
+    from tilerl.model import _native_fp4
+    packed, scale, gscale = expected_packed["layers.0.up_proj"]
+    return _native_fp4(packed, scale, gscale, divide=True)
+
+
+def test_pack_fp4_bounded_is_bit_identical_and_respects_budget(monkeypatch):
+    from tilerl.model import _PACK_BYTES_PER_WEIGHT, _pack_fp4_bounded
+    from tilerl_kernels.reference import pack_fp4 as pf4
+
+    gen = torch.Generator().manual_seed(3)
+    w = torch.randn(257, 128, generator=gen).to(torch.bfloat16)
+    wq_whole, sc_whole = pf4(w)
+
+    calls = []
+    import tilerl.model as mm
+    real = mm.pack_fp4
+
+    def spy(x, block=32):
+        calls.append(tuple(x.shape))
+        return real(x, block=block)
+
+    monkeypatch.setattr(mm, "pack_fp4", spy)
+    # 64 rows max per call: 64*128*48 bytes = 393216.
+    monkeypatch.setenv("TILERL_FP4_PACK_BUDGET_BYTES", "393216")
+    wq_b, sc_b = _pack_fp4_bounded(w)
+    assert torch.equal(wq_b, wq_whole) and torch.equal(sc_b, sc_whole)
+    assert len(calls) > 1, "the bound must force chunking, this gate is inert otherwise"
+    assert max(rows for rows, _ in calls) <= 64
+    # Negative control for the gate itself: a one-shot pack of this weight
+    # would allocate well over the bound it was held to.
+    assert w.shape[0] * w.shape[1] * _PACK_BYTES_PER_WEIGHT > 393216
+
+
+def test_load_hf_packs_bf16_linears_under_a_tiny_budget(tmp_path, monkeypatch):
+    """End-to-end V100 failure: bf16 lm_head (248320x5120 there) packed whole
+    needs ~41 GiB of temporaries. With a tiny per-chunk budget load still
+    succeeds and yields the SAME served bytes as one whole pack."""
+    from tilerl.model import _native_fp4  # noqa: F401
+    from tilerl_kernels.reference import pack_fp4, renorm_fp4_scale
+
+    cfg = tiny()
+    model = build_random(cfg, seed=7)
+    _write_checkpoint(tmp_path, cfg, model.params)
+    monkeypatch.setenv("TILERL_FP4_PACK_BUDGET_BYTES", "6144")
+    import tilerl.model as mm
+    calls = []
+    real_pack = mm.pack_fp4
+
+    def spy(x, block=32):
+        calls.append(x.shape)
+        return real_pack(x, block=block)
+
+    monkeypatch.setattr(mm, "pack_fp4", spy)
+    loaded = load_hf(replace(cfg, fp4=True), str(tmp_path), keep_master=True)
+    key = next(k for k in fp4_param_keys(cfg) if k in model.params)
+    master = model.params[key]
+    wq0, sc0 = pack_fp4(master)
+    sc0, osc0 = renorm_fp4_scale(sc0)
+    assert torch.equal(loaded.params[key + ".wq"], wq0)
+    assert torch.equal(loaded.params[key + ".scale"], sc0)
+    assert torch.equal(loaded.params[key + ".oscale"], osc0)
+    # Discriminating half: every pack call's distance-tensor footprint stayed
+    # inside the budget; a one-shot pack of the biggest linear exceeds it.
+    from tilerl.model import _PACK_BYTES_PER_WEIGHT
+    assert calls, "no pack_fp4 call observed"
+    assert max(r * k_ * _PACK_BYTES_PER_WEIGHT for r, k_ in calls) <= 6144
+    n_linears = sum(1 for k in fp4_param_keys(cfg))
+    assert len(calls) > n_linears, "expected chunking: more calls than linears"

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -214,6 +215,32 @@ def _native_fp4(packed, weight_scale, gscale, *, divide: bool = False):
     gs = 1.0 / gs if divide else gs  # ModelOpt stores the global scale's reciprocal
     scale, oscale = renorm_fp4_scale(weight_scale.float(), gs.expand(packed.shape[0]))
     return packed.contiguous(), scale, oscale
+
+
+#: Per-row bytes of pack_fp4's largest temporary, the [r, K/B, B, 8] distance
+#: tensor: 8 floats per weight. (The other temporaries are <= 4 per weight.)
+_PACK_BYTES_PER_WEIGHT = 8 * 4 + 4 * 4
+#: Default ceiling for one pack chunk: half a GiB. A 248320x5120 lm_head packed
+#: whole needs ~41 GiB for the distance tensor and OOMs a 31 GiB host.
+_PACK_BUDGET_DEFAULT = 512 * 1024 * 1024
+
+
+def _pack_fp4_bounded(master: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+    """pack_fp4 in row chunks so the 8-wide e2m1 distance tensor's peak bytes
+    stay under TILERL_FP4_PACK_BUDGET_BYTES (default 512 MiB). Every pack/renorm
+    op is per row, so the concatenated result is bit-identical to one whole
+    pack_fp4; the caller applies the same renorm_fp4_scale it did before."""
+    n, k = master.shape
+    budget = int(os.environ.get("TILERL_FP4_PACK_BUDGET_BYTES", str(_PACK_BUDGET_DEFAULT)))
+    rows = max(1, budget // (_PACK_BYTES_PER_WEIGHT * k))
+    if rows >= n:
+        return pack_fp4(master, block=block)
+    wq_parts, scale_parts = [], []
+    for i in range(0, n, rows):
+        wq_c, scale_c = pack_fp4(master[i : i + rows], block=block)
+        wq_parts.append(wq_c)
+        scale_parts.append(scale_c)
+    return torch.cat(wq_parts, 0), torch.cat(scale_parts, 0)
 
 
 # --- Model ------------------------------------------------------------------
@@ -985,12 +1012,35 @@ def load_hf(
     specs = param_specs(cfg)
     group_size = hf_cfg.get("quantization", {}).get("group_size", 64)
     awq_group = (hf_cfg.get("quantization_config") or {}).get("group_size", 128)
+    index_path = ckpt_dir / "model.safetensors.index.json"
+    weight_map = (
+        json.loads(index_path.read_text()).get("weight_map", {})
+        if index_path.exists()
+        else {}
+    )
     params: dict[str, torch.Tensor] = {}
     fp8_native: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
     fp4_native: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
     lm_head_tensor: str | None = None
     for shard in _shard_files(ckpt_dir, source_desc):
         tensors = load_file(str(shard))
+
+        def sibling(name: str):
+            """A packed weight's scale/global-scale can live in a DIFFERENT
+            shard than its .weight_packed (observed on ThinkingCap-NVFP4:
+            layers.22.up_proj's global_scale was split across the two files).
+            Read only that tensor out of the indexed shard instead of
+            demanding every sibling inside the one file in hand."""
+            if name in tensors:
+                return tensors[name]
+            other = weight_map.get(name)
+            if other is None or other == shard.name:
+                return tensors[name]  # preserve the original KeyError
+            from safetensors import safe_open
+
+            with safe_open(str(ckpt_dir / other), framework="pt") as sf:
+                return sf.get_tensor(name)
+
         lm_head_tensor = lm_head_tensor or next((n for n in tensors if _is_lm_head(n)), None)
         mlx = next((n for n in tensors if n.startswith("language_model.")), None) is not None
         if mlx:
@@ -1009,7 +1059,8 @@ def load_hf(
                 stem = hf_name.removesuffix(".weight_packed")
                 key = _param_key_for(stem + ".weight")
                 if key is not None:
-                    sib = (tensors[stem + ".weight_scale"], tensors[stem + ".weight_global_scale"])
+                    sib = (sibling(stem + ".weight_scale"),
+                           sibling(stem + ".weight_global_scale"))
                     if cfg.fp4:
                         fp4_native[key] = _native_fp4(tensor, *sib, divide=True)
                         key = None  # served packed
@@ -1050,7 +1101,8 @@ def load_hf(
                 stem = hf_name.removesuffix(".weight")
                 key = _param_key_for(hf_name)
                 if key is not None:
-                    sib = (tensors[stem + ".weight_scale"], tensors[stem + ".weight_scale_2"])
+                    sib = (sibling(stem + ".weight_scale"),
+                           sibling(stem + ".weight_scale_2"))
                     if cfg.fp4:
                         fp4_native[key] = _native_fp4(tensor, *sib)
                         key = None
@@ -1153,7 +1205,7 @@ def load_hf(
             if master.dtype != torch.bfloat16:
                 master = master.to(torch.bfloat16)
                 params[key] = master
-            wq, scale = pack_fp4(master)
+            wq, scale = _pack_fp4_bounded(master)
             params[f"{key}.wq"] = wq
             params[f"{key}.scale"], params[f"{key}.oscale"] = renorm_fp4_scale(scale)
 
