@@ -2173,6 +2173,9 @@ class Engine:
         if _tm is not None:
             _tm.mark("sample", _t)
             _t = time.perf_counter()
+        # Ids of rows whose draft step is skipped THIS tick, snapshotted before
+        # _finish_prefills flips last-chunk rows to DECODE.
+        skip_draft_ids = self._draft_prefill_skip_ids(prefills, chunks) if prefills else set()
         if prefills:
             self._prefill_forwards += 1
             # mixed ticks included: excluding them reports a rate no request sees
@@ -2192,7 +2195,10 @@ class Engine:
             if _tm is not None:
                 _tm.mark("draft_blocks", _t)
                 _t = time.perf_counter()
-            self._draft_step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
+            draft_rows = rows
+            if skip_draft_ids:
+                draft_rows = [r for r in rows if r.req_id not in skip_draft_ids]
+            self._draft_step(draft_rows)
             if _tm is not None:
                 _tm.mark("draft_step", _t)
                 _t = time.perf_counter()
@@ -2572,6 +2578,25 @@ class Engine:
                 r.own_blocks += 1
                 self._blocks_used += 1
         return kept
+
+    def _draft_prefill_skip_ids(self, prefills: list[_Req], chunks: list[int]) -> set:
+        """Rows mid-prefill whose draft forward THIS tick writes no KV decode
+        will read, so the engine skips ``draft.step`` for them (a 512-token
+        chunk costs 6.5-10 s on V100). The draft attention reads only its
+        trailing W-window, which starts at the page covering n-W
+        (floor((n-W)/BLOCK_TOKENS)*BLOCK_TOKENS); an interior chunk ending at s
+        is skippable when s <= that page start. W=0 (full prefix, the head's
+        default) skips nothing. Skipping a later chunk leaves window positions
+        holding another draft-pool user's KV and quietly cuts acceptance."""
+        W = getattr(self._draft, "attn_window_tokens", 0) if self._draft is not None else 0
+        if W <= 0:
+            return set()
+        ids = set()
+        for r, c in zip(prefills, chunks):
+            s = r.prefill_from + c
+            if s < len(r.tokens) and s <= (len(r.tokens) - W) // BLOCK_TOKENS * BLOCK_TOKENS:
+                ids.add(r.req_id)
+        return ids
 
     def _draft_step(self, rows: list[_Req]) -> None:
         """One named tick-step binding for the draft head: timed when the engine
