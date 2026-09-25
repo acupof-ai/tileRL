@@ -358,11 +358,8 @@ def test_tool_choice_none_streaming_never_emits_call_xml(tmp_path):
 
 def test_stream_pacing_preserves_content_and_order_but_delays_first_frame():
     """#165469: --stream-pace re-times SSE deltas only. The concatenated content,
-    frame order, finish frame and [DONE] must be byte-identical to pacing off;
-    the only permitted change is the first-content frame arriving later (the
-    one-time headroom fill)."""
-    import time
-
+    frame order, finish frame and [DONE] must be byte-identical whether pacing
+    is on (the default) or explicitly off; the pacing config is on by default."""
     tok = _ByteTokenizer()
     reply = "abcdefghijklmnopqrstuvwxyz0123456789ABCD"  # 40 one-byte tokens
 
@@ -383,12 +380,16 @@ def test_stream_pacing_preserves_content_and_order_but_delays_first_frame():
         content = "".join((f["choices"][0].get("delta", {}).get("content") or "") for f in fr)
         return fr, content, done
 
-    fr_off, c_off, done_off = frames_of(create_app(_ScriptedEngine(tok, [reply]), tok))
-    t0 = time.perf_counter()
-    fr_on, c_on, done_on = frames_of(
-        create_app(_ScriptedEngine(tok, [reply]), tok, stream_pace=True, stream_pace_depth=3)
-    )
-    elapsed = time.perf_counter() - t0
+    off_app = create_app(_ScriptedEngine(tok, [reply]), tok, stream_pace=False)
+    on_app = create_app(_ScriptedEngine(tok, [reply]), tok, stream_pace_depth=3)
+    # pacing is ON by default (--stream-pace default on): the default app must
+    # carry the paced config, and the explicit-off app must not. The headroom
+    # delay itself is asserted deterministically in test_stream_pacing.py with
+    # a virtual clock, not with a wall-clock race here.
+    assert on_app.state.stream_pace is True and on_app.state.stream_pace_depth == 3
+    assert off_app.state.stream_pace is False
+    fr_off, c_off, done_off = frames_of(off_app)
+    fr_on, c_on, done_on = frames_of(on_app)
 
     # API fidelity: same concatenated text, same terminal finish, same [DONE]
     assert c_on == c_off == reply
@@ -398,8 +399,6 @@ def test_stream_pacing_preserves_content_and_order_but_delays_first_frame():
     assert fin_off == fin_on == "stop"
     # every paced frame's delta is a prefix-preserving slice: order is kept
     assert "".join((f["choices"][0].get("delta", {}).get("content") or "") for f in fr_on) == reply
-    # pacing bought headroom: depth 3 tokens held before the first content frame
-    assert elapsed >= 0.050, f"paced stream returned in {elapsed * 1000:.0f} ms, no headroom"
 
 
 def test_chat_refuses_hosted_tools(tmp_path):
@@ -3218,7 +3217,7 @@ class _MidStreamEngine:
         return {}
 
 
-def _uvicorn_server(engine, tok, wrap_app=None):
+def _uvicorn_server(engine, tok, wrap_app=None, **app_kw):
     """A real uvicorn loop over a custom engine: the ONLY transport under
     which an SSE socket close reaches engine.cancel. httptools reads the EOF,
     posts http.disconnect, Starlette's disconnect watcher cancels the
@@ -3233,7 +3232,7 @@ def _uvicorn_server(engine, tok, wrap_app=None):
 
     import uvicorn
 
-    app = create_app(engine, tok)
+    app = create_app(engine, tok, **app_kw)
     if wrap_app is not None:
         app = wrap_app(app)
     with socket.socket() as probe:
@@ -4263,7 +4262,10 @@ def test_simultaneous_sse_hangups_with_inflight_workers_do_not_freeze_the_loop()
     tok = _ByteTokenizer()
     eng = _MultiParkEngine(tok, N)
     server, port = _uvicorn_server(
-        eng, tok, wrap_app=lambda app: _WideDefaultExecutor(app, N * 2 + 8)
+        eng,
+        tok,
+        wrap_app=lambda app: _WideDefaultExecutor(app, N * 2 + 8),
+        stream_pace=False,
     )
     payload = json.dumps(
         {"messages": [{"role": "user", "content": "hi"}], "stream": True, "max_tokens": 64}

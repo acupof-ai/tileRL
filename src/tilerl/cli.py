@@ -217,7 +217,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         tokenizer,
         model_name=cfg.name,
         completion_timeout_s=getattr(args, "completion_timeout_s", None),
-        stream_pace=getattr(args, "stream_pace", False),
+        stream_pace=getattr(args, "stream_pace", True),
         stream_pace_depth=getattr(args, "stream_pace_depth", 12),
     )
     # --dry-run: build (which materializes and fits) then print the memory ledger and stop,
@@ -717,11 +717,13 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     )
     p_serve.add_argument(
         "--stream-pace",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="smooth the periodic sparse-refresh stall in SSE output: buffer "
-        "the first --stream-pace-depth tokens, then emit at the long-run "
-        "rate. Changes ONLY send timing; SSE fields/order/usage are "
-        "unchanged. Default off. First token is delayed ~depth*24 ms.",
+        "the first --stream-pace-depth tokens, then emit at the adaptive "
+        "long-run rate. Changes ONLY send timing; SSE fields/order/usage are "
+        "unchanged. Default ON; --no-stream-pace disables it. First token is "
+        "delayed ~depth*24 ms.",
     )
     p_serve.add_argument(
         "--stream-pace-depth",

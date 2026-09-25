@@ -377,6 +377,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
             "--sparse-window-tokens",
             "--state-bytes",
             "--stream-pace",
+            "--no-stream-pace",
             "--stream-pace-depth",
         }
     ),

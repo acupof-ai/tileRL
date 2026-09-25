@@ -460,7 +460,7 @@ def create_app(
     tokenizer: Tokenizer,
     model_name: str = "tilerl",
     completion_timeout_s: float | None = None,
-    stream_pace: bool = False,
+    stream_pace: bool = True,
     stream_pace_depth: int = 12,
 ) -> FastAPI:
     """Build the FastAPI app around a running engine and a tokenizer.
@@ -484,6 +484,8 @@ def create_app(
         else float(completion_timeout_s)
     )
     app = FastAPI(title="tilerl", version=__version__, lifespan=_lifespan)
+    app.state.stream_pace = bool(stream_pace)
+    app.state.stream_pace_depth = int(stream_pace_depth)
     app_started = int(time.time())
 
     @app.exception_handler(RequestValidationError)
