@@ -18,9 +18,9 @@
   delivered — `_finish` → `_release` sets `_finished` inside the same tick
   that holds `engine._lock`, so a same-thread reorder cannot expose the
   result earlier; a background publish is the only true off-response move and
-  is deferred for its pin-pool-capacity cost. Device re-measurement of the
-  tick-352 release sub-phases is pending a V100 window.
-  — [errors/2026-09-25-shared-promote-per-page-sync-and-two-oneshot-stalls.md](docs/experience/errors/2026-09-25-shared-promote-per-page-sync-and-two-oneshot-stalls.md)
+  is deferred for its pin-pool-capacity cost. Device-verified on V100 (same
+  37.6k prompt, tick 352): publish D2H 1729→914 ms and the release phase
+  2543→1338 ms (−47%), with identical accept 0.8484.
 - **fix (kv)** — a prefix-hit refresh no longer stalls one sync per adopted
   page. `shared_promote` (the shared-prefix → private-block H2D on a warm
   adoption) called `torch.cuda.synchronize()` unconditionally per page, while

@@ -133,8 +133,26 @@ byte-equal; two separate contexts sync twice; red on the old code
 both commit entry points during a real run and asserts the batching flag is
 down at every call (a commit inside the window fails it), then proves the
 deferred commits landed — shared bytes plus a follower adoption — so it
-cannot pass vacuously on a no-publish build. Device re-measurement of tick
-352's `release_cold_forget` sub-phases is pending a card slot.
+cannot pass vacuously on a no-publish build.
+
+Device verification (V100, same 37.6k-token prompt 0, W1024/R32, cold8g,
+tick 352 — the finish-publish tick on the request's first run):
+
+| measure | #832 tree | #833 tree |
+|---|---|---|
+| `pub_bounds_d2h` | 289 ms | (folded below) |
+| `pub_draft_clone` | 426 ms | (folded below) |
+| `pub_frame_d2h` | 1014 ms | 914 ms (bounds+draft+frame launches + one sync) |
+| publish D2H sum | **1729 ms** | **914 ms** |
+| `pub_share_hold` / `pub_cold_transfer` | 9 / 48 ms | 2 / 13 ms |
+| `release_cold_forget` | **2543 ms** | **1338 ms** |
+| tick total | 2578 ms | 1373 ms |
+
+Per-page `pub_bounds_d2h`/`pub_draft_clone` marks disappear in the batched
+path — those copies launch inside the window and are folded into the one
+`pub_frame_d2h` segment. Acceptance was identical across the two runs
+(0.8484). The residual ~914 ms is the unavoidable D2H byte time for the
+published pages.
 
 Question asked before building: is the stall before or after the last token /
 finish? Answer from the code — **before delivery, and reordering in the same
