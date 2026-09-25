@@ -108,14 +108,14 @@ def _publisher_with_failing_finish_transfer(mode: str):
         state["armed"] = True  # finish is this publisher's last publish
         return real_close(*a, **k)
 
-    def fault_xfer(r, page, content_key, draft_block=None):
+    def fault_xfer(r, page, content_key, draft_block=None, pending=None):
         if getattr(state, "armed", False) or state.get("armed"):
             state["calls"] += 1
             if state["calls"] == 3:
                 if mode == "raise":
                     raise SpillWriteError("injected spill failure")
-                return  # soft: no record placed
-        return real_xfer(r, page, content_key, draft_block)
+                return  # soft: no record placed (nothing appended to pending)
+        return real_xfer(r, page, content_key, draft_block, pending)
 
     sp.transfer_to_shared = fault_xfer
     sp.prefix.close_prompt = arm_close
@@ -200,6 +200,47 @@ def test_the_same_publisher_decoding_past_a_chunk_does_publish_and_adopt():
         entry = pfx.lookup(prompt)
         assert entry is not None, "a published prefix is not findable by its own prompt"
         assert _adopt_after(e, prompt) > 0, "follower did not adopt a published prefix"
+    finally:
+        e.shutdown()
+
+
+def test_finish_publish_commits_no_blob_until_the_batch_sync_drains():
+    """B (2026-09-25): finish-publish D2H is batched — every page's frame,
+    bounds and draft copy launches non-blocking and the cold-tier commit (which
+    may spill a blob to disk, reading its host bytes) is deferred past the
+    batch's one sync. A commit while the snapshot flag is up would spill-read
+    bytes the D2H has not finished writing. This gate spies on both commit
+    entry points during a whole run and requires the flag down at every call;
+    it then proves the deferred commits actually landed (shared bytes and a
+    follower adoption), so it is not vacuously green on a no-publish build."""
+    e = _build_engine()
+    try:
+        cold = e._kv.cold
+        kv = e._kv
+        seen = {"commit": 0}
+        real_hold = cold.share_hold
+        real_hold_kv = cold.share_hold_kv
+
+        def spy_hold(*a, **k):
+            assert not getattr(kv, "_snapshot_batching", False), (
+                "share_hold ran inside frame_snapshots: spill could read a blob "
+                "before its non-blocking D2H landed")
+            seen["commit"] += 1
+            return real_hold(*a, **k)
+
+        def spy_hold_kv(*a, **k):
+            assert not getattr(kv, "_snapshot_batching", False), (
+                "share_hold_kv ran inside frame_snapshots: spill could read a "
+                "blob before its non-blocking D2H landed")
+            seen["commit"] += 1
+            return real_hold_kv(*a, **k)
+
+        cold.share_hold = spy_hold
+        cold.share_hold_kv = spy_hold_kv
+        prompt, _saw = _run(e, _SHORT_DECODE)
+        assert seen["commit"] > 0, "no cold-tier commit happened — publish never fired"
+        assert _shared_bytes(cold) > 0, "deferred commits placed no shared blob bytes"
+        assert _adopt_after(e, prompt) > 0, "follower did not adopt the batch-published prefix"
     finally:
         e.shutdown()
 

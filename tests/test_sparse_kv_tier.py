@@ -1360,3 +1360,48 @@ def test_batched_shared_promotions_sync_once_not_per_page():
             assert sync_fn.call_count == 1
     finally:
         pool.device = real_device
+
+
+def test_batched_frame_snapshots_sync_once_and_byte_equal():
+    """Finish-publish snapshots several still-resident pages; each _page_blob D2H
+    must batch to ONE device sync inside pool.frame_snapshots(), not one per
+    page (the per-page sync was ~1 s of the 2.6 s request-finish stall). Blobs
+    stay byte-equal; outside the context a snapshot still syncs per call."""
+    import unittest.mock as mock
+
+    p, hkv, d = 4, 2, 8
+    pool = PagedKvPool(p + 8, hkv, d, num_layers=2, device=_device())
+    blocks, snaps = [], {}
+    for i in range(3):
+        b = pool.alloc_block()
+        kk, vv = _kv(300 + i, 1, hkv, d)
+        for plane in range(2):
+            pool.write_block(b, 0, kk[0], vv[0], layer=plane)
+        snaps[b] = (pool.k_pool[:, b].clone(), pool.v_pool[:, b].clone())
+        blocks.append(b)
+
+    real_device = pool.device
+    pool.device = torch.device("cuda")
+    try:
+        with mock.patch("tilerl.kv_cache.torch.cuda.synchronize") as sync_fn, pool.frame_snapshots():
+            got = [pool._page_blob(b) for b in blocks]
+            assert sync_fn.call_count == 0, sync_fn.call_count
+        assert sync_fn.call_count == 1, f"expected one batched sync, got {sync_fn.call_count}"
+    finally:
+        pool.device = real_device
+    for b, (blob, _n) in zip(blocks, got):
+        assert torch.equal(blob["k"], snaps[b][0])
+        assert torch.equal(blob["v"], snaps[b][1])
+
+    # A fresh context re-arms: two separate contexts sync once each, never
+    # sharing a sync across contexts.
+    pool.device = torch.device("cuda")
+    try:
+        with mock.patch("tilerl.kv_cache.torch.cuda.synchronize") as sync_fn:
+            with pool.frame_snapshots():
+                pool._page_blob(blocks[0])
+            with pool.frame_snapshots():
+                pool._page_blob(blocks[1])
+            assert sync_fn.call_count == 2, sync_fn.call_count
+    finally:
+        pool.device = real_device

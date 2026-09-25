@@ -102,3 +102,52 @@ as fast as a miss or a warm repeat. The only >2 s decode tick left was the
 class-C request-finish publish (tick 352, 2578 ms; one per unique prompt);
 class B did not recur in this window. Hit decode tok/s 39.0 on the fixed
 first hit vs 12.0 baseline; acceptance unchanged 0.8484 across all four runs.
+
+## Class C fix (B): batch every finish-publish D2H — and why reordering alone does not help
+
+The device-resident pages finish-publish snapshots (`transfer_to_shared` →
+`PagedKvPool._page_blob`) were blocking copies: `_page_blob` defaults to
+`non_blocking=False`, so each page's D2H drained the stream before the next —
+the same per-page-sync defect shape as class A, on the D2H (snapshot) side.
+The per-page bounds `bv.cpu()` and warm-spec draft `dk/dv` `.cpu().clone()`
+were separate blocking D2Hs as well, so batching only the trunk frames would
+have left two stalls per page. The finish loop now opens
+`pool.frame_snapshots()` for the whole `keys` batch: frame, bounds and draft
+copies all launch non-blocking into their own pinned blobs and there is ONE
+`cuda.synchronize` at the context exit. Frames are not freed/demoted there
+(the caller keeps their lifecycle).
+
+One correctness condition the first draft got wrong: the cold-tier commit
+(`share_hold` / `share_hold_kv`) can spill an existing RAM blob to disk under
+budget pressure, which reads host bytes. Committing inside the context could
+therefore spill-read a page whose own D2H was still in flight. The batched
+`transfer_to_shared(..., pending=[])` only launches copies and appends a
+descriptor; `publish_at_finish` commits them all after the sync. The
+non-batched offer_drop path is unchanged (inline, synchronous).
+
+Gates: `test_batched_frame_snapshots_sync_once_and_byte_equal` — three
+snapshots in one context = zero syncs in-context, one at exit, blobs
+byte-equal; two separate contexts sync twice; red on the old code
+(`frame_snapshots` does not exist).
+`test_finish_publish_commits_no_blob_until_the_batch_sync_drains` spies on
+both commit entry points during a real run and asserts the batching flag is
+down at every call (a commit inside the window fails it), then proves the
+deferred commits landed — shared bytes plus a follower adoption — so it
+cannot pass vacuously on a no-publish build. Device re-measurement of tick
+352's `release_cold_forget` sub-phases is pending a card slot.
+
+Question asked before building: is the stall before or after the last token /
+finish? Answer from the code — **before delivery, and reordering in the same
+thread is not enough**. `_commit` calls `_finish` (→ `_release` → publish)
+the moment max_new/stop is reached; `_finished[rid]` is only assigned inside
+that same `_finish`, and `step()` holds `engine._lock` across the entire tick,
+so `poll`/`take` cannot read the result until `_release` returns the lock.
+Writing `_finished` before the publish within one tick therefore exposes
+nothing earlier — the client still waits out the release. The only way to
+fully move publish off the response path is a background thread, which needs
+(a) delayed return of the snapshotted frames until the D2H lands (the pool is
+sized to the n_groups*k pin ceiling with 0.5–0.9 GB free, so holding a
+finished request's frames risks the evict/池-full path), and (b)
+half-published-visibility and request-state-lifecycle gates. That is plan A,
+not taken; B is taken first because it removes the per-page sync overhead
+with zero concurrency/pool risk, leaving only the unavoidable D2H byte time.
