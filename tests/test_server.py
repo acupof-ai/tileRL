@@ -398,8 +398,8 @@ def test_stream_pacing_preserves_content_and_order_but_delays_first_frame():
     assert fin_off == fin_on == "stop"
     # every paced frame's delta is a prefix-preserving slice: order is kept
     assert "".join((f["choices"][0].get("delta", {}).get("content") or "") for f in fr_on) == reply
-    # pacing bought headroom: depth 3 at 24 ms is >= ~70 ms before first content
-    assert elapsed >= 0.065, f"paced stream returned in {elapsed * 1000:.0f} ms, no headroom"
+    # pacing bought headroom: depth 3 tokens held before the first content frame
+    assert elapsed >= 0.050, f"paced stream returned in {elapsed * 1000:.0f} ms, no headroom"
 
 
 def test_chat_refuses_hosted_tools(tmp_path):

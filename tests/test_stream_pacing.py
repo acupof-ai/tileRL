@@ -37,11 +37,12 @@ def _timeline():
     return out
 
 
-def _drive(enabled: bool, target_depth: int = 12):
-    timeline = _timeline()
+def _drive(enabled: bool, target_depth: int = 12, timeline=None):
+    timeline = _timeline() if timeline is None else timeline
+    ntok = len(timeline)
     if not enabled:
         # raw stream: an item is observable exactly at its production arrival
-        return [a for a, _p in timeline], list(range(N_TOK)), timeline[-1][0]
+        return [a for a, _p in timeline], list(range(ntok)), timeline[-1][0]
 
     now = {"t": 0.0}
     pi = 0
@@ -54,9 +55,9 @@ def _drive(enabled: bool, target_depth: int = 12):
     def drive_clock_to(want: float):
         nonlocal pi
         # producer runs concurrently: move the clock straight to `want` (do NOT
-        # snap to a production tick — that would skip the 24 ms due times), and
+        # snap to a production tick — that would skip the due times), and
         # enqueue every item whose arrival is crossed.
-        while pi < N_TOK and timeline[pi][0] <= want + 1e-9:
+        while pi < ntok and timeline[pi][0] <= want + 1e-9:
             _a, pos = timeline[pi]
             p._enqueue(pos, ("delta", pi, pos))
             pi += 1
@@ -69,25 +70,39 @@ def _drive(enabled: bool, target_depth: int = 12):
 
     drive_clock_to(0.0)  # items arriving at t=0
     emit_s, order = [], []
-    while pi < N_TOK:
-        # pace only while production is still running
-        t_before = now["t"]
-        outs = list(p.pump())  # pump sleeps the virtual clock via sim_sleep
-        if not outs and now["t"] <= t_before + 1e-12:
-            # fill phase, or a due time the producer has not filled yet: advance
-            # production to its next arrival and re-enqueue.
+    gen = p.pump()
+    while pi < ntok:
+        # consume one paced item at a time so its emit timestamp is the clock
+        # AT the yield (list() would run the generator to the end and stamp all
+        # items with the final time)
+        sentinel = object()
+        item = next(gen, sentinel)
+        if item is sentinel:
+            gen = p.pump()  # generator exhausted; reopen on the fresh buffer
+            item = next(gen, sentinel)
+        if item is sentinel:
+            # nothing due/buffered yet: advance production to its next arrival
+            assert pi < ntok
             now["t"] = max(now["t"], timeline[pi][0])
             drive_clock_to(now["t"])
-        for triple in outs:
-            _kind, idx, _pos = triple
-            order.append(idx)
-            emit_s.append(now["t"])
+            continue
+        _kind, idx, _pos = item
+        order.append(idx)
+        emit_s.append(now["t"])
     # production ended: the tail flushes immediately at the last arrival, no wait
     end_t = timeline[-1][0]
     for triple in p.flush():
         order.append(triple[1])
         emit_s.append(end_t)
     return emit_s, order, end_t
+
+
+def _slow_timeline():
+    """Cold/first-miss regime: one token every 47 ms, no graph/refresh split.
+    The adaptive pacer must follow the real (slow) rate instead of the 24 ms
+    hot prior, or its buffer drains and the slow cadence reaches the client."""
+    per = 0.047
+    return [(i * per, i + 1) for i in range(N_TOK)]
 
 
 def _gaps(ms: list[float]) -> list[float]:
@@ -123,11 +138,27 @@ def test_pacer_smooths_the_periodic_refresh_stall():
     assert end_ms <= _timeline()[-1][0] + 1e-6, (
         f"pacer added {(end_ms - _timeline()[-1][0]) * 1000:.1f} ms of trailing wait"
     )
-    assert paced[0] >= 0.24, (
-        f"first-token fill {paced[0] * 1000:.0f} ms shorter than the bought headroom"
-    )
+    # first token waits for the headroom fill: 12 tokens arrive over 6 graph
+    # ticks (2 tokens/tick) = ~205 ms
+    assert paced[0] >= 0.20, f"first-token fill {paced[0] * 1000:.0f} ms shorter than the headroom"
 
 
 def test_pacer_off_is_a_passthrough():
     src = [("delta", {"x": 0}, 1), ("done", "stop", 1)]
     assert list(pace_deltas(iter(src), False)) == src
+
+
+def test_pacer_adapts_to_a_slow_cold_regime_instead_of_draining():
+    """47 ms/token production (first-miss decode) must pace near 47 ms, not at
+    the 24 ms hot prior: a faster-than-production clock drains the buffer and
+    hands the slow cadence straight to the client."""
+    tl = _slow_timeline()
+    paced, order, end_s = _drive(True, timeline=tl)
+    assert order == list(range(len(tl))), "slow-regime pacer dropped/reordered"
+    gaps = _gaps(paced)[len(order) // 4 :]  # after the one-time fill
+    med = sorted(gaps)[len(gaps) // 2]
+    assert 0.040 < med < 0.055, f"paced median {med * 1000:.1f} ms not tracking 47 ms"
+    # no gap longer than the production beat + a small beat of slack: a drained
+    # buffer would show a long wait once the next token finally arrives
+    assert max(gaps) < 0.10, f"buffer drained: max paced gap {max(gaps) * 1000:.0f} ms"
+    assert end_s <= tl[-1][0] + 1e-6, "trailing wait added"
