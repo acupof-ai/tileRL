@@ -1,4 +1,4 @@
-# Two NVFP4 loader limits: cross-shard scales and a 41 GiB bf16-lm_head pack — 2026-09-25
+# Two NVFP4 loader limits: cross-shard scales and a 40.7 GB bf16-lm_head pack — 2026-09-25
 
 > Status: fixed by `bb3fe08b` (PR pending). The V100 had the checkpoint patched
 > out of tree to unblock the ThinkingCap cutover; both workarounds are
@@ -29,16 +29,19 @@ to the owning shard when a scale is not in the packed tensor's file. A sibling
 that is neither in the file nor routable via the index still KeyErrors (the
 negative control in the gate).
 
-### 2. An unpacked bf16 lm_head packed whole needs 41 GiB of host RAM
+### 2. An unpacked bf16 lm_head packed whole needs 40.7 GB of host RAM
 
 `lm_head` is on the NVFP4 quant ignore list (`recipe.yaml`:
 `ignore: [lm_head, 're:.*mtp.*', ...]`), so the checkpoint ships it as bf16
 (248320×5120). The loader's "pack the bf16 linears the checkpoint did not
 ship quantized" pass called `pack_fp4` on it in one shot. The reference
-`pack_fp4` builds an e2m1 distance tensor `[n, K/B, B, 8]` — for that shape
-`248320·5120·48 bytes = 40.7 GiB` — and the V100 has 31 GiB host RAM. The
-shipped Qwen3.8 checkpoint never hit this: its lm_head is already
-`.wq/.scale/.oscale`.
+`pack_fp4` builds an e2m1 distance tensor `[n, K/B, B, 8]` of f32 —
+`248320·5120·32 bytes = 40.7 GB` (37.9 GiB) for that one tensor — and the V100
+has 31 GiB host RAM. (The chunk sizer's 48 B/weight is a separate combined
+upper bound: 32 B for that distance tensor plus at most 16 B for the other
+live temporaries — master float copy, scaled input, index bytes; it is not the
+distance tensor's own size.) The shipped Qwen3.8 checkpoint never hit this:
+its lm_head is already `.wq/.scale/.oscale`.
 
 Fix: `_pack_fp4_bounded` packs row chunks under a byte budget
 (`TILERL_FP4_PACK_BUDGET_BYTES`, 512 MiB default). Blocking is along K, so row

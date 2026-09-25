@@ -217,11 +217,13 @@ def _native_fp4(packed, weight_scale, gscale, *, divide: bool = False):
     return packed.contiguous(), scale, oscale
 
 
-#: Per-row bytes of pack_fp4's largest temporary, the [r, K/B, B, 8] distance
-#: tensor: 8 floats per weight. (The other temporaries are <= 4 per weight.)
+#: Bytes-per-weight upper bound used to size a pack chunk. The e2m1 distance
+#: tensor [r, K/B, B, 8] alone is 8 floats = 32 B per weight; the other live
+#: temporaries add at most another 16 B (master float copy, scaled x, index
+#: bytes), so 48 B is the combined peak bound, not the distance tensor's size.
 _PACK_BYTES_PER_WEIGHT = 8 * 4 + 4 * 4
 #: Default ceiling for one pack chunk: half a GiB. A 248320x5120 lm_head packed
-#: whole needs ~41 GiB for the distance tensor and OOMs a 31 GiB host.
+#: whole makes a 40.7 GB (37.9 GiB) distance tensor and OOMs a 31 GiB host.
 _PACK_BUDGET_DEFAULT = 512 * 1024 * 1024
 
 

@@ -754,7 +754,8 @@ def test_pack_fp4_bounded_is_bit_identical_and_respects_budget(monkeypatch):
 
 def test_load_hf_packs_bf16_linears_under_a_tiny_budget(tmp_path, monkeypatch):
     """End-to-end V100 failure: bf16 lm_head (248320x5120 there) packed whole
-    needs ~41 GiB of temporaries. With a tiny per-chunk budget load still
+    needs 40.7 GB (37.9 GiB) for its f32 distance tensor. With a tiny
+    per-chunk budget load still
     succeeds and yields the SAME served bytes as one whole pack."""
     from tilerl_kernels.reference import pack_fp4, renorm_fp4_scale
 
