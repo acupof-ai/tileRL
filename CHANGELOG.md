@@ -18,6 +18,14 @@
   reclaimed) and the synchronous request-finish prefix publish (2.65 s once
   per unique prompt).
   — [errors/2026-09-25-shared-promote-per-page-sync-and-two-oneshot-stalls.md](docs/experience/errors/2026-09-25-shared-promote-per-page-sync-and-two-oneshot-stalls.md)
+- **default flip (server, #831)** — SSE output pacing is ON by default
+  (`--stream-pace` / `--no-stream-pace`). The sparse decode graph stalls for an
+  eager refresh every 32 ticks (~218–259 ms vs ~41 ms graph ticks), so raw SSE
+  showed a >150 ms gap on a strict period. The server now buffers the first 12
+  tokens and re-times only SSE delta sends at the adaptive long-run rate; the
+  SSE envelope, fields, order and usage are unchanged and `/ws` is untouched.
+  Decision (ckl): end-to-end tests take the production config as baseline;
+  kernel/step timing has its own probes and does not go through SSE.
 - **fix (model)** — `load_hf` now loads a third-party NVFP4 checkpoint
   (`bottlecapai/ThinkingCap-Qwen3.8-27B-NVFP4`) as shipped, after two limits
   stopped it on V100. A `.weight_packed`'s `weight_scale`/`weight_global_scale`
