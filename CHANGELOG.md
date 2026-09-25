@@ -1,6 +1,18 @@
 # Changelog
 
 ## 2026-09-25
+- **reject (ops)** — did not ship the optimization that skipped the draft
+  forward on prefill chunks before the decode read window (PR #835 closed).
+  The trunk-output parity gate was vacuous for it: verify makes emitted tokens
+  invariant, so the discriminator is the draft's own first proposal, which
+  differs OLD vs NEW on 3/4 CPU tiny d1 geometries (a kept prefill chunk still
+  reads the FULL prefix, including the skipped chunks' un-written pages, and
+  contaminates the K/V it writes into the decode window). A structurally
+  correct skip must back-fill those pages anyway; against a warm saving of only
+  ~0.36-0.53 s per cold request (the quoted 6.5-10 s was first-use TileLang
+  compile, warm same-shape forwards are 100-270 ms), the prompt-dependent
+  acceptance risk is not worth it. See
+  `docs/experience/errors/2026-09-25-trunk-parity-gate-cannot-see-draft-contamination.md`.
 - **fix (kv)** — the request-finish prefix publish no longer stalls one sync
   per published page. `transfer_to_shared` did blocking per-page D2H on THREE
   copies — the trunk `_page_blob` snapshot, the bounds `.cpu()` and the
