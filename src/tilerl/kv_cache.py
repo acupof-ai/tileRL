@@ -198,6 +198,9 @@ class PagedKvPool:
         #: K/V narrow on the host copy when a cold dtype is set; the f32 fp8 scale
         #: planes stay their native dtype.
         cold_dtype = self.cold_dtype
+        #: frame_snapshots() batches finish-publish copies: non-blocking D2H with
+        #: one sync at context exit.
+        non_blocking = non_blocking or getattr(self, "_snapshot_batching", False)
         planes = [
             ("k", self.k_pool[:, block], cold_dtype),
             ("v", self.v_pool[:, block], cold_dtype),
@@ -303,6 +306,24 @@ class PagedKvPool:
                             self.free_block(block)
                     raise
             del pending[held_before:]
+
+    @contextlib.contextmanager
+    def frame_snapshots(self):
+        """Batch the D2H copies of several :meth:`_page_blob` snapshots into ONE
+        device sync. Finish-publish snapshots a whole still-resident prefix off
+        live frames; without this each snapshot's copy synchronised per page
+        (measured 1 s of a 2.6 s request-finish tick). The frames are NOT freed
+        or demoted here — the caller owns their lifecycle — so unlike
+        ``demotions()`` this only batches the copies. Pinned blobs returned
+        inside the context must not be read (or spilled to disk) until its exit
+        sync — the caller defers every cold-tier commit until then."""
+        self._snapshot_batching = True
+        try:
+            yield self
+        finally:
+            self._snapshot_batching = False
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
 
     def promote_keyed(self, key) -> int:
         """Reload a blob held under ``demote_page(key=...)`` into a FRESH block

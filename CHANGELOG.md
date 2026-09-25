@@ -1,6 +1,26 @@
 # Changelog
 
 ## 2026-09-25
+- **fix (kv)** — the request-finish prefix publish no longer stalls one sync
+  per published page. `transfer_to_shared` did blocking per-page D2H on THREE
+  copies — the trunk `_page_blob` snapshot, the bounds `.cpu()` and the
+  warm-spec draft `.cpu().clone()` (the same per-page-sync shape as the
+  shared-promote fix below, on the publish side). `publish_at_finish` now
+  opens `pool.frame_snapshots()` over the whole page batch: every copy
+  launches non-blocking into its own pinned blob and there is one sync at
+  exit; the cold-tier commits, which can spill an existing RAM blob to disk,
+  are deferred to after that sync so a spill never reads a D2H still in
+  flight. Gates: three snapshots in one context = zero syncs in-context, one
+  at exit, byte-equal blobs (red on the old code); and a spy proving no
+  cold-tier commit runs inside the batching window while commits still land.
+  The non-batched offer_drop path is unchanged. The remaining cost is the
+  unavoidable D2H byte time (~1 s). The publish runs before the result is
+  delivered — `_finish` → `_release` sets `_finished` inside the same tick
+  that holds `engine._lock`, so a same-thread reorder cannot expose the
+  result earlier; a background publish is the only true off-response move and
+  is deferred for its pin-pool-capacity cost. Device-verified on V100 (same
+  37.6k prompt, tick 352): publish D2H 1729→914 ms and the release phase
+  2543→1338 ms (−47%), with identical accept 0.8484.
 - **fix (kv)** — a prefix-hit refresh no longer stalls one sync per adopted
   page. `shared_promote` (the shared-prefix → private-block H2D on a warm
   adoption) called `torch.cuda.synchronize()` unconditionally per page, while

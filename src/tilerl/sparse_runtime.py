@@ -494,10 +494,45 @@ class SparseRuntime:
         )
         try:
             landed: list[int] = []
-            for p, content_key in keys.items():
-                draft_block = r.draft_blocks[p] if p <= written_page else None
-                self.transfer_to_shared(r, p, content_key, draft_block)
-                landed.append(content_key)
+            # Device-snapshot/cold-transfer descriptors committed AFTER the
+            # batch's single sync: share_hold/share_hold_kv may spill a blob to
+            # disk, which reads host bytes that are not valid until then.
+            pending: list[tuple] = []
+            tm = ctx.step_timing
+            t = time.perf_counter() if tm is not None else 0.0
+            # Every resident page's D2H (trunk frames, bounds, draft K/V)
+            # launches non-blocking inside the context; there is a single sync
+            # at its exit (the per-page synchronize here was ~1 s of the
+            # request-finish stall).
+            with ctx.kv.frame_snapshots():
+                for p, content_key in keys.items():
+                    draft_block = r.draft_blocks[p] if p <= written_page else None
+                    self.transfer_to_shared(r, p, content_key, draft_block, pending)
+                    landed.append(content_key)
+            if tm is not None:
+                # Whole launch+wait window; per-page bounds/draft marks are
+                # skipped in the batched path and folded into this one segment.
+                tm.mark("pub_frame_d2h", t)
+                t = time.perf_counter()
+            for desc in pending:
+                if desc[0] == "frame":
+                    _, blob, n, extra_host, content_key = desc
+                    self._commit_frame(blob, n, extra_host, content_key, tm, t)
+                    if tm is not None:
+                        t = time.perf_counter()
+                else:
+                    _, private_key, content_key, extra_host = desc
+                    n = ctx.kv.cold.share_hold_kv(
+                        private_key, content_key, extra=extra_host)
+                    if tm is not None:
+                        tm.mark("pub_cold_transfer", t)
+                        t = time.perf_counter()
+                    if not n:
+                        r.cold_pages = [
+                            content_key
+                            if (isinstance(p, tuple) and p == private_key) else p
+                            for p in r.cold_pages
+                        ]
             # A spill write can also fail SOFTLY (share_hold_kv returns 0 and
             # places no record) rather than raising: verify, do not trust.
             if any(k not in ctx.kv.cold.share_keys() for k in landed):
@@ -516,7 +551,8 @@ class SparseRuntime:
             ctx.kv.cold.share_ref(content_key)
 
     def transfer_to_shared(
-        self, r, page: int, content_key: int, draft_block: int | None = None
+        self, r, page: int, content_key: int, draft_block: int | None = None,
+        pending: list | None = None,
     ) -> None:
         """Publish one page under its content key: attach bounds (+ draft K/V for
         a warm spec entry) to the page's trunk K/V.
@@ -536,11 +572,16 @@ class SparseRuntime:
         file measures itself and the engine reports it as ``ssd_mmap``, so a
         profile attributing disk time to any of these five is misreading.
 
-        Every page commits inline here (bounds/draft/frame D2H are synchronous);
-        pages whose source is already host/SSD move no device bytes."""
+        With ``pending`` (the finish-publish batch) every D2H launches
+        non-blocking and the cold-tier commit is deferred to the caller's list,
+        committed after the batch's single sync — a commit may spill the host
+        blob to disk, which must not read it before the D2H lands. Without it
+        (offer_drop) each copy and commit is inline and synchronous."""
         ctx = self.ctx
         tr = self.tracker
         tm = ctx.step_timing
+        batched = pending is not None
+        cuda = ctx.kv.k_pool.is_cuda
         tr.shared.setdefault(r.req_id, {})[page] = content_key
         # Dup content key (typically an adopted page re-leaving the union): the
         # identical trunk/bounds/draft bytes are already shared, so no D2H and no
@@ -561,31 +602,54 @@ class SparseRuntime:
                     r.cold_pages.remove(page)
             return
         t = time.perf_counter() if tm is not None else 0.0
-        # bounds: one blocking page D2H.
+        # bounds page D2H: non-blocking into pinned memory inside a batch, else
+        # the old blocking .cpu().
         bv = tr.bounds_view(r.req_id)[page]
-        bounds_host = bv.cpu()
-        if tm is not None:
+        if batched:
+            bounds_host = torch.empty(
+                bv.shape, dtype=bv.dtype, device="cpu", pin_memory=cuda)
+            bounds_host.copy_(bv, non_blocking=cuda)
+        else:
+            bounds_host = bv.cpu()
+        if tm is not None and not batched:
             tm.mark("pub_bounds_d2h", t)
             t = time.perf_counter()
         extra_host = {"bounds": bounds_host}
         if draft_block is not None and ctx.draft is not None:
             dpool = ctx.draft.kv
-            # clone: .cpu() is a no-op on the CPU cell, so without it the blob
-            # aliases a draft block that gets recycled and overwritten.
-            extra_host["dk"] = dpool.k_pool[:, draft_block].detach().cpu().clone()
-            extra_host["dv"] = dpool.v_pool[:, draft_block].detach().cpu().clone()
-        if tm is not None:
+            if batched:
+                for name, src in (
+                    ("dk", dpool.k_pool[:, draft_block]),
+                    ("dv", dpool.v_pool[:, draft_block]),
+                ):
+                    host = torch.empty(
+                        src.shape, dtype=src.dtype, device="cpu",
+                        pin_memory=cuda)
+                    host.copy_(src.detach(), non_blocking=cuda)
+                    extra_host[name] = host
+            else:
+                # clone: .cpu() is a no-op on the CPU cell, so without it the blob
+                # aliases a draft block that gets recycled and overwritten.
+                extra_host["dk"] = dpool.k_pool[:, draft_block].detach().cpu().clone()
+                extra_host["dv"] = dpool.v_pool[:, draft_block].detach().cpu().clone()
+        if tm is not None and not batched:
             tm.mark("pub_draft_clone", t)
             t = time.perf_counter()
-        if (r.req_id, page) in ctx.kv.cold:
-            # Host-resident or already on the private SSD: no device bytes.
-            n = ctx.kv.cold.share_hold_kv((r.req_id, page), content_key, extra=extra_host)
+        private_key = (r.req_id, page)
+        if private_key in ctx.kv.cold:
+            # Host-resident or already on the private SSD: no device bytes. In a
+            # batch the commit (which may spill-read OTHER blobs under budget
+            # pressure) waits until the D2H sync.
+            if batched:
+                pending.append(("cold", private_key, content_key, extra_host))
+                return
+            n = ctx.kv.cold.share_hold_kv(private_key, content_key, extra=extra_host)
             if tm is not None:
                 tm.mark("pub_cold_transfer", t)
             if n:
                 return
             r.cold_pages = [
-                content_key if (isinstance(p, tuple) and p == (r.req_id, page)) else p
+                content_key if (isinstance(p, tuple) and p == private_key) else p
                 for p in r.cold_pages
             ]
             return
@@ -595,12 +659,16 @@ class SparseRuntime:
                 f"publish page {page}: neither a private host blob nor a resident "
                 f"frame exists (req {r.req_id}, content key {content_key})"
             )
-        # Device-resident frame snapshot, committed inline.
+        # Device-resident frame snapshot: non-blocking inside the batch (the
+        # frame_snapshots flag makes _page_blob non-blocking); commit deferred.
         blob, n = ctx.kv._page_blob(phys)
-        if tm is not None:
+        if tm is not None and not batched:
             tm.mark("pub_frame_d2h", t)
             t = time.perf_counter()
-        self._commit_frame(blob, n, extra_host, content_key, tm, t)
+        if batched:
+            pending.append(("frame", blob, n, extra_host, content_key))
+        else:
+            self._commit_frame(blob, n, extra_host, content_key, tm, t)
 
     def _commit_frame(self, blob, n, extra_host, content_key, tm, t):
         """Commit one already-valid host frame blob to the shared cold tier."""
