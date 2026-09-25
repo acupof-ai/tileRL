@@ -372,7 +372,13 @@ class PagedKvPool:
         """Copy a SHARED prefix-page blob (K/V + fp8 scales) into a fresh PRIVATE
         block. The shared blob stays read-only with the store; the new block is the
         adopting request's own. The promoted K/V use the pool dtype (cold narrowing
-        widened here, same as promote_page)."""
+        widened here, same as promote_page).
+
+        Batched like :meth:`promote_keyed`: inside ``promotions()`` every copy is
+        non-blocking and there is ONE sync at batch exit, not one per page. A
+        prefix hit selects ~200 shared pages on a refresh tick; an unconditional
+        per-page sync here turned that into ~200 full-stream stalls (measured
+        1.5-1.9 s refresh ticks, model envelope only — ssd_mmap=0)."""
         new = self.alloc_block()
         nb = blob["k"].is_pinned()
         self.k_pool[:, new].copy_(blob["k"], non_blocking=nb)
@@ -380,7 +386,10 @@ class PagedKvPool:
         if self.k_scale is not None and "ks" in blob:
             self.k_scale[:, new].copy_(blob["ks"], non_blocking=nb)
             self.v_scale[:, new].copy_(blob["vs"], non_blocking=nb)
-        if self.device.type == "cuda":
+        batched = getattr(self, "_promote_batching", False)
+        if not batched and self.device.type == "cuda":
+            # The pinned blob could be reused/freed on return; an in-flight
+            # non-blocking H2D would then read stale bytes.
             torch.cuda.synchronize(self.device)
         return new
 

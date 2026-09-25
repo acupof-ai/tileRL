@@ -1,6 +1,23 @@
 # Changelog
 
 ## 2026-09-25
+- **fix (kv)** — a prefix-hit refresh no longer stalls one sync per adopted
+  page. `shared_promote` (the shared-prefix → private-block H2D on a warm
+  adoption) called `torch.cuda.synchronize()` unconditionally per page, while
+  the private-cold path had long been batched to one sync under
+  `pool.promotions()`. A refresh names up to ~200 shared pages, so the first
+  37.6k prefix hit paid ~200 full-stream stalls: eight refresh ticks at
+  **1.5–1.9 s** with `ssd_mmap=0`, against 173–235 ms for the identical
+  refresh positions on a miss and on a fully-warm repeat (same geometry, same
+  offers_pages). It now honours `_promote_batching` (non-blocking launches,
+  one sync at context exit; the per-call sync stays outside it). Gate: three
+  shared promotes inside `promotions()` = one sync and byte-equal copies;
+  outside = one sync per call; fails on the old code. Two other post-cold-tier
+  stalls were separated and left: a one-shot CUDA allocator reclaim on the
+  first decode graph tick after prefill (2.97 s, `alloc_reclaim`, 23 segments
+  reclaimed) and the synchronous request-finish prefix publish (2.65 s once
+  per unique prompt).
+  — [errors/2026-09-25-shared-promote-per-page-sync-and-two-oneshot-stalls.md](docs/experience/errors/2026-09-25-shared-promote-per-page-sync-and-two-oneshot-stalls.md)
 - **fix (model)** — `load_hf` now loads a third-party NVFP4 checkpoint
   (`bottlecapai/ThinkingCap-Qwen3.8-27B-NVFP4`) as shipped, after two limits
   stopped it on V100. A `.weight_packed`'s `weight_scale`/`weight_global_scale`

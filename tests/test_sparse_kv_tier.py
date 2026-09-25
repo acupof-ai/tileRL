@@ -1316,3 +1316,47 @@ def test_step_thread_shared_write_failure_keeps_page_in_ram_no_leak(tmp_path):
     cold.close()
 
 
+
+
+def test_batched_shared_promotions_sync_once_not_per_page():
+    """A prefix-hit refresh selects ~200 SHARED pages; shared_promote had an
+    unconditional cuda.synchronize per page, so that refresh paid ~200 full
+    stream stalls (measured 1.5-1.9 s refresh ticks with ssd_mmap=0 on the
+    V100). Inside promotions() the shared copies must batch to the one
+    end-of-context sync exactly like promote_keyed."""
+    import unittest.mock as mock
+
+    p, hkv, d = 4, 2, 8
+    pool = PagedKvPool(p + 8, hkv, d, num_layers=2, device=_device())
+    blobs = []
+    for i in range(3):
+        b = pool.alloc_block()
+        kk, vv = _kv(200 + i, 1, hkv, d)
+        for plane in range(2):
+            pool.write_block(b, 0, kk[0], vv[0], layer=plane)
+        blob = {"k": pool.k_pool[:, b].clone(), "v": pool.v_pool[:, b].clone()}
+        pool.free_block(b)
+        blobs.append(blob)
+
+    real_device = pool.device
+    pool.device = torch.device("cuda")
+    try:
+        with mock.patch("tilerl.kv_cache.torch.cuda.synchronize") as sync_fn, pool.promotions():
+            new_blocks = [pool.shared_promote(blob) for blob in blobs]
+            assert sync_fn.call_count == 0, sync_fn.call_count
+        assert sync_fn.call_count == 1, f"expected one batched sync, got {sync_fn.call_count}"
+    finally:
+        pool.device = real_device
+    for nb, blob in zip(new_blocks, blobs):
+        assert torch.equal(pool.k_pool[:, nb], blob["k"])
+        assert torch.equal(pool.v_pool[:, nb], blob["v"])
+
+    # Negative control: outside a promotions() context the per-call sync stays
+    # (a pinned blob is reusable on return; an in-flight async H2D would race).
+    pool.device = torch.device("cuda")
+    try:
+        with mock.patch("tilerl.kv_cache.torch.cuda.synchronize") as sync_fn:
+            pool.shared_promote(blobs[0])
+            assert sync_fn.call_count == 1
+    finally:
+        pool.device = real_device
