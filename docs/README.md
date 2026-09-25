@@ -39,7 +39,7 @@ phase exits, default flips, accept-or-reject verdicts.
 
 ## The archive
 
-[experience/](experience/) — 638 dated entries, one measurement each, wins and
+[experience/](experience/) — 639 dated entries, one measurement each, wins and
 rejections both. Start at [experience/README.md](experience/README.md), which
 picks the ~27 that carry the findings the rest of the repo rests on.
 

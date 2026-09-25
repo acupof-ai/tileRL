@@ -1,6 +1,26 @@
 # Changelog
 
 ## 2026-09-25
+- **fix (model)** — `load_hf` now loads a third-party NVFP4 checkpoint
+  (`bottlecapai/ThinkingCap-Qwen3.8-27B-NVFP4`) as shipped, after two limits
+  stopped it on V100. A `.weight_packed`'s `weight_scale`/`weight_global_scale`
+  could live in a different safetensors file than the packed bytes — one triple
+  (layers.22.up_proj's scalar global scale) was split across the two shards and
+  the shard-local read KeyError'd; the loader now follows
+  `model.safetensors.index.json` to the owning shard. And a bf16 linear the
+  checkpoint ships unpacked (its `lm_head`, on the recipe's quant ignore list)
+  was packed by one `pack_fp4` call whose e2m1 distance temporary is
+  **40.7 GiB**, OOMing the 31 GiB host; it now packs row chunks under a byte
+  budget (`TILERL_FP4_PACK_BUDGET_BYTES`, 512 MiB default), bit-identical
+  because pack/renorm are per-row. CPU gates: cross-shard triple loads and
+  matches `_native_fp4` (unrouted sibling still raises), chunked pack equals
+  the one-shot pack with every call inside the budget, end-to-end tiny load
+  under a 6 KiB budget; all three fail on the old loader. V100: truncated load
+  of the pristine checkpoint packs lm_head bit-identical to the independent
+  offline pack, and a full load gets **497/497** fp4 linears with the
+  production service still running. The earlier "main loads it with zero
+  changes" CPU conclusion is withdrawn.
+  — [errors/2026-09-25-nvfp4-cross-shard-scales-and-lmhead-pack-oom.md](docs/experience/errors/2026-09-25-nvfp4-cross-shard-scales-and-lmhead-pack-oom.md)
 - **reject verdict (sparse, #805)** — the v2 lag-1 async carry (snapshot +
   cold-page promotion moved to a CUDA side stream one tick early, probe branch
   `probe/805-v2`) is **rejected at W1024/R32 on V100 sm70 and not merged**:
