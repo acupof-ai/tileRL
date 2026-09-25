@@ -476,7 +476,8 @@ def create_app(
 
     ``stream_pace`` re-times ONLY SSE delta frames through
     :mod:`stream_pacing` to smooth the periodic sparse-refresh stall; the SSE
-    envelope, fields, order and usage are unchanged. Opt-in, default off.
+    envelope, fields, order and usage are unchanged. Default on; pass
+    ``stream_pace=False`` / ``--no-stream-pace`` to disable.
     """
     completion_timeout_s = (
         completion_timeout_from_env()
