@@ -2915,11 +2915,26 @@ class Engine:
                     self._wake.set()
                     fatal_device_exit(exc)
                     return
-                except Exception:
+                except Exception as exc:
                     # ponytail: log-and-continue (a crashed daemon hangs the server); backpressure is the upgrade.
                     import traceback
 
                     traceback.print_exc()
+                    if not self._backend.device_alive():
+                        # The exception above may have been survivable, but the CUDA
+                        # context is not: an illegal memory access is sticky, so every
+                        # later call fails and no per-row unwinding serves another
+                        # token. Continuing here is what made a crashed serve answer
+                        # /health 200 with running=1 (2026-09-25 P0). Exit for the
+                        # supervisor instead. Asked of the context rather than the
+                        # exception's type: the c10 path raises a plain RuntimeError,
+                        # and CudaError is not a base of OutOfMemoryError, so no
+                        # isinstance identifies this. errors/2026-09-25-a-dead-cuda-context-is-not-an-exception-type.md
+                        with self._lock:
+                            self._fatal = exc
+                        self._wake.set()
+                        fatal_device_exit(exc)
+                        return
             else:
                 self._wake.wait(0.005)
 

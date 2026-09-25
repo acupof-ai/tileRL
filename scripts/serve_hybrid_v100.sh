@@ -42,6 +42,18 @@ MAX_RESTARTS=${MAX_RESTARTS:-10}
 RESTART_FUSE_MAX=${RESTART_FUSE_MAX:-5}
 RESTART_FUSE_WINDOW_S=${RESTART_FUSE_WINDOW_S:-600}
 READY_TRIALS=${SERVE_READY_TRIALS:-600}
+# The served arm. Overridable so one supervisor serves any V100 configuration:
+# the restart/fuse/liveness machinery below is orthogonal to which flags the
+# engine is built with, and a second copy of it per arm is how the arms drift
+# apart. The default is the hybrid arm this script was written for. Word-split on
+# purpose -- it is an argv list, not one argument.
+#   prod (pure-sparse, W1024/R32): --sparse-min-tokens 0 --sparse-window-tokens 1024
+#                                  --sparse-refresh-ticks 32
+SERVE_ARGS=${SERVE_ARGS:-"--model qwen38-27b --slots 4 --max-batch 4 --max-ctx 131072 \
+    --sparse-k 128 --sparse-min-tokens 8192 \
+    --cold-format f16 --kv-cold-bytes 8589934592 \
+    --cold-ssd-path $COLD_SSD --cold-ssd-bytes 8589934592 \
+    --draft $DRAFT --depth 1 --decode-graph"}
 LOG_CAP=$((32 * 1024 * 1024))
 
 command -v flock >/dev/null || { echo "flock(1) not found; refusing unlocked" >&2; exit 2; }
@@ -94,13 +106,8 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
   sha=$(cat "$REPO/.synced_commit" 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo unknown)
   echo "servehybrid: tree $REPO sha ${sha:0:10} boot $n at $(date +%Y-%m-%dT%H:%M:%S%z)" >> "$LOG"
   started=$SECONDS
-  "$PYTHON" -u -m tilerl.cli serve --model qwen38-27b \
-      --host 0.0.0.0 --port "$PORT" \
-      --slots 4 --max-batch 4 --max-ctx 131072 \
-      --sparse-k 128 --sparse-min-tokens 8192 \
-      --cold-format f16 --kv-cold-bytes 8589934592 \
-      --cold-ssd-path "$COLD_SSD" --cold-ssd-bytes 8589934592 \
-      --draft "$DRAFT" --depth 1 --decode-graph >> "$LOG" 2>&1 &
+  # shellcheck disable=SC2086  # SERVE_ARGS is an argv list, not one word
+  "$PYTHON" -u -m tilerl.cli serve --host 0.0.0.0 --port "$PORT" $SERVE_ARGS >> "$LOG" 2>&1 &
   child=$!
   ( for ((i = 1; i <= READY_TRIALS; i++)); do kill -0 $child 2>/dev/null || exit 1
       curl -sf -m 3 -o /dev/null "http://127.0.0.1:$PORT/health" && break; sleep 2; done

@@ -439,6 +439,31 @@ class Backend:
         """
         return name in _resolve(self.precision, self.arch)
 
+    def device_alive(self) -> bool:
+        """Is the CUDA context still usable? True on every non-cuda target.
+
+        Asked by the engine's daemon loop after it catches an exception, to decide
+        whether that exception was survivable. An illegal memory access poisons
+        the context: every later CUDA call fails, so no amount of per-row
+        unwinding lets the process serve again, and a loop that only prints the
+        traceback leaves a half-dead server answering /health 200. The engine
+        cannot ask this by exception type: the c10 path raises a plain
+        RuntimeError and ``torch.cuda.CudaError`` is a sibling of
+        torch.cuda.OutOfMemoryError, not a base, so neither an isinstance nor a
+        message check identifies it. A synchronize asks the context itself.
+
+        Deliberately a probe and not a raise: the caller is already inside an
+        ``except`` block, and a second exception there loses the original. Any
+        failure -- a CUDA error, a RuntimeError, anything -- means not alive.
+        """
+        if self.device.type != "cuda":
+            return True
+        try:
+            torch.cuda.synchronize(self.device)
+        except Exception:
+            return False
+        return True
+
     def _kernel(self, name: str, *args, **kw):
         """``args``/``kw`` are factory (compile-time variant) arguments; they key the cache.
 
