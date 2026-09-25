@@ -1,6 +1,20 @@
 # Changelog
 
 ## 2026-09-25
+- **perf (ops)** — a chunked-prefill row no longer runs a draft-head forward
+  on interior chunks whose draft K/V the decode read window never reads.
+  `_draft_step` ran once per prefill chunk and back-filled the draft's own
+  dense KV for positions the trailing W-window attention never sees. A chunk
+  ending at s is now skipped when s <= floor((n-W)/16)*16 (the window's first
+  page); the finishing chunk (first chain) is always drafted; W=0/full-prefix
+  skips nothing. At 5200 tokens/chunk512/W2048 six of eleven prefill draft
+  forwards disappear. V100 sparse-k128 d1, arms in BOTH orders (the order
+  controls first-use TileLang compile, so only warm numbers are compared):
+  accept 63/64 and all tokens identical OLD vs NEW solo, 110/128 identical with
+  three concurrent decode rows; warm draft kernel per cold 5200 request
+  1099→736 ms, solo TTFT 18.42→18.23 s. The big cold gap seen one order
+  (135.2 vs 18.3 s) is order-confounded compile, not a measured delta; the cold
+  benefit is only that six wide draft kernel shapes are never compiled.
 - **fix (kv)** — the request-finish prefix publish no longer stalls one sync
   per published page. `transfer_to_shared` did blocking per-page D2H on THREE
   copies — the trunk `_page_blob` snapshot, the bounds `.cpu()` and the
