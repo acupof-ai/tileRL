@@ -4113,6 +4113,127 @@ def test_forward_oom_is_fatal_but_a_normal_error_finishes_the_row():
         eng2.shutdown()
 
 
+def test_device_alive_is_true_off_cuda_and_false_when_the_context_raises():
+    """The probe the fatal branch asks, on its own.
+
+    Off cuda it must be True without reaching into torch.cuda (the CPU cell has no
+    context to lose). When a synchronize raises -- the sticky-error case -- it must
+    return False rather than letting the exception escape: the caller is inside an
+    ``except`` block, and a second exception there loses the original.
+    """
+    import types
+
+    import tilerl_kernels.backend as be
+    import torch
+
+    b = be.get_backend()
+    if b.device.type != "cuda":
+        assert b.device_alive() is True, "a non-cuda target has no context to lose"
+
+    # Drive the cuda branch without a card and without mutating the shared
+    # singleton's device: call the unbound method on a two-field shim.
+    shim = types.SimpleNamespace(device=torch.device("cuda", 0))
+
+    class _RaisingCuda:
+        @staticmethod
+        def synchronize(*a, **k):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    real_torch = be.torch
+    try:
+        be.torch = types.SimpleNamespace(cuda=_RaisingCuda(), device=real_torch.device)
+        assert be.Backend.device_alive(shim) is False, (
+            "a synchronize that raises is a dead context, and the probe must "
+            "swallow it rather than raise out of the caller's except block")
+    finally:
+        be.torch = real_torch
+
+
+def test_a_dead_cuda_context_is_fatal_even_for_a_survivable_exception():
+    """An exception the loop would normally log-and-continue is fatal when the CUDA
+    context is gone: an illegal memory access is sticky, so the process cannot serve
+    another token and continuing leaves a half-dead server answering /health 200.
+
+    This is the 2026-09-25 P0 shape. The exception in that crash was a plain
+    RuntimeError from the c10 path -- no isinstance identifies it (CudaError is a
+    sibling of OutOfMemoryError, not a base, and the message has no numeric code) --
+    so the loop asks the context, and this gate drives that seam. Both directions:
+    a dead context must exit, a live one must keep the current log-and-continue.
+    """
+    import time
+
+    import numpy as np
+
+    import tilerl.engine as eng_mod
+
+    def make_engine():
+        cfg = tiny()
+        return build_engine(cfg, build_random(cfg, seed=73), get_backend(),
+                            num_blocks=32, num_slots=4, max_batch=4,
+                            max_total_tokens=4096, sparse_k=0)
+
+    prompt = np.arange(5, 5 + 64, dtype=np.int64)
+    params = dict(temperature=0.0, max_new_tokens=2, seed=0)
+
+    def run_with(alive: bool):
+        """Drive the real loop with a forward that raises, and a stubbed context
+        probe. Returns (exit calls, engine)."""
+        eng = make_engine()
+        calls: list = []
+        real_forward = eng._run_forward
+        real_exit = eng_mod.fatal_device_exit
+        real_alive = eng._backend.device_alive
+
+        def boom(*a, **k):
+            # A plain RuntimeError, exactly the class the crash raised.
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        def fake_exit(exc):
+            calls.append(exc)
+            eng._wake.set()
+
+        eng._run_forward = boom
+        eng._backend.device_alive = lambda: alive
+        eng_mod.fatal_device_exit = fake_exit
+        eng.submit(prompt, SamplingParams(**params))
+        eng.run()
+        try:
+            # Wait for the seam, not for a condition that is already true: with
+            # alive=False a `not alive` in this predicate breaks on the first
+            # iteration, before the loop thread has run at all, and the test then
+            # reads 0 calls and reports a fix that works as broken.
+            for _ in range(100):
+                if calls:
+                    break
+                time.sleep(0.02)
+        finally:
+            eng_mod.fatal_device_exit = real_exit
+            eng._backend.device_alive = real_alive
+            eng._run_forward = real_forward
+        return calls, eng
+
+    # --- context dead: exit, even though the exception type is recoverable ------
+    calls, eng = run_with(False)
+    try:
+        assert len(calls) == 1, f"fatal seam called {len(calls)} times on a dead context"
+        assert isinstance(calls[0], RuntimeError)
+        assert eng._fatal is calls[0], "engine did not record the fatal state"
+        assert eng.liveness(60.0)[0] is False
+    finally:
+        eng.shutdown()
+
+    # --- negative control: same exception, live context -> NOT fatal ------------
+    calls2, eng2 = run_with(True)
+    try:
+        assert calls2 == [], (
+            "a live context must keep the log-and-continue: the exception itself is "
+            "not what makes a device error fatal")
+        assert eng2._fatal is None
+    finally:
+        eng2.shutdown()
+
+
+
 def test_health_stats_carry_in_process_device_free_and_limit():
     """The long-term observability for a memory-fraction reserve: stats expose the
     process allocator's free/limit (mem_get_info), distinct from nvidia-smi. Off
