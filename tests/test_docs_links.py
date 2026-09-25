@@ -68,9 +68,8 @@ def _unit_divisor_conflicts(text: str) -> list[tuple[int, str]]:
     """(lineno, line) where a GiB/GB label contradicts the divisor on that line."""
     bad = []
     for i, ln in enumerate(text.splitlines(), 1):
-        wrong = (
-            (_GIB_LABEL.search(ln) is not None and _DECIMAL_DIVISOR.search(ln) is not None)
-            or (_GB_LABEL.search(ln) is not None and _BINARY_DIVISOR.search(ln) is not None)
+        wrong = (_GIB_LABEL.search(ln) is not None and _DECIMAL_DIVISOR.search(ln) is not None) or (
+            _GB_LABEL.search(ln) is not None and _BINARY_DIVISOR.search(ln) is not None
         )
         if wrong:
             bad.append((i, ln.strip()))
@@ -103,6 +102,7 @@ def test_the_unit_divisor_rule_fires_on_the_shape_it_exists_for():
     assert not _unit_divisor_conflicts("held 12.8 GB, from nib_tot/1e9")
     # The whole-file mixing this rule must NOT flag.
     assert not _unit_divisor_conflicts("disk 500 GB\nvram 24 GiB")
+
 
 #: Pod tarballs have no .git — six tests here shell out to git and would fail with
 #: exit 128. Skip them there rather than fail; CI and dev machines always have .git.
@@ -137,8 +137,7 @@ def _scanned(tracked: set[str]) -> list[str]:
     branch, which is exactly the dead link this gate exists to catch.
     """
     return sorted(
-        p for p in tracked
-        if p.endswith(".md") and (p.startswith("docs/") or "/" not in p)
+        p for p in tracked if p.endswith(".md") and (p.startswith("docs/") or "/" not in p)
     )
 
 
@@ -303,12 +302,13 @@ def test_no_doc_invokes_a_flag_the_cli_does_not_have():
             hits = list(invoke.finditer(line))
             for n, m in enumerate(hits):
                 end = hits[n + 1].start() if n + 1 < len(hits) else len(line)
-                for f in flag.findall(line[m.end():end]):
+                for f in flag.findall(line[m.end() : end]):
                     if f not in accepted[m.group(1)]:
                         bad.append(f"{rel}:{i} -> tilerl {m.group(1)} {f}")
     assert not bad, (
         "docs invoke flags the CLI does not accept (mark a deliberate proposal with "
-        "NOT IMPLEMENTED on the same line):\n  " + "\n  ".join(bad))
+        "NOT IMPLEMENTED on the same line):\n  " + "\n  ".join(bad)
+    )
 
 
 def _cli_flags() -> dict[str, set[str]]:
@@ -327,8 +327,9 @@ def _cli_flags() -> dict[str, set[str]]:
     for action in parser._actions:
         if action.dest == "cmd" and getattr(action, "choices", None):
             for name, sp in action.choices.items():
-                accepted[name] = {o for a in sp._actions for o in a.option_strings
-                                  if o.startswith("--")}
+                accepted[name] = {
+                    o for a in sp._actions for o in a.option_strings if o.startswith("--")
+                }
     assert accepted, "could not read subcommands off the parser"
     return accepted
 
@@ -336,150 +337,165 @@ def _cli_flags() -> dict[str, set[str]]:
 #: The CLI surface as of 2026-09-09. Any change to it fails test_cli_surface_is_frozen
 #: until this set is edited in the same PR, so a surface change is deliberate and visible.
 _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
-    'serve': frozenset({
-        '--blocks',
-        '--checkpoint',
-        '--cold-format',
-        '--cold-ssd-bytes',
-        '--cold-ssd-path',
-        '--completion-timeout-s',
-        '--no-decode-graph',
-        '--decode-graph',
-        '--depth',
-        '--device-free',
-        '--device-headroom-mib',
-        '--device-reserve-mib',
-        '--draft',
-        '--draft-attn-window-tokens',
-        '--dram-bytes',
-        '--dry-run',
-        '--help',
-        '--host',
-        '--json',
-        '--kv-cold-bytes',
-        '--kv-fp8',
-        '--kv-store',
-        '--max-batch',
-        '--max-batched-tokens',
-        '--max-ctx',
-        '--model',
-        '--no-warmup',
-        '--port',
-        '--record-residency',
-        '--scorer',
-        '--slots',
-        '--sparse-k',
-        '--sparse-min-tokens',
-        '--sparse-prefill-tokens',
-        '--sparse-refresh-ticks',
-        '--sparse-window-tokens',
-        '--state-bytes',
-    }),
-    'train': frozenset({
-        '--allow-short-rollouts',
-        '--batch',
-        '--curve-target-pt',
-        '--data',
-        '--depth',
-        '--deterministic',
-        '--draft',
-        '--dry-run',
-        '--eval-curve-n',
-        '--eval-curve-seed',
-        '--eval-every',
-        '--eval-gsm8k',
-        '--eval-max-new-tokens',
-        '--eval-mmlu',
-        '--eval-n',
-        '--force',
-        '--group',
-        '--held-spans',
-        '--help',
-        '--indexer-control-corpus',
-        '--indexer-corpus',
-        '--indexer-di',
-        '--indexer-warmup',
-        '--json',
-        '--k-pages',
-        '--judge',
-        '--length-penalty',
-        '--load-adapter',
-        '--lora-rank',
-        '--lr',
-        '--max-new-tokens',
-        '--max-think-tokens',
-        '--micro',
-        '--model',
-        '--opd',
-        '--optim',
-        '--patience',
-        '--prompts-per-step',
-        '--q-min-pos',
-        '--q-samples',
-        '--recipe',
-        '--recall-threshold',
-        '--reward',
-        '--rl',
-        '--save-model',
-        '--seed',
-        '--served-fp4',
-        '--steps',
-        '--temperature',
-        '--tp',
-        '--train-seq-len',
-    }),
-    'bench': frozenset({
-        '--batches',
-        '--calibrate',
-        '--card',
-        '--checkpoint',
-        '--collectors',
-        '--context',
-        '--device-name',
-        '--gen',
-        '--gpu',
-        '--help',
-        '--kernels',
-        '--kv-fp8',
-        '--model',
-        '--prefill',
-        '--prompt-len',
-        '--questions',
-        '--readme',
-        '--regress',
-        '--scorer',
-        '--source',
-        '--sparse-k',
-        '--suite',
-        '--table',
-    }),
-    'generate': frozenset({
-        '--devices',
-        '--help',
-        '--max-batch',
-        '--max-new-tokens',
-        '--out',
-        '--seed',
-        '--source',
-        '--temperature',
-        '--top-p',
-    }),
-    'merge': frozenset({
-        '--base',
-        '--force',
-        '--help',
-        '--json',
-        '--method',
-        '--out',
-        '--specialists',
-    }),
-    'ledger': frozenset({
-        '--devices',
-        '--help',
-        '--json',
-        '--lineage',
-        '--time-to-score',
-    }),}
+    "serve": frozenset(
+        {
+            "--blocks",
+            "--checkpoint",
+            "--cold-format",
+            "--cold-ssd-bytes",
+            "--cold-ssd-path",
+            "--completion-timeout-s",
+            "--no-decode-graph",
+            "--decode-graph",
+            "--depth",
+            "--device-free",
+            "--device-headroom-mib",
+            "--device-reserve-mib",
+            "--draft",
+            "--draft-attn-window-tokens",
+            "--dram-bytes",
+            "--dry-run",
+            "--help",
+            "--host",
+            "--json",
+            "--kv-cold-bytes",
+            "--kv-fp8",
+            "--kv-store",
+            "--max-batch",
+            "--max-batched-tokens",
+            "--max-ctx",
+            "--model",
+            "--no-warmup",
+            "--port",
+            "--record-residency",
+            "--scorer",
+            "--slots",
+            "--sparse-k",
+            "--sparse-min-tokens",
+            "--sparse-prefill-tokens",
+            "--sparse-refresh-ticks",
+            "--sparse-window-tokens",
+            "--state-bytes",
+            "--stream-pace",
+            "--stream-pace-depth",
+        }
+    ),
+    "train": frozenset(
+        {
+            "--allow-short-rollouts",
+            "--batch",
+            "--curve-target-pt",
+            "--data",
+            "--depth",
+            "--deterministic",
+            "--draft",
+            "--dry-run",
+            "--eval-curve-n",
+            "--eval-curve-seed",
+            "--eval-every",
+            "--eval-gsm8k",
+            "--eval-max-new-tokens",
+            "--eval-mmlu",
+            "--eval-n",
+            "--force",
+            "--group",
+            "--held-spans",
+            "--help",
+            "--indexer-control-corpus",
+            "--indexer-corpus",
+            "--indexer-di",
+            "--indexer-warmup",
+            "--json",
+            "--k-pages",
+            "--judge",
+            "--length-penalty",
+            "--load-adapter",
+            "--lora-rank",
+            "--lr",
+            "--max-new-tokens",
+            "--max-think-tokens",
+            "--micro",
+            "--model",
+            "--opd",
+            "--optim",
+            "--patience",
+            "--prompts-per-step",
+            "--q-min-pos",
+            "--q-samples",
+            "--recipe",
+            "--recall-threshold",
+            "--reward",
+            "--rl",
+            "--save-model",
+            "--seed",
+            "--served-fp4",
+            "--steps",
+            "--temperature",
+            "--tp",
+            "--train-seq-len",
+        }
+    ),
+    "bench": frozenset(
+        {
+            "--batches",
+            "--calibrate",
+            "--card",
+            "--checkpoint",
+            "--collectors",
+            "--context",
+            "--device-name",
+            "--gen",
+            "--gpu",
+            "--help",
+            "--kernels",
+            "--kv-fp8",
+            "--model",
+            "--prefill",
+            "--prompt-len",
+            "--questions",
+            "--readme",
+            "--regress",
+            "--scorer",
+            "--source",
+            "--sparse-k",
+            "--suite",
+            "--table",
+        }
+    ),
+    "generate": frozenset(
+        {
+            "--devices",
+            "--help",
+            "--max-batch",
+            "--max-new-tokens",
+            "--out",
+            "--seed",
+            "--source",
+            "--temperature",
+            "--top-p",
+        }
+    ),
+    "merge": frozenset(
+        {
+            "--base",
+            "--force",
+            "--help",
+            "--json",
+            "--method",
+            "--out",
+            "--specialists",
+        }
+    ),
+    "ledger": frozenset(
+        {
+            "--devices",
+            "--help",
+            "--json",
+            "--lineage",
+            "--time-to-score",
+        }
+    ),
+}
 
 
 def test_cli_surface_is_frozen():
@@ -502,13 +518,15 @@ def test_cli_surface_is_frozen():
         "subcommands changed: "
         f"new {sorted(set(actual) - set(_EXPECTED_CLI_FLAGS))}, "
         f"removed {sorted(set(_EXPECTED_CLI_FLAGS) - set(actual))}; "
-        "edit _EXPECTED_CLI_FLAGS in the same PR")
+        "edit _EXPECTED_CLI_FLAGS in the same PR"
+    )
     for sub, expected in _EXPECTED_CLI_FLAGS.items():
         lost = sorted(expected - actual[sub])
         gained = sorted(actual[sub] - expected)
         assert not lost and not gained, (
             f"{sub} surface changed: lost {lost}, gained {gained}; "
-            "edit _EXPECTED_CLI_FLAGS in the same PR")
+            "edit _EXPECTED_CLI_FLAGS in the same PR"
+        )
 
 
 @_skip_no_git
@@ -542,8 +560,7 @@ def test_no_readme_number_is_absent_from_every_dated_entry():
     # A decimal, not bounded by word chars or another dot: `1.6` must not match `21.65`
     # or a version like `0.1.8`.
     num = _re.compile(r"(?<![\w.])(\d+\.\d+)(?![\w.])")
-    corpus = "\n".join((ROOT / p).read_text(errors="ignore")
-                       for p in dated if (ROOT / p).is_file())
+    corpus = "\n".join((ROOT / p).read_text(errors="ignore") for p in dated if (ROOT / p).is_file())
 
     missing = []
     for n in dict.fromkeys(num.findall(text)):
@@ -552,14 +569,17 @@ def test_no_readme_number_is_absent_from_every_dated_entry():
             missing.append(f"README.md:{line} -> {n}")
     assert not missing, (
         "README numbers that appear in no dated entry under docs/ — either the entry is "
-        "missing or the number was never measured:\n  " + "\n  ".join(missing))
+        "missing or the number was never measured:\n  " + "\n  ".join(missing)
+    )
 
 
 def _dated_counts() -> tuple[int, int, int]:
     """(wins, errors, total) dated entries git actually tracks, TEMPLATE excluded."""
-    dated = {p for p in _tracked()
-             if p.endswith(".md")
-             and re.search(r"docs/experience/(wins|errors)/20\d\d-\d\d-\d\d-", p)}
+    dated = {
+        p
+        for p in _tracked()
+        if p.endswith(".md") and re.search(r"docs/experience/(wins|errors)/20\d\d-\d\d-\d\d-", p)
+    }
     wins = sum("/wins/" in p for p in dated)
     errors = sum("/errors/" in p for p in dated)
     return wins, errors, len(dated)
@@ -572,20 +592,23 @@ def test_experience_counts_in_prose_match_the_tree():
     reader trust a stale number."""
     wins, errors, total = _dated_counts()
     assert wins > 100 and errors > 100 and total == wins + errors, (
-        f"the count scan is broken: {wins=} {errors=} {total=}")
+        f"the count scan is broken: {wins=} {errors=} {total=}"
+    )
 
     arch = (DOCS / "experience" / "README.md").read_text()
     m = re.search(r"(\d+) dated entries — (\d+) wins, (\d+) errors", arch)
     assert m, "docs/experience/README.md lost its '<n> dated entries — <w> wins, <e> errors' line"
     assert (int(m.group(1)), int(m.group(2)), int(m.group(3))) == (total, wins, errors), (
         f"docs/experience/README.md says {m.groups()}, tree has total={total} "
-        f"wins={wins} errors={errors}")
+        f"wins={wins} errors={errors}"
+    )
 
     docs_readme = (DOCS / "README.md").read_text()
     m = re.search(r"(\d+) dated entries", docs_readme)
     assert m, "docs/README.md lost its '<n> dated entries' line"
     assert int(m.group(1)) == total, (
-        f"docs/README.md says {m.group(1)} dated entries, tree has {total}")
+        f"docs/README.md says {m.group(1)} dated entries, tree has {total}"
+    )
 
 
 def test_no_entry_is_dated_in_the_future():
@@ -621,14 +644,17 @@ def test_root_readme_open_defect_count_matches_open_md():
     'Closed by triage' appendix below it."""
     open_md = (DOCS / "experience" / "OPEN.md").read_text()
     table = open_md.split("## Closed by triage")[0]
-    rows = [ln for ln in table.splitlines()
-            if ln.startswith("|") and not ln.startswith("| entry")
-            and not set(ln) <= set("|-: ")]
+    rows = [
+        ln
+        for ln in table.splitlines()
+        if ln.startswith("|") and not ln.startswith("| entry") and not set(ln) <= set("|-: ")
+    ]
     readme = (ROOT / "README.md").read_text()
     m = re.search(r"(\d+) open defects", readme)
     assert m, "README.md lost its '<n> open defects' phrase"
     assert int(m.group(1)) == len(rows), (
-        f"README.md says {m.group(1)} open defects, OPEN.md has {len(rows)} live rows")
+        f"README.md says {m.group(1)} open defects, OPEN.md has {len(rows)} live rows"
+    )
 
 
 if __name__ == "__main__":

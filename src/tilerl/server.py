@@ -121,17 +121,22 @@ def _normalize_thinking(body: dict) -> dict:
     renderer sees it. OpenAI/sglang clients send it top-level; without the move
     pydantic (extra=allow) swallows it on the HTTP route and thinking stays on."""
     if "enable_thinking" in body:
-        body["chat_template_kwargs"] = {**(body.get("chat_template_kwargs") or {}),
-                                        "enable_thinking": body.pop("enable_thinking")}
+        body["chat_template_kwargs"] = {
+            **(body.get("chat_template_kwargs") or {}),
+            "enable_thinking": body.pop("enable_thinking"),
+        }
     return body
 
 
-
-def _render_chat(messages: list[ChatMessage], thinking: bool | None = None,
-                 reasoning_effort: str | None = None,
-                 tools: list[dict[str, Any]] | None = None) -> str:
-    return render_prompt([m.model_dump() for m in messages], tools=tools,
-                         thinking=thinking, effort=reasoning_effort)
+def _render_chat(
+    messages: list[ChatMessage],
+    thinking: bool | None = None,
+    reasoning_effort: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+) -> str:
+    return render_prompt(
+        [m.model_dump() for m in messages], tools=tools, thinking=thinking, effort=reasoning_effort
+    )
 
 
 def _chat_chunk(
@@ -180,8 +185,7 @@ def overloaded_body(exc: Exception) -> dict[str, Any] | None:
 
     m = re.search(r"(\d+) in-flight requests and the cap is (\d+)", str(exc))
     inflight, cap = (int(m.group(1)), int(m.group(2))) if m else (None, None)
-    return {"message": str(exc), "type": "overloaded_error",
-            "inflight": inflight, "cap": cap}
+    return {"message": str(exc), "type": "overloaded_error", "inflight": inflight, "cap": cap}
 
 
 _DISCONNECT_POLL_S = 0.05
@@ -195,6 +199,7 @@ def _worker_retrieved(t: Any) -> None:
     if t.cancelled():
         return
     t.exception()
+
 
 #: Cap on detaching an SSE body's final drain. A disconnected SSE task must not
 #: await its in-flight executor worker from INSIDE its own cancellation: under a
@@ -247,7 +252,10 @@ async def _drain_body(engine: Any, request_id: int, worker: Any, body: Any) -> N
     except Exception:
         logging.warning(
             "body drain rid=%s: engine.cancel raised; continuing to worker join "
-            "and generator close", request_id, exc_info=True)
+            "and generator close",
+            request_id,
+            exc_info=True,
+        )
     try:
         await asyncio.wait_for(asyncio.shield(worker), timeout=_DRAIN_WAIT_S)
     except TimeoutError:
@@ -257,12 +265,17 @@ async def _drain_body(engine: Any, request_id: int, worker: Any, body: Any) -> N
         logging.warning(
             "sse drain rid=%s: in-flight worker did not finish in %.0fs; "
             "body.close() skipped (row cancelled, generator unclosed)",
-            request_id, _DRAIN_WAIT_S)
+            request_id,
+            _DRAIN_WAIT_S,
+        )
         return
     except Exception:
         logging.warning(
             "sse drain rid=%s: in-flight worker raised; body.close() skipped "
-            "(row cancelled, generator unclosed)", request_id, exc_info=True)
+            "(row cancelled, generator unclosed)",
+            request_id,
+            exc_info=True,
+        )
         return
     await asyncio.to_thread(body.close)
 
@@ -279,7 +292,10 @@ async def _await_drains() -> None:
     if pending:
         logging.warning(
             "sse shutdown: %d body drain(s) unfinished after %.0fs; their "
-            "generators close late or unclosed", len(pending), _DRAIN_WAIT_S)
+            "generators close late or unclosed",
+            len(pending),
+            _DRAIN_WAIT_S,
+        )
 
 
 @contextlib.asynccontextmanager
@@ -287,14 +303,16 @@ async def _lifespan(app: Any):
     yield
     await _await_drains()
 
+
 #: /health reports unhealthy when active requests make no step progress for this
 #: long. A long but RETURNING prefill (up to a few s) must stay healthy; a
 #: wedged device forward (never returns) must not. Overridable for tests/ops.
 HEALTH_STUCK_AFTER_S = float(os.environ.get("TILERL_HEALTH_STUCK_S", "60"))
 
 
-async def await_or_cancel(request: Request, engine: Any, rid_box: list,
-                          run_fn: Any, *args: Any) -> Any:
+async def await_or_cancel(
+    request: Request, engine: Any, rid_box: list, run_fn: Any, *args: Any
+) -> Any:
     """Poll a blocking completion fn in a thread and watch the ASGI disconnect.
 
     uvicorn delivers a client hang-up as http.disconnect WITHOUT cancelling the
@@ -376,8 +394,7 @@ async def _ws_next_or_gone(ws: WebSocket, next_worker: Any) -> Any:
         raise
 
 
-async def stream_or_cancel(request: Request, engine: Any, request_id: int,
-                            body: Any):
+async def stream_or_cancel(request: Request, engine: Any, request_id: int, body: Any):
     """The SSE body under the same disconnect watch as the non-stream routes.
 
     Iterating the sync generator through ``to_thread(next, ...)`` leaves an
@@ -414,8 +431,7 @@ async def stream_or_cancel(request: Request, engine: Any, request_id: int,
                     await asyncio.to_thread(engine.cancel, request_id)
                     return
                 yield item
-                worker = asyncio.ensure_future(
-                    asyncio.to_thread(next, body, _STREAM_END))
+                worker = asyncio.ensure_future(asyncio.to_thread(next, body, _STREAM_END))
                 worker.add_done_callback(_worker_retrieved)
             elif await request.is_disconnected():
                 await asyncio.to_thread(engine.cancel, request_id)
@@ -439,8 +455,14 @@ async def stream_or_cancel(request: Request, engine: Any, request_id: int,
 # ---------------------------------------------------------------------------
 
 
-def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
-               completion_timeout_s: float | None = None) -> FastAPI:
+def create_app(
+    engine: Any,
+    tokenizer: Tokenizer,
+    model_name: str = "tilerl",
+    completion_timeout_s: float | None = None,
+    stream_pace: bool = False,
+    stream_pace_depth: int = 12,
+) -> FastAPI:
     """Build the FastAPI app around a running engine and a tokenizer.
 
     ``engine`` must implement the tileRL contract: ``submit``, ``poll``,
@@ -451,9 +473,16 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
     reply; None reads ``TILERL_COMPLETION_TIMEOUT_S`` (default 1800, 0 = no
     deadline). Streamed SSE and /ws keep the fixed ``_COMPLETION_TIMEOUT_S``
     frame guard.
+
+    ``stream_pace`` re-times ONLY SSE delta frames through
+    :mod:`stream_pacing` to smooth the periodic sparse-refresh stall; the SSE
+    envelope, fields, order and usage are unchanged. Opt-in, default off.
     """
     completion_timeout_s = (
-        completion_timeout_from_env() if completion_timeout_s is None else float(completion_timeout_s))
+        completion_timeout_from_env()
+        if completion_timeout_s is None
+        else float(completion_timeout_s)
+    )
     app = FastAPI(title="tilerl", version=__version__, lifespan=_lifespan)
     app_started = int(time.time())
 
@@ -468,15 +497,27 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
         shape -- pydantic runs before the handler body, so it bypassed them.
         One app serves both APIs, so the envelope is chosen by path.
         """
-        msg = "; ".join(
-            f"{'.'.join(str(p) for p in e.get('loc', ())[1:]) or 'body'}: {e.get('msg', '')}"
-            for e in exc.errors()) or "invalid request"
+        msg = (
+            "; ".join(
+                f"{'.'.join(str(p) for p in e.get('loc', ())[1:]) or 'body'}: {e.get('msg', '')}"
+                for e in exc.errors()
+            )
+            or "invalid request"
+        )
         if request.url.path.startswith("/v1/messages"):
-            body: dict[str, Any] = {"type": "error",
-                                    "error": {"type": "invalid_request_error", "message": msg}}
+            body: dict[str, Any] = {
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": msg},
+            }
         else:
-            body = {"error": {"message": msg, "type": "invalid_request_error",
-                              "param": None, "code": None}}
+            body = {
+                "error": {
+                    "message": msg,
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": None,
+                }
+            }
         return JSONResponse(status_code=400, content=body)
 
     def _submit(req: ChatCompletionRequest) -> tuple[int, int, int, bool, list | None]:
@@ -496,31 +537,46 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
         # tool_choice stronger than a hint is refused rather than echoed.
         unknown_fields(req)  # warns; this route has no recorder, so the warn is all there is
         named = choice_name(req.tool_choice)
-        refuse_unsupported(reasoning_effort=bad_effort(effort or None),
-                          tool_choice=named not in ("auto", "none", None),
-                          **hosted_tool_fields(req.tools))
+        refuse_unsupported(
+            reasoning_effort=bad_effort(effort or None),
+            tool_choice=named not in ("auto", "none", None),
+            **hosted_tool_fields(req.tools),
+        )
         tools = tools_for_render(flatten_tools(req.tools), req.tool_choice)
-        input_ids = tokenizer.encode(_render_chat(
-            req.messages, thinking, kw.get("reasoning_effort") or req.reasoning_effort, tools
-        ))
+        input_ids = tokenizer.encode(
+            _render_chat(
+                req.messages, thinking, kw.get("reasoning_effort") or req.reasoning_effort, tools
+            )
+        )
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
         # Omitted max_tokens means "as much as fits", not 512: a 512 cap ends a long
         # reply at finish_reason=length, which reads to a client as a dropped stream.
         # `room_for` is the engine's own admission arithmetic, so the default is always
         # accepted and a prompt that does not fit still hits submit's refusal.
-        max_new = (req.max_tokens if req.max_tokens is not None
-                   else engine.room_for(len(input_ids)))
-        params = sampling(tokenizer, thinking, max_new,
-                          temperature=req.temperature, top_p=req.top_p, max_think_tokens=cap,
-                          seed=req.seed, logprobs=bool(req.logprobs), stop=req.stop)
+        max_new = req.max_tokens if req.max_tokens is not None else engine.room_for(len(input_ids))
+        params = sampling(
+            tokenizer,
+            thinking,
+            max_new,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            max_think_tokens=cap,
+            seed=req.seed,
+            logprobs=bool(req.logprobs),
+            stop=req.stop,
+        )
         # bool(thinking): True when the prompt opened <think>, so the reply carries only
         # the closer and strip_think must be told (None = bare turn, nothing to strip)
-        return (engine.submit(input_ids, params), len(input_ids), params.max_new_tokens,
-                bool(thinking), tools)
+        return (
+            engine.submit(input_ids, params),
+            len(input_ids),
+            params.max_new_tokens,
+            bool(thinking),
+            tools,
+        )
 
-    def _await_completion(request_id: int,
-                          timeout_s: float = completion_timeout_s) -> list[int]:
+    def _await_completion(request_id: int, timeout_s: float = completion_timeout_s) -> list[int]:
         return await_completion(engine, request_id, timeout_s)
 
     @app.get("/health")
@@ -533,8 +589,13 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
         except Exception as exc:
             return JSONResponse(
                 status_code=503,
-                content={"status": "degraded", "model": model_name, "stats": None,
-                         "error": f"{type(exc).__name__}: {exc}"})
+                content={
+                    "status": "degraded",
+                    "model": model_name,
+                    "stats": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
         # Step-loop progress: stats() is a lock-free SNAPSHOT, so it keeps
         # returning the last tick while the loop is frozen inside a device
         # forward -- a wedged server answered 200. liveness() reads the last
@@ -546,8 +607,13 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
             if not live:
                 return JSONResponse(
                     status_code=503,
-                    content={"status": "unhealthy", "model": model_name, "stats": stats,
-                             "stuck_secs": round(stuck_s, 3)})
+                    content={
+                        "status": "unhealthy",
+                        "model": model_name,
+                        "stats": stats,
+                        "stuck_secs": round(stuck_s, 3),
+                    },
+                )
         return {"status": "ok", "model": model_name, "stats": stats}
 
     @app.get("/v1/models")
@@ -571,7 +637,9 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
         try:
             # to_thread: engine.submit takes step()'s lock; on the loop a request arriving
             # during a long prefill freezes every route, /health included.
-            request_id, prompt_tokens, max_new, opened, tools = await asyncio.to_thread(_submit, req)
+            request_id, prompt_tokens, max_new, opened, tools = await asyncio.to_thread(
+                _submit, req
+            )
         except ValueError as exc:
             return JSONResponse(
                 status_code=400,
@@ -580,17 +648,36 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
         except RuntimeError as exc:
             return JSONResponse(
                 status_code=503,
-                content={"error": overloaded_body(exc) or {
-                    "message": str(exc), "type": "api_error"}},
+                content={
+                    "error": overloaded_body(exc) or {"message": str(exc), "type": "api_error"}
+                },
             )
 
         if req.stream:
+            from .stream_pacing import pace_deltas
+
+            triples = _deltas(
+                request_id,
+                max_new,
+                opened,
+                stop_texts(req.stop),
+                tools,
+                choice_name(req.tool_choice) != "none",
+            )
+            triples = pace_deltas(triples, stream_pace, target_depth=stream_pace_depth)
+            body = _stream(
+                request_id,
+                max_new,
+                prompt_tokens,
+                opened,
+                bool((req.stream_options or {}).get("include_usage")),
+                stop_texts(req.stop),
+                tools,
+                choice_name(req.tool_choice) != "none",
+                triples,
+            )
             return StreamingResponse(
-                stream_or_cancel(request, engine, request_id,
-                                 _stream(request_id, max_new, prompt_tokens, opened, bool(
-                                     (req.stream_options or {}).get("include_usage")
-                                 ), stop_texts(req.stop), tools,
-                                 choice_name(req.tool_choice) != "none")),
+                stream_or_cancel(request, engine, request_id, body),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -598,7 +685,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
         rid_box = [request_id]
         try:
             output_ids = await await_or_cancel(
-                request, engine, rid_box, _await_completion, request_id)
+                request, engine, rid_box, _await_completion, request_id
+            )
         except asyncio.CancelledError:
             # Client hung up before the non-stream reply; stop generating for
             # nobody. Off the loop (cancel takes engine._lock across _release).
@@ -640,8 +728,11 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
         if choice_name(req.tool_choice) == "none":
             calls = []
         tool_calls = [
-            {"id": f"call_{request_id}_{i}", "type": "function",
-             "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}}
+            {
+                "id": f"call_{request_id}_{i}",
+                "type": "function",
+                "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)},
+            }
             for i, (n, a) in enumerate(calls)
         ] or None
         created = int(time.time())
@@ -653,10 +744,14 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
         # deliberately different lengths. Truncating this list to match the
         # text would break the RL join, which scores what was sampled.
         scores = (await asyncio.to_thread(engine.logprobs, request_id)) if req.logprobs else None
-        content = None if scores is None else [
-            {"token": tokenizer.decode([tid]), "logprob": None if lp != lp else lp}
-            for tid, lp in zip(output_ids, scores)
-        ]
+        content = (
+            None
+            if scores is None
+            else [
+                {"token": tokenizer.decode([tid]), "logprob": None if lp != lp else lp}
+                for tid, lp in zip(output_ids, scores)
+            ]
+        )
         return {
             "id": f"chatcmpl-{request_id}",
             "object": "chat.completion",
@@ -665,27 +760,42 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant",
-                                # null, not "", when a tool call carries no prose:
-                                # OpenAI's shape, and "" reads as an empty reply.
-                                "content": text or None if tool_calls else text,
-                                # None, not "": the field is absent for a bare turn
-                                # or thinking off, which is what a client checks.
-                                "reasoning_content": reasoning or None,
-                                "tool_calls": tool_calls},
+                    "message": {
+                        "role": "assistant",
+                        # null, not "", when a tool call carries no prose:
+                        # OpenAI's shape, and "" reads as an empty reply.
+                        "content": text or None if tool_calls else text,
+                        # None, not "": the field is absent for a bare turn
+                        # or thinking off, which is what a client checks.
+                        "reasoning_content": reasoning or None,
+                        "tool_calls": tool_calls,
+                    },
                     "logprobs": None if content is None else {"content": content},
                     # A stop sequence is OpenAI's "stop" too, and it takes precedence
                     # over length: the cap was not what ended this one.
-                    "finish_reason": ("tool_calls" if tool_calls else "stop" if stopped
-                                      else "length" if len(output_ids) >= max_new else "stop"),
+                    "finish_reason": (
+                        "tool_calls"
+                        if tool_calls
+                        else "stop"
+                        if stopped
+                        else "length"
+                        if len(output_ids) >= max_new
+                        else "stop"
+                    ),
                 }
             ],
             "usage": _usage(prompt_tokens, len(output_ids)),
             "system_fingerprint": SYSTEM_FINGERPRINT,
         }
 
-    def _deltas(request_id: int, max_new: int, opened: bool, stops: tuple[str, ...] = (),
-                tools: list | None = None, allow_tool_calls: bool = True):
+    def _deltas(
+        request_id: int,
+        max_new: int,
+        opened: bool,
+        stops: tuple[str, ...] = (),
+        tools: list | None = None,
+        allow_tool_calls: bool = True,
+    ):
         """One request's reply, as ``(kind, payload, completion_tokens)`` triples.
 
         ``kind`` is ``delta`` (payload is a ``reasoning_content``/``content`` dict),
@@ -742,8 +852,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
                     safe = text
                     if stops:
                         done = [safe.index(x) for x in stops if x in safe]
-                        safe = (safe[:min(done)] if done
-                                else safe[:max(0, len(safe) - stop_hold)])
+                        safe = safe[: min(done)] if done else safe[: max(0, len(safe) - stop_hold)]
                     # The opener hold runs UNCONDITIONALLY: even when
                     # tool_choice:"none" discards the structured calls
                     # (allow_tool_calls False), the raw XML bytes must not
@@ -767,7 +876,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
                         sent = upto
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
-                        f"request {request_id} did not finish within {_COMPLETION_TIMEOUT_S}s")
+                        f"request {request_id} did not finish within {_COMPLETION_TIMEOUT_S}s"
+                    )
                 time.sleep(POLL_INTERVAL_S)
             output_ids = _await_completion(request_id)
         except GeneratorExit:
@@ -793,8 +903,11 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
             # framed, because a tidy error frame is easier to ignore than silence and
             # this branch means a defect, not a busy engine.
             logging.exception("stream for request %s died", request_id)
-            yield "error", {"message": f"{type(exc).__name__}: {exc}",
-                            "type": "internal_error"}, seen
+            yield (
+                "error",
+                {"message": f"{type(exc).__name__}: {exc}", "type": "internal_error"},
+                seen,
+            )
             return
         # sent counts stripped characters, so these are the remainders of the same
         # strings the deltas were cut from
@@ -818,20 +931,36 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
             yield "delta", {"content": tail[sent:]}, len(output_ids)
         if calls:
             yield "tool_calls", calls, len(output_ids)
-        finish = ("tool_calls" if calls else "stop" if stopped
-                   else "length" if len(output_ids) >= max_new else "stop")
+        finish = (
+            "tool_calls"
+            if calls
+            else "stop"
+            if stopped
+            else "length"
+            if len(output_ids) >= max_new
+            else "stop"
+        )
         yield ("done", finish, len(output_ids))
 
-    def _stream(request_id: int, max_new: int, prompt_tokens: int, opened: bool,
-                include_usage: bool, stops: tuple[str, ...] = (),
-                tools: list | None = None, allow_tool_calls: bool = True):
+    def _stream(
+        request_id: int,
+        max_new: int,
+        prompt_tokens: int,
+        opened: bool,
+        include_usage: bool,
+        stops: tuple[str, ...] = (),
+        tools: list | None = None,
+        allow_tool_calls: bool = True,
+        triples=None,
+    ):
         created = int(time.time())
         chunk_id = f"chatcmpl-{request_id}"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {"role": "assistant"}))
         completion = 0
+        if triples is None:
+            triples = _deltas(request_id, max_new, opened, stops, tools, allow_tool_calls)
         try:
-            for kind, payload, completion in _deltas(request_id, max_new, opened, stops,
-                                                      tools, allow_tool_calls):
+            for kind, payload, completion in triples:
                 if kind == "error":
                     yield _sse({"error": payload})
                     yield "data: [DONE]\n\n"
@@ -841,14 +970,26 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
                         # One full-arguments delta per call: the SDK appends, and
                         # index/id/function are byte-identical to the non-stream
                         # message.tool_calls element.
-                        yield _sse(_chat_chunk(chunk_id, created, model_name, {
-                            "tool_calls": [{"index": i,
+                        yield _sse(
+                            _chat_chunk(
+                                chunk_id,
+                                created,
+                                model_name,
+                                {
+                                    "tool_calls": [
+                                        {
+                                            "index": i,
                                             "id": f"call_{request_id}_{i}",
                                             "type": "function",
                                             "function": {
                                                 "name": name,
-                                                "arguments": json.dumps(args,
-                                                                       ensure_ascii=False)}}]}))
+                                                "arguments": json.dumps(args, ensure_ascii=False),
+                                            },
+                                        }
+                                    ]
+                                },
+                            )
+                        )
                     continue
                 if kind == "delta":
                     # Cumulative tokens on every content frame, vLLM's
@@ -863,8 +1004,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
                         chunk["usage"] = _usage(prompt_tokens, completion)
                     yield _sse(chunk)
                 else:
-                    yield _sse(_chat_chunk(chunk_id, created, model_name, {},
-                                           finish=payload))
+                    yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=payload))
         except GeneratorExit:
             # Free the row if the sync generator is finalized without going
             # through stream_or_cancel's disconnect branch. Threading caveat:
@@ -917,8 +1057,9 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
         try:
             # A picked constructor hides every other field from extra="allow".
             req = ChatCompletionRequest.model_validate(_ws_body(ask))
-            request_id, prompt_tokens, max_new, opened, tools = (
-                await asyncio.to_thread(_submit, req))
+            request_id, prompt_tokens, max_new, opened, tools = await asyncio.to_thread(
+                _submit, req
+            )
         except Exception as exc:
             await ws.send_json({"t": "error", "message": f"{type(exc).__name__}: {exc}"})
             await ws.close()
@@ -926,8 +1067,17 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
 
         # _deltas blocks on the engine; stepping it in a thread keeps the event loop free
         # to serve the other routes while one page streams.
-        gen, end = _deltas(request_id, max_new, opened, stop_texts(req.stop),
-                           tools, choice_name(req.tool_choice) != "none"), object()
+        gen, end = (
+            _deltas(
+                request_id,
+                max_new,
+                opened,
+                stop_texts(req.stop),
+                tools,
+                choice_name(req.tool_choice) != "none",
+            ),
+            object(),
+        )
         calls = None
         worker = None
         gone = False
@@ -944,17 +1094,28 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl",
                 if kind == "delta":
                     await ws.send_json({"t": "delta", **payload})
                 elif kind == "tool_calls":
-                    calls = [{"id": f"call_{request_id}_{i}", "type": "function",
-                              "name": n, "arguments": json.dumps(a, ensure_ascii=False)}
-                             for i, (n, a) in enumerate(payload)]
+                    calls = [
+                        {
+                            "id": f"call_{request_id}_{i}",
+                            "type": "function",
+                            "name": n,
+                            "arguments": json.dumps(a, ensure_ascii=False),
+                        }
+                        for i, (n, a) in enumerate(payload)
+                    ]
                     await ws.send_json({"t": "tool_calls", "tool_calls": calls})
                 elif kind == "error":
                     await ws.send_json({"t": "error", "message": payload["message"]})
                     break
                 else:
-                    await ws.send_json({"t": "done", "finish_reason": payload,
-                                        **({"tool_calls": calls} if payload == "tool_calls" else {}),
-                                        "usage": _usage(prompt_tokens, completion)})
+                    await ws.send_json(
+                        {
+                            "t": "done",
+                            "finish_reason": payload,
+                            **({"tool_calls": calls} if payload == "tool_calls" else {}),
+                            "usage": _usage(prompt_tokens, completion),
+                        }
+                    )
         except asyncio.CancelledError:
             # Bare parent-task cancel (shutdown/supervisor): no websocket.disconnect
             # frame ever arrives, so the disconnect watcher cannot see it. Let the

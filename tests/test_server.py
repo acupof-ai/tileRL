@@ -92,8 +92,15 @@ def _build_engine(seed: int) -> Engine:
     # a one-tool request is ~1.1k tokens. Shrinking the prompt to fit would be
     # measuring a format the 27B never sees.
     return build_engine(
-        cfg, model, backend, num_blocks=256, num_slots=4, max_batch=4, max_total_tokens=4096,
-        sparse_k=0)  # dense server feature suite (prefix cache, health, dram/state bytes)
+        cfg,
+        model,
+        backend,
+        num_blocks=256,
+        num_slots=4,
+        max_batch=4,
+        max_total_tokens=4096,
+        sparse_k=0,
+    )  # dense server feature suite (prefix cache, health, dram/state bytes)
 
 
 @pytest.fixture(scope="module")
@@ -179,43 +186,74 @@ def test_streaming_tool_call_is_structured_at_the_terminal_frame(tmp_path):
     byte-identical to the non-stream message, with finish tool_calls."""
     tok = _ByteTokenizer()
     from tilerl.prompt import render_tool_call
+
     reply = "I will run it.\n" + render_tool_call("Bash", {"command": "ls"})
     app = create_app(_ScriptedEngine(tok, [reply]), tok)
     with TestClient(app) as c:
-        r = c.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "run ls"}],
-            "tools": [{"type": "function", "function": {
-                "name": "Bash", "description": "run",
-                "parameters": {"type": "object",
-                               "properties": {"command": {"type": "string"}}}}}],
-            "stream": True, "max_tokens": 256,
-        })
+        r = c.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "run ls"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Bash",
+                            "description": "run",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"command": {"type": "string"}},
+                            },
+                        },
+                    }
+                ],
+                "stream": True,
+                "max_tokens": 256,
+            },
+        )
     assert r.status_code == 200, r.text
-    frames = [json.loads(ln[6:]) for ln in r.text.splitlines()
-              if ln.startswith("data: ") and ln[6:] != "[DONE]"]
-    content = "".join(
-        (f["choices"][0].get("delta", {}).get("content") or "") for f in frames)
+    frames = [
+        json.loads(ln[6:])
+        for ln in r.text.splitlines()
+        if ln.startswith("data: ") and ln[6:] != "[DONE]"
+    ]
+    content = "".join((f["choices"][0].get("delta", {}).get("content") or "") for f in frames)
     assert "<tool_call>" not in content and "Bash" not in content, content
     assert content == "I will run it.", repr(content)
-    tc_frames = [f for f in frames
-                 if f["choices"][0].get("delta", {}).get("tool_calls")]
+    tc_frames = [f for f in frames if f["choices"][0].get("delta", {}).get("tool_calls")]
     assert len(tc_frames) == 1, [f["choices"][0]["delta"] for f in frames]
     tc = tc_frames[0]["choices"][0]["delta"]["tool_calls"][0]
-    assert tc == {"index": 0, "id": "call_1_0", "type": "function",
-                 "function": {"name": "Bash", "arguments": '{"command": "ls"}'}}, tc
+    assert tc == {
+        "index": 0,
+        "id": "call_1_0",
+        "type": "function",
+        "function": {"name": "Bash", "arguments": '{"command": "ls"}'},
+    }, tc
     terminal = frames[-1]["choices"][0]
     assert terminal["delta"] == {} and terminal["finish_reason"] == "tool_calls"
     # The non-stream reply for the SAME canned text must equal the stream frame.
     app2 = create_app(_ScriptedEngine(tok, [reply]), tok)
     with TestClient(app2) as c:
-        body = c.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "run ls"}],
-            "tools": [{"type": "function", "function": {
-                "name": "Bash", "description": "run",
-                "parameters": {"type": "object",
-                               "properties": {"command": {"type": "string"}}}}}],
-            "max_tokens": 256,
-        }).json()
+        body = c.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "run ls"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Bash",
+                            "description": "run",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"command": {"type": "string"}},
+                            },
+                        },
+                    }
+                ],
+                "max_tokens": 256,
+            },
+        ).json()
     nonstream = body["choices"][0]["message"]["tool_calls"][0]
     assert tc["id"] == nonstream["id"]
     assert tc["function"] == nonstream["function"]
@@ -228,6 +266,7 @@ def test_tool_choice_none_suppresses_render_and_output(tmp_path):
     tok = _ByteTokenizer()
     seen = {}
     from tilerl.prompt import render_tool_call
+
     reply = "I will run it.\n" + render_tool_call("Bash", {"command": "ls"})
 
     class _Cap(_ScriptedEngine):
@@ -237,14 +276,27 @@ def test_tool_choice_none_suppresses_render_and_output(tmp_path):
 
     app = create_app(_Cap(tok, [reply]), tok)
     with TestClient(app) as c:
-        r = c.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "run ls"}],
-            "tools": [{"type": "function", "function": {"name": "Bash",
-                       "description": "run",
-                       "parameters": {"type": "object",
-                                      "properties": {"command": {"type": "string"}}}}}],
-            "tool_choice": "none", "max_tokens": 256,
-        })
+        r = c.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "run ls"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Bash",
+                            "description": "run",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"command": {"type": "string"}},
+                            },
+                        },
+                    }
+                ],
+                "tool_choice": "none",
+                "max_tokens": 256,
+            },
+        )
     assert "<tools>" not in seen["prompt"] and "Bash" not in seen["prompt"]
     ch = r.json()["choices"][0]
     assert ch["finish_reason"] == "stop"
@@ -263,29 +315,91 @@ def test_tool_choice_none_streaming_never_emits_call_xml(tmp_path):
     <tool_call> block)."""
     tok = _ByteTokenizer()
     from tilerl.prompt import render_tool_call
+
     reply = "I will run it.\n" + render_tool_call("Bash", {"command": "ls"})
     app = create_app(_ScriptedEngine(tok, [reply]), tok)
     with TestClient(app) as c:
-        r = c.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "run ls"}],
-            "tools": [{"type": "function", "function": {
-                "name": "Bash", "description": "run",
-                "parameters": {"type": "object",
-                               "properties": {"command": {"type": "string"}}}}}],
-            "tool_choice": "none", "stream": True, "max_tokens": 256,
-        })
+        r = c.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "run ls"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Bash",
+                            "description": "run",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"command": {"type": "string"}},
+                            },
+                        },
+                    }
+                ],
+                "tool_choice": "none",
+                "stream": True,
+                "max_tokens": 256,
+            },
+        )
     assert r.status_code == 200, r.text
-    frames = [json.loads(ln[6:]) for ln in r.text.splitlines()
-              if ln.startswith("data: ") and ln[6:] != "[DONE]"]
-    content = "".join(
-        f["choices"][0].get("delta", {}).get("content") or "" for f in frames)
+    frames = [
+        json.loads(ln[6:])
+        for ln in r.text.splitlines()
+        if ln.startswith("data: ") and ln[6:] != "[DONE]"
+    ]
+    content = "".join(f["choices"][0].get("delta", {}).get("content") or "" for f in frames)
     assert "<tool_call>" not in content
     assert "<function=Bash>" not in content
     assert "ls" not in content
     assert content == "I will run it.", repr(content)
-    assert not [f for f in frames
-                if f["choices"][0].get("delta", {}).get("tool_calls")]
+    assert not [f for f in frames if f["choices"][0].get("delta", {}).get("tool_calls")]
     assert frames[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_stream_pacing_preserves_content_and_order_but_delays_first_frame():
+    """#165469: --stream-pace re-times SSE deltas only. The concatenated content,
+    frame order, finish frame and [DONE] must be byte-identical to pacing off;
+    the only permitted change is the first-content frame arriving later (the
+    one-time headroom fill)."""
+    import time
+
+    tok = _ByteTokenizer()
+    reply = "abcdefghijklmnopqrstuvwxyz0123456789ABCD"  # 40 one-byte tokens
+
+    def frames_of(app):
+        with TestClient(app) as c:
+            r = c.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "go"}],
+                    "stream": True,
+                    "max_tokens": 128,
+                },
+            )
+        assert r.status_code == 200, r.text
+        raw = r.text.splitlines()
+        fr = [json.loads(ln[6:]) for ln in raw if ln.startswith("data: ") and ln[6:] != "[DONE]"]
+        done = raw[-2] == "data: [DONE]" if len(raw) >= 2 else False
+        content = "".join((f["choices"][0].get("delta", {}).get("content") or "") for f in fr)
+        return fr, content, done
+
+    fr_off, c_off, done_off = frames_of(create_app(_ScriptedEngine(tok, [reply]), tok))
+    t0 = time.perf_counter()
+    fr_on, c_on, done_on = frames_of(
+        create_app(_ScriptedEngine(tok, [reply]), tok, stream_pace=True, stream_pace_depth=3)
+    )
+    elapsed = time.perf_counter() - t0
+
+    # API fidelity: same concatenated text, same terminal finish, same [DONE]
+    assert c_on == c_off == reply
+    assert done_on and done_off
+    fin_off = fr_off[-1]["choices"][0]["finish_reason"]
+    fin_on = fr_on[-1]["choices"][0]["finish_reason"]
+    assert fin_off == fin_on == "stop"
+    # every paced frame's delta is a prefix-preserving slice: order is kept
+    assert "".join((f["choices"][0].get("delta", {}).get("content") or "") for f in fr_on) == reply
+    # pacing bought headroom: depth 3 at 24 ms is >= ~70 ms before first content
+    assert elapsed >= 0.065, f"paced stream returned in {elapsed * 1000:.0f} ms, no headroom"
 
 
 def test_chat_refuses_hosted_tools(tmp_path):
@@ -294,28 +408,57 @@ def test_chat_refuses_hosted_tools(tmp_path):
     tok = _ByteTokenizer()
     app = create_app(_ScriptedEngine(tok, ["ok"]), tok)
     with TestClient(app) as c:
-        r = c.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "web_search"}],
-        })
+        r = c.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "web_search"}],
+            },
+        )
     assert r.status_code == 400, r.text
     assert "web_search" in r.json()["error"]["message"]
 
 
-@pytest.mark.parametrize(("path", "body_extra"), [
-    ("/v1/messages", {"max_tokens": 256,
-                       "messages": [{"role": "user", "content": "run ls"}],
-                       "tools": [{"name": "Bash", "description": "run",
-                                  "input_schema": {"properties": {
-                                      "command": {"type": "string"}}}}]}),
-    ("/v1/responses", {"max_output_tokens": 256, "input": [{"type": "message", "role": "user",
-                                 "content": [{"type": "input_text",
-                                              "text": "run ls"}]}],
-                       "tools": [{"type": "function", "name": "Bash",
-                                  "description": "run",
-                                  "parameters": {"properties": {
-                                      "command": {"type": "string"}}}}]}),
-])
+@pytest.mark.parametrize(
+    ("path", "body_extra"),
+    [
+        (
+            "/v1/messages",
+            {
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": "run ls"}],
+                "tools": [
+                    {
+                        "name": "Bash",
+                        "description": "run",
+                        "input_schema": {"properties": {"command": {"type": "string"}}},
+                    }
+                ],
+            },
+        ),
+        (
+            "/v1/responses",
+            {
+                "max_output_tokens": 256,
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run ls"}],
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "Bash",
+                        "description": "run",
+                        "parameters": {"properties": {"command": {"type": "string"}}},
+                    }
+                ],
+            },
+        ),
+    ],
+)
 def test_tool_choice_none_suppresses_each_route(tmp_path, monkeypatch, path, body_extra):
     """Refinement 4: choice none suppresses calls at output on messages and
     responses too, not only chat (render suppression covered by the chat
@@ -323,6 +466,7 @@ def test_tool_choice_none_suppresses_each_route(tmp_path, monkeypatch, path, bod
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "r.jsonl"))
     tok = _ByteTokenizer()
     from tilerl.prompt import render_tool_call
+
     reply = "</think>\n\n" + render_tool_call("Bash", {"command": "ls"})
 
     class _BigRoom(_ScriptedEngine):
@@ -375,13 +519,18 @@ def test_replayed_tool_transcript_renders_the_call_and_a_user_tool_response():
     from tilerl.prompt import render_tool_call
     from tilerl.server import ChatMessage, _render_chat
 
-    call = {"id": "call_1_0", "type": "function",
-            "function": {"name": "Bash", "arguments": '{"command": "ls"}'}}
-    out = _render_chat([
-        ChatMessage(role="user", content="run ls"),
-        ChatMessage(role="assistant", content=None, tool_calls=[call]),
-        ChatMessage(role="tool", content="a.txt", tool_call_id="call_1_0"),
-    ])
+    call = {
+        "id": "call_1_0",
+        "type": "function",
+        "function": {"name": "Bash", "arguments": '{"command": "ls"}'},
+    }
+    out = _render_chat(
+        [
+            ChatMessage(role="user", content="run ls"),
+            ChatMessage(role="assistant", content=None, tool_calls=[call]),
+            ChatMessage(role="tool", content="a.txt", tool_call_id="call_1_0"),
+        ]
+    )
     expect_call = render_tool_call("Bash", {"command": "ls"})
     assert expect_call in out
     assert "<|im_start|>assistant\n" + expect_call + "<|im_end|>\n" in out
@@ -400,10 +549,18 @@ def test_responses_input_text_part_reaches_the_prompt(tmp_path):
     tok = _ByteTokenizer()
     app = create_app(_ScriptedEngine(tok, ["ok"]), tok)
     with TestClient(app) as c:
-        r = c.post("/v1/responses", json={
-            "input": [{"type": "message", "role": "user",
-                       "content": [{"type": "input_text", "text": "hello"}]}],
-        })
+        r = c.post(
+            "/v1/responses",
+            json={
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}],
+                    }
+                ],
+            },
+        )
     assert r.status_code == 200, r.text
     assert r.json()["output"][0]["content"][0]["text"] == "ok"
 
@@ -424,8 +581,7 @@ def test_top_level_enable_thinking_reaches_the_rendered_prompt():
     msgs = [{"role": "user", "content": "hi"}]
     think = "<" + "think>"
     closed = rendered({"messages": msgs, "enable_thinking": False})
-    via_kwargs = rendered({"messages": msgs,
-                           "chat_template_kwargs": {"enable_thinking": False}})
+    via_kwargs = rendered({"messages": msgs, "chat_template_kwargs": {"enable_thinking": False}})
     on = rendered({"messages": msgs, "enable_thinking": True})
     assert closed.endswith(f"<|im_start|>assistant\n{think}\n\n</think>\n\n")
     assert closed == via_kwargs
@@ -461,10 +617,15 @@ def test_seedless_requests_decorrelate(client, model_id, monkeypatch):
 
     seeds = []
     real = srv.sampling
-    monkeypatch.setattr(srv, "sampling",
-                        lambda *a, **k: (lambda p: (seeds.append(p.seed), p)[1])(real(*a, **k)))
-    body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
-            "temperature": 0.7, "max_tokens": 8}
+    monkeypatch.setattr(
+        srv, "sampling", lambda *a, **k: (lambda p: (seeds.append(p.seed), p)[1])(real(*a, **k))
+    )
+    body = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.7,
+        "max_tokens": 8,
+    }
     for _ in range(4):
         assert client.post("/v1/chat/completions", json=body).status_code == 200
     assert len(set(seeds)) == len(seeds) == 4, seeds
@@ -492,8 +653,9 @@ def test_the_stream_arrives_in_pieces_and_never_splits_a_character():
     # 2-byte e-acute, a raw 0xff (invalid alone), and a 3-byte arrow --
     # the exact sequence that split across CI chunks.
     text = "café →"
-    full = json.dumps(_chat_chunk(
-        "c", 0, "tiny", {"content": text}, finish="stop"), ensure_ascii=False)
+    full = json.dumps(
+        _chat_chunk("c", 0, "tiny", {"content": text}, finish="stop"), ensure_ascii=False
+    )
     cut = full.encode().index("é".encode()) * 1
 
     async def asgi_app(scope, receive, send):
@@ -505,17 +667,17 @@ def test_the_stream_arrives_in_pieces_and_never_splits_a_character():
                 # Alternate a mid-character window with a safe one; the modulo
                 # forces at least one cut inside the 3-byte arrow.
                 w = cut % 8 + 2
-                yield body[pos:pos + w]
+                yield body[pos : pos + w]
                 pos += w
 
-        await StreamingResponse(chunks(), media_type="text/event-stream")(
-            scope, receive, send)
+        await StreamingResponse(chunks(), media_type="text/event-stream")(scope, receive, send)
 
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(
-        asgi_app, host="127.0.0.1", port=port, log_level="error"))
+    server = uvicorn.Server(
+        uvicorn.Config(asgi_app, host="127.0.0.1", port=port, log_level="error")
+    )
     threading.Thread(target=server.run, daemon=True).start()
     try:
         for _ in range(400):
@@ -548,7 +710,7 @@ def test_the_stream_arrives_in_pieces_and_never_splits_a_character():
         if size == 0:
             break
         start = nl + 2
-        raw = tail + body[start:start + size]
+        raw = tail + body[start : start + size]
         # All complete UTF-8 chars stream now; leftover continuation bytes
         # stay buffered exactly the way the production rstrip holds them.
         ok = 0
@@ -565,11 +727,16 @@ def test_the_stream_arrives_in_pieces_and_never_splits_a_character():
         tail.decode("utf-8")  # the held tail was a real dangling char
     assert len(pieces) > 1, f"the reply did not stream: {len(pieces)} chunk(s)"
     text = b"".join(pieces).decode("utf-8")
-    payloads = [json.loads(ln[6:]) for ln in text.splitlines()
-                if ln.startswith("data: ") and ln[6:] != "[DONE]"]
+    payloads = [
+        json.loads(ln[6:])
+        for ln in text.splitlines()
+        if ln.startswith("data: ") and ln[6:] != "[DONE]"
+    ]
     content = "".join(
-        f["choices"][0]["delta"]["content"] for f in payloads
-        if f["choices"][0].get("delta", {}).get("content"))
+        f["choices"][0]["delta"]["content"]
+        for f in payloads
+        if f["choices"][0].get("delta", {}).get("content")
+    )
     assert content == json.loads(full)["choices"][0]["delta"]["content"]
 
 
@@ -630,14 +797,21 @@ def test_a_reply_that_arrives_over_many_polls_streams_over_many_deltas():
     ids = [b + 3 for b in text]  # one id per byte, so a prefix can cut a character
     engine = _StepEngine(ids)
     client = TestClient(create_app(engine, _TextTokenizer()))
-    body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": len(ids),
-            "temperature": 0.0, "stream": True}
+    body = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": len(ids),
+        "temperature": 0.0,
+        "stream": True,
+    }
     r = client.post("/v1/chat/completions", json=body)
     assert r.status_code == 200, r.text
     lines = [ln for ln in r.text.split("\n") if ln.startswith("data:")]
     payloads = [json.loads(ln[len("data: ") :]) for ln in lines[:-1]]
-    deltas = [p["choices"][0]["delta"]["content"] for p in payloads
-              if p["choices"][0].get("delta", {}).get("content")]
+    deltas = [
+        p["choices"][0]["delta"]["content"]
+        for p in payloads
+        if p["choices"][0].get("delta", {}).get("content")
+    ]
     full = text.decode("utf-8", errors="replace")  # the 0xFF is a U+FFFD, deliberately
 
     assert "".join(deltas) == full, f"joined {''.join(deltas)!r} != {full!r}"
@@ -674,8 +848,14 @@ def test_usage_in_the_stream_is_opt_in_and_counts_tokens_not_characters(client, 
     completion_tokens is the engine's count, not a character estimate: the page used to
     compute chars/4, which is ~4x low for Chinese (roughly one token per character).
     """
-    body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 16, "temperature": 0.0, "seed": 5, "stream": True}
+    body = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "seed": 5,
+        "stream": True,
+    }
 
     def frames(extra):
         resp = client.post("/v1/chat/completions", json={**body, **extra})
@@ -768,16 +948,26 @@ def test_the_sse_stream_keeps_the_shape_a_reader_has_to_handle(client, model_id)
     frames `/ws/chat` emits. What is left here is the wire contract itself, which the
     SDK clients in `test_api_sdk.py` depend on.
     """
-    resp = client.post("/v1/chat/completions", json={
-        "model": model_id, "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 8, "temperature": 0.0, "seed": 11,
-        "stream": True, "stream_options": {"include_usage": True},
-    })
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": model_id,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "temperature": 0.0,
+            "seed": 11,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    )
     assert resp.status_code == 200, resp.text[:200]
     sse = resp.text
     assert "[DONE]" in sse and '"usage"' in sse, "the fixture is not a complete stream"
-    frames = [json.loads(ln[6:]) for ln in sse.splitlines()
-              if ln.startswith("data: ") and ln[6:] != "[DONE]"]
+    frames = [
+        json.loads(ln[6:])
+        for ln in sse.splitlines()
+        if ln.startswith("data: ") and ln[6:] != "[DONE]"
+    ]
     assert len(frames) > 1, f"the stream yielded nothing usable: {frames}"
 
     def has_text(f):
@@ -788,8 +978,7 @@ def test_the_sse_stream_keeps_the_shape_a_reader_has_to_handle(client, model_id)
         "this server's first frame now carries content, so the assertion no longer "
         "exercises the role-only frame a real reply starts with"
     )
-    empty_choices = [f for f in frames if isinstance(f.get("choices"), list)
-                     and not f["choices"]]
+    empty_choices = [f for f in frames if isinstance(f.get("choices"), list) and not f["choices"]]
     assert len(empty_choices) == 1, (
         f"exactly one frame must carry an empty choices list -- the usage chunk. Got "
         f"{len(empty_choices)}. A reader indexing choices[0] unconditionally dies on it."
@@ -808,6 +997,7 @@ def test_the_sse_stream_keeps_the_shape_a_reader_has_to_handle(client, model_id)
         f"the live gauge counting frames for that stretch"
     )
     assert counts == sorted(counts), f"cumulative token counts went backwards: {counts}"
+
 
 class _SplitlinesTokenizer(_ByteTokenizer):
     """Decodes a fixed text containing the three characters `splitlines()` cuts on and
@@ -841,10 +1031,17 @@ def test_sse_frames_survive_a_separator_splitlines_cuts_on():
     engine.run()
     try:
         with TestClient(create_app(engine, _SplitlinesTokenizer())) as c:
-            resp = c.post("/v1/chat/completions", json={
-                "model": "tiny", "messages": [{"role": "user", "content": "hi"}],
-                "stream": True, "max_tokens": 16, "temperature": 0.0, "seed": 5,
-            })
+            resp = c.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "tiny",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                    "max_tokens": 16,
+                    "temperature": 0.0,
+                    "seed": 5,
+                },
+            )
         assert resp.status_code == 200, resp.text
         lines = [ln for ln in resp.text.split("\n") if ln.startswith("data: {")]
         assert lines, f"no SSE payload frames: {resp.text[:200]!r}"
@@ -922,14 +1119,19 @@ def test_configured_tokenizer_fails_closed(tmp_path):
         get_tokenizer(str(tmp_path))
 
 
-@pytest.mark.parametrize("path,body", [
-    ("/v1/messages", {"model": "tiny", "max_tokens": 8,
-                      "messages": [{"role": "user", "content": "hi"}]}),
-    # Both, because /v1/responses had the SAME defect and 27's brief named only messages:
-    # `async def responses` called `_run` directly, and its own poll loop sleeps at :186.
-    # A gate on one route would have left a known instance of this defect in the tree.
-    ("/v1/responses", {"model": "tiny", "max_output_tokens": 8, "input": "hi"}),
-])
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        (
+            "/v1/messages",
+            {"model": "tiny", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        # Both, because /v1/responses had the SAME defect and 27's brief named only messages:
+        # `async def responses` called `_run` directly, and its own poll loop sleeps at :186.
+        # A gate on one route would have left a known instance of this defect in the tree.
+        ("/v1/responses", {"model": "tiny", "max_output_tokens": 8, "input": "hi"}),
+    ],
+)
 def test_a_request_in_flight_does_not_freeze_the_server(tmp_path, monkeypatch, path, body):
     """`/health` must answer while a reply is being generated, on every async route.
 
@@ -967,8 +1169,7 @@ def test_a_request_in_flight_does_not_freeze_the_server(tmp_path, monkeypatch, p
     app = create_app(engine, tok, model_name="tiny")
     with TestClient(app) as c:
         done: dict[str, object] = {}
-        t = threading.Thread(target=lambda: done.update(
-            code=c.post(path, json=body).status_code))
+        t = threading.Thread(target=lambda: done.update(code=c.post(path, json=body).status_code))
         t.start()
         try:
             assert engine.entered.wait(10.0), f"{path} never entered take; the arm proves nothing"
@@ -979,9 +1180,11 @@ def test_a_request_in_flight_does_not_freeze_the_server(tmp_path, monkeypatch, p
             ht.join(5.0)
             assert not ht.is_alive(), (
                 f"/health did not return while {path} was in take — the route blocks the "
-                f"event loop instead of awaiting through asyncio.to_thread")
+                f"event loop instead of awaiting through asyncio.to_thread"
+            )
             assert not engine.release.is_set(), (
-                "/health returned only after the in-flight request completed")
+                "/health returned only after the in-flight request completed"
+            )
             health = box["resp"]
         finally:
             engine.release.set()
@@ -1011,8 +1214,15 @@ def test_health_does_not_wait_on_the_engine_lock(tmp_path):
     own behaviour. The only substitution is the forward (the layer below).
     """
     cfg = tiny()
-    engine = build_engine(cfg, build_random(cfg, seed=43), get_backend(),
-                          num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096)
+    engine = build_engine(
+        cfg,
+        build_random(cfg, seed=43),
+        get_backend(),
+        num_blocks=32,
+        num_slots=4,
+        max_batch=4,
+        max_total_tokens=4096,
+    )
 
     entered = threading.Event()
     release = threading.Event()
@@ -1038,7 +1248,8 @@ def test_health_does_not_wait_on_the_engine_lock(tmp_path):
         reader.join(5.0)
         assert not reader.is_alive(), (
             "stats() did not return while step() held the lock — /health waits on "
-            "the engine lock instead of reading a published snapshot")
+            "the engine lock instead of reading a published snapshot"
+        )
         assert not release.is_set(), "stats returned only because the lock was released"
         snap = box["snap"]
     finally:
@@ -1062,9 +1273,16 @@ def test_stats_snapshot_is_built_once_per_tick_and_carries_tick_end_state():
     against a fresh build fails.
     """
     cfg = tiny()
-    engine = build_engine(cfg, build_random(cfg, seed=42), get_backend(),
-                          num_blocks=32, num_slots=4, max_batch=1,
-                          max_total_tokens=4096, sparse_k=0)
+    engine = build_engine(
+        cfg,
+        build_random(cfg, seed=42),
+        get_backend(),
+        num_blocks=32,
+        num_slots=4,
+        max_batch=1,
+        max_total_tokens=4096,
+        sparse_k=0,
+    )
     orig_build = engine._build_stats
     builds = 0
 
@@ -1134,8 +1352,13 @@ def test_messages_route_records_token_ids(client, tmp_path, monkeypatch):
         "model": "tiny",
         "max_tokens": 8,
         "system": [{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}],
-        "tools": [{"name": "Bash", "description": "Run a command",
-                   "input_schema": {"properties": {"command": {"type": "string"}}}}],
+        "tools": [
+            {
+                "name": "Bash",
+                "description": "Run a command",
+                "input_schema": {"properties": {"command": {"type": "string"}}},
+            }
+        ],
         "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
     }
     r = client.post("/v1/messages", json=body)
@@ -1158,16 +1381,20 @@ def test_messages_route_records_token_ids(client, tmp_path, monkeypatch):
     assert row["stop_reason"] == out["stop_reason"]
 
 
-@pytest.mark.parametrize("choice,refused", [
-    ({"type": "any"}, True),      # Anthropic's "call some tool"
-    ({"type": "tool", "name": "Bash"}, True),
-    ("required", True),           # OpenAI's spelling, same claim
-    ({"type": "auto"}, False),    # a hint, which is what we already do
-    ({"type": "none"}, False),
-    (None, False),
-])
-def test_messages_refuses_a_tool_choice_it_cannot_honour(client, tmp_path, monkeypatch,
-                                                         choice, refused):
+@pytest.mark.parametrize(
+    "choice,refused",
+    [
+        ({"type": "any"}, True),  # Anthropic's "call some tool"
+        ({"type": "tool", "name": "Bash"}, True),
+        ("required", True),  # OpenAI's spelling, same claim
+        ({"type": "auto"}, False),  # a hint, which is what we already do
+        ({"type": "none"}, False),
+        (None, False),
+    ],
+)
+def test_messages_refuses_a_tool_choice_it_cannot_honour(
+    client, tmp_path, monkeypatch, choice, refused
+):
     """Forcing a call is unimplementable here, so it must 400 rather than be ignored.
 
     Found by the live endpoint, not by reading: #201's `unknown_fields` produced its first
@@ -1181,10 +1408,12 @@ def test_messages_refuses_a_tool_choice_it_cannot_honour(client, tmp_path, monke
     "your choice", so refusing it would refuse a request that asked for nothing.
     """
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "tc.jsonl"))
-    body = {"model": "tiny", "max_tokens": 8,
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"name": "Bash", "description": "run",
-                       "input_schema": {"properties": {}}}]}
+    body = {
+        "model": "tiny",
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "Bash", "description": "run", "input_schema": {"properties": {}}}],
+    }
     if choice is not None:
         body["tool_choice"] = choice
     r = client.post("/v1/messages", json=body)
@@ -1198,10 +1427,14 @@ def test_messages_refuses_a_tool_choice_it_cannot_honour(client, tmp_path, monke
 def test_messages_stream_is_anthropic_sse(client, tmp_path, monkeypatch):
     """stream=true emits the event names Claude Code's parser expects."""
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "s.jsonl"))
-    r = client.post("/v1/messages", json={
-        "max_tokens": 4, "stream": True,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    r = client.post(
+        "/v1/messages",
+        json={
+            "max_tokens": 4,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert r.status_code == 200, r.text
     events = [ln[7:] for ln in r.text.splitlines() if ln.startswith("event: ")]
     assert events[0] == "message_start" and events[-1] == "message_stop"
@@ -1304,18 +1537,29 @@ def test_messages_tool_use_round_trip(tmp_path, monkeypatch):
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "rt.jsonl"))
     tok = _ByteTokenizer()
     # /v1/messages opens <think> in the prompt, so a real reply starts with the closer
-    engine = _ScriptedEngine(tok, [
-        "</think>\n\n" + render_tool_call("Bash", {"command": "ls"}),
-        "</think>\n\nthere are 3 files",
-    ])
+    engine = _ScriptedEngine(
+        tok,
+        [
+            "</think>\n\n" + render_tool_call("Bash", {"command": "ls"}),
+            "</think>\n\nthere are 3 files",
+        ],
+    )
     app = create_app(engine, tok)
     with TestClient(app) as c:
-        first = c.post("/v1/messages", json={
-            "max_tokens": 64,
-            "tools": [{"name": "Bash", "description": "Run a command",
-                       "input_schema": {"properties": {"command": {}}}}],
-            "messages": [{"role": "user", "content": "list the files"}],
-        })
+        first = c.post(
+            "/v1/messages",
+            json={
+                "max_tokens": 64,
+                "tools": [
+                    {
+                        "name": "Bash",
+                        "description": "Run a command",
+                        "input_schema": {"properties": {"command": {}}},
+                    }
+                ],
+                "messages": [{"role": "user", "content": "list the files"}],
+            },
+        )
         assert first.status_code == 200, first.text
         body = first.json()
         assert body["stop_reason"] == "tool_use", body
@@ -1325,16 +1569,26 @@ def test_messages_tool_use_round_trip(tmp_path, monkeypatch):
         assert block["id"].startswith("toolu_")
 
         # the client executes the tool and sends the result back, as Claude Code does
-        second = c.post("/v1/messages", json={
-            "max_tokens": 64,
-            "messages": [
-                {"role": "user", "content": "list the files"},
-                {"role": "assistant", "content": [block]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": block["id"], "content": "a.py b.py c.py"}
-                ]},
-            ],
-        })
+        second = c.post(
+            "/v1/messages",
+            json={
+                "max_tokens": 64,
+                "messages": [
+                    {"role": "user", "content": "list the files"},
+                    {"role": "assistant", "content": [block]},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block["id"],
+                                "content": "a.py b.py c.py",
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
         assert second.status_code == 200, second.text
         final = second.json()
         assert final["stop_reason"] == "end_turn"
@@ -1362,16 +1616,28 @@ def test_parallel_tool_calls_become_separate_blocks(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "p.jsonl"))
     tok = _ByteTokenizer()
-    reply = ("Listing both.\n" + render_tool_call("Bash", {"command": "ls"})
-             + "\n" + render_tool_call("Bash", {"command": "pwd"}))
+    reply = (
+        "Listing both.\n"
+        + render_tool_call("Bash", {"command": "ls"})
+        + "\n"
+        + render_tool_call("Bash", {"command": "pwd"})
+    )
     app = create_app(_ScriptedEngine(tok, ["</think>\n\n" + reply]), tok)
     with TestClient(app) as c:
-        body = c.post("/v1/messages", json={
-            "max_tokens": 64,
-            "tools": [{"name": "Bash", "description": "Run a command",
-                       "input_schema": {"properties": {"command": {"type": "string"}}}}],
-            "messages": [{"role": "user", "content": "list and pwd"}],
-        }).json()
+        body = c.post(
+            "/v1/messages",
+            json={
+                "max_tokens": 64,
+                "tools": [
+                    {
+                        "name": "Bash",
+                        "description": "Run a command",
+                        "input_schema": {"properties": {"command": {"type": "string"}}},
+                    }
+                ],
+                "messages": [{"role": "user", "content": "list and pwd"}],
+            },
+        ).json()
     assert body["stop_reason"] == "tool_use"
     kinds = [b["type"] for b in body["content"]]
     assert kinds == ["text", "tool_use", "tool_use"], body["content"]
@@ -1388,10 +1654,13 @@ def test_max_tokens_is_clamped_not_refused(client, tmp_path, monkeypatch):
     engine refuses prompt+max_new_tokens over its budget, so the shim clamps.
     """
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "c.jsonl"))
-    r = client.post("/v1/messages", json={
-        "max_tokens": 32000,  # far past the 4096-token test engine
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    r = client.post(
+        "/v1/messages",
+        json={
+            "max_tokens": 32000,  # far past the 4096-token test engine
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert r.status_code == 200, r.text
     assert r.json()["stop_reason"] in ("end_turn", "max_tokens", "tool_use")
 
@@ -1411,41 +1680,56 @@ def test_the_messages_clamp_honours_the_pool_not_only_the_context(tmp_path, monk
     """
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "pool.jsonl"))
     cfg = tiny()
-    engine = build_engine(cfg, build_random(cfg, seed=41), get_backend(),
-                          num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096,
-                          sparse_k=0)  # dense: the clamp reads the dense pool capacity
+    engine = build_engine(
+        cfg,
+        build_random(cfg, seed=41),
+        get_backend(),
+        num_blocks=32,
+        num_slots=4,
+        max_batch=4,
+        max_total_tokens=4096,
+        sparse_k=0,
+    )  # dense: the clamp reads the dense pool capacity
     engine.run()
     try:
         assert engine.room_for(1) < engine.limits.max_total_tokens - 1, (
-            "fixture does not bind on the pool, so it cannot see the defect")
-        with TestClient(create_app(engine, _ByteTokenizer(), model_name="tiny"),
-                        raise_server_exceptions=False) as c:
-            body = {"model": "tiny", "max_tokens": 32000,
-                    "messages": [{"role": "user", "content": "hi"}]}
+            "fixture does not bind on the pool, so it cannot see the defect"
+        )
+        with TestClient(
+            create_app(engine, _ByteTokenizer(), model_name="tiny"), raise_server_exceptions=False
+        ) as c:
+            body = {
+                "model": "tiny",
+                "max_tokens": 32000,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
             got = c.post("/v1/messages", json=body)
-            control = c.post("/v1/chat/completions", json={k: v for k, v in body.items()
-                                                           if k != "max_tokens"})
+            control = c.post(
+                "/v1/chat/completions", json={k: v for k, v in body.items() if k != "max_tokens"}
+            )
         assert control.status_code == 200, f"the control route broke: {control.text}"
         assert got.status_code == 200, (
             f"a 32000-token ask 400-ed on a pool-bound engine: {got.text} — the clamp "
-            f"bounds one of submit's two ceilings")
+            f"bounds one of submit's two ceilings"
+        )
         row_file = tmp_path / "pool.jsonl"
         # Named, because the refusal is raised inside `submit` before the recorder runs:
         # with the defect present there is no row at all, and the bare FileNotFoundError
         # reads as a broken test rather than the second half of the same finding.
         assert row_file.exists(), (
             "no recorder row: submit refused before `_record`, so the request log cannot "
-            "see this failure class")
+            "see this failure class"
+        )
         row = json.loads(row_file.read_text().splitlines()[-1])
         # The clamp is the pool's number, and tight: room_for is what submit accepts to
         # the token, so an off-by-one here is the shape the hand-rolled version had.
         room = engine.room_for(row["prompt_len"])
         assert row["budget"] == room, f"budget {row['budget']} is not room_for {room}"
         assert room < row["engine_limit"] - row["prompt_len"], (
-            "the pool did not bind on the recorded prompt, so `budget` proves nothing")
+            "the pool did not bind on the recorded prompt, so `budget` proves nothing"
+        )
         with pytest.raises(ValueError, match="KV pool"):
-            engine.submit(list(range(row["prompt_len"])),
-                          SamplingParams(max_new_tokens=room + 1))
+            engine.submit(list(range(row["prompt_len"])), SamplingParams(max_new_tokens=room + 1))
     finally:
         engine.shutdown()
 
@@ -1453,18 +1737,34 @@ def test_the_messages_clamp_honours_the_pool_not_only_the_context(tmp_path, monk
 def test_image_blocks_are_refused_not_dropped(client, tmp_path, monkeypatch):
     """A text-only model must say so rather than answer a turn missing its subject."""
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "i.jsonl"))
-    r = client.post("/v1/messages", json={
-        "max_tokens": 8,
-        "messages": [{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                                         "data": "iVBOR"}}]}],
-    })
+    r = client.post(
+        "/v1/messages",
+        json={
+            "max_tokens": 8,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "iVBOR",
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+    )
     assert r.status_code == 400, r.text
     assert r.json()["error"]["type"] == "invalid_request_error"
 
 
-def test_an_undeclared_field_is_recorded_by_shape_on_every_route(client, tmp_path,
-                                                                monkeypatch, recwarn):
+def test_an_undeclared_field_is_recorded_by_shape_on_every_route(
+    client, tmp_path, monkeypatch, recwarn
+):
     """A field the client sends and we do not declare must become visible, not vanish.
 
     Before `extra="allow"`, pydantic dropped unknown keys before any handler ran AND the
@@ -1481,15 +1781,23 @@ def test_an_undeclared_field_is_recorded_by_shape_on_every_route(client, tmp_pat
     extra = {"made_up_field": secret, "a_number": 7, "an_object": {"type": "auto", "k": 1}}
 
     # /v1/messages is the only route with a recorder, and the one Claude Code drives.
-    r = client.post("/v1/messages", json={"model": "tiny", "max_tokens": 8,
-                                          "messages": [{"role": "user", "content": "hi"}],
-                                          **extra})
+    r = client.post(
+        "/v1/messages",
+        json={
+            "model": "tiny",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+            **extra,
+        },
+    )
     assert r.status_code == 200, r.text
     text = rec.read_text(encoding="utf-8")
     got = json.loads(text.splitlines()[-1])["unknown_fields"]
     # Named before indexed: `set(None)` raises a TypeError that reads as a broken test.
-    assert got, ("the row recorded no unknown fields at all -- the request model is "
-                 "dropping them before the handler runs (extra=\"ignore\")")
+    assert got, (
+        "the row recorded no unknown fields at all -- the request model is "
+        'dropping them before the handler runs (extra="ignore")'
+    )
     assert set(got) == set(extra), got
     assert got["made_up_field"] == f"str[{len(secret)}]", got
     assert got["a_number"] == "int(7)", got
@@ -1498,15 +1806,25 @@ def test_an_undeclared_field_is_recorded_by_shape_on_every_route(client, tmp_pat
     assert secret not in text, "the field's VALUE reached the row"
 
     # No recorder on these two, so the warning is the only signal -- and it must name it.
-    for path, body in (("/v1/chat/completions",
-                        {"model": "tiny", "stream": False, "max_tokens": 8,
-                         "messages": [{"role": "user", "content": "hi"}], **extra}),
-                       ("/v1/responses", {"model": "tiny", "input": "hi", **extra})):
+    for path, body in (
+        (
+            "/v1/chat/completions",
+            {
+                "model": "tiny",
+                "stream": False,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}],
+                **extra,
+            },
+        ),
+        ("/v1/responses", {"model": "tiny", "input": "hi", **extra}),
+    ):
         recwarn.clear()
         assert client.post(path, json=body).status_code == 200, path
         texts = [str(w.message) for w in recwarn]
         assert any("made_up_field" in t for t in texts), (
-            f"{path} ignored an undeclared field with no warning: {texts}")
+            f"{path} ignored an undeclared field with no warning: {texts}"
+        )
         assert secret not in " ".join(texts), f"{path} warned with the field's VALUE"
 
 
@@ -1544,8 +1862,16 @@ def test_every_engine_the_routes_accept_implements_what_they_call():
 
     # The set is asserted, not just used: a regex that silently matched nothing would make
     # every implementation pass. These are the names the routes call today.
-    assert called >= {"submit", "take", "peek", "stop_text", "logprobs", "stats",
-                      "room_for", "limits"}, called
+    assert called >= {
+        "submit",
+        "take",
+        "peek",
+        "stop_text",
+        "logprobs",
+        "stats",
+        "room_for",
+        "limits",
+    }, called
 
     # Instances, not classes: `Engine.limits` is assigned in __init__, so `hasattr` on the
     # class reports it missing and this gate would fail on a correct engine.
@@ -1555,7 +1881,8 @@ def test_every_engine_the_routes_accept_implements_what_they_call():
         assert not missing, (
             f"{type(impl).__name__} is accepted by the routes but does not implement "
             f"{missing} — the shape of the missing `limits` (400 on every turn) and the "
-            f"missing `room_for` (500 on every omitted cap)")
+            f"missing `room_for` (500 on every omitted cap)"
+        )
 
 
 def test_serve_sizes_its_pools_from_the_flags_not_the_context():
@@ -1632,8 +1959,12 @@ def test_a_stream_that_dies_mid_decode_does_not_look_like_success():
     engine = _build_engine(seed=31)
     engine.run()
     try:
-        body = {"model": "tiny", "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 24, "stream": True}
+        body = {
+            "model": "tiny",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 24,
+            "stream": True,
+        }
         for exc in (RuntimeError, ValueError, AttributeError, KeyError):
             app = create_app(_DiesAfterOnePeek(engine, exc), _ByteTokenizer())
             with TestClient(app, raise_server_exceptions=False) as c:
@@ -1641,7 +1972,8 @@ def test_a_stream_that_dies_mid_decode_does_not_look_like_success():
                 assert "[DONE]" in r.text or '"error"' in r.text or r.status_code >= 400, (
                     f"{exc.__name__}: HTTP {r.status_code} with no [DONE] and no error "
                     f"frame — a client reads this as an empty reply. "
-                    f"body={r.text[:200]!r}")
+                    f"body={r.text[:200]!r}"
+                )
     finally:
         engine.shutdown()
 
@@ -1693,21 +2025,24 @@ def test_v1_messages_never_answers_200_for_an_engine_failure(tmp_path, monkeypat
     engine = _build_engine(seed=33)
     engine.run()
     try:
-        body = {"model": "tiny", "max_tokens": 16,
-                "messages": [{"role": "user", "content": "hi"}]}
+        body = {"model": "tiny", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}
         for exc in (RuntimeError, ValueError, AttributeError, KeyError):
             app = FastAPI()
             mount_messages(app, _Dies(engine, exc), _ByteTokenizer(), "tiny")
             with TestClient(app, raise_server_exceptions=False) as c:
-                codes = [c.post("/v1/messages", json={**body, "stream": s}).status_code
-                         for s in (False, True)]
+                codes = [
+                    c.post("/v1/messages", json={**body, "stream": s}).status_code
+                    for s in (False, True)
+                ]
             assert codes[0] == codes[1], (
                 f"{exc.__name__}: non-stream {codes[0]} but stream {codes[1]} — the "
                 f"streaming path is diverging, which is how server.py's _stream came "
-                f"to answer 200 for a failed request")
+                f"to answer 200 for a failed request"
+            )
             assert codes[0] >= 400, (
                 f"{exc.__name__}: HTTP {codes[0]} for an engine failure — a client "
-                f"cannot tell this from a model that chose to say nothing")
+                f"cannot tell this from a model that chose to say nothing"
+            )
     finally:
         engine.shutdown()
 
@@ -1732,15 +2067,21 @@ def test_the_record_says_which_operand_capped_the_completion(tmp_path, monkeypat
     with TestClient(create_app(engine, tok)) as client:
         r = client.post(
             "/v1/messages",
-            json={"model": "m", "max_tokens": 3,
-                  "messages": [{"role": "user", "content": "hi"}]},
+            json={"model": "m", "max_tokens": 3, "messages": [{"role": "user", "content": "hi"}]},
         )
     assert r.status_code == 200, r.text
     rows = [json.loads(x) for x in record.read_text().splitlines() if x.strip()]
     assert rows, f"nothing recorded; file={record.read_text()[:200]!r}"
     row = rows[-1]
-    for field in ("asked_max_tokens", "budget", "engine_limit", "prompt_len",
-                  "effective_max_tokens", "stream", "stop_reason"):
+    for field in (
+        "asked_max_tokens",
+        "budget",
+        "engine_limit",
+        "prompt_len",
+        "effective_max_tokens",
+        "stream",
+        "stop_reason",
+    ):
         assert field in row, (
             f"{field!r} missing from the record, so a capped completion cannot be "
             f"attributed without re-deriving it. Row keys: {sorted(row)}"
@@ -1776,8 +2117,20 @@ def test_serve_dram_bytes_reaches_health(dram_bytes, monkeypatch, capsys):
         "uvicorn.run",
         lambda app, **kw: served.update(health=TestClient(app).get("/health").json()),
     )
-    argv = ["serve", "--slots", "2", "--max-batch", "2", "--blocks", "64",
-            "--max-ctx", "512", "--no-warmup", "--sparse-k", "0"]
+    argv = [
+        "serve",
+        "--slots",
+        "2",
+        "--max-batch",
+        "2",
+        "--blocks",
+        "64",
+        "--max-ctx",
+        "512",
+        "--no-warmup",
+        "--sparse-k",
+        "0",
+    ]
     if dram_bytes:
         argv += ["--dram-bytes", str(dram_bytes)]
     cli.cmd_serve(cli._build_parser().parse_args(argv))
@@ -1811,8 +2164,10 @@ def test_health_publishes_each_ceiling_beside_its_counter(client):
     pool while 438 blocks were retained.
     """
     stats = client.get("/health").json()["stats"]
-    for fill, ceiling in (("blocks_used", "blocks_total"),
-                          ("prefix_state_bytes", "prefix_state_bytes_budget")):
+    for fill, ceiling in (
+        ("blocks_used", "blocks_total"),
+        ("prefix_state_bytes", "prefix_state_bytes_budget"),
+    ):
         assert fill in stats and ceiling in stats, (
             f"{fill}/{ceiling} must both be published or pressure is unreadable; "
             f"keys: {sorted(stats)}"
@@ -1835,44 +2190,77 @@ def test_a_reply_that_carries_only_the_think_closer_is_the_answer(tmp_path, monk
     opened, only what follows the closer is the reply; with thinking off, or on a
     bare turn (the byte tokenizer has no ``<think>`` token), nothing is stripped."""
     tok = _ByteTokenizer()
-    engine = _ScriptedEngine(tok, ["planning\n</think>\n\n<p>hi</p>", "no block here",
-                                   "bare turn"])
+    engine = _ScriptedEngine(tok, ["planning\n</think>\n\n<p>hi</p>", "no block here", "bare turn"])
     with TestClient(create_app(engine, tok)) as c:
-        opened = c.post("/v1/messages", json={
-            "model": "m", "max_tokens": 64,
-            "messages": [{"role": "user", "content": "page"}]}).json()
+        opened = c.post(
+            "/v1/messages",
+            json={
+                "model": "m",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "page"}],
+            },
+        ).json()
         assert _text_blocks(opened) == "<p>hi</p>", opened
         # The reasoning is not discarded, it moves to its own block -- Anthropic's
         # native shape. Asserted here so a regression to stripping is caught by the
         # same test that gates the closer handling.
-        assert [b["thinking"] for b in opened["content"]
-                if b["type"] == "thinking"] == ["planning\n"], opened
-        off = c.post("/v1/messages", json={
-            "model": "m", "max_tokens": 64, "thinking": {"type": "disabled"},
-            "messages": [{"role": "user", "content": "page"}]}).json()
+        assert [b["thinking"] for b in opened["content"] if b["type"] == "thinking"] == [
+            "planning\n"
+        ], opened
+        off = c.post(
+            "/v1/messages",
+            json={
+                "model": "m",
+                "max_tokens": 64,
+                "thinking": {"type": "disabled"},
+                "messages": [{"role": "user", "content": "page"}],
+            },
+        ).json()
         assert _text_blocks(off) == "no block here", off
         assert not [b for b in off["content"] if b["type"] == "thinking"], off
-        bare = c.post("/v1/chat/completions", json={
-            "model": "m", "max_tokens": 64,
-            "messages": [{"role": "user", "content": "page"}]}).json()
+        bare = c.post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "page"}],
+            },
+        ).json()
         assert bare["choices"][0]["message"]["content"] == "bare turn", bare
 
 
 def _chat_stream_fields(client, reply: str, max_tokens: int) -> tuple[list, list, str]:
     """(reasoning deltas, content deltas, finish) of one thinking-on chat stream."""
-    resp = client.post("/v1/chat/completions", json={
-        "model": "m", "max_tokens": max_tokens, "stream": True,
-        "chat_template_kwargs": {"enable_thinking": True},
-        "messages": [{"role": "user", "content": reply}]})
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "m",
+            "max_tokens": max_tokens,
+            "stream": True,
+            "chat_template_kwargs": {"enable_thinking": True},
+            "messages": [{"role": "user", "content": reply}],
+        },
+    )
     assert resp.status_code == 200, resp.text
-    frames = [json.loads(ln[6:]) for ln in resp.text.splitlines()
-              if ln.startswith("data: ") and ln != "data: [DONE]"]
+    frames = [
+        json.loads(ln[6:])
+        for ln in resp.text.splitlines()
+        if ln.startswith("data: ") and ln != "data: [DONE]"
+    ]
     assert not any("error" in f for f in frames), frames
-    kinds = [(k, c["delta"][k]) for f in frames for c in f["choices"]
-             for k in ("reasoning_content", "content") if c.get("delta", {}).get(k)]
+    kinds = [
+        (k, c["delta"][k])
+        for f in frames
+        for c in f["choices"]
+        for k in ("reasoning_content", "content")
+        if c.get("delta", {}).get(k)
+    ]
     finish = [c["finish_reason"] for f in frames for c in f["choices"] if c.get("finish_reason")]
-    return ([t for k, t in kinds if k == "reasoning_content"],
-            [t for k, t in kinds if k == "content"], finish[-1])
+    return (
+        [t for k, t in kinds if k == "reasoning_content"],
+        [t for k, t in kinds if k == "content"],
+        finish[-1],
+    )
 
 
 def test_the_stream_carries_the_reasoning_as_its_own_field(tmp_path, monkeypatch):
@@ -1889,7 +2277,9 @@ def test_the_stream_carries_the_reasoning_as_its_own_field(tmp_path, monkeypatch
         assert "".join(content) == "<p>hi</p>", content
         assert len(reasoning) >= 1 and len(content) >= 1 and finish == "stop"
         assert not any("</think>" in t for t in reasoning + content)
-        reasoning, content, finish = _chat_stream_fields(c, "page", len(tok.encode("still planning")))
+        reasoning, content, finish = _chat_stream_fields(
+            c, "page", len(tok.encode("still planning"))
+        )
         assert "".join(reasoning) == "still planning" and content == [], (reasoning, content)
         assert finish == "length"
 
@@ -1913,9 +2303,10 @@ def test_an_omitted_max_tokens_gets_the_context_remainder(client, model_id, monk
         return real(tokenizer, thinking, max_new, **kw)
 
     monkeypatch.setattr(srv, "sampling", spy)
-    r = client.post("/v1/chat/completions",
-                    json={"model": model_id, "stream": False,
-                          "messages": [{"role": "user", "content": "hi"}]})
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": model_id, "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
     assert r.status_code == 200, r.text
     assert seen, "sampling was never called"
     prompt_tokens = r.json()["usage"]["prompt_tokens"]
@@ -1925,8 +2316,9 @@ def test_an_omitted_max_tokens_gets_the_context_remainder(client, model_id, monk
     assert seen[-1] != 512, "the omitted default is still the old flat 512"
 
 
-def test_an_omitted_max_output_tokens_gets_the_remainder_on_responses(client, model_id,
-                                                                     monkeypatch):
+def test_an_omitted_max_output_tokens_gets_the_remainder_on_responses(
+    client, model_id, monkeypatch
+):
     """The Responses route carries the same default, asserted through its own module.
 
     One route's fix is not the other's: `responses.py` reads `max_output_tokens` and
@@ -1942,8 +2334,7 @@ def test_an_omitted_max_output_tokens_gets_the_remainder_on_responses(client, mo
         return real(tokenizer, thinking, max_new, **kw)
 
     monkeypatch.setattr(rsp, "sampling", spy)
-    r = client.post("/v1/responses",
-                    json={"model": model_id, "input": "hi"})
+    r = client.post("/v1/responses", json={"model": model_id, "input": "hi"})
     assert r.status_code == 200, r.text
     assert seen, "sampling was never called"
     assert seen[-1] != 512, "the omitted default is still the old flat 512"
@@ -1962,11 +2353,18 @@ def test_an_explicit_max_tokens_is_still_honoured(client, model_id, monkeypatch)
 
     seen: list[int] = []
     real = srv.sampling
-    monkeypatch.setattr(srv, "sampling",
-                        lambda t, th, mn, **kw: (seen.append(mn), real(t, th, mn, **kw))[1])
-    r = client.post("/v1/chat/completions",
-                    json={"model": model_id, "stream": False, "max_tokens": 8,
-                          "messages": [{"role": "user", "content": "hi"}]})
+    monkeypatch.setattr(
+        srv, "sampling", lambda t, th, mn, **kw: (seen.append(mn), real(t, th, mn, **kw))[1]
+    )
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": model_id,
+            "stream": False,
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert r.status_code == 200, r.text
     assert seen[-1] == 8, seen
 
@@ -2015,8 +2413,16 @@ def test_a_cancel_returns_the_blocks_a_disconnected_reader_was_holding():
     # max_batch=1 at build: StepLimits is frozen, so this is the only way to force
     # a second request to sit in _waiting.
     cfg = tiny()
-    one = build_engine(cfg, build_random(cfg, seed=71), get_backend(), num_blocks=256,
-                       num_slots=4, max_batch=1, max_total_tokens=4096, sparse_k=0)
+    one = build_engine(
+        cfg,
+        build_random(cfg, seed=71),
+        get_backend(),
+        num_blocks=256,
+        num_slots=4,
+        max_batch=1,
+        max_total_tokens=4096,
+        sparse_k=0,
+    )
     a = one.submit(list(range(1, 40)), params)
     b = one.submit(list(range(1, 40)), params)
     one.step()
@@ -2033,8 +2439,8 @@ def test_a_cancel_returns_the_blocks_a_disconnected_reader_was_holding():
     # that cancelling a waiting request leaves the RUNNING one's accounting untouched -- the
     # bug this arm exists to catch is a cancel that frees someone else's blocks.
     assert one._blocks_used == before, (
-        f"cancelling an unadmitted request moved the block count: {before} -> "
-        f"{one._blocks_used}")
+        f"cancelling an unadmitted request moved the block count: {before} -> {one._blocks_used}"
+    )
     assert any(r.req_id == a for r in one._running), "cancel took the wrong request"
 
     # --- admitted arm: #209's original behaviour, at the level where it still applies ------
@@ -2057,9 +2463,11 @@ def test_a_cancel_returns_the_blocks_a_disconnected_reader_was_holding():
     assert one.cancel(c) is True
     assert not any(r.req_id == c for r in one._running), "cancel left it running"
     assert one._blocks_used < held, (
-        f"an admitted request's blocks were never returned: {held} -> {one._blocks_used}")
+        f"an admitted request's blocks were never returned: {held} -> {one._blocks_used}"
+    )
     assert one._slots_used < slots, (
-        f"an admitted request's state slot was never returned: {slots} -> {one._slots_used}")
+        f"an admitted request's state slot was never returned: {slots} -> {one._slots_used}"
+    )
 
 
 def test_the_routes_cancel_when_the_client_hangs_up():
@@ -2084,7 +2492,8 @@ def test_the_routes_cancel_when_the_client_hangs_up():
     # through stream_or_cancel, whose live-disconnect watcher cancels the row,
     # and the GeneratorExit teardown line stays as GC/process defense.
     assert "stream_or_cancel(request, engine, request_id," in src, (
-        "the SSE body must run under the shared disconnect watcher")
+        "the SSE body must run under the shared disconnect watcher"
+    )
     # Every cancel that runs ON the event loop (route handlers, watchers) must go
     # through to_thread: engine.cancel takes engine._lock across _release, and a
     # synchronous call freezes /health during a long tick. The detached drain's
@@ -2098,26 +2507,30 @@ def test_the_routes_cancel_when_the_client_hangs_up():
         f"7 to_thread cancel sites (3 stream_or_cancel: CancelledError, "
         f"fetch-finished-while-disconnected, the poll-wait disconnect; chat "
         f"Cancelled/timeout/RuntimeError; the shared detached drain backstop used "
-        f"by both SSE and WS after #667); found {on_loop}")
+        f"by both SSE and WS after #667); found {on_loop}"
+    )
     for mod in (messages, responses):
         msrc = inspect.getsource(mod)
         assert msrc.count("asyncio.to_thread(engine.cancel, rid_box[0])") == 2, (
             f"{mod.__name__}: both on-loop cancels (CancelledError and the "
-            f"timeout/503 handler) must run through to_thread")
+            f"timeout/503 handler) must run through to_thread"
+        )
     assert src.count("engine.cancel(request_id)") == 3, (
         "only the three sync generator-internal sites may call cancel directly "
         "(SSE error frame, SSE GeneratorExit teardown, and the WS _deltas "
-        "GeneratorExit teardown added in #667); they run in worker threads")
+        "GeneratorExit teardown added in #667); they run in worker threads"
+    )
     assert "except GeneratorExit:" in src, (
         "the SSE route keeps GeneratorExit as GC/teardown defense: the live "
         "watcher is the client hang-up path, but a finalized generator must "
-        "still free its row")
+        "still free its row"
+    )
     for mod in (messages, responses):
         msrc = inspect.getsource(mod)
-        assert "except asyncio.CancelledError:" in msrc and \
-            "to_thread(engine.cancel" in msrc, (
+        assert "except asyncio.CancelledError:" in msrc and "to_thread(engine.cancel" in msrc, (
             f"{mod.__name__}'s non-stream route must cancel on a client "
-            "disconnect, off the event loop")
+            "disconnect, off the event loop"
+        )
 
 
 @pytest.mark.parametrize("state_bytes", [0, 12345678])
@@ -2137,8 +2550,20 @@ def test_serve_state_bytes_reaches_health(state_bytes, monkeypatch, capsys):
         "uvicorn.run",
         lambda app, **kw: served.update(health=TestClient(app).get("/health").json()),
     )
-    argv = ["serve", "--slots", "2", "--max-batch", "2", "--blocks", "64",
-            "--max-ctx", "512", "--no-warmup", "--sparse-k", "0"]
+    argv = [
+        "serve",
+        "--slots",
+        "2",
+        "--max-batch",
+        "2",
+        "--blocks",
+        "64",
+        "--max-ctx",
+        "512",
+        "--no-warmup",
+        "--sparse-k",
+        "0",
+    ]
     if state_bytes:
         argv += ["--state-bytes", str(state_bytes)]
     cli.cmd_serve(cli._build_parser().parse_args(argv))
@@ -2187,8 +2612,7 @@ def test_a_nonstream_client_disconnect_cancels_its_request():
 
     async def scenario(path: str, body: dict) -> None:
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://t",
-                                     timeout=30.0) as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://t", timeout=30.0) as ac:
             # Fresh gate per scenario: the follow-up post at the end also admits a
             # row and would leave a shared event already set before this dispatch.
             admitted = admit_gate["event"] = threading.Event()
@@ -2197,7 +2621,8 @@ def test_a_nonstream_client_disconnect_cancels_its_request():
             # Wait until THIS request's row is owned by the engine, then emulate
             # the reader leaving. Event, not a fixed wall deadline.
             assert await asyncio.to_thread(admitted.wait, 30.0), (
-                f"{path}: request never reached the engine")
+                f"{path}: request never reached the engine"
+            )
             task.cancel()
             # The wrapper task ends one of two ways under a cancel delivered at
             # this instant. It raises CancelledError if the cancel is scheduled
@@ -2217,7 +2642,8 @@ def test_a_nonstream_client_disconnect_cancels_its_request():
             else:
                 assert raced.status_code == 200, (
                     f"{path}: disconnect window ended {raced.status_code}, "
-                    "not a clean same-turn completion")
+                    "not a clean same-turn completion"
+                )
 
             # cancel() drops the row under the lock; two loop polls is the bound the
             # route contract claims.
@@ -2232,16 +2658,22 @@ def test_a_nonstream_client_disconnect_cancels_its_request():
             assert follow_up.status_code == 200, follow_up.text
 
     async def main():
-        await scenario("/v1/chat/completions",
-                       {"model": "m", "max_tokens": 512,
-                        "messages": [{"role": "user", "content": "x" * 64}]})
-        await scenario("/v1/messages",
-                       {"model": "m", "max_tokens": 512,
-                        "messages": [{"role": "user", "content": "x" * 64}]})
-        await scenario("/v1/responses",
-                       {"model": "m", "max_output_tokens": 512,
-                        "input": [{"role": "user", "content": [{"type": "input_text",
-                                                                 "text": "x" * 64}]}]})
+        await scenario(
+            "/v1/chat/completions",
+            {"model": "m", "max_tokens": 512, "messages": [{"role": "user", "content": "x" * 64}]},
+        )
+        await scenario(
+            "/v1/messages",
+            {"model": "m", "max_tokens": 512, "messages": [{"role": "user", "content": "x" * 64}]},
+        )
+        await scenario(
+            "/v1/responses",
+            {
+                "model": "m",
+                "max_output_tokens": 512,
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "x" * 64}]}],
+            },
+        )
 
     try:
         asyncio.run(main())
@@ -2281,10 +2713,13 @@ def test_a_real_http_disconnect_event_cancels_without_task_cancellation():
             return 512
 
         limits = None
+
         def stats(self):
             return {}
+
         def stop_text(self, rid):
             return None
+
         def logprobs(self, rid):
             return []
 
@@ -2317,43 +2752,58 @@ def test_a_real_http_disconnect_event_cancels_without_task_cancellation():
         async def send(message):
             received.append(message)
 
-        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
-                 "method": "POST", "scheme": "http", "path": path,
-                 "query_string": b"", "root_path": "",
-                 "headers": [(b"content-type", b"application/json")],
-                 "client": ("test", 1234), "server": ("test", 80)}
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": path,
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("test", 1234),
+            "server": ("test", 80),
+        }
         task = asyncio.ensure_future(app(scope, receive, send))
         # Poll interval is 0.05 s; the route must react well inside 1 s.
         deadline = time.monotonic() + 1.0
         while not engine.cancelled and time.monotonic() < deadline:
             await asyncio.sleep(0.02)
         assert engine.cancelled == [42], (
-            f"{path}: engine.cancel not called on http.disconnect within 1 s")
+            f"{path}: engine.cancel not called on http.disconnect within 1 s"
+        )
         await asyncio.wait_for(task, timeout=2.0)
-        status = next((m.get("status") for m in received
-                       if m["type"] == "http.response.start"), None)
+        status = next(
+            (m.get("status") for m in received if m["type"] == "http.response.start"), None
+        )
         assert status == 499, f"{path}: expected 499 on disconnect, got {status}"
         if delay_s:
             # Polled, not spun: 0.25 s at a 0.05 s interval is ~5 fresh peeks;
             # a busy loop (a reused one-shot watcher) makes thousands.
             assert peeks["n"] - 1 <= 12, (
-                f"{path}: {peeks['n'] - 1} disconnect peeks in {delay_s}s - spinning")
+                f"{path}: {peeks['n'] - 1} disconnect peeks in {delay_s}s - spinning"
+            )
 
     async def main():
         for body3 in (
-            ("/v1/chat/completions",
-             b'{"model":"m","max_tokens":512,'
-             b'"messages":[{"role":"user","content":"hi"}]}'),
-            ("/v1/messages",
-             b'{"model":"m","max_tokens":512,'
-             b'"messages":[{"role":"user","content":"hi"}]}'),
-            ("/v1/responses",
-             b'{"model":"m","max_output_tokens":512,'
-             b'"input":[{"role":"user","content":'
-             b'[{"type":"input_text","text":"hi"}]}]}'),
+            (
+                "/v1/chat/completions",
+                b'{"model":"m","max_tokens":512,"messages":[{"role":"user","content":"hi"}]}',
+            ),
+            (
+                "/v1/messages",
+                b'{"model":"m","max_tokens":512,"messages":[{"role":"user","content":"hi"}]}',
+            ),
+            (
+                "/v1/responses",
+                b'{"model":"m","max_output_tokens":512,'
+                b'"input":[{"role":"user","content":'
+                b'[{"type":"input_text","text":"hi"}]}]}',
+            ),
         ):
-            await scenario(body3[0], body3[1], 0.0)     # disconnect at start
-            await scenario(body3[0], body3[1], 0.25)    # delayed, mid-worker
+            await scenario(body3[0], body3[1], 0.0)  # disconnect at start
+            await scenario(body3[0], body3[1], 0.25)  # delayed, mid-worker
 
     try:
         asyncio.run(main())
@@ -2397,8 +2847,7 @@ def test_await_or_cancel_polls_disconnect_at_interval_not_spin():
     async def main() -> None:
         req, eng = _Req(), _Eng()
         with pytest.raises(ClientDisconnected):
-            await asyncio.wait_for(
-                await_or_cancel(req, eng, [7], eng.take, 7), timeout=1.0)
+            await asyncio.wait_for(await_or_cancel(req, eng, [7], eng.take, 7), timeout=1.0)
         assert eng.cancelled == [7]
         # 0.25 s / 0.05 s ~= 5 ticks; a spin loop makes thousands.
         assert req.peeks <= 12, f"{req.peeks} is_disconnected peeks in 0.25 s - spinning"
@@ -2409,22 +2858,35 @@ def test_await_or_cancel_polls_disconnect_at_interval_not_spin():
     asyncio.run(main())
 
 
-@pytest.mark.parametrize("path,body,status", [
-    ("/v1/chat/completions",
-     {"model": "m", "max_tokens": 4,
-      "messages": [{"role": "user", "content": "hi"}]}, 504),
-    ("/v1/messages",
-     {"model": "m", "max_tokens": 4,
-      "messages": [{"role": "user", "content": "hi"}]}, 503),
-    ("/v1/responses",
-     {"model": "m", "max_output_tokens": 4,
-      "input": [{"role": "user", "content": [{"type": "input_text",
-                                              "text": "hi"}]}]}, 503),
-])
+@pytest.mark.parametrize(
+    "path,body,status",
+    [
+        (
+            "/v1/chat/completions",
+            {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]},
+            504,
+        ),
+        (
+            "/v1/messages",
+            {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]},
+            503,
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": "m",
+                "max_output_tokens": 4,
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            },
+            503,
+        ),
+    ],
+)
 def test_completion_timeout_cancels_the_still_running_row(path, body, status):
     """A 504/503 from a completion TIMEOUT returns to the client but the engine
     row is still generating. The route must cancel it, else slot and blocks
     run to max_new_tokens for nobody (audit finding 3)."""
+
     class _TimeoutEngine:
         cancelled: list[int] = []
 
@@ -2457,18 +2919,27 @@ def test_completion_timeout_cancels_the_still_running_row(path, body, status):
     assert engine.cancelled == [7], (path, "the timed-out row was never cancelled")
 
 
-@pytest.mark.parametrize("path,body", [
-    ("/v1/chat/completions",
-     {"model": "m", "max_tokens": 4,
-      "messages": [{"role": "user", "content": "hi"}]}),
-    ("/v1/messages",
-     {"model": "m", "max_tokens": 4,
-      "messages": [{"role": "user", "content": "hi"}]}),
-    ("/v1/responses",
-     {"model": "m", "max_output_tokens": 4,
-      "input": [{"role": "user", "content": [{"type": "input_text",
-                                              "text": "hi"}]}]}),
-])
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        (
+            "/v1/chat/completions",
+            {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        (
+            "/v1/messages",
+            {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": "m",
+                "max_output_tokens": 4,
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            },
+        ),
+    ],
+)
 def test_completion_failure_cancel_is_a_noop_not_a_double_release(path, body):
     """RuntimeError (engine already failed the row, e.g. pool exhausted): the
     route still calls cancel, but the row is gone so it returns False and no
@@ -2505,20 +2976,30 @@ def test_completion_failure_cancel_is_a_noop_not_a_double_release(path, body):
     assert freed == [9], "cancel called once as a no-op"
 
 
-@pytest.mark.parametrize("path,body", [
-    ("/v1/chat/completions",
-     {"model": "m", "max_tokens": 4,
-      "messages": [{"role": "user", "content": "hi"}]}),
-    ("/v1/messages",
-     {"model": "m", "max_tokens": 4,
-      "messages": [{"role": "user", "content": "hi"}]}),
-    ("/v1/responses",
-     {"model": "m", "max_output_tokens": 4,
-      "input": [{"role": "user", "content": [{"type": "input_text",
-                                              "text": "hi"}]}]}),
-])
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        (
+            "/v1/chat/completions",
+            {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        (
+            "/v1/messages",
+            {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": "m",
+                "max_output_tokens": 4,
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            },
+        ),
+    ],
+)
 def test_a_successful_completion_never_cancels(path, body):
     """The cancel additions must not touch the success path."""
+
     class _OkEngine:
         cancelled: list[int] = []
 
@@ -2552,30 +3033,46 @@ def test_a_successful_completion_never_cancels(path, body):
 
 
 EFFORT_PATHS = [
-    ("/v1/chat/completions",
-     {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "low"}),
-    ("/v1/messages",
-     {"max_tokens": 64, "messages": [{"role": "user", "content": "hi"}],
-      "output_config": {"effort": "high"}}),
-    ("/v1/responses",
-     {"input": "hi", "reasoning": {"effort": "none"}}),
+    (
+        "/v1/chat/completions",
+        {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "low"},
+    ),
+    (
+        "/v1/messages",
+        {
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "high"},
+        },
+    ),
+    ("/v1/responses", {"input": "hi", "reasoning": {"effort": "none"}}),
 ]
 
 
-@pytest.mark.parametrize(("path", "body", "cap"), [
-    ("/v1/chat/completions",
-     {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "low"}, 512),
-    ("/v1/messages",
-     {"max_tokens": 64, "messages": [{"role": "user", "content": "hi"}],
-      "output_config": {"effort": "high"}}, 8192),
-    # effort:"none" closes the think block in the prompt; sampling then
-    # carries no cap (sampling drops max_think_tokens when thinking is off),
-    # so the engine sees None on that route too.
-    ("/v1/responses",
-     {"input": "hi", "reasoning": {"effort": "none"}}, None),
-])
-def test_reasoning_effort_caps_the_engine_on_every_route(tmp_path, monkeypatch,
-                                                          path, body, cap):
+@pytest.mark.parametrize(
+    ("path", "body", "cap"),
+    [
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "low"},
+            512,
+        ),
+        (
+            "/v1/messages",
+            {
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"effort": "high"},
+            },
+            8192,
+        ),
+        # effort:"none" closes the think block in the prompt; sampling then
+        # carries no cap (sampling drops max_think_tokens when thinking is off),
+        # so the engine sees None on that route too.
+        ("/v1/responses", {"input": "hi", "reasoning": {"effort": "none"}}, None),
+    ],
+)
+def test_reasoning_effort_caps_the_engine_on_every_route(tmp_path, monkeypatch, path, body, cap):
     """Finding 14: only chat mapped effort to the engine cap; messages/responses
     wrote effort into prompt text and sampled with no max_think_tokens. All three
     now use the shared prompt.think_cap mapping."""
@@ -2598,8 +3095,9 @@ def test_no_effort_input_means_no_engine_cap(tmp_path, monkeypatch, path, body):
     """An absent effort must reach sampling as max_think_tokens=None on every
     route, not default to some budget."""
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "r.jsonl"))
-    body = {k: v for k, v in body.items()
-            if k not in ("reasoning_effort", "output_config", "reasoning")}
+    body = {
+        k: v for k, v in body.items() if k not in ("reasoning_effort", "output_config", "reasoning")
+    }
     tok = _ByteTokenizer()
     eng = _ScriptedEngine(tok, ["ok"])
     with TestClient(create_app(eng, tok)) as c:
@@ -2635,11 +3133,9 @@ def test_chat_effort_render_is_byte_identical():
     always did. The shared mapping must not start rendering new prose."""
     from tilerl.server import ChatMessage, _render_chat
 
-    high = _render_chat([ChatMessage(role="user", content="hi")],
-                         reasoning_effort="high")
+    high = _render_chat([ChatMessage(role="user", content="hi")], reasoning_effort="high")
     assert "Reasoning effort is set to" not in high
-    low = _render_chat([ChatMessage(role="user", content="hi")],
-                        reasoning_effort="low")
+    low = _render_chat([ChatMessage(role="user", content="hi")], reasoning_effort="low")
     assert "Reasoning effort is set to low." in low
 
 
@@ -2743,8 +3239,7 @@ def _uvicorn_server(engine, tok, wrap_app=None):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(
-        app, host="127.0.0.1", port=port, log_level="error"))
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
     threading.Thread(target=server.run, daemon=True).start()
     for _ in range(400):
         if server.started:
@@ -2766,12 +3261,14 @@ def test_a_mid_stream_sse_close_cancels_and_releases_the_row():
     eng = _MidStreamEngine(tok, "streaming reply text")
     server, port = _uvicorn_server(eng, tok)
     try:
-        payload = json.dumps({"messages": [{"role": "user", "content": "hi"}],
-                            "stream": True, "max_tokens": 64})
+        payload = json.dumps(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True, "max_tokens": 64}
+        )
         request = (
             f"POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
             f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
-            f"\r\n{payload}").encode()
+            f"\r\n{payload}"
+        ).encode()
         with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
             s.sendall(request)
             buf = b""
@@ -2788,8 +3285,8 @@ def test_a_mid_stream_sse_close_cancels_and_releases_the_row():
             time.sleep(0.02)
         assert eng.cancelled == [7], "SSE GeneratorExit never reached engine.cancel"
         assert eng.blocks_used == 0 and eng.slots_used == 0, (
-            f"the live row kept its allocation: {eng.blocks_used} blocks, "
-            f"{eng.slots_used} slots")
+            f"the live row kept its allocation: {eng.blocks_used} blocks, {eng.slots_used} slots"
+        )
     finally:
         server.should_exit = True
 
@@ -2822,10 +3319,19 @@ def _raw_ws_app(engine, ask: bytes):
         if len(sent) >= 3:
             raise OSError("broken pipe")
 
-    scope = {"type": "websocket", "asgi": {"version": "3.0"}, "http_version": "1.1",
-             "scheme": "ws", "path": "/ws/chat", "query_string": b"", "root_path": "",
-             "headers": [], "client": ("test", 1), "server": ("test", 80),
-             "subprotocols": None}
+    scope = {
+        "type": "websocket",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "scheme": "ws",
+        "path": "/ws/chat",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [],
+        "client": ("test", 1),
+        "server": ("test", 80),
+        "subprotocols": None,
+    }
     return app, scope, receive, send, engine, sent
 
 
@@ -2837,37 +3343,47 @@ def test_a_mid_stream_ws_close_cancels_and_releases_the_row():
 
     ask = b'{"messages":[{"role":"user","content":"hi"}],"max_tokens":64}'
     app, scope, receive, send, eng, sent = _raw_ws_app(
-        _MidStreamEngine(_ByteTokenizer(), "ws reply"), ask)
+        _MidStreamEngine(_ByteTokenizer(), "ws reply"), ask
+    )
 
     async def scenario():
         await app(scope, receive, send)  # WebSocketDisconnect is caught, not raised
 
     asyncio.run(scenario())
-    assert eng.cancelled == [7], (
-        "websocket WebSocketDisconnect never reached engine.cancel")
+    assert eng.cancelled == [7], "websocket WebSocketDisconnect never reached engine.cancel"
     assert eng.blocks_used == 0 and eng.slots_used == 0, (
-        f"the live row kept its allocation: {eng.blocks_used} blocks, "
-        f"{eng.slots_used} slots")
+        f"the live row kept its allocation: {eng.blocks_used} blocks, {eng.slots_used} slots"
+    )
     assert [m["type"] for m in sent].count("websocket.accept") == 1
 
 
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("path,body,envelope", [
-    ("/v1/chat/completions",
-     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4},
-     ("error",)),
-    ("/v1/messages",
-     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4},
-     ("error",)),
-    ("/v1/responses",
-     {"input": [{"role": "user", "content": [{"type": "input_text",
-                                               "text": "hi"}]}],
-      "max_output_tokens": 4},
-     ("error",)),
-])
-def test_engine_overloaded_is_a_503_overloaded_body(tmp_path, monkeypatch,
-                                                      path, body, envelope,
-                                                      stream):
+@pytest.mark.parametrize(
+    "path,body,envelope",
+    [
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4},
+            ("error",),
+        ),
+        (
+            "/v1/messages",
+            {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4},
+            ("error",),
+        ),
+        (
+            "/v1/responses",
+            {
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "max_output_tokens": 4,
+            },
+            ("error",),
+        ),
+    ],
+)
+def test_engine_overloaded_is_a_503_overloaded_body(
+    tmp_path, monkeypatch, path, body, envelope, stream
+):
     """Finding 17 route half (#633): submit raises EngineOverloaded
     synchronously at queue capacity. Every route answers 503 with the
     overloaded type and cap/inflight ints, stream and non-stream alike
@@ -2879,7 +3395,8 @@ def test_engine_overloaded_is_a_503_overloaded_body(tmp_path, monkeypatch,
         def submit(self, input_ids, params=None) -> int:
             raise EngineOverloaded(
                 "engine is saturated: 8 in-flight requests and the cap is 8 "
-                "(running + waiting); retry later")
+                "(running + waiting); retry later"
+            )
 
         def room_for(self, prompt_tokens: int) -> int:
             return 64
@@ -2893,8 +3410,7 @@ def test_engine_overloaded_is_a_503_overloaded_body(tmp_path, monkeypatch,
     payload = dict(body)
     if stream:
         payload["stream"] = True
-    r = TestClient(create_app(_Saturated(), _ByteTokenizer())).post(path,
-                                                                     json=payload)
+    r = TestClient(create_app(_Saturated(), _ByteTokenizer())).post(path, json=payload)
     assert r.status_code == 503, (path, stream, r.status_code, r.text)
     assert r.headers.get("retry-after") is None
     err = r.json()[envelope[0]]
@@ -2904,16 +3420,23 @@ def test_engine_overloaded_is_a_503_overloaded_body(tmp_path, monkeypatch,
     assert all(k not in err for k in ("retry_after", "retryAfter")), err
 
 
-@pytest.mark.parametrize("path,body", [
-    ("/v1/chat/completions",
-     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}),
-    ("/v1/messages",
-     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}),
-    ("/v1/responses",
-     {"input": [{"role": "user", "content": [{"type": "input_text",
-                                              "text": "hi"}]}],
-      "max_output_tokens": 4}),
-])
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4},
+        ),
+        ("/v1/messages", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}),
+        (
+            "/v1/responses",
+            {
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "max_output_tokens": 4,
+            },
+        ),
+    ],
+)
 def test_a_plain_runtime_error_stays_api_error(tmp_path, monkeypatch, path, body):
     """Only EngineOverloaded maps to overloaded_error; a RequestFailed or
     other RuntimeError keeps the generic api_error 503 body."""
@@ -2941,8 +3464,7 @@ def test_a_plain_runtime_error_stays_api_error(tmp_path, monkeypatch, path, body
         def stats(self) -> dict:
             return {}
 
-    r = TestClient(create_app(_OtherFailure(), _ByteTokenizer())).post(
-        path, json=body)
+    r = TestClient(create_app(_OtherFailure(), _ByteTokenizer())).post(path, json=body)
     assert r.status_code in (500, 503), r.text
     assert r.json()["error"]["type"] == "api_error", r.text
 
@@ -2954,6 +3476,7 @@ class _LockParkEngine(_MidStreamEngine):
     def __init__(self, tok, text, *, cancel_park_s: float = 2.0):
         super().__init__(tok, text)
         import threading as _t
+
         self.cancel_lock = _t.Lock()
         self._cancel_park_s = cancel_park_s
         self.cancel_started = _t.Event()
@@ -2990,12 +3513,14 @@ def test_a_late_sse_disconnect_does_not_freeze_the_event_loop():
     eng.cancel_lock.acquire()  # the "slow step tick": held until the probe ends
     server, port = _uvicorn_server(eng, tok)
     try:
-        payload = json.dumps({"messages": [{"role": "user", "content": "hi"}],
-                            "stream": True, "max_tokens": 64})
+        payload = json.dumps(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True, "max_tokens": 64}
+        )
         request = (
             f"POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
             f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
-            f"\r\n{payload}").encode()
+            f"\r\n{payload}"
+        ).encode()
         with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
             s.sendall(request)
             # Event-synced, not a wall-clock race: the engine marks the first
@@ -3023,34 +3548,37 @@ def test_a_late_sse_disconnect_does_not_freeze_the_event_loop():
         elapsed = time.monotonic() - t0
         probe.close()
         assert b" 200 " in answer.split(b"\r\n", 1)[0], answer[:80]
-        assert elapsed < 0.5, (
-            f"event loop froze {elapsed:.2f}s waiting for engine.cancel's lock")
+        assert elapsed < 0.5, f"event loop froze {elapsed:.2f}s waiting for engine.cancel's lock"
         # Release the parked critical section: the queued cancel completes and
         # the next-tick cleanup flag drains the allocation. Wait on the
         # completion event, not a poll deadline.
         eng.cancel_lock.release()
         assert eng.cancel_finished.wait(10.0), "queued cancel never finished"
-        assert eng.cancelled == [7] and eng.blocks_used == 0 \
-            and eng.slots_used == 0
+        assert eng.cancelled == [7] and eng.blocks_used == 0 and eng.slots_used == 0
     finally:
         if eng.cancel_lock.locked():
             eng.cancel_lock.release()
         server.should_exit = True
 
 
-@pytest.mark.parametrize("path,body", [
-    ("/v1/chat/completions",
-     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 64}),
-    ("/v1/messages",
-     {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 64}),
-    ("/v1/responses",
-     {"input": [{"role": "user", "content": [{"type": "input_text",
-                                               "text": "hi"}]}],
-      "max_output_tokens": 64}),
-])
-def test_a_nonstream_disconnect_does_not_freeze_the_event_loop(tmp_path,
-                                                                monkeypatch,
-                                                                path, body):
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 64},
+        ),
+        ("/v1/messages", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 64}),
+        (
+            "/v1/responses",
+            {
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "max_output_tokens": 64,
+            },
+        ),
+    ],
+)
+def test_a_nonstream_disconnect_does_not_freeze_the_event_loop(tmp_path, monkeypatch, path, body):
     """await_or_cancel is the non-stream analog of stream_or_cancel: its live
     disconnect branch used to call the lock-taking engine.cancel on the event
     loop, so a disconnect in a long tick froze /health identically. All three
@@ -3069,14 +3597,16 @@ def test_a_nonstream_disconnect_does_not_freeze_the_event_loop(tmp_path,
         request = (
             f"POST {path} HTTP/1.1\r\nHost: t\r\n"
             f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
-            f"\r\n").encode() + payload
+            f"\r\n"
+        ).encode() + payload
         with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
             s.sendall(request)
             # Wait until the request is enqueued (take is blocked in the
             # worker), then close to deliver http.disconnect. Event, not sleep.
             assert eng.submitted.wait(10.0), f"{path}: request never submitted"
         assert eng.cancel_started.wait(10.0), (
-            f"{path}: await_or_cancel never dispatched engine.cancel")
+            f"{path}: await_or_cancel never dispatched engine.cancel"
+        )
         probe = socket.create_connection(("127.0.0.1", port), timeout=5)
         probe.sendall(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
         t0 = time.monotonic()
@@ -3096,14 +3626,16 @@ def test_a_nonstream_disconnect_does_not_freeze_the_event_loop(tmp_path,
         assert b" 200 " in answer.split(b"\r\n", 1)[0], answer[:80]
         assert not eng.cancel_finished.is_set(), (
             f"{path}: /health did not answer until cancel's lock released -- "
-            "the loop was serialized behind engine.cancel")
+            "the loop was serialized behind engine.cancel"
+        )
         # Sanity cap only: a loop genuinely frozen behind the lock answers at
         # ~cancel_park_s (2 s, after the release). Anything clearly below that is
         # scheduling jitter, not a freeze; do not hard-code a tight host-specific
         # number that a contended CI runner misses.
         assert elapsed < eng._cancel_park_s - 0.25, (
             f"{path}: /health took {elapsed:.2f}s, within {eng._cancel_park_s:.2f}s of "
-            "the parked lock -- serialized, not jitter")
+            "the parked lock -- serialized, not jitter"
+        )
         probe.close()
         eng.cancel_lock.release()
         assert eng.cancel_finished.wait(10.0), f"{path}: queued cancel never finished"
@@ -3172,22 +3704,30 @@ def test_a_disconnect_with_an_already_failed_worker_retrieves_its_exception():
         async def receive():
             peeks["n"] += 1
             if peeks["n"] == 1:
-                return {"type": "http.request",
-                        "body": b'{"messages":[{"role":"user","content":"hi"}]}',
-                        "more_body": False}
+                return {
+                    "type": "http.request",
+                    "body": b'{"messages":[{"role":"user","content":"hi"}]}',
+                    "more_body": False,
+                }
             return {"type": "http.disconnect"}
 
         async def send(message):
             pass
 
-        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
-                 "method": "POST", "scheme": "http",
-                 "path": "/v1/chat/completions", "query_string": b"",
-                 "root_path": "",
-                 "headers": [(b"content-type", b"application/json")],
-                 "client": ("t", 1), "server": ("t", 80)}
-        asyncio.get_running_loop().set_exception_handler(
-            lambda loop, ctx: errors.append(ctx))
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("t", 1),
+            "server": ("t", 80),
+        }
+        asyncio.get_running_loop().set_exception_handler(lambda loop, ctx: errors.append(ctx))
         with contextlib.suppress(ClientDisconnected, Exception):
             await app(scope, receive, send)
         # The leak is reported when the failed Task is destroyed without its
@@ -3198,8 +3738,9 @@ def test_a_disconnect_with_an_already_failed_worker_retrieves_its_exception():
 
     errors: list[dict] = []
     asyncio.run(scenario(errors))
-    leaked = [e for e in errors
-              if "Task exception was never retrieved" in str(e.get("message", ""))]
+    leaked = [
+        e for e in errors if "Task exception was never retrieved" in str(e.get("message", ""))
+    ]
     assert not leaked, [str(e["message"]) for e in leaked]
 
 
@@ -3295,7 +3836,8 @@ def test_sse_body_generator_exit_cancel_runs_off_the_event_loop():
     responsive = asyncio.run(scenario())
     assert gen_threads, "body GeneratorExit did not run"
     assert all(t != loop_id for t in gen_threads), (
-        f"GeneratorExit ran on the event loop thread ({loop_id}), threads {gen_threads}")
+        f"GeneratorExit ran on the event loop thread ({loop_id}), threads {gen_threads}"
+    )
     assert responsive, "event loop stalled while GeneratorExit cancel parked"
 
 
@@ -3339,10 +3881,16 @@ def test_engine_liveness_idle_is_live_and_active_stall_is_not(monkeypatch):
     timestamp reports stuck, and a fresh one is live."""
     import time as _time
 
-
     cfg = tiny()
-    eng = build_engine(cfg, build_random(cfg, seed=71), get_backend(),
-                       num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096)
+    eng = build_engine(
+        cfg,
+        build_random(cfg, seed=71),
+        get_backend(),
+        num_blocks=32,
+        num_slots=4,
+        max_batch=4,
+        max_total_tokens=4096,
+    )
     try:
         # idle: no requests, ancient timestamp must still be live (quiet server)
         eng._last_progress_ts = _time.perf_counter() - 9999.0
@@ -3377,8 +3925,15 @@ def test_engine_liveness_first_tick_after_long_idle_is_live():
     import numpy as np
 
     cfg = tiny()
-    eng = build_engine(cfg, build_random(cfg, seed=91), get_backend(),
-                       num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096)
+    eng = build_engine(
+        cfg,
+        build_random(cfg, seed=91),
+        get_backend(),
+        num_blocks=32,
+        num_slots=4,
+        max_batch=4,
+        max_total_tokens=4096,
+    )
     seen: dict = {}
     real_forward = eng._run_forward
 
@@ -3395,13 +3950,15 @@ def test_engine_liveness_first_tick_after_long_idle_is_live():
     try:
         eng._last_progress_ts = _time.perf_counter() - 300.0  # long idle
         assert eng.liveness(60.0) == (True, 0.0)  # idle stays live
-        eng.submit(np.arange(5, 5 + 128, dtype=np.int64),
-                   SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+        eng.submit(
+            np.arange(5, 5 + 128, dtype=np.int64),
+            SamplingParams(temperature=0.0, max_new_tokens=2, seed=0),
+        )
         eng.step()
         assert seen, "the in-flight forward hook never ran"
         assert seen["inflight_live"] is True, (
-            f"first forward in flight after idle wrongly flagged stuck: "
-            f"{seen['inflight_stuck']}s")
+            f"first forward in flight after idle wrongly flagged stuck: {seen['inflight_stuck']}s"
+        )
         eng.poll()
     finally:
         eng._run_forward = real_forward
@@ -3422,8 +3979,15 @@ def test_liveness_stamped_on_submit_idle_to_active_edge_only():
     import numpy as np
 
     cfg = tiny()
-    eng = build_engine(cfg, build_random(cfg, seed=97), get_backend(),
-                       num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096)
+    eng = build_engine(
+        cfg,
+        build_random(cfg, seed=97),
+        get_backend(),
+        num_blocks=32,
+        num_slots=4,
+        max_batch=4,
+        max_total_tokens=4096,
+    )
     try:
         prompt = np.arange(5, 5 + 128, dtype=np.int64)
         params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=0)
@@ -3461,9 +4025,16 @@ def test_forward_oom_is_fatal_but_a_normal_error_finishes_the_row():
 
     def make_engine():
         cfg = tiny()
-        return build_engine(cfg, build_random(cfg, seed=71), get_backend(),
-                            num_blocks=32, num_slots=4, max_batch=4,
-                            max_total_tokens=4096, sparse_k=0)
+        return build_engine(
+            cfg,
+            build_random(cfg, seed=71),
+            get_backend(),
+            num_blocks=32,
+            num_slots=4,
+            max_batch=4,
+            max_total_tokens=4096,
+            sparse_k=0,
+        )
 
     prompt = np.arange(5, 5 + 64, dtype=np.int64)
     params = dict(temperature=0.0, max_new_tokens=2, seed=0)
@@ -3543,16 +4114,22 @@ def test_forward_oom_is_fatal_but_a_normal_error_finishes_the_row():
         eng2.shutdown()
 
 
-
 def test_health_stats_carry_in_process_device_free_and_limit():
     """The long-term observability for a memory-fraction reserve: stats expose the
     process allocator's free/limit (mem_get_info), distinct from nvidia-smi. Off
     cuda both are 0 (no device); the fields always exist so readers need no
     device branch. The cuda values are pending-remote."""
     cfg = tiny()
-    eng = build_engine(cfg, build_random(cfg, seed=7), get_backend(),
-                       num_blocks=8, num_slots=4, max_batch=4,
-                       max_total_tokens=2048, sparse_k=0)
+    eng = build_engine(
+        cfg,
+        build_random(cfg, seed=7),
+        get_backend(),
+        num_blocks=8,
+        num_slots=4,
+        max_batch=4,
+        max_total_tokens=2048,
+        sparse_k=0,
+    )
     try:
         s = eng.stats()
         assert s["device_free_bytes"] == 0
@@ -3588,7 +4165,7 @@ class _MultiParkEngine:
         if not self.frame_sent[rid].is_set():
             self.frame_sent[rid].set()
             return self.tok.encode(f"frame-{rid}")
-        self.park[rid].wait(30.0)   # blocked in-flight poll; cancel sets the event
+        self.park[rid].wait(30.0)  # blocked in-flight poll; cancel sets the event
         return None if rid in self.cancelled else self.tok.encode(f"more-{rid}")
 
     def take(self, rid):
@@ -3614,10 +4191,13 @@ class _MultiParkEngine:
 
 def _open_stream_socket(port, payload):
     import socket
+
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
-    req = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
-           f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
-           f"\r\n{payload}").encode()
+    req = (
+        f"POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
+        f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+        f"\r\n{payload}"
+    ).encode()
     s.sendall(req)
     return s
 
@@ -3641,6 +4221,7 @@ class _WideDefaultExecutor:
             await self.inner(scope, receive, send)
             return
         import concurrent.futures
+
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
         self._pool = pool
         self._loop = asyncio.get_running_loop()
@@ -3682,9 +4263,11 @@ def test_simultaneous_sse_hangups_with_inflight_workers_do_not_freeze_the_loop()
     tok = _ByteTokenizer()
     eng = _MultiParkEngine(tok, N)
     server, port = _uvicorn_server(
-        eng, tok, wrap_app=lambda app: _WideDefaultExecutor(app, N * 2 + 8))
-    payload = json.dumps({"messages": [{"role": "user", "content": "hi"}],
-                          "stream": True, "max_tokens": 64})
+        eng, tok, wrap_app=lambda app: _WideDefaultExecutor(app, N * 2 + 8)
+    )
+    payload = json.dumps(
+        {"messages": [{"role": "user", "content": "hi"}], "stream": True, "max_tokens": 64}
+    )
     socks = []
     try:
         for _ in range(N):
@@ -3699,8 +4282,7 @@ def test_simultaneous_sse_hangups_with_inflight_workers_do_not_freeze_the_loop()
         def health_latency():
             probe = socket.create_connection(("127.0.0.1", port), timeout=5)
             try:
-                probe.sendall(b"GET /health HTTP/1.1\r\nHost: t\r\n"
-                              b"Connection: close\r\n\r\n")
+                probe.sendall(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
                 t0 = time.monotonic()
                 ans = b""
                 while b"\r\n\r\n" not in ans:
@@ -3768,12 +4350,17 @@ def test_stream_or_cancel_final_drain_is_detached_not_awaited_in_cancel_scope():
     # no shield / wait-for on an executor inside stream_or_cancel at all
     for node in ast.walk(tree):
         assert not (isinstance(node, ast.Attribute) and node.attr == "shield"), (
-            "stream_or_cancel must not shield/await an executor in its cancel scope")
+            "stream_or_cancel must not shield/await an executor in its cancel scope"
+        )
         assert not (isinstance(node, ast.Attribute) and node.attr == "wait_for"), (
-            "stream_or_cancel must not wait_for an executor in its cancel scope")
+            "stream_or_cancel must not wait_for an executor in its cancel scope"
+        )
     # the frame detaches to the helper
-    calls = {n.func.id for n in ast.walk(tree)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    calls = {
+        n.func.id
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
     assert "_detach_drain" in calls, "final drain must be detached via _detach_drain"
     assert "to_thread" not in calls, "stream_or_cancel must not run body.close on the loop"
 
@@ -3788,7 +4375,8 @@ def test_stream_or_cancel_final_drain_is_detached_not_awaited_in_cancel_scope():
     assert dsrc.index("to_thread(engine.cancel") < dsrc.index("wait_for(asyncio.shield"), (
         "drain must cancel the row before waiting on its in-flight worker: "
         "a GeneratorExit-at-yield skips the in-scope cancel and the worker is "
-        "parked until cancel runs, so waiting first deadlocks the drain")
+        "parked until cancel runs, so waiting first deadlocks the drain"
+    )
     # the set is both added and discard-on-done (no unbounded growth / GC)
     assert "_draining.add" in full and "discard" in full
     # the prompt disconnect paths still await their cancel IN the frame (slot
@@ -3928,8 +4516,10 @@ def test_await_completion_zero_means_no_deadline():
 def test_nonstream_request_504s_past_a_short_completion_timeout():
     engine = _GatedTakeEngine(_ByteTokenizer(), ["late"], ready_after=None)  # never finishes
     with TestClient(create_app(engine, _ByteTokenizer(), completion_timeout_s=0.1)) as c:
-        r = c.post("/v1/chat/completions",
-                   json={"messages": [{"role": "user", "content": "hi"}], "stream": False})
+        r = c.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "stream": False},
+        )
     assert r.status_code == 504, r.text
     assert r.json()["error"]["type"] == "api_error"
     assert engine.cancelled, "the timed-out row must be cancelled to free its slot"
@@ -3938,7 +4528,9 @@ def test_nonstream_request_504s_past_a_short_completion_timeout():
 def test_nonstream_request_waits_through_zero_completion_timeout():
     engine = _GatedTakeEngine(_ByteTokenizer(), ["late-but-ok"], ready_after=0.15)
     with TestClient(create_app(engine, _ByteTokenizer(), completion_timeout_s=0.0)) as c:
-        r = c.post("/v1/chat/completions",
-                   json={"messages": [{"role": "user", "content": "hi"}], "stream": False})
+        r = c.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "stream": False},
+        )
     assert r.status_code == 200, r.text
     assert r.json()["choices"][0]["message"]["content"] == "late-but-ok"
