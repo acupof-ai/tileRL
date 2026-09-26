@@ -113,8 +113,11 @@ def main() -> int:
         now = _cubins(args.cache_dir)
         added = None if now is None or sweep0 is None else now - sweep0
         total_added = None if now is None or before is None else now - before
+        # The gate is THIS verify sweep's delta (fresh lengths vs the cache the
+        # bake sweep left), not since-start: the bake sweep legitimately adds the
+        # shapes it exists to bake; only a verify increment means a missed bucket.
         if label.startswith("verify"):
-            verify_added = total_added
+            verify_added = added
         print(
             f"{label}: {total} requests, cubins={now} "
             f"(+{added} this sweep, +{total_added} since start)",
