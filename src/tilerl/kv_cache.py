@@ -104,6 +104,9 @@ class PagedKvPool:
         self.v_scale = None if kv_fp8 is None else torch.ones(sshape, device=self.device)
         self._free: list[int] = list(range(num_blocks))
         self.refcount: list[int] = [0] * num_blocks
+        #: reserved sentinel block (padded sparse table target), -1 if none. It
+        #: is never allocated to a request and is excluded from used_blocks.
+        self._sentinel: int = -1
         #: HostKvPages tier when sparse KV demotion is enabled; None = dense pool.
         self.cold: HostKvPages | None = None
 
@@ -168,6 +171,19 @@ class PagedKvPool:
             raise RuntimeError(f"PagedKvPool exhausted: all {self.num_blocks} blocks in use")
         block = self._free.pop()
         self.refcount[block] = 1
+        return block
+
+    def reserve_sentinel(self) -> int:
+        """Reserve one block out of the allocator as a fixed target for padded
+        packed-table columns. It never appears in a real block table's read
+        range; it only gives OOB-clamp lanes a live address so eager sparse
+        tables can round their width up to a compile bucket without reading a
+        freed block. Returns its id; call once, the block is never freed."""
+        block = self.num_blocks - 1
+        if self._sentinel >= 0 or block not in self._free:
+            raise RuntimeError("reserve_sentinel: last block already allocated or reserved")
+        self._free.remove(block)
+        self._sentinel = block  # never freed/reallocated; excluded from used_blocks
         return block
 
     def retain(self, block: int) -> None:
@@ -505,7 +521,8 @@ class PagedKvPool:
 
     @property
     def used_blocks(self) -> int:
-        return self.num_blocks - len(self._free)
+        used = self.num_blocks - len(self._free)
+        return used - (1 if self._sentinel >= 0 else 0)
 
     @staticmethod
     def blocks_for_tokens(tokens: int) -> int:

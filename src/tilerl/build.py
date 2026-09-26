@@ -471,6 +471,9 @@ def build_engine(
         kv_fp8=kv_fp8,
         cold_dtype=cold_dtype,
     )
+    if sparse_tracker is not None:
+        # Fixed target for eager verify-table width padding (Mb buckets).
+        sparse_tracker.sentinel_page = kv_pool.reserve_sentinel()
     if sparse_k and draft is not None:
         # The draft head stays DENSE under sparse, so its pool is independent of the
         # hot set: on a card, fit it to the memory left after weights/state/hot pool

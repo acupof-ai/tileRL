@@ -1222,7 +1222,6 @@ def test_verify_tick_packed_table_shape_is_fixed():
     decode widths are one context-independent constant per query width. Capture
     itself stays eager-only in the first cut."""
     from tilerl import sparse_engine as se
-    from tilerl.sparse_index import WINDOW_PAGES
 
     K = 2
     engine = _sparse_engine(K, draft=True)  # verify ticks carry up to W+1=2 q
@@ -1248,9 +1247,90 @@ def test_verify_tick_packed_table_shape_is_fixed():
     engine.shutdown()
 
     assert seen, "no decode/verify tick observed"
-    bound = K + WINDOW_PAGES
+    # Host-eager decode tables are rounded UP to the fixed Mb bucket, independent
+    # of context: a fresh verify ramp's selected-page count would otherwise re-JIT
+    # attention per ramp value. The graph/device captured width (k_pages+window,
+    # cuda only) is a separate path this CPU cell never runs. Invariant here:
+    # context-independence (one width per query width) and a bucket multiple.
+    bucket = engine._sparse.tracker.verify_mb_bucket
     for tq, widths in seen.items():
-        assert widths <= {bound, bound + 1}, (tq, widths)
+        assert len(widths) == 1, (tq, widths)  # same width for 10- and 16-page contexts
+        (w,) = widths
+        assert w >= bucket and w % bucket == 0, (tq, w, bucket)
+
+
+def _verify_mb_engine(bucket: int, max_batch: int):
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    from tilerl_kernels.backend import get_backend
+
+    e = build_engine(
+        cfg=cfg,
+        model=model,
+        backend=get_backend(),
+        num_blocks=200,
+        num_slots=4,
+        max_batch=max_batch,
+        max_total_tokens=8192,
+        max_num_batched_tokens=512,
+        sparse_k=2,
+        scorer="bounds",
+        kv_cold_bytes=1 << 30,
+        draft=_draft(cfg, model),
+        spec_depth=1,
+    )
+    e._sparse.tracker.verify_mb_bucket = bucket
+    return e
+
+
+def _drain_n(e, rid, n):
+    for _ in range(900):
+        d = e.poll()
+        if rid in d and len(d[rid]) >= n:
+            return d[rid][:n]
+        e.step()
+    raise TimeoutError("engine did not finish")
+
+
+def test_verify_mb_bucketing_leaves_solo_tokens_unchanged():
+    prompt = np.arange(7, 7 + 6 * BLOCK_TOKENS + 3, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=10, seed=0)
+    e_on = _verify_mb_engine(32, 1)
+    on = _drain_n(e_on, e_on.submit(prompt, params), 10)
+    e_on.shutdown()
+    # bucket=1 = exact data width, no padded column: the numerics oracle.
+    e_off = _verify_mb_engine(1, 1)
+    off = _drain_n(e_off, e_off.submit(prompt, params), 10)
+    e_off.shutdown()
+    assert on == off, (on, off)
+
+
+def test_verify_mb_bucketing_leaves_mixed_tick_tokens_unchanged():
+    # Long prompt enters decode first; the second prompt then prefills beside it,
+    # producing mixed prefill+decode ticks (the production insert scenario).
+    long = np.arange(21, 21 + 14 * BLOCK_TOKENS + 5, dtype=np.int64)
+    short = np.arange(7, 7 + 6 * BLOCK_TOKENS + 3, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=10, seed=0)
+
+    def run(bucket):
+        e = _verify_mb_engine(bucket, 2)
+        rids = [e.submit(long, params), e.submit(short, params)]
+        outs = [None, None]
+        for _ in range(1500):
+            d = e.poll()
+            for i, r in enumerate(rids):
+                if r in d:
+                    outs[i] = d[r]
+            if all(o is not None and len(o) >= 10 for o in outs):
+                break
+            e.step()
+        else:
+            e.shutdown()
+            raise TimeoutError("mixed engine did not finish")
+        e.shutdown()
+        return [o[:10] for o in outs]
+
+    assert run(32) == run(1)
 
 
 if __name__ == "__main__":
