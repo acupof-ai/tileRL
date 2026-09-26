@@ -1,30 +1,45 @@
 /** Smooth a token stream into per-frame character reveals.
  *
- * Sparse V100 decode delivers one multi-character token every ~110-167 ms
- * (6-9 tok/s). Appending each token as it arrives makes the text jump in
- * token-sized lumps at 6-9 Hz. The existing rAF paint coalescing cannot batch
- * this: a token arrives more slowly than a frame, so every token still paints.
+ * Sparse V100 decode is bursty: graph ticks deliver characters steadily for
+ * ~31 frames, then one eager refresh stalls the wire for ~218-272 ms (~13-16
+ * frames at 60 Hz) on a strict 32-tick period. The old revealer drained a
+ * character every frame whenever ANYTHING was queued and accelerated from a
+ * backlog of 8, so its queue was empty almost always: each refresh gap became
+ * ~183 ms with no new character on the page (recorded fixture,
+ * web/test/fixtures/).
  *
- * Deltas go into a queue; a scheduler (requestAnimationFrame in the page) drains
- * a few characters per frame, turning the 110 ms arrival granularity into a
- * ~16 ms visual one. The drain step grows with the backlog so a fast model or a
- * burst catches up instead of falling ever further behind, but it is capped so
- * catch-up never re-introduces a visible multi-character jump.
+ * The smoother:
+ *   1. Banks headroom — holds the first characters HEADROOM_FRAMES before
+ *      revealing, so a reserve already exists when the first periodic gap hits.
+ *   2. Drains one character per frame while the reserve is healthy, matching
+ *      the measured production rate (~24 tok/s × ~2.8 chars/tok ≈ 67 chars/s):
+ *      spend the reserve only as production replenishes it.
+ *   3. Adds a bounded catch-up term only once a real backlog accumulates
+ *      (CATCHUP_BACKLOG), capped at MAX_CHARS, so a regime change or a long
+ *      stall never strands characters and never jumps visibly.
+ *   4. Flushes everything at once on done/stop/pagehide.
  *
- * Pure logic: the scheduler/canceller are injected, so the timing tests run with
- * a manual step function and no wall clock.
+ * Banked by FRAME COUNT, not wall time: animation frames are the 60 Hz clock
+ * the page actually reveals on, so no separate time source is needed. Pure
+ * logic; the scheduler/canceller are injected, so timing tests replay a
+ * recorded arrival timeline on a manual frame stepper with no wall clock.
  */
 
-/** Characters revealed on a frame with an empty backlog — the floor rate. */
-export const BASE_CHARS = 1
+/** Frames banked before the first reveal. 18 frames ≈ 300 ms at 60 Hz, covering
+ * the measured 272 ms refresh stall (≈16 frames) for the first cycles. */
+export const HEADROOM_FRAMES = 18
+/** Characters revealed per frame while the reserve is healthy. */
+const BASE_CHARS = 1
 /** Most characters one frame may reveal, however large the backlog. */
 export const MAX_CHARS = 8
-/** A character is added to the per-frame step for each this many queued
- * characters: queue 8 → +1/frame, queue 56 → the MAX_CHARS cap. */
-const BACKLOG_DIVISOR = 8
+/** A residual backlog at/over this many characters adds a bounded catch-up term.
+ * Kept above the headroom-bank size (~20 chars) so ordinary refresh absorption
+ * never accelerates the drain; only a genuine regime change does. */
+const CATCHUP_BACKLOG = 24
+const CATCHUP_DIVISOR = 8
 
 export interface Reveal {
-  /** Queue a freshly arrived chunk; it will leave via onReveal over frames. */
+  /** Queue a freshly arrived chunk; it leaves via onReveal over frames. */
   push: (chunk: string) => void
   /** Reveal every queued character synchronously, once. Terminal/stop/pagehide. */
   flush: () => void
@@ -33,6 +48,7 @@ export interface Reveal {
 }
 
 export interface Timers {
+  /** Run cb on the next animation frame. */
   schedule: (cb: () => void) => number
   cancel: (handle: number) => void
 }
@@ -48,14 +64,31 @@ export const createReveal = (
   let start = 0
   let handle: number | null = null
 
+  /** One-time headroom bank, opened after HEADROOM_FRAMES ticks with content. */
+  let banking = true
+  let bankFrames = 0
+
   const queued = (): number => pending.length - start
 
   const tick = (): void => {
-    // Floor rate is BASE_CHARS whenever anything is queued; the backlog term
-    // only adds whole characters, so a thin stream reveals a steady one per
-    // frame with no fractional-credit jitter, and a burst speeds up to the cap.
-    const step = Math.min(MAX_CHARS, BASE_CHARS + Math.floor(queued() / BACKLOG_DIVISOR))
-    const n = Math.min(step, queued())
+    if (banking) {
+      // Still buying headroom: keep the loop alive but reveal nothing.
+      if (queued() === 0) {
+        handle = null
+        return
+      }
+      bankFrames += 1
+      if (bankFrames < HEADROOM_FRAMES) {
+        handle = timers.schedule(tick)
+        return
+      }
+      banking = false
+    }
+
+    const backlog = queued()
+    const catchUp =
+      backlog >= CATCHUP_BACKLOG ? Math.floor(backlog / CATCHUP_DIVISOR) : 0
+    const n = Math.min(MAX_CHARS, BASE_CHARS + catchUp, backlog)
     if (n > 0) {
       onReveal(pending.slice(start, start + n))
       start += n
@@ -76,7 +109,6 @@ export const createReveal = (
   return {
     push(chunk: string): void {
       if (chunk === "") return
-      // Compact a fully-drained prefix before appending.
       if (start > 0 && start === pending.length) {
         pending = ""
         start = 0
@@ -92,6 +124,8 @@ export const createReveal = (
       const rest = queued() > 0 ? pending.slice(start) : ""
       pending = ""
       start = 0
+      banking = true
+      bankFrames = 0
       if (rest !== "") onReveal(rest)
     },
     get pendingLength(): number {
