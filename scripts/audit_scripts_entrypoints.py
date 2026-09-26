@@ -91,12 +91,6 @@ MANUAL_KEEP: dict[str, str] = {
                                   "keepalive comment frames or an early close. "
                                   "Manual live check, no CPU twin, --self-check "
                                   "covers classify().",
-    "probe_prefill_jit_bake": "ops bake after deploy (#839/#840): drives a live "
-                             "V100 serve over real /v1/chat/completions to bake the "
-                             "finite prefill/draft/verify TileLang shapes into the "
-                             "shared on-disk JIT cache; needs the running 27B server, "
-                             "no CPU twin. The half-bucket verify sweep is the gate "
-                             "(--cache-dir: nonzero exit if fresh lengths add cubins).",
 }
 
 
