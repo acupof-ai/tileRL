@@ -74,12 +74,19 @@ def _cubins(cache_dir: str | None) -> int | None:
     if not cache_dir:
         return None
     try:
-        return len([f for f in os.listdir(cache_dir) if not f.startswith(".")])
+        return len([f for f in os.listdir(cache_dir) if f.endswith(".cubin")])
     except FileNotFoundError:
         return 0
 
 
-def main() -> None:
+def _bake_ok(verify_added: int | None) -> bool:
+    """Gate: without --cache-dir there is nothing to count (OK); with it, even one
+    cubin added by the fresh-length verify sweep means a prefill bucket was
+    missed and the disk cache is incomplete."""
+    return verify_added in (None, 0)
+
+
+def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--base", default="http://127.0.0.1:8000")
     ap.add_argument(
@@ -94,7 +101,9 @@ def main() -> None:
     t0 = time.perf_counter()
     total = 0
     sweeps = (("bake", TAILS), ("verify-fresh-lengths", VERIFY_TAILS))
-    for p, (label, tails) in enumerate(sweeps):
+    verify_added = None
+    for label, tails in sweeps:
+        sweep0 = _cubins(args.cache_dir)
         for b in batches:
             for tail in tails:
                 prompt = _prompt(tail)
@@ -102,10 +111,29 @@ def main() -> None:
                     list(ex.map(lambda _: _post(args.base, prompt, args.emit), range(b)))
                 total += b
         now = _cubins(args.cache_dir)
-        added = None if now is None or before is None else now - before
-        print(f"{label}: {total} requests, cubins={now} (+{added})", flush=True)
+        added = None if now is None or sweep0 is None else now - sweep0
+        total_added = None if now is None or before is None else now - before
+        if label.startswith("verify"):
+            verify_added = total_added
+        print(
+            f"{label}: {total} requests, cubins={now} "
+            f"(+{added} this sweep, +{total_added} since start)",
+            flush=True,
+        )
     print(f"bake done: {total} requests in {time.perf_counter() - t0:.0f}s", flush=True)
+    # Hard gate: with --cache-dir, the fresh-length verify sweep must compile
+    # NOTHING. A nonzero count means the bake sweep missed a prefill bucket (the
+    # half-bucket offsets land in every bucket), so the cache is incomplete.
+    if args.cache_dir and not _bake_ok(verify_added):
+        print(
+            f"BAKE INCOMPLETE: verify over fresh prompt lengths added "
+            f"{verify_added} cubin(s); the bake sweep did not cover every shape.",
+            flush=True,
+        )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
+    raise SystemExit(main())
     main()
