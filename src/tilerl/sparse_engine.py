@@ -242,12 +242,29 @@ class SparseTracker:
     #: initial page-row capacity of a request's bounds tensor
     INIT_CAP = 64
 
-    def __init__(self, cfg, k_pages: int, scorer: str, weights: dict | None = None, device=None):
+    def __init__(
+        self,
+        cfg,
+        k_pages: int,
+        scorer: str,
+        weights: dict | None = None,
+        device=None,
+        chunk_tokens: int = 0,
+    ):
         if scorer not in ("bounds", "index"):
             raise NotImplementedError(f'sparse engine scorer {scorer!r}: want "bounds" or "index"')
         self.cfg = cfg
         self.k_pages = k_pages
         self.scorer = scorer
+        #: Max pages a prefill chunk's OWN span can occupy (+1 for the
+        #: tail==1 back-off making a 17-token final chunk). 0 = no cap known
+        #: (direct test construction); the eager table then takes the batch's
+        #: data width. Set from max_num_batched_tokens in build_engine.
+        self.chunk_pages_cap = -(-int(chunk_tokens) // BLOCK_TOKENS) + 1 if chunk_tokens else 0
+        #: Fixed eager packed-table width (Mb): k selected + forced window + the
+        #: largest chunk own span. Constant across prompt lengths so the eager
+        #: prefill attention compiles ONE Mb per (S, B), not one per length.
+        self.eager_mb_cap = k_pages + WINDOW_PAGES + self.chunk_pages_cap if chunk_tokens else 0
         #: Device the preallocated bounds/l2p tensors live on. Must be the
         #: BACKEND device: attach runs before any bound exists, so inferring it
         #: from existing tensors put the first request's bounds_t/l2p_t on CPU on
@@ -847,7 +864,21 @@ class SparseForward:
             own_n = len(r["own"])
             packed.append(torch.cat((sel, self.own_table[bi, :own_n])))
             sl.append(sel.shape[0] * BLOCK_TOKENS + int(r["own_len"]))
-        width = max(t.shape[0] for t in packed)
+        # Fixed Mb per (S, B) for a PREFILL tick, not the batch's data width:
+        # paged_attention specializes on the table WIDTH (Mb is a TileLang
+        # const), and a prefill row's own-page count moves by a page with every
+        # prompt length, so a data-sized table recompiled the attention kernel
+        # per distinct length. Pad prefill ticks to k_pages + forced window +
+        # largest chunk own span (constant across prompt lengths). Pure
+        # decode/refresh ticks keep their data width — a decode own span is the
+        # fixed 8-page window (+1 across a boundary), so it is already
+        # context-independent and padding it only wastes attention reads. Per-row
+        # sl stays true; the padded page-0 columns are past each row's causal n
+        # and never read (the kernel clamps table index to Mb-1 only for OOB
+        # lanes), so this changes the compile shape, not numerics.
+        has_prefill = any(not r["decoding"] for r in self.rows)
+        cap = self.tracker.eager_mb_cap if has_prefill else 0
+        width = cap if cap else max(t.shape[0] for t in packed)
         table = torch.zeros(self.b, width, dtype=torch.long, device=self.device)
         for i, t in enumerate(packed):
             table[i, : t.shape[0]] = t

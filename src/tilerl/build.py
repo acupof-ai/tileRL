@@ -279,7 +279,13 @@ def build_engine(
         # The sparse decode/verify tick has its own captured graph
         # (_run_sparse_decode_graph); decode_graph must stay auto so it can be
         # built. The fused sparse read is correct post-#567, so no guard here.
-        sparse_tracker = SparseTracker(cfg, sparse_k, scorer, device=backend.device)
+        sparse_tracker = SparseTracker(
+            cfg,
+            sparse_k,
+            scorer,
+            device=backend.device,
+            chunk_tokens=max_num_batched_tokens,
+        )
         # An explicitly-passed NoPrefixStore means "sharing off" (training/old
         # tests); otherwise the sparse prefix index attaches once the cold tier
         # exists.
