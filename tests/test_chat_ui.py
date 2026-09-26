@@ -257,7 +257,15 @@ globalThis.CSS = { escape: (s) => String(s) };
 // coalescing collapses to paint-per-frame, which is the behaviour these gates
 // already assert. A rAF that deferred would put every assertion ahead of the
 // paint it checks.
-globalThis.requestAnimationFrame = (fn) => { fn(); return 0; };
+//
+// The reveal buffer is TIME-driven (rAF timestamp + performance.now share one
+// clock in a browser), so the synchronous shim must also ADVANCE that clock:
+// one virtual 60 Hz tick per callback. Frames are delivered as one batch and
+// the terminal frame flushes the buffer, so only monotonicity matters here;
+// real cadence is covered by the virtual-clock replay gate in the node tests.
+let __vt = 0;
+globalThis.performance = { now: () => __vt };
+globalThis.requestAnimationFrame = (fn) => { __vt += 1000 / 60; fn(__vt); return 0; };
 // The reveal buffer cancels a still-queued drain when a terminal frame flushes
 // it; cancelAnimationFrame is a browser global the synchronous rAF shim also has
 // to provide (a no-op, since the shim's frame already ran).
