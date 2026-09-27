@@ -265,6 +265,20 @@ class SparseTracker:
         #: largest chunk own span. Constant across prompt lengths so the eager
         #: prefill attention compiles ONE Mb per (S, B), not one per length.
         self.eager_mb_cap = k_pages + WINDOW_PAGES + self.chunk_pages_cap if chunk_tokens else 0
+        #: A verify/decode tick's packed-table width (Mb) rounds up to this many
+        #: pages. A fresh sequence's first verify ticks select 0..k_pages pages,
+        #: and Mb is a TileLang const, so without bucketing every ramp value
+        #: re-JITs paged_attention/write_tokens on the first mixed stream of a new
+        #: process. Padded columns hold sentinel_page and sit past each row's
+        #: causal bound, so they are never read.
+        self.verify_mb_bucket = 32
+        #: Legal pool block id used to fill padded table columns. Assigned by
+        #: build_engine after the KV pool reserves its last block (0 until then,
+        #: for direct test construction). The column is never read, so its
+        #: contents are irrelevant in production; a real block only keeps
+        #: OOB-clamp lanes on a live address and lets a NaN-fill test prove the
+        #: column is unread.
+        self.sentinel_page = 0
         #: Device the preallocated bounds/l2p tensors live on. Must be the
         #: BACKEND device: attach runs before any bound exists, so inferring it
         #: from existing tensors put the first request's bounds_t/l2p_t on CPU on
@@ -560,9 +574,20 @@ class SparseForward:
             self.rows = rows
             self.b = len(rows)
             own_w = max(len(r["own"]) for r in rows)
+        # Host-eager write_tokens reads own_table; round its width to the Mb
+        # bucket on a pure decode/verify tick, so a fresh verify ramp does not
+        # re-JIT it. Prefill ticks keep the data width (their own span is bounded
+        # by the chunk and prefill S is already bucketed). The graph/device path
+        # captures a fixed width above and stays untouched. Padded own columns are
+        # never indexed: write only touches pos//block-page_base < own count.
+        if not reuse and not device_select and all(r["decoding"] for r in rows):
+            bucket = tracker.verify_mb_bucket
+            own_w = max(bucket, -(-own_w // bucket) * bucket)
         self.own_w = own_w
         self.page_base = torch.zeros(self.b, dtype=torch.long, device=device)
-        self.own_table = torch.zeros(self.b, own_w, dtype=torch.long, device=device)
+        self.own_table = torch.full(
+            (self.b, own_w), tracker.sentinel_page, dtype=torch.long, device=device
+        )
 
         # The graph-captured width is constant PER VERIFY WIDTH, never per context:
         # a plain decode row (tq=1) is k_pages + 8-window; a verify row's chain can
@@ -877,9 +902,22 @@ class SparseForward:
         # and never read (the kernel clamps table index to Mb-1 only for OOB
         # lanes), so this changes the compile shape, not numerics.
         has_prefill = any(not r["decoding"] for r in self.rows)
-        cap = self.tracker.eager_mb_cap if has_prefill else 0
-        width = cap if cap else max(t.shape[0] for t in packed)
-        table = torch.zeros(self.b, width, dtype=torch.long, device=self.device)
+        data_w = max(t.shape[0] for t in packed)
+        if has_prefill:
+            # A prefill tick uses the fixed per-(S,B) cap when known; with no cap
+            # (direct test construction) it keeps its data width. It is NOT
+            # bucketed: the verify buckets below are for decode ticks only.
+            width = self.tracker.eager_mb_cap or data_w
+        else:
+            # ponytail: verify/decode Mb rounds up to 32 pages, wastes <=31 table
+            # columns; finer buckets if a profile shows them. Data width is
+            # selected(k)+own and bounded by k_pages+9 on a saturated row; the
+            # ramp is a fresh sequence's first verify ticks.
+            bucket = self.tracker.verify_mb_bucket
+            width = -(-data_w // bucket) * bucket
+        table = torch.full(
+            (self.b, width), self.tracker.sentinel_page, dtype=torch.long, device=self.device
+        )
         for i, t in enumerate(packed):
             table[i, : t.shape[0]] = t
         return table, torch.tensor(sl, dtype=torch.long, device=self.device)
