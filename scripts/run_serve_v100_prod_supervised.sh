@@ -18,6 +18,14 @@
 # (--sparse-min-tokens 0), a 1024-token window and a 32-tick refresh cadence.
 set -u
 
+# kcompactd TLB-shootdown stalls; see errors/2026-09-27-kcompactd-tlb-storm-stalls-eager-ticks.md
+if [ -r /proc/sys/vm/compaction_proactiveness ]; then
+  __cp="$(cat /proc/sys/vm/compaction_proactiveness 2>/dev/null || echo ?)"
+  if [ "$__cp" != "0" ]; then
+    echo "WARNING vm.compaction_proactiveness=$__cp (want 0): kcompactd TLB-shootdown stalls likely; sudo sysctl vm.compaction_proactiveness=0" >&2
+  fi
+fi
+
 ROOT=${SERVE_ROOT:-$HOME}
 REPO=${SERVE_REPO:-$ROOT/tilerl-v100-prod-5a0c54cc}
 PORT=${SERVE_PORT:-8000}

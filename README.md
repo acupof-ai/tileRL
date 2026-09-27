@@ -44,6 +44,9 @@ What runs today (H20 unless noted; every number links its entry):
 - **V100 sm70 runs a stable dense serve** — 4 slots / 8192 ctx, verified 2026-09-13
   (4×7.4k concurrent prefill peak 27.2/31.7 GiB, 0 OOM; soak 234 turns 0 errors).
   Endpoint, config and operations: [docs/serve-v100.md](docs/serve-v100.md).
+  Before launching set `sudo sysctl vm.compaction_proactiveness=0` or the
+  `kcompactd` TLB-shootdown storm adds periodic 1.2-1.5 s frame stalls
+  ([errors/2026-09-27-kcompactd-tlb-storm-stalls-eager-ticks](docs/experience/errors/2026-09-27-kcompactd-tlb-storm-stalls-eager-ticks.md)).
   Sparse is limited there: 64k serves at B=1 (3.44 tok/s decode, 343.2 s prefill,
   RSS 27.92/31 GiB) and the
   **256k prefill is SIGKILLed (OOM)** before its spill file is ever written

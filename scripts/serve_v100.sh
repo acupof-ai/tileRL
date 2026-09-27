@@ -14,6 +14,17 @@
 # on this pod, so a --user unit dies with the ssh session.
 set -u
 
+# kcompactd tries to migrate our pinned memory and storms the engine CPU with TLB
+# shootdowns unless proactive compaction is off -> periodic 1.2-1.5 s eager-tick
+# stalls. See docs/experience/errors/2026-09-27-kcompactd-tlb-storm-stalls-eager-ticks.md
+if [ -r /proc/sys/vm/compaction_proactiveness ]; then
+  __cp="$(cat /proc/sys/vm/compaction_proactiveness 2>/dev/null || echo ?)"
+  if [ "$__cp" != "0" ]; then
+    echo "WARNING vm.compaction_proactiveness=$__cp (want 0): kcompactd TLB-shootdown stalls likely;" \
+         "run 'sudo sysctl vm.compaction_proactiveness=0' before serving" >&2
+  fi
+fi
+
 ROOT=/data00/home/chenkailun.c
 REPO=$ROOT/tilerl-git
 LOG=$ROOT/serve70c.log
