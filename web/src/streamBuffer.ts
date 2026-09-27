@@ -29,13 +29,19 @@
  * wall time.
  */
 
-/** Hold the first characters this many ms after the first character arrives. */
-export const HEADROOM_MS = 300
+/** Hold the first characters this many ms after the first character arrives.
+ * 1000 ms, not 300: a long-context sparse turn's first refresh gap measured
+ * 1241 ms on the wire (2026-09-27 30k recording); a 300 ms bank left a 450 ms
+ * visible hole. The added 0.7 s first-char wait is negligible against the
+ * 26-73 s long-context TTFT, and short-context streams are unchanged. */
+export const HEADROOM_MS = 1000
 /** Reveal at this fraction of the cumulative mean arrival rate; the remainder
  * banks during fill cycles and covers the periodic refresh stall. */
 const RATE_FRACTION = 0.8
-/** A backlog worth this many ms of production adds a bounded catch-up term. */
-const CATCHUP_MS = 600
+/** A backlog worth this many ms of production adds a bounded catch-up term.
+ * 2000 ms: long-context two-turn refresh gaps ran to 1.4 s, and a 600 ms
+ * threshold started draining the reserve before the gap landed. */
+const CATCHUP_MS = 2000
 /** A tab-switch rAF pause must not bank infinite credit; cap per-frame dt. */
 const DT_CAP_MS = 100
 /** Most characters one frame may reveal, however large the credit/backlog. */
@@ -58,6 +64,13 @@ export interface Timers {
   now: () => number
 }
 
+export interface RevealTuning {
+  /** Headroom bank in ms. */
+  headroomMs?: number
+  /** Backlog-vs-production window in ms for the catch-up term. */
+  catchupMs?: number
+}
+
 export const createReveal = (
   onReveal: (chunk: string) => void,
   timers: Timers = {
@@ -65,7 +78,10 @@ export const createReveal = (
     cancel: (h) => cancelAnimationFrame(h),
     now: () => performance.now(),
   },
+  tuning: RevealTuning = {},
 ): Reveal => {
+  const headroomMs = tuning.headroomMs ?? HEADROOM_MS
+  const catchupMs = tuning.catchupMs ?? CATCHUP_MS
   let pending = ""
   let start = 0
   let handle: number | null = null
@@ -88,7 +104,7 @@ export const createReveal = (
         handle = null
         return
       }
-      if (now - (firstAt as number) < HEADROOM_MS) {
+      if (now - (firstAt as number) < headroomMs) {
         handle = timers.schedule(tick)
         return
       }
@@ -102,8 +118,8 @@ export const createReveal = (
     const rate = RATE_FRACTION * mean
     credit += rate * dt
     const backlog = queued()
-    if (backlog >= rate * CATCHUP_MS) {
-      credit += (backlog * dt) / CATCHUP_MS
+    if (backlog >= rate * catchupMs) {
+      credit += (backlog * dt) / catchupMs
     }
     const n = Math.min(MAX_CHARS, Math.floor(credit), backlog)
     credit -= n

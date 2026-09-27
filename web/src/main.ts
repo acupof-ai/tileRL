@@ -10,6 +10,7 @@ import {
 } from "./render.ts"
 import { ask, socketUrl, waitForHealth } from "./transport.ts"
 import { createReveal } from "./streamBuffer.ts"
+import { createSpeedMeter } from "./meter.ts"
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id)
@@ -108,6 +109,12 @@ let socketClose: (() => void) | null = null
 const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<void> => {
   const stopWaiting = startWaiting(turn)
   let firstFrame = true
+  const speed = createSpeedMeter()
+  speed.start(Date.now())
+  const paintMeter = (): void => {
+    const text = speed.liveText(Date.now())
+    if (text !== "") meter.replaceChildren(document.createTextNode(text))
+  }
   // Reveal streamed answer characters at a steady per-frame rate instead of in
   // token-sized lumps (sparse decode delivers one token every ~110-167 ms).
   // reasoning is folded away, so it needs no smoothing.
@@ -134,6 +141,10 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
         if (firstFrame) {
           stopWaiting()
           firstFrame = false
+        }
+        if (f.tokens !== undefined) {
+          speed.observe(f.tokens, Date.now())
+          paintMeter()
         }
         // reasoning renders immediately (it is folded away); answer content is
         // queued and painted only when the reveal loop discloses characters, so
@@ -164,7 +175,7 @@ const stream = (turn: Turn, cap: number | null, resend: () => void): Promise<voi
                cap ?? f.usage.completion_tokens)
         meter.replaceChildren(
           document.createTextNode(
-            `${f.usage.prompt_tokens} prompt + ${f.usage.completion_tokens} completion tokens`,
+            speed.finishText(f.usage.prompt_tokens, f.usage.completion_tokens, Date.now()),
           ),
         )
         // Only a real answer joins the history. Replaying reasoning as an
