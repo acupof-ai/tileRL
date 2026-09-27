@@ -28,6 +28,14 @@
 # --user unit dies with the ssh session.
 set -u
 
+# kcompactd TLB-shootdown stalls; see errors/2026-09-27-kcompactd-tlb-storm-stalls-eager-ticks.md
+if [ -r /proc/sys/vm/compaction_proactiveness ]; then
+  __cp="$(cat /proc/sys/vm/compaction_proactiveness 2>/dev/null || echo ?)"
+  if [ "$__cp" != "0" ]; then
+    echo "WARNING vm.compaction_proactiveness=$__cp (want 0): kcompactd TLB-shootdown stalls likely; sudo sysctl vm.compaction_proactiveness=0" >&2
+  fi
+fi
+
 ROOT=${SERVE_ROOT:-$HOME}
 REPO=${SERVE_REPO:-$ROOT/tilerl-v100-sse}
 PORT=${SERVE_PORT:-8000}

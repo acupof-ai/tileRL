@@ -8,6 +8,12 @@ The Qwen3.8-27B-NVFP4 server on the V100 host, a 31.7 GiB single card
 - Host `n37-002-027` (ssh alias `v100`), port **8000**. The port is not
   exposed externally; tunnel:
   `ssh -L 8000:127.0.0.1:8000 v100`, then `http://127.0.0.1:8000`.
+- **Before serving, set `sudo sysctl vm.compaction_proactiveness=0`.** The
+  default (20) makes `kcompactd` attempt migration of the process's pinned
+  memory; the failed unmap/remap storms the engine core with TLB shootdowns,
+  producing periodic 1.2-1.5 s eager-tick frame stalls. The V100 launchers
+  warn at startup if the value is not 0. See
+  [errors/2026-09-27-kcompactd-tlb-storm-stalls-eager-ticks](experience/errors/2026-09-27-kcompactd-tlb-storm-stalls-eager-ticks.md).
 - `GET /health`, `GET /v1/models`,
   `POST /v1/chat/completions` (OpenAI-shaped, model `qwen38-27b`).
 
