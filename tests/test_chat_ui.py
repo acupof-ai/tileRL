@@ -414,6 +414,14 @@ def test_the_websocket_route_streams_reasoning_then_the_answer():
     assert last_r < first_c, f"the two phases interleave: {frames}"
     assert frames[-1]["finish_reason"] == "stop", frames
     assert frames[-1]["usage"]["completion_tokens"] > 0, frames
+    # Every delta carries the cumulative generated-token count for the page's
+    # live tok/s meter: present, positive, monotonic, bounded by the done usage.
+    tok_frames = [f["tokens"] for f in frames if f["t"] == "delta"]
+    assert tok_frames and all(isinstance(n, int) and n > 0 for n in tok_frames), frames
+    # reasoning and content deltas from the same decode step share `seen`, so
+    # the sequence is non-decreasing rather than strictly increasing.
+    assert tok_frames == sorted(tok_frames), tok_frames
+    assert tok_frames[-1] <= frames[-1]["usage"]["completion_tokens"], frames
 
 
 def test_a_reply_cut_off_inside_the_block_says_length():

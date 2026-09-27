@@ -12,8 +12,9 @@ that route diverge, fix the server or this doc in the same PR.
 `/ws/chat`: the client sends one JSON ask; the server streams JSON text frames, with exactly
 one terminal frame last.
 
-- `{"t":"delta","reasoning_content"?:string,"content"?:string}` — 0..N; reasoning frames all
-  precede content frames.
+- `{"t":"delta","reasoning_content"?:string,"content"?:string,"tokens"?:number}` — 0..N; reasoning frames all
+  precede content frames. `tokens`, when present, is the cumulative generated-token count at that frame
+  (the page's live tok/s meter; additive — a server that omits it just shows no live rate).
 - `{"t":"tool_calls","tool_calls":Array<{id,type:"function",name,arguments:string}>}` — 0..1,
   emitted before the terminal frame; 1 entry per call, additive to the contract.
 - `{"t":"done","finish_reason":string,"tool_calls"?:Array<…>,"usage":{prompt_tokens,completion_tokens}}`

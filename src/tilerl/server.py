@@ -1095,7 +1095,11 @@ def create_app(
                     break
                 kind, payload, completion = item
                 if kind == "delta":
-                    await ws.send_json({"t": "delta", **payload})
+                    # `tokens` is the cumulative generated-token count at this
+                    # frame (`seen`, and len(output_ids) for the terminal tail),
+                    # so the page's live tok/s meter needs no client tokenizer.
+                    # Additive: older clients ignore the extra field.
+                    await ws.send_json({"t": "delta", **payload, "tokens": completion})
                 elif kind == "tool_calls":
                     calls = [
                         {

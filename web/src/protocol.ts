@@ -23,7 +23,13 @@ export interface ToolCall {
  * server never emits this today; the parse + render is forward compatibility for
  * when it does (the OpenAI-compatible routes already serve hosted tools). */
 export type Frame =
-  | { readonly t: "delta"; readonly reasoning_content?: string; readonly content?: string }
+  | {
+      readonly t: "delta"
+      readonly reasoning_content?: string
+      readonly content?: string
+      /** Cumulative generated-token count at this frame; absent on old servers. */
+      readonly tokens?: number
+    }
   | { readonly t: "tool_calls"; readonly tool_calls: ReadonlyArray<ToolCall> }
   | {
       readonly t: "done"
@@ -68,10 +74,13 @@ export const parseFrame = (raw: string): Frame | null => {
     const c = o["content"]
     if (r !== undefined && typeof r !== "string") return null
     if (c !== undefined && typeof c !== "string") return null
+    const tk = o["tokens"]
+    if (tk !== undefined && typeof tk !== "number") return null
     return {
       t: "delta",
       ...(typeof r === "string" ? { reasoning_content: r } : {}),
       ...(typeof c === "string" ? { content: c } : {}),
+      ...(typeof tk === "number" ? { tokens: tk } : {}),
     }
   }
   if (o["t"] === "tool_calls") {
