@@ -65,8 +65,11 @@ Controlled on/off comparison on the same V100, two 30k two-turn runs each:
   **223 ms**.
 - `20` (default): storm in 72 / 421 samples; the ~1.4 s stalls reproduce.
 
-Only the runtime value has been changed; making it persistent (a sysctl drop-in)
-is a follow-up for the host image. The engine code needs no change.
+The setting is persistent on the V100 host at
+`/etc/sysctl.d/90-tilerl-no-proactive-compaction.conf`
+(`vm.compaction_proactiveness=0`, per ckl 2026-09-27), so it survives reboot;
+the runtime sysctl above only changes the live value. The engine code needs no
+change.
 
 ## Rule
 
