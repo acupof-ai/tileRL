@@ -284,9 +284,11 @@ def test_the_flavour_probe_separates_the_two_parse_forms():
     if gnu_bin is not None:
         r = subprocess.run([gnu_bin, "-j", "-f", fmt, "2026-01-01", "+%s"],
                            capture_output=True, text=True, timeout=30)
-        # The message names the invoked binary (`gdate: invalid option -- 'j'`), so
-        # match the quoted flag, not the program name.
-        assert r.returncode != 0 and "'j'" in r.stderr, r.stderr[:200]
+        # Match the flag, not the wording: coreutils < 9.5 says
+        # `date: invalid option -- 'j'` and >= 9.5 says
+        # `error: unexpected argument '-j' found`, so a runner image bump turned
+        # a correct probe red. Neither spelling contains the other.
+        assert r.returncode != 0 and ("'j'" in r.stderr or "-j" in r.stderr), r.stderr[:200]
 
 
 def test_the_old_form_really_was_broken_on_this_platform():
