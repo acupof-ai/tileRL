@@ -43,6 +43,20 @@ footprint, not the block count, sets the ceiling.
 per-thread local array for registers, and the cooperative grid grows to 640
 blocks with it. GDN is 0.4% of the time, so spilling it is free.
 
+The sweep is not monotonic, so the choice is measured rather than derived:
+
+| min blocks/SM | grid | all ms |
+|---:|---:|---:|
+| 1 | 160 | 613 |
+| 2 | 160 | 617 |
+| 4 | 320 | 365 |
+| 8 | 640 | 295 |
+| 16 | 1280 | 1064 |
+
+The last row falls back to the unfixed time and the cause is not established —
+a 32-register cap makes GDN spill harder, but that would cost milliseconds, not
+770. 16 is not used.
+
 Same bench, both arms, both orders, after the fix:
 
 | arm | ms per token |
