@@ -6,7 +6,6 @@ import json
 import urllib.request
 from pathlib import Path
 
-
 root = Path(__file__).resolve().parent
 url = "https://download.pytorch.org/whl/cu121/torch-2.5.1%2Bcu121-cp311-cp311-linux_x86_64.whl"
 size = 780460642
