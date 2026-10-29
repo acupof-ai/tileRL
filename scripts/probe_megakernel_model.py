@@ -9,6 +9,7 @@ from tilerl_kernels.backend import Backend
 from tilerl_kernels.mega import MegaForward
 
 from tilerl.config import qwen38_27b
+from tilerl.engine import card_guard
 from tilerl.kv_cache import BatchKv, LinearStatePool, PagedKvPool
 from tilerl.model import build_random, load_hf
 
@@ -58,6 +59,7 @@ def main():
         model.params[base+".w8"] = (value/osc[:, None]).to(torch.float8_e4m3fn)
         model.params[base+".oscale"] = osc
         model.params[base+".wscale"] = torch.ones((value.shape[0]+127)//128, value.shape[1]//128)
+    card_guard()
     model.params = backend.materialize(model.params)
     model.materialized = True
     if args.load_only:

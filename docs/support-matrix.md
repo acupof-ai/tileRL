@@ -20,10 +20,10 @@ two cells share is only an override when the maker differs:
 | cpu | 16 | — | — | — |
 | metal | 16 | 3 (`gemm_nn/nt/tn`) | 0 | 13 |
 | sm90 | 50 | 9 | 34 | 7 |
-| sm70 | 27 | 2 (`silu_mul`, `gdn_prep`) | 11 | 14 |
+| sm70 | 28 | 2 (`silu_mul`, `gdn_prep`) | 12 | 14 |
 
 **sm70 reuses the CPU source more than any other accelerated cell**: 14 of its
-27 entries are the same maker object CPU runs, and only `silu_mul` and
+28 entries are the same maker object CPU runs, and only `silu_mul` and
 `gdn_prep` are replaced (the sparse `page_bounds` narrows to f16 via a lambda
 around the same `make_page_bounds` factory, so it is an addition, not an
 override). `gdn_prep` became an override because the CPU source
@@ -32,11 +32,12 @@ loops `T.serial(DK)` in every thread while the launch passes `threads=DK`, so al
 264.33 ms against 54.04 ms for the same work at `threads=1`, and `gdn_prep` was
 53.5% of a prefill tick's GPU time. sm70 now takes sm90's one-thread-per-column
 schedule at f32 rather than a third copy of the kernel.
-Its 11 additions are the sm70-specific paths — `linear_fp4_gemv`,
+Its 12 additions are the sm70-specific paths — `linear_fp4_gemv`,
 `linear_fp4_gemv_sm70_m`, `linear_fp4_f16_mma` (M>8 prefill), `paged_attention_split`,
 `paged_attention_split_combine`, `gdn_chunk_fused`, `gdn_decode_fused`,
-`rmsnorm_apply_narrow`, `write_tokens`, plus the sparse-KV pair
-`page_bounds` (f16 index bounds) and `page_bound_scores` (f32 scorer).
+`rmsnorm_apply_narrow`, `write_tokens`, the sparse-KV pair
+`page_bounds` (f16 index bounds) and `page_bound_scores` (f32 scorer), and
+`linear_fp8_sm70` (keeps FP8 weights on device and decodes them on demand).
 
 Line partition of `kernels*.py` (**4,604** lines: `kernels_linear.py` 1883,
 `kernels.py` 1082, `kernels_gdn.py` 939, `kernels_attn.py` 334,
@@ -93,7 +94,7 @@ sm70 is the served arch (27B NVFP4 on a V100), so its **fwd** column is
 evidenced end to end; **bwd** on sm70 has never been run and is marked
 accordingly rather than inferred from the registry. A cell with no sm70 entry
 resolves through the fallback chain to the CPU maker, which is how sm70 runs 14
-of its 27 entries — reached, not reimplemented.
+of its 28 entries — reached, not reimplemented.
 
 | Op | cpu | sm70 | sm90 | sm100 | metal |
 | --- | --- | --- | --- | --- | --- |

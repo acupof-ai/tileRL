@@ -9,6 +9,7 @@ from tilerl_kernels.backend import Backend
 from tilerl_kernels.mega import MegaForward
 
 from tilerl.config import qwen38_27b
+from tilerl.engine import card_guard
 from tilerl.kv_cache import BatchKv, LinearStatePool, PagedKvPool
 from tilerl.model import build_random, load_hf
 
@@ -40,6 +41,7 @@ def main():
         for name, tensor in model.params.items():
             if name.endswith(".oscale") or tensor.ndim == 2 and not name.endswith((".wq", ".scale")):
                 tensor.mul_(0.02)
+    card_guard()
     model.params = backend.materialize(model.params)
     model.materialized = True
     batch, tokens = args.batch, args.tokens
