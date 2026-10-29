@@ -200,8 +200,12 @@ def _fuse_projections(cfg: ModelConfig, params: dict[str, torch.Tensor]) -> None
             if any(params[f"{k}.w8"].shape[0] % 128 for k in group[:-1]):
                 continue  # the per-128-block wscale grid would not concat losslessly
             for suffix in (".w8", ".wscale"):
-                params[fused_key + suffix] = torch.cat(
-                    [params.pop(k + suffix) for k in group]).contiguous()
+                parts = [params.pop(k + suffix) for k in group]
+                if suffix == ".w8":
+                    dtype = parts[0].dtype
+                    params[fused_key + suffix] = torch.cat([v.view(torch.uint8) for v in parts]).view(dtype)
+                else:
+                    params[fused_key + suffix] = torch.cat(parts).contiguous()
             if f"{group[0]}.oscale" in params:
                 params[f"{fused_key}.oscale"] = torch.cat(
                     [params[f"{k}.oscale"] for k in group]).contiguous()
@@ -1094,7 +1098,10 @@ def load_hf(
                 if key is not None:
                     wscale = tensors[hf_name.removesuffix(".weight") + ".weight_scale_inv"].float()
                     fp8_native[key] = (tensor, wscale, None)
-                    tensor = dequant_fp8(tensor, wscale).to(torch.bfloat16)
+                    if not keep_master:
+                        key = None
+                    else:
+                        tensor = dequant_fp8(tensor, wscale).to(torch.bfloat16)
             elif (
                 hf_name.endswith(".weight")
                 and hf_name.removesuffix(".weight") + ".weight_scale_2" in tensors
@@ -1124,8 +1131,10 @@ def load_hf(
                     oscale = ws.expand(n).contiguous()
                     wscale = torch.ones(((n + 127) // 128), ((k + 127) // 128))
                     fp8_native[key] = (tensor, wscale, oscale)
-                    # the master carries the full magnitude, oscale included
-                    tensor = (tensor.float() * oscale.reshape(-1, 1)).to(torch.bfloat16)
+                    if not keep_master:
+                        key = None
+                    else:
+                        tensor = (tensor.float() * oscale.reshape(-1, 1)).to(torch.bfloat16)
             elif hf_name.endswith(
                 (
                     ".weight_scale",

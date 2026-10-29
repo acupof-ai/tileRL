@@ -1,0 +1,25 @@
+[project]
+name = "tilerl-v100-experiment"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "torch==2.5.1+cu121",
+  "tilelang[fp4]==0.1.13",
+  "safetensors==0.8.0",
+  "tokenizers==0.23.1",
+  "huggingface-hub==1.28.0",
+  "numpy==2.2.6",
+  "pytest==9.1.1",
+  "ruff==0.16.4",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { path = "torch-2.5.1+cu121-cp311-cp311-linux_x86_64.whl" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
