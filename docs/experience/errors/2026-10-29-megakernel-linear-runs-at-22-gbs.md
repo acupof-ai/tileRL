@@ -36,10 +36,25 @@ footprint, not the block count, sets the ceiling.
 
 ## Fix
 
-Not landed. The occupancy sweep (`scripts/probe_megakernel_occupancy.py`)
-trades GDN's 128-float per-thread local array for registers via
-`annotate_min_blocks_per_sm` and raises the grid with it. GDN is 0.4% of the
-time, so spilling it is free if linear gains warps.
+`MegaForward` now defaults to `blocks = sms * 8` and
+`annotate_min_blocks_per_sm(8)`: the occupancy sweep
+(`scripts/probe_megakernel_occupancy.py`) trades GDN's 128-float per-thread
+local array for registers, and the grid grows to 640 blocks with it. GDN is
+0.4% of the time, so spilling it is free.
+
+Rows-per-warp (giving one warp four independent weight rows to hide latency)
+does not help. At grid 640 / 8 blocks-per-SM, full kernel and linear-only:
+
+| rows per warp | all ms | linear ms |
+|---:|---:|---:|
+| 1 | 297 | 255 |
+| 2 | 307 | 265 |
+| 4 | 381 | 339 |
+| 8 | 502 | 460 |
+
+Each extra row adds registers to a kernel already register-capped for
+occupancy, so the loss of resident warps outweighs the longer memory chain.
+The knob was removed rather than left at 1.
 
 ## Rule
 

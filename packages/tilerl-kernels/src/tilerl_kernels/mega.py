@@ -6,7 +6,8 @@ from .kernels_mega import ADD, ATTENTION, EMBED, GDN, LINEAR, NORM, ROPE, SILU, 
 
 
 class MegaForward:
-    def __init__(self, model, backend, batch=1, max_context=512, cpu_reference=False, blocks=None):
+    def __init__(self, model, backend, batch=1, max_context=512, cpu_reference=False,
+                 blocks=None, min_blocks=8):
         cfg = model.cfg
         if backend.arch != "sm70" and not cpu_reference:
             raise ValueError("MegaForward requires sm70 or its CPU interpreter")
@@ -18,7 +19,10 @@ class MegaForward:
         if not cfg.full_attn_gated or cfg.tie_word_embeddings:
             raise ValueError("Requires a gated, untied model")
         self.cfg, self.backend = cfg, backend
-        self.blocks = blocks or backend._sms
+        # 8 blocks/SM is where the cooperative grid stops growing on sm70; the
+        # register cap that buys it costs GDN spills and nothing else (4 ms).
+        self.blocks = blocks or backend._sms * 8
+        self.min_blocks = min_blocks
         self.batch, self.max_context = batch, max_context
         self.buffers = [torch.zeros(1, device=backend.device)]
         self.rows = []
@@ -152,7 +156,9 @@ class MegaForward:
         linear("lm_head", normalized, bind(self.logits), cfg.vocab_size, h)
         self.program = torch.tensor(self.rows, device=backend.device, dtype=torch.int64)
         self.pointers = torch.tensor([p.data_ptr() for p in self.buffers], device=backend.device, dtype=torch.uint64)
-        self.kernel = None if cpu_reference else make_megakernel(self.blocks, len(self.rows), len(self.buffers))
+        self.kernel = None if cpu_reference else make_megakernel(
+            self.blocks, len(self.rows), len(self.buffers),
+            min_blocks=self.min_blocks)
 
     def reset(self):
         for tensor in self.state_buffers:
@@ -173,7 +179,8 @@ class MegaForward:
         pointers = self.pointers.clone()
         pointers[self.rows[0][4]] = tokens.data_ptr()
         self.position.fill_(self.cursor)
-        kernel = make_megakernel(self.blocks, len(self.rows), len(self.buffers), ids.shape[1])
+        kernel = make_megakernel(self.blocks, len(self.rows), len(self.buffers), ids.shape[1],
+                                 min_blocks=self.min_blocks)
         kernel(self.program, pointers, self.position)
         self.cursor += ids.shape[1]
         return self.logits
