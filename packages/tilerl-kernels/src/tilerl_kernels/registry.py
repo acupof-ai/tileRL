@@ -7,7 +7,7 @@ import os
 
 import torch
 
-from . import kernels, kernels_attn, kernels_gdn, kernels_linear, kernels_mma
+from . import kernels, kernels_attn, kernels_fp8_sm70, kernels_gdn, kernels_linear, kernels_mma
 
 _REGISTRY: dict[tuple[str, str], dict[str, object]] = {}
 
@@ -136,6 +136,7 @@ _register("fp4", "sm90", _SM90_KERNELS)
 # dead — the cell is the CPU f32 floor plus the kernels that also run on Volta.
 _SM70_KERNELS = {
     **_CPU_KERNELS,
+    "linear_fp8_sm70": kernels_fp8_sm70.make_linear_fp8_sm70,
     # Narrow variants for the elementwise ops whose output feeds a GEMV: the sm70
     # GEMV wants X in f16 and used to cast it at dispatch — one cast per launch,
     # over bytes rmsnorm/silu_mul had just written. Producing f16 at the source

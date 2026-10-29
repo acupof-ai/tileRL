@@ -910,6 +910,12 @@ class Backend:
         # only sm90 has an fp8 kernel; elsewhere materialize() made the weight bf16
         lead, K, N = x.shape[:-1], x.shape[-1], w8.shape[0]
         M = x.numel() // K
+        if self.arch == "sm70" and os.environ.get("TILERL_SM70_NATIVE_FP8") == "1":
+            xx = self._f32(x).reshape(M, K).contiguous()
+            osc = self._ones(N) if oscale is None else self._const_f32(oscale)
+            out = self._kernel("linear_fp8_sm70")(
+                xx, w8.view(torch.uint8), self._const_f32(wscale), osc).reshape(*lead, N)
+            return out if residual is None else out + residual
         plan = self._plan("linear_fp8", M, N, K)
         if plan is None:
             raise NotImplementedError(
@@ -971,7 +977,8 @@ class Backend:
         off sm90, .w8/.wscale/.oscale collapse into a bf16 weight once at wiring.
         Never rewrites an existing tensor: optimizer moments are keyed by id(param)."""
         out = dict(params)
-        if "linear_fp8" not in _resolve(self.precision, self.arch):
+        keep_fp8 = self.arch == "sm70" and os.environ.get("TILERL_SM70_NATIVE_FP8") == "1"
+        if not keep_fp8 and "linear_fp8" not in _resolve(self.precision, self.arch):
             for base in sorted(k[:-3] for k in params if k.endswith(".w8")):
                 if base not in out:
                     w = reference.dequant_fp8(params[f"{base}.w8"], params[f"{base}.wscale"])
